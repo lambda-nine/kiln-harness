@@ -1,0 +1,242 @@
+// Vendored from kilnd commit 867d731162d4581c01c756036873732c42649c6f.
+// kilnd API, version 1.
+syntax = "proto3";
+
+package kilnd.v1;
+
+service KilndService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  rpc Exec(ExecRequest) returns (ExecResponse);
+  rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_SERVING = 1;
+    STATUS_DEGRADED = 2;
+    STATUS_SHUTTING_DOWN = 3;
+  }
+  Status status = 1;
+  string version = 2;
+  string backend = 3;
+  string backend_version = 4;
+  string detail = 5;
+  int64 started_at_unix_ms = 6;
+  uint32 active_sandboxes = 7;
+  uint32 running_executions = 8;
+  AdmissionStats admission = 9;
+  NodeResourceStats node_resources = 10;
+}
+
+message NodeResourceStats {
+  uint64 max_sandboxes = 1;
+  uint64 reserved_sandboxes = 2;
+  uint64 max_memory_bytes = 3;
+  uint64 reserved_memory_bytes = 4;
+  uint64 max_pids = 5;
+  uint64 reserved_pids = 6;
+  uint64 max_disk_bytes = 7;
+  uint64 reserved_disk_bytes = 8;
+  uint64 rejected_creates = 9;
+}
+
+message AdmissionStats {
+  uint64 max_connections = 1;
+  uint64 current_connections = 2;
+  uint64 rejected_connections = 3;
+  uint64 max_concurrent_rpcs = 4;
+  uint64 current_rpcs = 5;
+  uint64 rejected_rpcs = 6;
+  uint64 max_concurrent_health = 7;
+  uint64 current_health = 8;
+  uint64 rejected_health = 9;
+  uint64 max_concurrent_execs = 10;
+  uint64 current_execs = 11;
+  uint64 rejected_execs = 12;
+  uint64 max_queued_exec_stdin_bytes = 13;
+  uint64 current_stdin_bytes = 14;
+  uint64 rejected_stdin = 15;
+  uint64 max_queued_execs_per_sandbox = 16;
+  uint64 rejected_sandbox_execs = 17;
+}
+
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_CREATING = 1;
+  SANDBOX_STATE_READY = 2;
+  SANDBOX_STATE_DELETING = 3;
+  SANDBOX_STATE_DELETED = 4;
+  SANDBOX_STATE_FAILED = 5;
+  SANDBOX_STATE_LOST = 6;
+}
+
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  NETWORK_MODE_NONE = 1;
+  NETWORK_MODE_FULL = 2;
+  NETWORK_MODE_ALLOWLIST = 3;
+}
+
+message NetworkPolicy {
+  NetworkMode mode = 1;
+  repeated string allow = 2;
+}
+
+message ResourceLimits {
+  uint64 memory_bytes = 1;
+  uint32 cpu_millis = 2;
+  uint32 pids = 3;
+  uint64 disk_bytes = 4;
+}
+
+message SandboxSpec {
+  string image = 1;
+  ResourceLimits limits = 2;
+  NetworkPolicy network = 3;
+  bool read_only_root = 4;
+  repeated string writable_paths = 5;
+  map<string, string> labels = 6;
+}
+
+message Sandbox {
+  string id = 1;
+  SandboxState state = 2;
+  SandboxSpec spec = 3;
+  string backend = 4;
+  string backend_id = 5;
+  int64 created_at_unix_ms = 6;
+  int64 updated_at_unix_ms = 7;
+  int64 deleted_at_unix_ms = 8;
+  string failure_reason = 9;
+}
+
+message CreateSandboxRequest { SandboxSpec spec = 1; }
+message CreateSandboxResponse { Sandbox sandbox = 1; }
+
+message GetSandboxRequest {
+  string id = 1;
+  uint32 execution_limit = 2;
+}
+
+message GetSandboxResponse {
+  Sandbox sandbox = 1;
+  repeated Execution recent_executions = 2;
+}
+
+message ListSandboxesRequest {
+  bool include_deleted = 1;
+  optional uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSandboxRequest { string id = 1; }
+message DeleteSandboxResponse { Sandbox sandbox = 1; }
+
+message ExecRequest {
+  string sandbox_id = 1;
+  repeated string argv = 2;
+  bytes stdin = 3;
+  uint32 timeout_ms = 4;
+}
+
+message ExecResponse { Execution execution = 1; }
+message GetExecutionRequest { string id = 1; }
+message GetExecutionResponse { Execution execution = 1; }
+
+enum ExecutionState {
+  EXECUTION_STATE_UNSPECIFIED = 0;
+  EXECUTION_STATE_RUNNING = 1;
+  EXECUTION_STATE_EXITED = 2;
+  EXECUTION_STATE_TIMED_OUT = 3;
+  EXECUTION_STATE_CANCELED = 4;
+  EXECUTION_STATE_FAILED = 5;
+  EXECUTION_STATE_INTERRUPTED = 6;
+}
+
+message Output {
+  bytes data = 1;
+  uint64 total_bytes = 2;
+  bool truncated = 3;
+  bool total_bytes_known = 4;
+}
+
+message Execution {
+  string id = 1;
+  string sandbox_id = 2;
+  repeated string argv = 3;
+  ExecutionState state = 4;
+  optional int32 exit_code = 5;
+  string failure_reason = 6;
+  int64 started_at_unix_ms = 7;
+  int64 finished_at_unix_ms = 8;
+  uint32 timeout_ms = 9;
+  uint64 stdin_bytes = 10;
+  Output stdout = 11;
+  Output stderr = 12;
+  CommandStatus command_status = 13;
+  RuntimeDiagnostic runtime_error = 14;
+}
+
+message CommandStatus {
+  oneof termination {
+    int32 exit_code = 1;
+    SignalStatus signal = 2;
+  }
+}
+
+message SignalStatus {
+  uint32 number = 1;
+  bool core_dumped = 2;
+}
+
+enum RuntimeErrorKind {
+  RUNTIME_ERROR_KIND_UNSPECIFIED = 0;
+  RUNTIME_ERROR_KIND_INVALID_REQUEST = 1;
+  RUNTIME_ERROR_KIND_UNAVAILABLE = 2;
+  RUNTIME_ERROR_KIND_NOT_FOUND = 3;
+  RUNTIME_ERROR_KIND_INCOMPATIBLE = 4;
+  RUNTIME_ERROR_KIND_BUSY = 5;
+  RUNTIME_ERROR_KIND_LAUNCH_FAILED = 6;
+  RUNTIME_ERROR_KIND_IO = 7;
+  RUNTIME_ERROR_KIND_PROTOCOL = 8;
+  RUNTIME_ERROR_KIND_CLEANUP_FAILED = 9;
+  RUNTIME_ERROR_KIND_INTERNAL = 10;
+  RUNTIME_ERROR_KIND_STOPPED = 11;
+}
+
+enum RuntimeStage {
+  RUNTIME_STAGE_UNSPECIFIED = 0;
+  RUNTIME_STAGE_VALIDATE = 1;
+  RUNTIME_STAGE_CONNECT = 2;
+  RUNTIME_STAGE_REQUEST = 3;
+  RUNTIME_STAGE_PREPARE = 4;
+  RUNTIME_STAGE_FORK = 5;
+  RUNTIME_STAGE_ADMISSION = 6;
+  RUNTIME_STAGE_STDIO = 7;
+  RUNTIME_STAGE_EXEC = 8;
+  RUNTIME_STAGE_WAIT = 9;
+  RUNTIME_STAGE_CLEANUP = 10;
+  RUNTIME_STAGE_REPORT = 11;
+  RUNTIME_STAGE_CAPTURE = 12;
+  RUNTIME_STAGE_HANDSHAKE = 13;
+}
+
+message RuntimeDiagnostic {
+  RuntimeErrorKind kind = 1;
+  RuntimeStage stage = 2;
+  string message = 3;
+  optional string native_code = 4;
+  bool message_truncated = 5;
+}
