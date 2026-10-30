@@ -85,13 +85,15 @@ pub enum AuditEvent {
     ModelTurn {
         turn: u32,
         action: String,
-        call_id: Option<String>,
+        /// Host-generated correlation ID, scoped to this session.
+        audit_call_id: Option<String>,
         tool: Option<String>,
         arguments: Option<ContentSummary>,
     },
     ToolCompleted {
         turn: u32,
-        call_id: String,
+        /// Matches the host-generated ID in the corresponding model turn.
+        audit_call_id: String,
         tool: String,
         ok: bool,
         execution_ids: Vec<String>,

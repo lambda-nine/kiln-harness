@@ -23,8 +23,9 @@ it is not a hostile multi-tenant boundary.
 - Provider, audit, budget, cancellation, deadline, and tool errors all enter a
   separate bounded cleanup path. Delete is retried and absence checked; an
   unconfirmed cleanup is surfaced instead of hidden.
-- Audit records omit content. They store hashes, byte/truncation evidence, safe
-  identifiers, sandbox IDs, and kilnd execution IDs.
+- Audit records omit content. They store hashes, byte/truncation evidence,
+  host-generated call correlation IDs, sandbox IDs, and kilnd execution IDs. Raw
+  provider call IDs stay only in the transient provider transcript.
 
 ## Deliberate limits
 

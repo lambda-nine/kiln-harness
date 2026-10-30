@@ -66,9 +66,11 @@ seconds so deadline construction cannot overflow after a sandbox exists.
 Each JSONL record has a session-local sequence, timestamp, session ID, sandbox
 ID once known, and one event. Accepted model arguments and final answers, tool results, and
 sandbox output are represented by SHA-256 plus byte counts or by output
-evidence; their contents are excluded. Tool events retain safe call IDs,
-registered tool names, kilnd execution IDs, and the sandbox ID. Unknown model
-tool names are recorded as `unknown`, not copied into the log. Oversized or
+evidence; their contents are excluded. Tool events use `audit_call_id`, a
+host-generated ID unique within the session, to link model turns and tool
+completion. Raw provider call IDs remain only in the transient transcript for
+result routing. Events retain registered tool names, kilnd execution IDs, and
+the sandbox ID. Unknown model tool names are recorded as `unknown`, not copied into the log. Oversized or
 invalid model actions are recorded as rejected before termination. On a client
 deadline/cancel, the harness queries recent sandbox executions to recover any
 ID kilnd already assigned and copies that row's byte/truncation evidence; an

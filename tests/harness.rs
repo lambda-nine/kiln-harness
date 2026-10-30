@@ -10,7 +10,7 @@ use kiln_harness::api::{
 use kiln_harness::audit::{AuditError, AuditEvent, AuditSink, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError};
 use kiln_harness::provider::{
-    ModelAction, Provider, ProviderContext, ProviderError, ScriptedProvider,
+    ModelAction, Provider, ProviderContext, ProviderError, ScriptedProvider, TranscriptItem,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -387,7 +387,7 @@ async fn audit_excludes_model_arguments_and_file_contents() {
     let secret = "TOPSECRET-should-not-enter-audit";
     let provider = ScriptedProvider::new([
         ModelAction::ToolCall {
-            call_id: "write-secret".to_string(),
+            call_id: secret.to_string(),
             tool: "write_file".to_string(),
             arguments: json!({"path": "secret.txt", "content": secret}),
         },
@@ -411,6 +411,73 @@ async fn audit_excludes_model_arguments_and_file_contents() {
     assert!(!encoded.contains(secret));
     assert!(!encoded.contains("secret.txt"));
     assert!(encoded.contains("sha256"));
+}
+
+#[tokio::test]
+async fn audit_correlation_is_host_generated_and_preserves_provider_result_routing() {
+    const PROVIDER_ID: &str = "TOPSECRET-provider-reuses-this-id";
+    struct ReusedIdProvider;
+
+    #[async_trait]
+    impl Provider for ReusedIdProvider {
+        async fn next(
+            &mut self,
+            context: ProviderContext<'_>,
+        ) -> Result<ModelAction, ProviderError> {
+            if context.turn > 1 {
+                assert!(matches!(
+                    context.transcript.last(),
+                    Some(TranscriptItem::ToolResult { call_id, .. }) if call_id == PROVIDER_ID
+                ));
+                assert!(matches!(
+                    &context.transcript[context.transcript.len() - 2],
+                    TranscriptItem::Model(ModelAction::ToolCall { call_id, .. })
+                        if call_id == PROVIDER_ID
+                ));
+            }
+            Ok(if context.turn <= 2 {
+                ModelAction::ToolCall {
+                    call_id: PROVIDER_ID.to_string(),
+                    tool: "workspace_diff".to_string(),
+                    arguments: json!({}),
+                }
+            } else {
+                ModelAction::FinalAnswer {
+                    text: "done".to_string(),
+                }
+            })
+        }
+    }
+
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ReusedIdProvider,
+        MemoryAudit::default(),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(CancellationToken::new())
+        .await
+        .expect("session succeeds");
+
+    let mut model_ids = Vec::new();
+    let mut completed_ids = Vec::new();
+    for record in &harness.audit().records {
+        match &record.event {
+            AuditEvent::ModelTurn {
+                audit_call_id: Some(id),
+                ..
+            } => model_ids.push(id.as_str()),
+            AuditEvent::ToolCompleted { audit_call_id, .. } => {
+                completed_ids.push(audit_call_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(model_ids, ["call-1", "call-2"]);
+    assert_eq!(completed_ids, model_ids);
+    let encoded = serde_json::to_string(&harness.audit().records).expect("serialize audit");
+    assert!(!encoded.contains(PROVIDER_ID));
 }
 
 #[tokio::test]

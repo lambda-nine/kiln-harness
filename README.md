@@ -7,7 +7,8 @@ or network access.
 It creates one no-network sandbox per session, exposes five typed tools
 (`exec`, `read_file`, `write_file`, `list_dir`, and `workspace_diff`), applies
 hard step/call/input/output/deadline budgets, writes a metadata-only append-only
-JSONL audit, and retries sandbox deletion after every returned work outcome.
+JSONL audit with host-generated call correlation IDs, and retries sandbox
+deletion after every returned work outcome.
 An unconfirmed cleanup is a bounded, explicit error rather than a hidden
 success. All sandbox work goes through kilnd's Unix-socket API; the harness
 never invokes `kiln` or a host shell.

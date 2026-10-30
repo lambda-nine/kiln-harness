@@ -351,7 +351,7 @@ where
                         } else {
                             "final_answer".to_string()
                         },
-                        call_id: None,
+                        audit_call_id: None,
                         tool: None,
                         arguments: None,
                     },
@@ -380,6 +380,8 @@ where
                 tool,
                 arguments,
             } => {
+                // Provider IDs are untrusted content and stay in the transient transcript.
+                let audit_call_id = format!("call-{turn}");
                 let call_id_valid = validate_call_id(&call_id).is_ok();
                 let tool_name_valid = tool.len() <= 64
                     && !tool.is_empty()
@@ -410,7 +412,7 @@ where
                         } else {
                             "tool_call".to_string()
                         },
-                        call_id: call_id_valid.then(|| call_id.clone()),
+                        audit_call_id: Some(audit_call_id.clone()),
                         tool: Some(audited_tool.clone()),
                         arguments: argument_summary.clone(),
                     },
@@ -470,7 +472,7 @@ where
                     Some(sandbox_id),
                     AuditEvent::ToolCompleted {
                         turn,
-                        call_id: call_id.clone(),
+                        audit_call_id,
                         tool: audited_tool.clone(),
                         ok: run.ok,
                         execution_ids: run.execution_ids,
