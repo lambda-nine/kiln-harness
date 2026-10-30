@@ -14,6 +14,7 @@ use kiln_harness::provider::{
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use tonic::{Code, Status};
 
 #[derive(Clone, Default)]
 struct FakeApi {
@@ -40,6 +41,7 @@ struct FakeState {
     create_ready_at: Option<std::time::Instant>,
     suppress_create_record: bool,
     create_error_after_record: bool,
+    create_rejection: Option<ApiError>,
     tool_exec_delay: Duration,
     baseline_exec_delay: Duration,
     fail_baseline: bool,
@@ -75,6 +77,9 @@ impl SandboxApi for FakeApi {
         let labels = request.labels.clone();
         let (delay, fail) = {
             let mut state = self.state();
+            if let Some(error) = &state.create_rejection {
+                return Err(error.clone());
+            }
             let delay = state.create_delay;
             let fail = state.create_error_after_record;
             if !state.suppress_create_record {
@@ -87,7 +92,7 @@ impl SandboxApi for FakeApi {
             tokio::time::sleep(delay).await;
         }
         if fail {
-            return Err(api_error("unavailable", "create response lost"));
+            return Err(api_error(Code::Unavailable, "create response lost"));
         }
         Ok(Sandbox {
             id: "sb-0000000000000001".to_string(),
@@ -187,13 +192,13 @@ impl SandboxApi for FakeApi {
             .is_some_and(|ready_at| std::time::Instant::now() < ready_at)
         {
             return Err(api_error(
-                "failed_precondition",
+                Code::FailedPrecondition,
                 "create operation is still in progress",
             ));
         }
         if state.delete_failures > 0 {
             state.delete_failures -= 1;
-            return Err(api_error("unavailable", "transient delete failure"));
+            return Err(api_error(Code::Unavailable, "transient delete failure"));
         }
         if matches!(state.delete_behavior, DeleteBehavior::AcknowledgeOnly) {
             return Ok(());
@@ -206,7 +211,7 @@ impl SandboxApi for FakeApi {
             state.deleted.push(sandbox_id.to_string());
         }
         if matches!(state.delete_behavior, DeleteBehavior::FailAfterRemoving) {
-            return Err(api_error("unavailable", "delete response lost"));
+            return Err(api_error(Code::Unavailable, "delete response lost"));
         }
         Ok(())
     }
@@ -222,7 +227,7 @@ impl SandboxApi for FakeApi {
             state.list_attempts += 1;
             if state.list_failures > 0 {
                 state.list_failures -= 1;
-                return Err(api_error("unavailable", "listing failed"));
+                return Err(api_error(Code::Unavailable, "listing failed"));
             }
             state.list_delay
         };
@@ -245,9 +250,9 @@ impl SandboxApi for FakeApi {
     }
 }
 
-fn api_error(code: &str, message: &str) -> ApiError {
+fn api_error(code: Code, message: &str) -> ApiError {
     ApiError {
-        code: code.to_string(),
+        code,
         message: message.to_string(),
     }
 }
@@ -574,6 +579,63 @@ async fn lost_create_response_is_recovered_by_session_label() {
             deleted: true,
         } if sandbox_ids == &["sb-0000000000000001"]
     )));
+}
+
+#[tokio::test]
+async fn every_tonic_status_is_classified_through_adapter_conversion() {
+    for (code, unambiguous) in [
+        (Code::Ok, false),
+        (Code::Cancelled, false),
+        (Code::Unknown, false),
+        (Code::InvalidArgument, true),
+        (Code::DeadlineExceeded, false),
+        (Code::NotFound, false),
+        (Code::AlreadyExists, false),
+        (Code::PermissionDenied, true),
+        (Code::ResourceExhausted, true),
+        (Code::FailedPrecondition, true),
+        (Code::Aborted, false),
+        (Code::OutOfRange, false),
+        (Code::Unimplemented, false),
+        (Code::Internal, false),
+        (Code::Unavailable, false),
+        (Code::DataLoss, false),
+        (Code::Unauthenticated, true),
+    ] {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        // Use the exact Status -> ApiError conversion used by the tonic adapter.
+        observer.state().create_rejection = Some(ApiError::from(Status::new(code, "rejected")));
+        let mut config = short_lifecycle_config();
+        config.lifecycle_timeout = Duration::from_millis(15);
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::demo(),
+            MemoryAudit::default(),
+            config,
+        );
+
+        let error = harness
+            .run(CancellationToken::new())
+            .await
+            .expect_err("create was rejected");
+
+        let actual_code = match error {
+            HarnessError::Api(error) if unambiguous => error.code,
+            HarnessError::CreateUncertain(error) if !unambiguous => error.code,
+            other => panic!("incorrect classification for {code:?}: {other}"),
+        };
+        assert_eq!(actual_code, code);
+        assert!(observer.state().creates.is_empty());
+        assert!(
+            observer.state().list_attempts > 0,
+            "recovery listing is still required"
+        );
+        assert!(matches!(
+            harness.audit().records.last().map(|record| &record.event),
+            Some(AuditEvent::SessionFinished { sandbox_deleted, .. }) if *sandbox_deleted == unambiguous
+        ));
+    }
 }
 
 #[tokio::test]

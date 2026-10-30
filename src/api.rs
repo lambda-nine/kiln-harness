@@ -96,21 +96,24 @@ pub struct Health {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("kilnd {code}: {message}")]
 pub struct ApiError {
-    pub code: String,
+    pub code: tonic::Code,
     pub message: String,
 }
 
 impl ApiError {
     fn local(message: impl Into<String>) -> Self {
         Self {
-            code: "local".to_string(),
+            // Local transport/protocol failures cannot prove create rejection.
+            code: tonic::Code::Unknown,
             message: message.into(),
         }
     }
+}
 
-    fn rpc(status: &tonic::Status) -> Self {
+impl From<tonic::Status> for ApiError {
+    fn from(status: tonic::Status) -> Self {
         Self {
-            code: format!("{:?}", status.code()).to_lowercase(),
+            code: status.code(),
             message: status.message().to_string(),
         }
     }
@@ -182,7 +185,7 @@ impl SandboxApi for TonicKilnd {
             .clone()
             .health(pb::HealthRequest {})
             .await
-            .map_err(|status| ApiError::rpc(&status))?
+            .map_err(ApiError::from)?
             .into_inner();
         let resources = response.node_resources.unwrap_or_default();
         Ok(Health {
@@ -227,7 +230,7 @@ impl SandboxApi for TonicKilnd {
                 }),
             })
             .await
-            .map_err(|status| ApiError::rpc(&status))?
+            .map_err(ApiError::from)?
             .into_inner();
         Self::sandbox(response.sandbox)
     }
@@ -245,7 +248,7 @@ impl SandboxApi for TonicKilnd {
                 timeout_ms,
             })
             .await
-            .map_err(|status| ApiError::rpc(&status))?
+            .map_err(ApiError::from)?
             .into_inner();
         let execution = response
             .execution
@@ -262,7 +265,7 @@ impl SandboxApi for TonicKilnd {
                 execution_limit: 100,
             })
             .await
-            .map_err(|status| ApiError::rpc(&status))?
+            .map_err(ApiError::from)?
             .into_inner();
         Ok(response
             .recent_executions
@@ -279,7 +282,7 @@ impl SandboxApi for TonicKilnd {
                 id: sandbox_id.to_string(),
             })
             .await
-            .map_err(|status| ApiError::rpc(&status))?
+            .map_err(ApiError::from)?
             .into_inner();
         let sandbox = response
             .sandbox
@@ -306,7 +309,7 @@ impl SandboxApi for TonicKilnd {
                     page_token,
                 })
                 .await
-                .map_err(|status| ApiError::rpc(&status))?
+                .map_err(ApiError::from)?
                 .into_inner();
             for sandbox in response.sandboxes {
                 sandboxes.push(Sandbox {
@@ -352,5 +355,27 @@ fn execution_from_proto(execution: pb::Execution) -> Execution {
         failure_reason: execution.failure_reason,
         stdout: output(execution.stdout),
         stderr: output(execution.stderr),
+    }
+}
+
+#[cfg(test)]
+mod status_contract_test {
+    use super::ApiError;
+    use tonic::{Code, Status};
+
+    #[test]
+    fn tonic_status_codes_survive_adapter_conversion() {
+        for code in [
+            Code::InvalidArgument,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+        ] {
+            let error = ApiError::from(Status::new(code, "rejected"));
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, "rejected");
+        }
+        assert_eq!(ApiError::local("response lost").code, Code::Unknown);
     }
 }

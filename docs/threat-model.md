@@ -25,6 +25,10 @@ it is not a hostile multi-tenant boundary.
   error is independently checked with a complete non-deleted listing. Delete
   and verification are retried within the same cleanup window; failed or
   stalled verification is surfaced as unconfirmed cleanup.
+- Create recovery classifies typed gRPC status codes: invalid argument, resource
+  exhausted, failed precondition, permission denied, and unauthenticated are
+  definite rejections only after successful recovery listings. Other codes and
+  local transport/protocol failures remain ambiguous without a recovered row.
 - Audit records omit content. They store hashes, byte/truncation evidence,
   host-generated call correlation IDs, sandbox IDs, and kilnd execution IDs. Raw
   provider call IDs stay only in the transient provider transcript.

@@ -590,19 +590,19 @@ fn recovery_deadline(timeout: Duration) -> Instant {
 
 fn deadline_api(message: &str) -> ApiError {
     ApiError {
-        code: "deadline_exceeded".to_string(),
+        code: tonic::Code::DeadlineExceeded,
         message: message.to_string(),
     }
 }
 
 fn unambiguous_create_error(error: &ApiError) -> bool {
     matches!(
-        error.code.as_str(),
-        "invalid_argument"
-            | "resource_exhausted"
-            | "failed_precondition"
-            | "permission_denied"
-            | "unauthenticated"
+        error.code,
+        tonic::Code::InvalidArgument
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
     )
 }
 

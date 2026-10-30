@@ -11,8 +11,9 @@ JSONL audit with host-generated call correlation IDs, and retries sandbox
 deletion after every returned work outcome. Every delete acknowledgement needs
 a separate listing confirming absence within the cleanup window.
 An unconfirmed cleanup is a bounded, explicit error rather than a hidden
-success. All sandbox work goes through kilnd's Unix-socket API; the harness
-never invokes `kiln` or a host shell.
+success. Typed gRPC status codes distinguish definite create rejections from
+ambiguous outcomes, which require lifecycle recovery. All sandbox work goes
+through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shell.
 
 kiln is experimental shared-kernel isolation. It is not a boundary for hostile
 multi-tenant workloads.

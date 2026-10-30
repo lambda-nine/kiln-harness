@@ -37,6 +37,8 @@ Create shares the 30-second session wall deadline. Every request has unique
 polls bounded non-deleted listings for those labels and deletes every match.
 If an ambiguous failure produces no discoverable row before the recovery
 window closes, the result is `CreateUncertain`, not a false cleanup claim.
+The adapter preserves `tonic::Code` for create rejection classification; local
+transport/protocol failures use `Unknown` and remain ambiguous.
 Idempotent create and sandbox TTLs remain control-plane roadmap items. Forced
 process death still depends on kilnd reconciliation and a future TTL.
 
