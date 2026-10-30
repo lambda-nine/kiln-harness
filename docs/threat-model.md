@@ -21,8 +21,10 @@ it is not a hostile multi-tenant boundary.
 - Step, call, argv, stdin, file, manifest, result, per-execution, and session
   bounds are finite. kilnd supplies a second validation and capture boundary.
 - Provider, audit, budget, cancellation, deadline, and tool errors all enter a
-  separate bounded cleanup path. Delete is retried and absence checked; an
-  unconfirmed cleanup is surfaced instead of hidden.
+  separate bounded cleanup path. Every delete acknowledgement and ambiguous
+  error is independently checked with a complete non-deleted listing. Delete
+  and verification are retried within the same cleanup window; failed or
+  stalled verification is surfaced as unconfirmed cleanup.
 - Audit records omit content. They store hashes, byte/truncation evidence,
   host-generated call correlation IDs, sandbox IDs, and kilnd execution IDs. Raw
   provider call IDs stay only in the transient provider transcript.

@@ -261,7 +261,7 @@ where
         .await;
 
         // Cleanup has a separate finite settlement window. Delete is
-        // idempotently retried and absence is checked after ambiguous RPCs.
+        // idempotently retried and independently verified after every response.
         let cleanup_deadline = lifecycle_deadline(self.config.lifecycle_timeout);
         let cleanup = cleanup_sandbox(
             &self.api,
@@ -618,7 +618,9 @@ async fn cleanup_sandbox<A: SandboxApi>(
             return Err(last_error);
         }
         match timeout_at(deadline, api.delete(sandbox_id)).await {
-            Ok(Ok(())) => return Ok(()),
+            Ok(Ok(())) => {
+                last_error = deadline_api("delete acknowledged but sandbox absence is unconfirmed");
+            }
             Ok(Err(error)) => last_error = error,
             Err(_) => {
                 last_error = deadline_api("delete RPC did not settle before cleanup deadline");

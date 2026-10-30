@@ -26,7 +26,8 @@ No harness code depends on kiln files, process layout, or CLI behavior.
 3. Capture a bounded `/workspace` file-set baseline through kilnd.
 4. Alternate provider turns and typed tool results until a final answer or a
    budget/cancellation/error ends work.
-5. Retry idempotent `DeleteSandbox` and verify absence after ambiguous errors.
+5. Retry idempotent `DeleteSandbox` and independently verify absence with a
+   complete non-deleted listing after every acknowledgement or ambiguous error.
    Cleanup has a separate 10-second wall window because kilnd may need to drain
    descendants and publish terminal state after the work deadline. Failure to
    confirm deletion is returned as a cleanup error.

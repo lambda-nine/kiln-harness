@@ -122,7 +122,12 @@ pub trait SandboxApi: Send + Sync {
     async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError>;
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError>;
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError>;
+    /// Request idempotent deletion. Success acknowledges a deleted response state;
+    /// callers must independently confirm absence via `non_deleted_sandboxes`.
     async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError>;
+    /// Independently list every sandbox not yet deleted, including creating,
+    /// deleting, and failed sandboxes. Errors or incomplete pagination must not
+    /// be returned as a successful empty listing.
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError>;
 }
 

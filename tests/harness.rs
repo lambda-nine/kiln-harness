@@ -21,6 +21,14 @@ struct FakeApi {
 }
 
 #[derive(Default)]
+enum DeleteBehavior {
+    #[default]
+    Remove,
+    AcknowledgeOnly,
+    FailAfterRemoving,
+}
+
+#[derive(Default)]
 struct FakeState {
     creates: Vec<SandboxRequest>,
     execs: Vec<SandboxExec>,
@@ -37,6 +45,11 @@ struct FakeState {
     fail_baseline: bool,
     delete_failures: u32,
     delete_attempts: u32,
+    delete_behavior: DeleteBehavior,
+    delete_acknowledgements_before_removal: u32,
+    list_failures: u32,
+    list_delay: Duration,
+    list_attempts: u32,
 }
 
 impl FakeApi {
@@ -182,7 +195,19 @@ impl SandboxApi for FakeApi {
             state.delete_failures -= 1;
             return Err(api_error("unavailable", "transient delete failure"));
         }
-        state.deleted.push(sandbox_id.to_string());
+        if matches!(state.delete_behavior, DeleteBehavior::AcknowledgeOnly) {
+            return Ok(());
+        }
+        if state.delete_acknowledgements_before_removal > 0 {
+            state.delete_acknowledgements_before_removal -= 1;
+            return Ok(());
+        }
+        if !state.deleted.iter().any(|id| id == sandbox_id) {
+            state.deleted.push(sandbox_id.to_string());
+        }
+        if matches!(state.delete_behavior, DeleteBehavior::FailAfterRemoving) {
+            return Err(api_error("unavailable", "delete response lost"));
+        }
         Ok(())
     }
 
@@ -192,6 +217,18 @@ impl SandboxApi for FakeApi {
     }
 
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
+        let delay = {
+            let mut state = self.state();
+            state.list_attempts += 1;
+            if state.list_failures > 0 {
+                state.list_failures -= 1;
+                return Err(api_error("unavailable", "listing failed"));
+            }
+            state.list_delay
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let state = self.state();
         Ok(if state.creates.len() > state.deleted.len() {
             vec![Sandbox {
@@ -651,6 +688,167 @@ async fn permanent_delete_failure_is_bounded_and_reported() {
             ..
         })
     ));
+}
+
+#[tokio::test]
+async fn successful_delete_response_must_still_verify_absence() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    observer.state().delete_behavior = DeleteBehavior::AcknowledgeOnly;
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelAction::FinalAnswer {
+            text: "done".to_string(),
+        }]),
+        MemoryAudit::default(),
+        short_lifecycle_config(),
+    );
+
+    let started = tokio::time::Instant::now();
+    let error = harness
+        .run(CancellationToken::new())
+        .await
+        .expect_err("cleanup is not confirmed while the sandbox remains listed");
+
+    assert!(matches!(error, HarnessError::Cleanup(_)));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(observer.state().delete_attempts > 1);
+    {
+        let state = observer.state();
+        assert_eq!(state.list_attempts, state.delete_attempts);
+    }
+    assert_eq!(observer.state().deleted.len(), 0);
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished {
+            sandbox_deleted: false,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn acknowledged_delete_is_retried_until_independent_absence() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    observer.state().delete_acknowledgements_before_removal = 2;
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelAction::FinalAnswer {
+            text: "done".to_string(),
+        }]),
+        MemoryAudit::default(),
+        short_lifecycle_config(),
+    );
+
+    harness
+        .run(CancellationToken::new())
+        .await
+        .expect("absence is eventually verified");
+
+    let state = observer.state();
+    assert_eq!(state.delete_attempts, 3);
+    assert_eq!(state.list_attempts, 3);
+    assert_eq!(state.deleted.len(), 1);
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished {
+            sandbox_deleted: true,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn delete_acknowledgement_requires_successful_bounded_verification() {
+    for stalled in [false, true] {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        {
+            let mut state = observer.state();
+            if stalled {
+                state.list_delay = Duration::from_secs(1);
+            } else {
+                state.list_failures = u32::MAX;
+            }
+        }
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::new([ModelAction::FinalAnswer {
+                text: "done".to_string(),
+            }]),
+            MemoryAudit::default(),
+            short_lifecycle_config(),
+        );
+        let started = tokio::time::Instant::now();
+
+        let error = harness
+            .run(CancellationToken::new())
+            .await
+            .expect_err("verification is required");
+
+        assert!(matches!(error, HarnessError::Cleanup(_)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(
+            observer.state().deleted.len(),
+            1,
+            "deletion itself succeeded"
+        );
+        assert!(observer.state().list_attempts > 0);
+        assert!(matches!(
+            harness.audit().records.last().map(|record| &record.event),
+            Some(AuditEvent::SessionFinished {
+                sandbox_deleted: false,
+                ..
+            })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn transient_verification_errors_are_retried() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    observer.state().list_failures = 2;
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelAction::FinalAnswer {
+            text: "done".to_string(),
+        }]),
+        MemoryAudit::default(),
+        short_lifecycle_config(),
+    );
+
+    harness
+        .run(CancellationToken::new())
+        .await
+        .expect("listing eventually confirms absence");
+
+    assert_eq!(observer.state().list_attempts, 3);
+    assert_eq!(observer.state().deleted.len(), 1);
+}
+
+#[tokio::test]
+async fn lost_delete_response_is_confirmed_by_independent_absence() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    observer.state().delete_behavior = DeleteBehavior::FailAfterRemoving;
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelAction::FinalAnswer {
+            text: "done".to_string(),
+        }]),
+        MemoryAudit::default(),
+        short_lifecycle_config(),
+    );
+
+    harness
+        .run(CancellationToken::new())
+        .await
+        .expect("absence confirms ambiguous deletion");
+
+    assert_eq!(observer.state().list_attempts, 1);
+    assert_eq!(observer.state().deleted.len(), 1);
 }
 
 #[tokio::test]
