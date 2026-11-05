@@ -1,3 +1,5 @@
 /target/
 /audit/
 *.jsonl
+/dist/
+__pycache__/
