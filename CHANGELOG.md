@@ -12,8 +12,9 @@ change the CLI or audit format.
   per-request output cap now covers one call with its attempts
   (`--no-fallbacks` for a per-attempt cap). Authenticated error messages
   drop the error type and request ID when either contains the key. Opaque
-  content holding a float or an integer outside 64 bits is refused, since
-  it could not be echoed exactly. Responses must be a `message` from the
+  content holding a float or an integer outside 64 bits anywhere,
+  `tool_use` inputs included, is refused, since it could not be echoed
+  exactly. Responses must be a `message` from the
   `assistant` with a valid, now required, `model` and a known stop reason;
   `pause_turn`, unknown, and missing stop reasons are `InvalidResponse`,
   and the adapter no longer yields `StopReason::Other`. `--strict-tools`

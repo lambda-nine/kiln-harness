@@ -68,12 +68,13 @@
 //!
 //! Opaque content must echo value for value, and `serde_json` holds only
 //! 64-bit integers exactly: a float, or an integer outside `i64` and `u64`,
-//! anywhere in the blocks or `stop_details` is `InvalidResponse`. Current
-//! block types (`thinking`, `redacted_thinking`, `fallback`, `text`,
-//! `tool_use`) carry no such numbers, so this costs nothing in practice.
-//! A `tool_use` block's `input` is the neutral arguments rather than opaque
-//! content and is not checked; its numbers take `serde_json`'s
-//! `float_roundtrip` path, and the typed tool judges them.
+//! anywhere in the blocks or `stop_details`, `tool_use` inputs included, is
+//! `InvalidResponse`: a `tool_use` block is echoed from the blocks like
+//! any other, so its input is on the same verbatim path. Current block
+//! types (`thinking`, `redacted_thinking`, `fallback`, `text`) carry no such
+//! numbers, and every registered tool takes only strings, string arrays,
+//! and integers, so a float argument would fail typed validation anyway;
+//! this costs nothing in practice.
 //!
 //! `usage` is required. Its `input_tokens`, `cache_read_input_tokens`, and
 //! `cache_creation_input_tokens` are already disjoint, as the provider
@@ -774,10 +775,10 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
     // Opaque content must come back value for value; serde_json holds
     // only 64-bit integers exactly.
     for block in blocks {
-        check_exact_numbers(block, true)?;
+        check_exact_numbers(block)?;
     }
     if let Some(details) = &stop_details {
-        check_exact_numbers(details, false)?;
+        check_exact_numbers(details)?;
     }
     let response = ModelResponse {
         text,
@@ -796,25 +797,16 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
 }
 
 /// Refuse any JSON number `serde_json` does not hold exactly: a float, or an
-/// integer outside `i64` and `u64` (parsed through `f64`). A `tool_use`
-/// block's `input` is the neutral arguments, not opaque content, and is
-/// skipped when `block` is set: its numbers take the usual
-/// `float_roundtrip` path.
-fn check_exact_numbers(value: &Value, block: bool) -> Result<(), ProviderError> {
+/// integer outside `i64` and `u64` (parsed through `f64`), anywhere in
+/// `value`, with no exemptions.
+fn check_exact_numbers(value: &Value) -> Result<(), ProviderError> {
     match value {
         Value::Number(number) if number.as_i64().is_some() || number.as_u64().is_some() => Ok(()),
         Value::Number(_) => Err(invalid(
             "opaque content contains a number that cannot be echoed exactly",
         )),
-        Value::Array(items) => items
-            .iter()
-            .try_for_each(|item| check_exact_numbers(item, false)),
-        Value::Object(map) => {
-            let tool_use = block && map.get("type").and_then(Value::as_str) == Some("tool_use");
-            map.iter()
-                .filter(|(key, _)| !(tool_use && key.as_str() == "input"))
-                .try_for_each(|(_, item)| check_exact_numbers(item, false))
-        }
+        Value::Array(items) => items.iter().try_for_each(check_exact_numbers),
+        Value::Object(map) => map.values().try_for_each(check_exact_numbers),
         Value::Null | Value::Bool(_) | Value::String(_) => Ok(()),
     }
 }

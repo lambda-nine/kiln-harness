@@ -430,7 +430,7 @@ async fn sixty_four_bit_integers_echo_exactly() {
 }
 
 #[test]
-fn floats_in_opaque_content_are_refused_but_not_in_tool_input() {
+fn inexact_numbers_are_refused_anywhere_in_opaque_content() {
     for number in [
         "1.5",
         "1e3",
@@ -448,15 +448,35 @@ fn floats_in_opaque_content_are_refused_but_not_in_tool_input() {
     let mut refusal = message(&json!([]), "refusal", &usage(10, 0));
     refusal["stop_details"] = json!({"type": "refusal", "score": 0.5});
     assert!(invalid(&refusal).contains("cannot be echoed exactly"));
-    // tool_use.input is the neutral arguments; the typed tool judges them.
-    let call = message(
-        &json!([{"type": "tool_use", "id": "toolu_1", "name": "exec",
-                 "input": {"argv": ["/bin/true"], "timeout_ms": 1.5}}]),
-        "tool_use",
-        &usage(10, 10),
+    // tool_use.input is echoed from the blocks too, so it is checked too.
+    for number in ["1.5", "18446744073709551616"] {
+        let body = format!(
+            r#"{{"type":"message","role":"assistant","model":"claude-opus-5-5","content":[{{"type":"tool_use","id":"toolu_1","name":"exec","input":{{"argv":["/bin/true"],"timeout_ms":{number}}}}}],"stop_reason":"tool_use","usage":{{"input_tokens":10,"output_tokens":10}}}}"#
+        );
+        let body: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            invalid(&body),
+            "opaque content contains a number that cannot be echoed exactly",
+            "{number}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_u64_max_tool_argument_echoes_exactly() {
+    let call = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.txt","max_bytes":18446744073709551615}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"output_tokens":10}}"#;
+    let server = FakeHttp::start([raw(call.to_string()), final_text()]).await;
+    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let mut harness = harness_for(provider, short_lifecycle_config());
+    harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("completes");
+    let second = String::from_utf8(server.requests()[1].body.clone()).expect("utf-8");
+    assert!(
+        second.contains(r#""max_bytes":18446744073709551615"#),
+        "echoed exactly: {second}"
     );
-    let parsed = parse_response(&call).expect("tool input floats pass");
-    assert_eq!(parsed.tool_calls[0].arguments["timeout_ms"], json!(1.5));
 }
 
 // D4: only a real message with a known stop reason is a response.

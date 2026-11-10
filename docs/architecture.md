@@ -245,9 +245,9 @@ parallel. Blocks are held as JSON values, so the echo is value-for-value:
 strings are exact, object keys come out in the journal's canonical sorted
 order, and numbers are exact because a response whose opaque content holds
 one serde_json cannot hold exactly (a float, or an integer outside 64 bits)
-is refused. Current block types carry none. A `tool_use` block's `input`
-is the neutral arguments and is exempt: its numbers go through
-`float_roundtrip` and the typed tool.
+is refused, `tool_use` inputs included, since they are echoed from the
+blocks too. Current block types carry none, and the registered tools take
+only strings, string arrays, and integers, so nothing valid is lost.
 
 The response must be the success envelope: `type: "message"`,
 `role: "assistant"`, a valid `model` (now required), a `content` array, and
