@@ -806,8 +806,8 @@ impl Grammar {
         if outcome == CLEANUP_FAILED && *sandbox_deleted {
             return Err("cleanup_failed with confirmed deletion");
         }
-        if outcome == "completed" && !*sandbox_deleted {
-            return Err("completed without confirmed deletion");
+        if !*sandbox_deleted && outcome != CLEANUP_FAILED {
+            return Err("unconfirmed deletion must end cleanup_failed");
         }
         if *tool_calls != self.tool_calls {
             return Err("tool_calls differs from the tool_executed records");

@@ -358,8 +358,10 @@ where
                         deleted: absence_confirmed,
                     },
                 );
+                // As after work: without confirmed absence, the session's
+                // outcome is cleanup_failed whatever the work outcome was.
                 let terminal = Terminal {
-                    outcome: if recovery.is_ok() {
+                    outcome: if absence_confirmed {
                         work_outcome
                     } else {
                         "cleanup_failed"

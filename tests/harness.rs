@@ -412,10 +412,62 @@ async fn every_tonic_status_is_classified_through_adapter_conversion() {
         ));
         assert!(matches!(
             journal.last().map(|record| &record.event),
-            Some(JournalEvent::SessionEnded { outcome, sandbox_deleted, steps: 0, .. })
-                if outcome == "create_failed" && *sandbox_deleted == unambiguous
+            Some(JournalEvent::SessionEnded { outcome, work_outcome, sandbox_deleted, steps: 0, .. })
+                if work_outcome == "create_failed"
+                    && *sandbox_deleted == unambiguous
+                    && outcome == if unambiguous { "create_failed" } else { "cleanup_failed" }
+        ));
+        assert!(matches!(
+            harness.audit().records.last().map(|record| &record.event),
+            Some(AuditEvent::SessionFinished { outcome, work_outcome, .. })
+                if work_outcome == "create_failed"
+                    && outcome == if unambiguous { "create_failed" } else { "cleanup_failed" }
         ));
     }
+}
+
+/// The terminal records of a session whose sandbox absence was never
+/// confirmed.
+fn assert_unconfirmed_terminal(
+    harness: &Harness<FakeApi, ScriptedProvider, MemoryAudit, MemoryJournal>,
+    work: &str,
+) {
+    assert!(matches!(
+        harness.journal().records.last().map(|record| &record.event),
+        Some(JournalEvent::SessionEnded { outcome, work_outcome, sandbox_deleted: false, .. })
+            if outcome == "cleanup_failed" && work_outcome == work
+    ));
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished { outcome, work_outcome, sandbox_deleted: false })
+            if outcome == "cleanup_failed" && work_outcome == work
+    ));
+}
+
+#[tokio::test]
+async fn ambiguous_create_with_empty_listings_ends_cleanup_failed() {
+    let api = FakeApi::default();
+    api.state().create_rejection = Some(ApiError {
+        code: Code::Unknown,
+        message: "response is ambiguous".to_string(),
+    });
+    let mut config = short_lifecycle_config();
+    config.lifecycle_timeout = Duration::from_millis(25);
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("unused")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("create remains uncertain");
+
+    assert!(matches!(error, HarnessError::CreateUncertain(_)), "{error}");
+    assert_unconfirmed_terminal(&harness, "create_failed");
 }
 
 #[tokio::test]
@@ -475,6 +527,7 @@ async fn create_deadline_without_observable_row_is_reported_uncertain() {
     assert!(matches!(error, HarnessError::CreateUncertain(_)));
     assert!(observer.state().creates.is_empty());
     assert!(observer.state().deleted.is_empty());
+    assert_unconfirmed_terminal(&harness, "create_failed");
 }
 
 #[tokio::test]
@@ -1854,6 +1907,7 @@ async fn cancellation_during_create_without_a_row_is_uncertain() {
         "{result:?}"
     );
     assert!(started.elapsed() < Duration::from_millis(300));
+    assert_unconfirmed_terminal(&harness, "canceled");
 }
 
 #[tokio::test]

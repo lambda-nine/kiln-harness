@@ -277,7 +277,7 @@ fn engine_shaped_journals_are_accepted() {
 #[allow(clippy::too_many_lines)]
 fn out_of_order_and_inconsistent_journals_are_rejected() {
     type Mutation = fn(&mut Vec<JournalEvent>);
-    let cases: [(&str, Mutation); 24] = [
+    let cases: [(&str, Mutation); 25] = [
         ("tool before sandbox_ready", |events| {
             events.insert(1, executed(99, 7, "ghost"));
         }),
@@ -352,6 +352,24 @@ fn out_of_order_and_inconsistent_journals_are_rejected() {
             }
             .event();
         }),
+        (
+            "unconfirmed deletion that is not cleanup_failed",
+            |events| {
+                events.truncate(1);
+                events.push(
+                    Ended {
+                        outcome: "create_failed",
+                        work_outcome: "create_failed",
+                        final_answer: None,
+                        steps: 0,
+                        tool_calls: 0,
+                        usage: Usage::default(),
+                        sandbox_deleted: false,
+                    }
+                    .event(),
+                );
+            },
+        ),
         ("cleanup_failed with confirmed deletion", |events| {
             *events.last_mut().expect("end") = Ended {
                 outcome: "cleanup_failed",
