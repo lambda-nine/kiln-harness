@@ -1729,3 +1729,161 @@ async fn cached_input_tokens_count_against_the_input_budget() {
     }
     assert_eq!(usage(u64::MAX, 1, 1).total_input_tokens(), u64::MAX);
 }
+
+/// Run `harness` and cancel once `ready` holds; return the result and how
+/// long the run took after cancellation.
+async fn run_and_cancel_when<P: Provider>(
+    harness: &mut Harness<FakeApi, P, MemoryAudit, MemoryJournal>,
+    ready: impl Fn() -> bool,
+) -> (
+    Result<kiln_harness::engine::SessionOutcome, HarnessError>,
+    Duration,
+) {
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    let task = task();
+    let cancel_when_ready = async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let canceled_at = tokio::time::Instant::now();
+        trigger.cancel();
+        canceled_at
+    };
+    let (result, canceled_at) = tokio::join!(harness.run(&task, cancel), cancel_when_ready);
+    (result, canceled_at.elapsed())
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_an_active_create_and_recovers_its_sandbox() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    {
+        let mut state = observer.state();
+        state.create_delay = Duration::from_secs(5);
+        state.create_allows_early_delete = true;
+    }
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("unused")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+
+    let (result, after_cancel) =
+        run_and_cancel_when(&mut harness, || !observer.state().creates.is_empty()).await;
+
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    assert!(
+        after_cancel < Duration::from_millis(100),
+        "{after_cancel:?}"
+    );
+    assert_eq!(observer.state().deleted, ["sb-0000000000000001"]);
+    assert!(harness.audit().records.iter().any(|record| matches!(
+        &record.event,
+        AuditEvent::SandboxRecovered { sandbox_ids, deleted: true } if sandbox_ids.len() == 1
+    )));
+    assert!(matches!(
+        harness.journal().records.last().map(|record| &record.event),
+        Some(JournalEvent::SessionEnded { outcome, sandbox_deleted: true, .. })
+            if outcome == "canceled"
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_during_create_recovers_a_row_recorded_late() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    {
+        let mut state = observer.state();
+        state.create_delay = Duration::from_secs(5);
+        state.create_record_delay = Duration::from_millis(60);
+    }
+    let mut config = short_lifecycle_config();
+    config.lifecycle_timeout = Duration::from_millis(500);
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("unused")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let started = tokio::time::Instant::now();
+
+    let (result, _) = run_and_cancel_when(&mut harness, || {
+        started.elapsed() >= Duration::from_millis(10)
+    })
+    .await;
+
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    assert!(started.elapsed() < Duration::from_millis(400));
+    assert_eq!(observer.state().creates.len(), 1, "the row appeared late");
+    assert_eq!(observer.state().deleted, ["sb-0000000000000001"]);
+}
+
+#[tokio::test]
+async fn cancellation_during_create_without_a_row_is_uncertain() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    {
+        let mut state = observer.state();
+        state.create_delay = Duration::from_secs(5);
+        state.suppress_create_record = true;
+    }
+    let mut config = short_lifecycle_config();
+    config.lifecycle_timeout = Duration::from_millis(40);
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("unused")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let started = tokio::time::Instant::now();
+
+    let (result, _) = run_and_cancel_when(&mut harness, || {
+        started.elapsed() >= Duration::from_millis(10)
+    })
+    .await;
+
+    assert!(
+        matches!(result, Err(HarnessError::CreateUncertain(_))),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_millis(300));
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_an_active_baseline_and_cleans_up() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    observer.state().baseline_exec_delay = Duration::from_secs(5);
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("unused")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+
+    let (result, after_cancel) =
+        run_and_cancel_when(&mut harness, || !observer.state().execs.is_empty()).await;
+
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    assert!(
+        after_cancel < Duration::from_millis(100),
+        "{after_cancel:?}"
+    );
+    assert_eq!(observer.state().deleted.len(), 1);
+    assert!(harness.audit().records.iter().any(|record| matches!(
+        &record.event,
+        AuditEvent::WorkspaceBaseline { ok: false, execution_ids, .. }
+            if execution_ids == &["ex-0000000000000001"]
+    )));
+    assert!(matches!(
+        harness.journal().records.last().map(|record| &record.event),
+        Some(JournalEvent::SessionEnded { outcome, sandbox_deleted: true, .. })
+            if outcome == "canceled"
+    ));
+}

@@ -26,6 +26,8 @@ pub enum DeleteBehavior {
     FailAfterRemoving,
 }
 
+/// Test knobs; independent flags read better than a state enum here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct FakeState {
     pub creates: Vec<SandboxRequest>,
@@ -52,6 +54,11 @@ pub struct FakeState {
     /// Bytes `head` returns instead of the stored file, to simulate a sandbox
     /// that answers differently from a recording.
     pub read_override: Option<Vec<u8>>,
+    /// Let delete succeed while a create is still in flight.
+    pub create_allows_early_delete: bool,
+    /// Record the created row this long after the request, independently of
+    /// the RPC.
+    pub create_record_delay: Duration,
 }
 
 impl FakeApi {
@@ -83,8 +90,27 @@ impl SandboxApi for FakeApi {
             let delay = state.create_delay;
             let fail = state.create_error_after_record;
             if !state.suppress_create_record {
-                state.creates.push(request);
-                state.create_ready_at = std::time::Instant::now().checked_add(delay);
+                if state.create_record_delay.is_zero() {
+                    state.creates.push(request);
+                    state.create_ready_at = if state.create_allows_early_delete {
+                        None
+                    } else {
+                        std::time::Instant::now().checked_add(delay)
+                    };
+                } else {
+                    // The daemon records the row on its own schedule, even
+                    // after the client drops the RPC.
+                    let shared = self.state.clone();
+                    let after = state.create_record_delay;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(after).await;
+                        shared
+                            .lock()
+                            .expect("fake state lock")
+                            .creates
+                            .push(request);
+                    });
+                }
             }
             (delay, fail)
         };

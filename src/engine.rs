@@ -306,15 +306,38 @@ where
         }
         let mut progress = Progress::default();
 
-        let create = timeout_at(deadline, self.api.create(sandbox_request(&session_id))).await;
+        // Cancellation and the deadline both drop the create RPC. Its outcome
+        // is then ambiguous, so either goes through label-based recovery.
+        let create = tokio::select! {
+            () = cancel.cancelled() => Err(CreateStop::Canceled),
+            result = timeout_at(deadline, self.api.create(sandbox_request(&session_id))) => {
+                match result {
+                    Ok(Ok(sandbox)) => Ok(sandbox),
+                    Ok(Err(error)) => Err(CreateStop::Failed(error)),
+                    Err(_) => Err(CreateStop::Deadline),
+                }
+            }
+        };
         let sandbox = match create {
-            Ok(Ok(sandbox)) => sandbox,
-            failed => {
-                let (error, deadline_expired) = match failed {
-                    Ok(Err(error)) => (error, false),
-                    Err(_) => (deadline_api("create response deadline expired"), true),
-                    Ok(Ok(_)) => unreachable!("successful create handled above"),
+            Ok(sandbox) => sandbox,
+            Err(stop) => {
+                let (error, interrupted, work_outcome) = match stop {
+                    CreateStop::Failed(error) => (error, None, "create_failed"),
+                    CreateStop::Deadline => (
+                        deadline_api("create response deadline expired"),
+                        Some(HarnessError::Deadline),
+                        "create_failed",
+                    ),
+                    CreateStop::Canceled => (
+                        ApiError {
+                            code: tonic::Code::Cancelled,
+                            message: "create canceled before its response".to_string(),
+                        },
+                        Some(HarnessError::Canceled),
+                        "canceled",
+                    ),
                 };
+                let deadline_expired = interrupted.is_some();
                 let recovery_deadline = lifecycle_deadline(self.config.lifecycle_timeout);
                 let recovery = recover_session_sandboxes(
                     &self.api,
@@ -337,11 +360,11 @@ where
                 );
                 let terminal = Terminal {
                     outcome: if recovery.is_ok() {
-                        "create_failed"
+                        work_outcome
                     } else {
                         "cleanup_failed"
                     },
-                    work_outcome: "create_failed",
+                    work_outcome,
                     sandbox_deleted: absence_confirmed,
                 };
                 let finish_audit = self.audit.append(&session_id, None, terminal.audit_event());
@@ -357,11 +380,7 @@ where
                 if !recovered && (deadline_expired || !unambiguous_create_error(&error)) {
                     return Err(HarnessError::CreateUncertain(error));
                 }
-                return Err(if deadline_expired {
-                    HarnessError::Deadline
-                } else {
-                    HarnessError::Api(error)
-                });
+                return Err(interrupted.unwrap_or(HarnessError::Api(error)));
             }
         };
         let sandbox_id = sandbox.id.clone();
@@ -381,13 +400,38 @@ where
                 return Err(HarnessError::Deadline);
             }
 
-            let (tools, baseline) = match self
-                .registry
-                .start_session(&self.api, sandbox_id.clone(), deadline)
-                .await
-            {
-                Ok(value) => value,
-                Err(error) => {
+            let started = tokio::select! {
+                () = cancel.cancelled() => None,
+                started = self
+                    .registry
+                    .start_session(&self.api, sandbox_id.clone(), deadline) => Some(started),
+            };
+            let (tools, baseline) = match started {
+                Some(Ok(value)) => value,
+                None => {
+                    // The dropped baseline RPC asks kilnd to cancel it; record
+                    // any execution it already assigned, then clean up.
+                    let recovery_deadline = recovery_deadline(self.config.lifecycle_timeout);
+                    let execution_ids = recover_execution_evidence(
+                        &self.api,
+                        &sandbox_id,
+                        &BTreeSet::new(),
+                        recovery_deadline,
+                    )
+                    .await
+                    .execution_ids;
+                    self.audit.append(
+                        &session_id,
+                        Some(&sandbox_id),
+                        AuditEvent::WorkspaceBaseline {
+                            ok: false,
+                            execution_ids,
+                            file_count: 0,
+                        },
+                    )?;
+                    return Err(HarnessError::Canceled);
+                }
+                Some(Err(error)) => {
                     let (mut execution_ids, _, _) = error.execution_evidence();
                     if execution_ids.is_empty() {
                         let recovery_deadline = recovery_deadline(self.config.lifecycle_timeout);
@@ -871,6 +915,12 @@ where
         tool_calls: progress.tool_calls,
         usage: progress.usage,
     })
+}
+
+enum CreateStop {
+    Failed(ApiError),
+    Deadline,
+    Canceled,
 }
 
 /// How a session ended, written identically to the audit and the journal.
