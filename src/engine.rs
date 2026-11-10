@@ -123,6 +123,17 @@ impl HarnessConfig {
         }
     }
 
+    /// Check every limit against its hard ceilings, exactly as
+    /// [`Harness::run`] does before any sandbox exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a limit is zero, over its ceiling, or a
+    /// duration is not whole milliseconds.
+    pub fn validate(&self) -> Result<(), HarnessError> {
+        validate_config(self)
+    }
+
     /// Replace every recorded limit with the given ones. Lifecycle windows
     /// are kept. `Harness::run` validates the result before any sandbox
     /// exists, so recorded limits cannot exceed the hard ceilings.

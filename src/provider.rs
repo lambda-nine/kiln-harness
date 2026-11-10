@@ -224,9 +224,11 @@ pub trait Provider: Send {
 
     /// Answer one request.
     ///
-    /// TODO(network adapters): bound the provider's response body in bytes
-    /// before parsing it. The loop and the journal bound what they keep and
-    /// write, but a response is fully in memory by the time it returns here.
+    /// Network adapters must bound the response body in bytes while reading
+    /// it, before parsing it: the loop and the journal bound what they keep
+    /// and write, but a response is fully in memory by the time it returns
+    /// here. [`crate::providers::OpenAiCompatProvider`] stops reading at its
+    /// `max_response_bytes`.
     async fn complete(&mut self, request: ModelRequest<'_>)
     -> Result<ModelResponse, ProviderError>;
 

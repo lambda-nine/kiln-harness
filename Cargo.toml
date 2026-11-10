@@ -12,6 +12,7 @@ async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "http2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 sha2 = "0.10"
@@ -30,6 +31,8 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
+# The fake HTTP server in tests/common/http.rs reads and writes sockets.
+tokio = { version = "1.47", features = ["io-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

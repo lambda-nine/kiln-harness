@@ -10,6 +10,7 @@ pub mod engine;
 pub mod journal;
 mod outputs;
 pub mod provider;
+pub mod providers;
 pub mod replay;
 pub mod tools;
 

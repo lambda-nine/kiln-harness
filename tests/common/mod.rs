@@ -1,6 +1,8 @@
 //! A fake kilnd shared by host-side tests.
 #![allow(dead_code)]
 
+pub mod http;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
