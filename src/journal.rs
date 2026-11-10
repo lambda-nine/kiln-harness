@@ -185,8 +185,18 @@ pub enum JournalError {
     Grammar { sequence: u64, reason: String },
     #[error("journal path {0:?} does not name a file")]
     InvalidPath(PathBuf),
-    #[error("journal directory {path:?} is unsafe: {reason}")]
-    UnsafeDirectory { path: PathBuf, reason: &'static str },
+    #[error(
+        "journal directory {shown} is unsafe: {problem} (mode {mode_text}); {remedy}",
+        shown = path.display(),
+        mode_text = mode.map_or_else(|| "unknown".to_string(), |mode| format!("{:04o}", mode & 0o7777)),
+        remedy = problem.remedy(path),
+    )]
+    UnsafeDirectory {
+        path: PathBuf,
+        /// The directory's mode from `fstat`, when it could be opened.
+        mode: Option<u32>,
+        problem: DirectoryProblem,
+    },
     #[error("journal sink is closed after a failed write or a finished session")]
     Closed,
 }
@@ -318,6 +328,8 @@ impl JsonlJournal {
             Mode::from_raw_mode(0o600),
         )
         .map_err(std::io::Error::from)?;
+        // As for directories: never let a umask or default ACL decide.
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600)).map_err(std::io::Error::from)?;
         Ok(Self {
             file: File::from(fd),
             chain: Chain::default(),
@@ -388,12 +400,21 @@ fn open_verified_directory(directory: &Path) -> Result<OwnedFd, JournalError> {
         let next = match rustix::fs::openat(&current, *name, walk, Mode::empty()) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => {
-                match rustix::fs::mkdirat(&current, *name, Mode::from_raw_mode(0o700)) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                let created = match rustix::fs::mkdirat(&current, *name, Mode::from_raw_mode(0o700))
+                {
+                    Ok(()) => true,
+                    Err(rustix::io::Errno::EXIST) => false,
                     Err(error) => return Err(std::io::Error::from(error).into()),
+                };
+                let fd = rustix::fs::openat(&current, *name, walk, Mode::empty())
+                    .map_err(|error| directory_error(&shown, error))?;
+                if created {
+                    // The umask can only narrow 0700, but a default ACL on
+                    // the parent can widen it; set the mode explicitly.
+                    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))
+                        .map_err(std::io::Error::from)?;
                 }
-                rustix::fs::openat(&current, *name, walk, Mode::empty())
-                    .map_err(|error| directory_error(&shown, error))?
+                fd
             }
             Err(error) => return Err(directory_error(&shown, error)),
         };
@@ -407,7 +428,8 @@ fn directory_error(path: &Path, error: rustix::io::Errno) -> JournalError {
     if matches!(error, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) {
         JournalError::UnsafeDirectory {
             path: path.to_path_buf(),
-            reason: "not a directory or a symlink",
+            mode: None,
+            problem: DirectoryProblem::NotADirectory,
         }
     } else {
         std::io::Error::from(error).into()
@@ -424,33 +446,81 @@ fn check_directory(
     euid: u32,
     is_final: bool,
 ) -> Result<(), JournalError> {
-    let unsafe_directory = |reason| JournalError::UnsafeDirectory {
-        path: path.to_path_buf(),
-        reason,
-    };
     let stat = rustix::fs::fstat(directory).map_err(std::io::Error::from)?;
     let mode = u32::from(stat.st_mode);
     let owner = stat.st_uid;
-    if is_final {
+    let problem = if is_final {
         if owner != euid {
-            return Err(unsafe_directory("not owned by the current user"));
+            Some(DirectoryProblem::NotOwned)
+        } else if mode & GROUP_OR_WORLD_WRITABLE != 0 {
+            Some(DirectoryProblem::WritableByOthers)
+        } else {
+            None
         }
-        if mode & GROUP_OR_WORLD_WRITABLE != 0 {
-            return Err(unsafe_directory("group- or world-writable"));
-        }
+    } else if owner != 0 && owner != euid {
+        Some(DirectoryProblem::AncestorNotOwned)
+    } else if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
+        Some(DirectoryProblem::AncestorWritableWithoutSticky)
     } else {
-        if owner != 0 && owner != euid {
-            return Err(unsafe_directory(
-                "ancestor not owned by root or the current user",
-            ));
-        }
-        if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
-            return Err(unsafe_directory(
-                "ancestor is group- or world-writable without the sticky bit",
-            ));
+        None
+    };
+    match problem {
+        Some(problem) => Err(JournalError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            mode: Some(mode),
+            problem,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Why a directory on the way to a journal was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryProblem {
+    /// A component is not a directory, or is a symlink.
+    NotADirectory,
+    /// The journal's own directory is not owned by the effective user.
+    NotOwned,
+    /// The journal's own directory is group- or world-writable.
+    WritableByOthers,
+    /// An ancestor is owned by someone other than root or the effective user.
+    AncestorNotOwned,
+    /// An ancestor is group- or world-writable without the sticky bit.
+    AncestorWritableWithoutSticky,
+}
+
+impl DirectoryProblem {
+    /// What to do about it, naming the directory.
+    #[must_use]
+    pub fn remedy(self, path: &Path) -> String {
+        let shown = path.display();
+        match self {
+            Self::WritableByOthers | Self::AncestorWritableWithoutSticky => format!(
+                "run `chmod g-w,o-w {shown}`, or pass --journal a path under a private directory"
+            ),
+            Self::NotOwned | Self::AncestorNotOwned => {
+                "pass --journal a path under a directory you own".to_string()
+            }
+            Self::NotADirectory => {
+                "pass --journal a path whose directories are real directories, not symlinks"
+                    .to_string()
+            }
         }
     }
-    Ok(())
+}
+
+impl std::fmt::Display for DirectoryProblem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotADirectory => "not a directory, or a symlink",
+            Self::NotOwned => "not owned by the current user",
+            Self::WritableByOthers => "group- or world-writable",
+            Self::AncestorNotOwned => "an ancestor not owned by root or the current user",
+            Self::AncestorWritableWithoutSticky => {
+                "an ancestor that is group- or world-writable without the sticky bit"
+            }
+        })
+    }
 }
 
 impl JournalSink for JsonlJournal {

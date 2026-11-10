@@ -346,3 +346,42 @@ async fn verify_rejects_a_tool_record_that_differs_from_the_model_call() {
 
     assert!(!ok, "{stdout}");
 }
+
+#[test]
+fn a_permissive_umask_cannot_widen_what_the_harness_creates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    let journal = dir.join("new/deeper/journal.jsonl");
+    let audit = dir.join("audit-dir/nested/audit.jsonl");
+    // demo opens both outputs before contacting kilnd, then fails to connect.
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("umask 0000; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_kiln-harness"))
+        .arg("--socket")
+        .arg(dir.join("no-kilnd.sock"))
+        .arg("demo")
+        .arg("--audit")
+        .arg(&audit)
+        .arg("--journal")
+        .arg(&journal)
+        .output()
+        .expect("run demo under umask 0000");
+    assert!(!output.status.success(), "there is no kilnd to connect to");
+
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode(&journal), 0o600);
+    assert_eq!(mode(&dir.join("new")), 0o700);
+    assert_eq!(mode(&dir.join("new/deeper")), 0o700);
+    assert_eq!(mode(&audit), 0o600);
+    assert_eq!(mode(&dir.join("audit-dir")), 0o700);
+    assert_eq!(mode(&dir.join("audit-dir/nested")), 0o700);
+}

@@ -176,7 +176,7 @@ impl JsonlAudit {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent)?;
+            create_private_dirs(parent)?;
         }
         let mut options = OpenOptions::new();
         options.append(true);
@@ -184,7 +184,15 @@ impl JsonlAudit {
         options.mode(0o600);
         // Try to create first so callers know whether this call made the file.
         let (file, created) = match options.clone().create_new(true).open(path) {
-            Ok(file) => (file, true),
+            Ok(file) => {
+                // Set the mode explicitly, whatever the umask or a default ACL.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                (file, true)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 (options.open(path)?, false)
             }
@@ -271,6 +279,30 @@ impl AuditSink for MemoryAudit {
         });
         Ok(())
     }
+}
+
+/// Create missing directories with mode 0700 set explicitly, so neither the
+/// umask nor a default ACL widens them. Existing directories are untouched.
+fn create_private_dirs(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut missing = Vec::new();
+    let mut current = Some(path);
+    while let Some(directory) = current.filter(|directory| {
+        !directory.as_os_str().is_empty() && std::fs::symlink_metadata(directory).is_err()
+    }) {
+        missing.push(directory);
+        current = directory.parent();
+    }
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(directory) {
+            Ok(()) => {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> String {

@@ -11,9 +11,9 @@ use kiln_harness::engine::{
     MAX_TOTAL_TOKENS, SessionOutcome, SessionTask,
 };
 use kiln_harness::journal::{
-    GENESIS_SHA256, JournalError, JournalEvent, JournalLimits, JournalRecord, JournalSink,
-    JsonlJournal, LoadedJournal, MAX_JOURNAL_BYTES, MAX_JOURNAL_LINE_BYTES, MemoryJournal,
-    read_journal, read_journal_with_limits, request_sha256,
+    DirectoryProblem, GENESIS_SHA256, JournalError, JournalEvent, JournalLimits, JournalRecord,
+    JournalSink, JsonlJournal, LoadedJournal, MAX_JOURNAL_BYTES, MAX_JOURNAL_LINE_BYTES,
+    MemoryJournal, read_journal, read_journal_with_limits, request_sha256,
 };
 use kiln_harness::provider::{
     DEMO_CONTENT, Message, ModelRequest, ModelResponse, Provider, ProviderErrorKind,
@@ -336,11 +336,16 @@ fn journal_file_is_private_and_parents_are_created() {
     let path = temp.path().join("nested/dir/journal.jsonl");
     let _journal = JsonlJournal::open(&path).expect("open journal");
 
-    let mode = std::fs::metadata(&path)
-        .expect("metadata")
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&temp.path().join("nested")), 0o700);
+    assert_eq!(mode(&temp.path().join("nested/dir")), 0o700);
 }
 
 #[test]
@@ -1085,6 +1090,25 @@ fn journal_is_created_in_the_resolved_parent_only_when_it_is_safe() {
         common::dir_all_with_mode(&parent, mode);
         let result = JsonlJournal::open(&parent.join("session.jsonl"));
         assert_eq!(result.is_ok(), safe, "parent mode {mode:o}");
+        if let Err(error) = &result {
+            // The refusal names the directory, its mode, and the fix.
+            let message = error.to_string();
+            assert!(message.contains(&parent.display().to_string()), "{message}");
+            assert!(message.contains(&format!("mode {mode:04o}")), "{message}");
+            assert!(message.contains("chmod g-w,o-w"), "{message}");
+            assert!(message.contains("--journal"), "{message}");
+            assert!(
+                matches!(
+                    error,
+                    JournalError::UnsafeDirectory {
+                        mode: Some(found),
+                        problem: DirectoryProblem::WritableByOthers,
+                        ..
+                    } if found & 0o7777 == mode
+                ),
+                "{error:?}"
+            );
+        }
         assert_eq!(parent.join("session.jsonl").exists(), safe);
         set_mode(&parent, 0o700);
     }
