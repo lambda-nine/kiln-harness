@@ -71,7 +71,11 @@ pub enum JournalEvent {
         execution_ids: Vec<String>,
     },
     SessionEnded {
+        /// `cleanup_failed` whenever sandbox deletion could not be confirmed
+        /// after work; otherwise the same as `work_outcome`.
         outcome: String,
+        /// How the work itself ended, before cleanup.
+        work_outcome: String,
         final_answer: Option<String>,
         steps: u32,
         tool_calls: u32,

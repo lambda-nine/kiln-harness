@@ -171,6 +171,11 @@ fn verify(path: &Path) -> ExitCode {
         Some(outcome) => println!("status: complete ({outcome})"),
         None => println!("status: incomplete"),
     }
+    // Deletion is confirmed only by a complete journal that says so.
+    println!(
+        "sandbox deleted: {}",
+        if summary.sandbox_deleted { "yes" } else { "no" }
+    );
     println!("turns: {}", summary.turns);
     println!("tool calls: {}", summary.tool_calls);
     println!(
@@ -185,6 +190,7 @@ fn verify(path: &Path) -> ExitCode {
 
 struct Summary {
     outcome: Option<String>,
+    sandbox_deleted: bool,
     turns: u32,
     tool_calls: u32,
     usage: Usage,
@@ -193,6 +199,7 @@ struct Summary {
 fn summarize(journal: &LoadedJournal) -> Summary {
     let mut summary = Summary {
         outcome: None,
+        sandbox_deleted: false,
         turns: 0,
         tool_calls: 0,
         usage: Usage::default(),
@@ -204,7 +211,14 @@ fn summarize(journal: &LoadedJournal) -> Summary {
                 summary.usage = summary.usage + response.usage;
             }
             JournalEvent::ToolExecuted { .. } => summary.tool_calls += 1,
-            JournalEvent::SessionEnded { outcome, .. } => summary.outcome = Some(outcome.clone()),
+            JournalEvent::SessionEnded {
+                outcome,
+                sandbox_deleted,
+                ..
+            } => {
+                summary.outcome = Some(outcome.clone());
+                summary.sandbox_deleted = *sandbox_deleted;
+            }
             _ => {}
         }
     }

@@ -116,7 +116,11 @@ pub enum AuditEvent {
         answer: ContentSummary,
     },
     SessionFinished {
+        /// `cleanup_failed` whenever sandbox deletion could not be confirmed
+        /// after work; otherwise the same as `work_outcome`.
         outcome: String,
+        /// How the work itself ended, before cleanup.
+        work_outcome: String,
         sandbox_deleted: bool,
     },
 }

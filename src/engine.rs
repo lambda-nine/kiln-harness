@@ -298,6 +298,7 @@ where
                 None,
                 AuditEvent::SessionFinished {
                     outcome: "failed".to_string(),
+                    work_outcome: "failed".to_string(),
                     sandbox_deleted: true,
                 },
             );
@@ -334,18 +335,19 @@ where
                         deleted: absence_confirmed,
                     },
                 );
-                let finish_audit = self.audit.append(
-                    &session_id,
-                    None,
-                    AuditEvent::SessionFinished {
-                        outcome: "create_failed".to_string(),
-                        sandbox_deleted: absence_confirmed,
+                let terminal = Terminal {
+                    outcome: if recovery.is_ok() {
+                        "create_failed"
+                    } else {
+                        "cleanup_failed"
                     },
-                );
-                let finish_journal = self.journal.append(
-                    &session_id,
-                    session_ended("create_failed", None, &progress, absence_confirmed),
-                );
+                    work_outcome: "create_failed",
+                    sandbox_deleted: absence_confirmed,
+                };
+                let finish_audit = self.audit.append(&session_id, None, terminal.audit_event());
+                let finish_journal = self
+                    .journal
+                    .append(&session_id, terminal.journal_event(None, &progress));
                 if let Err(cleanup_error) = recovery {
                     return Err(HarnessError::Cleanup(cleanup_error));
                 }
@@ -460,28 +462,32 @@ where
         )
         .await;
         let deleted = cleanup.is_ok();
-        let outcome_name = match &body {
+        let work_outcome = match &body {
             Ok(_) => "completed",
             Err(HarnessError::Canceled) => "canceled",
             Err(HarnessError::Deadline) => "deadline",
             Err(_) => "failed",
         };
-        let finish_audit = self.audit.append(
-            &session_id,
-            Some(&sandbox_id),
-            AuditEvent::SessionFinished {
-                outcome: outcome_name.to_string(),
-                sandbox_deleted: deleted,
+        // An unconfirmed cleanup is never reported as the work's outcome.
+        let terminal = Terminal {
+            outcome: if deleted {
+                work_outcome
+            } else {
+                "cleanup_failed"
             },
-        );
+            work_outcome,
+            sandbox_deleted: deleted,
+        };
+        let finish_audit =
+            self.audit
+                .append(&session_id, Some(&sandbox_id), terminal.audit_event());
         let final_answer = body
             .as_ref()
             .ok()
             .map(|outcome| outcome.final_answer.clone());
-        let finish_journal = self.journal.append(
-            &session_id,
-            session_ended(outcome_name, final_answer, &progress, deleted),
-        );
+        let finish_journal = self
+            .journal
+            .append(&session_id, terminal.journal_event(final_answer, &progress));
 
         if let Err(error) = cleanup {
             return Err(HarnessError::Cleanup(error));
@@ -867,19 +873,32 @@ where
     })
 }
 
-fn session_ended(
-    outcome: &str,
-    final_answer: Option<String>,
-    progress: &Progress,
+/// How a session ended, written identically to the audit and the journal.
+struct Terminal {
+    outcome: &'static str,
+    work_outcome: &'static str,
     sandbox_deleted: bool,
-) -> JournalEvent {
-    JournalEvent::SessionEnded {
-        outcome: outcome.to_string(),
-        final_answer,
-        steps: progress.steps,
-        tool_calls: progress.tool_calls,
-        usage: progress.usage,
-        sandbox_deleted,
+}
+
+impl Terminal {
+    fn audit_event(&self) -> AuditEvent {
+        AuditEvent::SessionFinished {
+            outcome: self.outcome.to_string(),
+            work_outcome: self.work_outcome.to_string(),
+            sandbox_deleted: self.sandbox_deleted,
+        }
+    }
+
+    fn journal_event(&self, final_answer: Option<String>, progress: &Progress) -> JournalEvent {
+        JournalEvent::SessionEnded {
+            outcome: self.outcome.to_string(),
+            work_outcome: self.work_outcome.to_string(),
+            final_answer,
+            steps: progress.steps,
+            tool_calls: progress.tool_calls,
+            usage: progress.usage,
+            sandbox_deleted: self.sandbox_deleted,
+        }
     }
 }
 
