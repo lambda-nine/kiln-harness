@@ -46,7 +46,10 @@ it is not a hostile multi-tenant boundary.
   without following links and non-blocking, then required to be regular files
   by `fstat`. `replay` holds its source open read-only and refuses any output
   whose open descriptor is the same file as the source or the other output,
-  so relinking a path after the checks cannot redirect a write.
+  so relinking a path after the checks cannot redirect a write. A
+  group-writable directory is refused even when its group is the user's own:
+  on macOS that group is the shared `staff`. Directories and files the harness
+  creates get 0700 and 0600 explicitly, whatever the umask.
 - Provider credentials must never be journaled. No provider handles one yet;
   adapters must keep keys out of `ModelRequest`, `ModelResponse`, and provider
   error messages.

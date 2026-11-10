@@ -119,6 +119,16 @@ call consumed. Otherwise it prints `diverged at turn N`, the first turn where
 a tool result or a request differed because the sandbox answered differently,
 and exits non-zero.
 
+Journal directories follow ssh's `StrictModes`: the journal's own directory
+must belong to you and be writable by no one else, and every directory above
+it must belong to you or root and be sticky if others can write it. On
+systems with a user-private-group umask of `0002`, such as Ubuntu, a checkout
+can be group-writable and is then refused as a journal ancestor. The error
+names the directory and its mode. Fix it with `chmod g-w <dir>`, or pass
+`--journal` a path under a private directory such as one made with
+`mkdir -m 700`. Directories the harness creates are always 0700 and journals
+0600, whatever the umask.
+
 ## Checks
 
 Host-side tests use a fake kilnd adapter:

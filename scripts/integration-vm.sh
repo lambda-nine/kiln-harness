@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+# The host suite first, as the invoking user rather than root: once with
+# that user's umask and once with Ubuntu's user-private-group default, under
+# which a careless test directory would be group-writable.
+test "$(id -u)" != 0
+cargo test --locked
+(umask 0002 && cargo test --locked)
+
 # The node may hold sandboxes this run does not own, such as a failed one
 # kilnd keeps charged because its absence is unproven. Require no activity,
 # then require the reservations and non-deleted sandbox IDs recorded before

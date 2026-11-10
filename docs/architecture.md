@@ -155,16 +155,19 @@ model-visible limit (steps, calls, timeouts, token budgets, argument and
 final-answer bounds, and all tool limits); lifecycle windows are not recorded.
 
 `JsonlJournal` resolves the parent once to an absolute starting path, then
-walks it from `/` through pinned descriptors: each component is opened
-relative to the previous directory with `O_DIRECTORY | O_NOFOLLOW`, created
-with mode 0700 if missing, and checked with `fstat`. Every directory must be
-owned by root or the effective user and be sticky if group- or world-writable,
-and the final one must be owned by the effective user and writable by no one
-else. The file is created relative to that verified descriptor with
-`O_CREAT | O_EXCL | O_NOFOLLOW` and mode 0600, so swapping a directory by path
-cannot redirect it. It syncs data after every record, serializes each record through a writer that stops at the line limit,
-and refuses further writes after `session_ended` or a failed write. A journal write failure
-ends work exactly like an audit failure; cleanup still runs.
+walks it from `/` through pinned descriptors: each component is opened relative
+to the previous directory with `O_DIRECTORY | O_NOFOLLOW`, created with mode
+0700 if missing (set again with `fchmod`, so neither the umask nor a default
+ACL widens it), and checked with `fstat`. Every directory must be owned by root
+or the effective user and be sticky if group- or world-writable, and the final
+one must be owned by the effective user and writable by no one else. The file
+is created relative to that verified descriptor with `O_CREAT | O_EXCL |
+O_NOFOLLOW` and mode 0600 (also set with `fchmod`), so swapping a directory by
+path cannot redirect it. A refusal names the directory, its mode, and the fix.
+It syncs data after every record, serializes each record through a writer that
+stops at the line limit, and refuses further writes after `session_ended` or a
+failed write. A journal write failure ends work exactly like an audit failure;
+cleanup still runs.
 
 `read_journal` opens the source with `O_NOFOLLOW | O_NONBLOCK`, requires a
 regular file by `fstat` on that descriptor, and only then makes it blocking, so
