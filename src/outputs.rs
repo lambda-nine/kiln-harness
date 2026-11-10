@@ -268,7 +268,15 @@ fn create_in(
     }
     match rustix::fs::openat(&directory, name, flags, Mode::from_raw_mode(0o600)) {
         Ok(fd) => {
-            let stat = rustix::fs::fstat(&fd)?;
+            let stat = match rustix::fs::fstat(&fd) {
+                Ok(stat) => stat,
+                Err(error) => {
+                    // Not yet recorded: remove the file this call just made.
+                    drop(fd);
+                    let _ = rustix::fs::unlinkat(&directory, name, AtFlags::empty());
+                    return Err(error.into());
+                }
+            };
             rollback.file = Some(CreatedEntry {
                 parent: directory,
                 name: name.to_os_string(),
@@ -352,24 +360,29 @@ fn open_verified_directory(
         let next = match rustix::fs::openat(&current, *name, walk, Mode::empty()) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => {
-                let made = match rustix::fs::mkdirat(&current, *name, Mode::from_raw_mode(0o700)) {
-                    Ok(()) => true,
-                    Err(Errno::EXIST) => false,
+                // Take what rollback will keep before creating anything, so
+                // running out of descriptors or memory here leaves nothing.
+                let parent = current.try_clone()?;
+                created.try_reserve(1).map_err(std::io::Error::other)?;
+                match rustix::fs::mkdirat(&current, *name, Mode::from_raw_mode(0o700)) {
+                    Ok(()) => {
+                        let fd = record_created_directory(&current, name, parent, created)
+                            .inspect_err(|_| {
+                                // Not yet recorded: remove this exact name now,
+                                // so the reverse rollback can remove its parents.
+                                let _ = rustix::fs::unlinkat(&current, *name, AtFlags::REMOVEDIR);
+                            })
+                            .map_err(|error| walk_error(&shown, Some((&current, *name)), error))?;
+                        // Set the mode explicitly rather than trusting the umask.
+                        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
+                        fd
+                    }
+                    Err(Errno::EXIST) => {
+                        rustix::fs::openat(&current, *name, walk, Mode::empty())
+                            .map_err(|error| walk_error(&shown, Some((&current, *name)), error))?
+                    }
                     Err(error) => return Err(error.into()),
-                };
-                let fd = rustix::fs::openat(&current, *name, walk, Mode::empty())
-                    .map_err(|error| walk_error(&shown, Some((&current, *name)), error))?;
-                if made {
-                    let stat = rustix::fs::fstat(&fd)?;
-                    created.push(CreatedEntry {
-                        parent: current.try_clone()?,
-                        name: name.to_os_string(),
-                        identity: identity(&stat),
-                    });
-                    // Set the mode explicitly rather than trusting the umask.
-                    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
                 }
-                fd
             }
             Err(error) => return Err(walk_error(&shown, Some((&current, *name)), error)),
         };
@@ -377,6 +390,26 @@ fn open_verified_directory(
         current = next;
     }
     Ok(current)
+}
+
+/// Open a directory this call just created and record it for rollback. The
+/// caller removes the directory if this fails, since it is not recorded yet.
+fn record_created_directory(
+    current: &OwnedFd,
+    name: &OsStr,
+    parent: OwnedFd,
+    created: &mut Vec<CreatedEntry>,
+) -> Result<OwnedFd, Errno> {
+    let walk = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = rustix::fs::openat(current, name, walk, Mode::empty())?;
+    let stat = rustix::fs::fstat(&fd)?;
+    // Capacity was reserved before the directory was made.
+    created.push(CreatedEntry {
+        parent,
+        name: name.to_os_string(),
+        identity: identity(&stat),
+    });
+    Ok(fd)
 }
 
 /// Turn a failed directory open into a typed refusal where it is one.
