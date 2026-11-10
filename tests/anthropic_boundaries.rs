@@ -80,23 +80,6 @@ fn harness_for(
     )
 }
 
-async fn complete(server: &FakeHttp, key: &str) -> Result<ModelResponse, ProviderError> {
-    let mut provider = AnthropicProvider::new(config_with(&base(server), key)).expect("provider");
-    let messages = [Message::User {
-        text: "hi".to_string(),
-    }];
-    provider
-        .complete(ModelRequest {
-            session_id: "hs-review",
-            turn: 1,
-            system: "",
-            tools: &[],
-            messages: &messages,
-            max_output_tokens: 64,
-        })
-        .await
-}
-
 fn invalid(body: &Value) -> String {
     let error = parse_response(body).expect_err("invalid");
     assert_eq!(error.kind, ProviderErrorKind::InvalidResponse, "{body}");
@@ -239,6 +222,9 @@ async fn a_mid_output_decline_is_summed_into_journal_audit_and_outcome() {
 #[test]
 fn malformed_iterations_are_invalid() {
     let text = json!([{"type": "text", "text": "ok"}]);
+    let entry = |tag: &str, model: &str, input: Value, output: Value| json!({"type": tag, "model": model, "input_tokens": input, "output_tokens": output});
+    // Top level 10/2 from claude-opus-5-5; a valid last entry matches it.
+    let serving = || entry("message", "claude-opus-5-5", json!(10), json!(2));
     let with = |iterations: Value| {
         message(
             &text,
@@ -246,54 +232,152 @@ fn malformed_iterations_are_invalid() {
             &json!({"input_tokens": 10, "output_tokens": 2, "iterations": iterations}),
         )
     };
+    parse_response(&with(json!([serving()]))).expect("a lone serving entry is valid");
     for (iterations, needle) in [
         (
-            json!([{"input_tokens": -1, "output_tokens": 2}]),
+            json!([entry("message", "m", json!(-1), json!(2)), serving()]),
             "iterations[0] input_tokens",
         ),
         (
-            json!([{"input_tokens": 10, "output_tokens": 2}, {"output_tokens": 1.5}]),
-            "iterations[1] output_tokens",
+            json!([entry("message", "m", json!(5), json!(1.5)), serving()]),
+            "iterations[0] output_tokens",
         ),
         (
-            json!([{"input_tokens": 10, "cache_read_input_tokens": "9"}]),
+            json!([{"type": "message", "model": "m", "input_tokens": 5,
+                 "cache_read_input_tokens": "9"}, serving()]),
             "iterations[0] cache_read_input_tokens",
         ),
-        (json!([7]), "iterations[0] is not an object"),
+        (json!([7, serving()]), "iterations[0] is not an object"),
+        (
+            json!([{"model": "m", "input_tokens": 5}, serving()]),
+            "iterations[0] has no known type",
+        ),
+        (
+            json!([entry("compaction", "m", json!(5), json!(1)), serving()]),
+            "iterations[0] has no known type",
+        ),
+        (
+            json!([{"type": "message", "input_tokens": 5}, serving()]),
+            "iterations[0] has no valid model",
+        ),
+        (
+            json!([entry("message", "bad model", json!(5), json!(1)), serving()]),
+            "iterations[0] has no valid model",
+        ),
+        (
+            json!([entry("message", "m", json!(0), json!(1)), serving()]),
+            "iterations[0] reports zero input tokens",
+        ),
         (json!([]), "not a non-empty array"),
         (json!({"input_tokens": 1}), "not a non-empty array"),
-        (
-            json!([{"input_tokens": 0, "output_tokens": 2}]),
-            "zero input tokens",
-        ),
-        (
-            json!([{"input_tokens": 10, "output_tokens": 0}]),
-            "zero completion tokens",
-        ),
     ] {
         let message = invalid(&with(iterations));
         assert!(message.contains(needle), "{needle}: {message}");
     }
-    // The floor runs on the sum: 3 + 2 tokens cover 300 bytes of text.
-    let long = json!([{"type": "text", "text": "x".repeat(300)}]);
-    let summed = message(
-        &long,
-        "end_turn",
-        &json!({"input_tokens": 1, "output_tokens": 2, "iterations": [
-            {"input_tokens": 1, "output_tokens": 3}, {"input_tokens": 1, "output_tokens": 2}]}),
-    );
-    assert_eq!(
-        parse_response(&summed).expect("valid").usage.output_tokens,
-        5
-    );
 }
 
-// D2: authenticated error fields never carry the key.
+#[test]
+fn iterations_must_end_with_the_serving_attempt() {
+    let mismatch = "usage iterations do not end with the serving attempt the top level reports";
+    let text = json!([{"type": "text", "text": "ok"}]);
+    let body = |top: Value, iterations: Value| {
+        let mut usage = top;
+        usage["iterations"] = iterations;
+        let mut body = message(&text, "end_turn", &usage);
+        body["model"] = json!("claude-opus-4-8");
+        body
+    };
+    let declined = json!({"type": "message", "model": "claude-opus-5-5",
+                          "input_tokens": 1, "output_tokens": 3});
+    // Daybreak r2-repro-01: 900/500 at the top level, 1/1 in the last entry.
+    let contradiction = body(
+        json!({"input_tokens": 900, "output_tokens": 500}),
+        json!([declined, {"type": "fallback_message", "model": "claude-opus-4-8",
+                          "input_tokens": 1, "output_tokens": 1}]),
+    );
+    assert_eq!(invalid(&contradiction), mismatch);
+    // The top level is validated even when iterations exist.
+    let typed = body(
+        json!({"input_tokens": "900", "output_tokens": 1}),
+        json!([declined, {"type": "fallback_message", "model": "claude-opus-4-8",
+                          "input_tokens": 900, "output_tokens": 1}]),
+    );
+    assert!(invalid(&typed).contains("usage input_tokens is not a count"));
+    // The last entry must be the serving model.
+    let wrong_model = body(
+        json!({"input_tokens": 5, "output_tokens": 1}),
+        json!([declined, {"type": "fallback_message", "model": "claude-opus-5",
+                          "input_tokens": 5, "output_tokens": 1}]),
+    );
+    assert_eq!(invalid(&wrong_model), mismatch);
+    // A serving entry that is there but not last does not count.
+    let not_last = body(
+        json!({"input_tokens": 5, "output_tokens": 1}),
+        json!([{"type": "fallback_message", "model": "claude-opus-4-8",
+                "input_tokens": 5, "output_tokens": 1}, declined]),
+    );
+    assert_eq!(invalid(&not_last), mismatch);
+    // Only the declined attempt, no serving entry.
+    let missing = body(
+        json!({"input_tokens": 5, "output_tokens": 1}),
+        json!([declined]),
+    );
+    assert_eq!(invalid(&missing), mismatch);
+    // Cache counters must match exactly too.
+    let cache = body(
+        json!({"input_tokens": 5, "output_tokens": 1, "cache_read_input_tokens": 7}),
+        json!([declined, {"type": "fallback_message", "model": "claude-opus-4-8",
+                          "input_tokens": 5, "output_tokens": 1, "cache_read_input_tokens": 8}]),
+    );
+    assert_eq!(invalid(&cache), mismatch);
+}
+
+#[tokio::test]
+async fn contradictory_serving_usage_cannot_complete_a_session() {
+    // Daybreak r2-repro-01 end to end: refused before any budget is checked.
+    let body = fallback_body(&json!([1, 3, 0, 0]), &json!([1, 1, 0, 0]), &usage(900, 500));
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let mut config = short_lifecycle_config();
+    config.max_total_input_tokens = 10;
+    config.max_total_output_tokens = 10;
+    let mut harness = harness_for(provider, config);
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+    let HarnessError::Provider(error) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+}
+
+#[test]
+fn the_token_floor_uses_the_serving_output() {
+    // 300 bytes of returned text: the serving attempt must account for them.
+    let long = json!([{"type": "text", "text": "x".repeat(300)}]);
+    let body = |serving: u64| {
+        message(
+            &long,
+            "end_turn",
+            &json!({"input_tokens": 1, "output_tokens": serving, "iterations": [
+                {"type": "message", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 50},
+                {"type": "fallback_message", "model": "claude-opus-5-5",
+                 "input_tokens": 1, "output_tokens": serving}]}),
+        )
+    };
+    // 2 serving tokens cannot cover 300 bytes, whatever the declined attempt spent.
+    assert!(invalid(&body(2)).contains("2 completion tokens for 300 bytes"));
+    let accepted = parse_response(&body(5)).expect("5 tokens cover 300 bytes");
+    assert_eq!(accepted.usage.output_tokens, 55, "budgets see the sum");
+}
+
+// D2 and E2: authenticated errors never carry the key.
 
 #[tokio::test]
 async fn a_credential_shaped_request_id_is_dropped() {
     // Daybreak repro-02: a key that is also a valid request ID.
-    let key = "req_DaybreakLeak42";
+    let key = "req_DaybreakLeak4242";
     let body = json!({"type": "error", "error": {"type": "authentication_error",
                       "message": "body text is withheld"}, "request_id": key});
     let server = FakeHttp::start([Reply::json(401, &body)]).await;
@@ -324,19 +408,14 @@ async fn a_credential_shaped_request_id_is_dropped() {
     assert!(!journal.contains("DaybreakLeak"));
 }
 
-#[tokio::test]
-async fn a_key_spelled_like_an_error_type_is_not_quoted() {
-    let key = "rate_limit_error";
-    let body = json!({"type": "error", "error": {"type": "rate_limit_error", "message": "x"},
-                      "request_id": "req_ok1"});
-    let server = FakeHttp::start([Reply::json(429, &body)]).await;
-    let mut config = config_with(&base(&server), key);
+async fn complete_once(server: &FakeHttp, key: &str) -> Result<ModelResponse, ProviderError> {
+    let mut config = config_with(&base(server), key);
     config.max_attempts = 1;
     let mut provider = AnthropicProvider::new(config).expect("provider");
     let messages = [Message::User {
         text: "hi".to_string(),
     }];
-    let error = provider
+    provider
         .complete(ModelRequest {
             session_id: "hs-review",
             turn: 1,
@@ -346,25 +425,120 @@ async fn a_key_spelled_like_an_error_type_is_not_quoted() {
             max_output_tokens: 8,
         })
         .await
-        .expect_err("rate limited");
-    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+}
+
+#[tokio::test]
+async fn a_key_spelled_like_an_error_type_is_not_quoted() {
+    let key = "authentication_error";
+    let body = json!({"type": "error", "error": {"type": key, "message": "x"},
+                      "request_id": "req_ok1"});
+    let server = FakeHttp::start([Reply::json(401, &body)]).await;
+    let error = complete_once(&server, key).await.expect_err("rejected");
+    assert_eq!(error.kind, ProviderErrorKind::Rejected);
     assert_eq!(
         error.message,
-        "HTTP 429 (body withheld: authenticated request)"
+        "HTTP 401 (body withheld: authenticated request)"
     );
 
     // An ordinary key keeps both fields.
-    let server = FakeHttp::start([
-        Reply::json(429, &body),
-        Reply::json(429, &body),
-        Reply::json(429, &body),
-    ])
-    .await;
-    let error = complete(&server, KEY).await.expect_err("rate limited");
+    let server = FakeHttp::start([Reply::json(401, &body)]).await;
+    let error = complete_once(&server, KEY).await.expect_err("rejected");
     assert_eq!(
         error.message,
-        "HTTP 429 rate_limit_error, request req_ok1 (body withheld: authenticated request)"
+        "HTTP 401 authentication_error, request req_ok1 (body withheld: authenticated request)"
     );
+}
+
+#[tokio::test]
+async fn a_key_completed_by_fixed_wording_empties_the_message() {
+    // Daybreak r2-repro-02, at the 20-byte floor: the key is the end of the
+    // allowlisted type plus the formatter's comma. Neither field holds it,
+    // and the body does not either; only the finished message does.
+    let key = "uthentication_error,";
+    assert_eq!(key.len(), 20);
+    let body = json!({"type": "error", "error": {"type": "authentication_error", "message": "x"},
+                      "request_id": "req_safe1"});
+    assert!(!body.to_string().contains(key));
+    let server = FakeHttp::start([Reply::json(401, &body)]).await;
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("run.jsonl");
+    let provider = AnthropicProvider::new(config_with(&base(&server), key)).expect("provider");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider,
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("rejected");
+    let HarnessError::Provider(error) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(error.kind, ProviderErrorKind::Rejected, "the kind is kept");
+    assert_eq!(error.message, "");
+    let journal = std::fs::read_to_string(&path).expect("journal");
+    assert!(!journal.contains(key), "{journal}");
+}
+
+#[tokio::test]
+async fn a_key_named_in_a_local_error_empties_it() {
+    // A tool name is local text; a request error that names it is scrubbed
+    // like any other.
+    let key = "a_tool_named_like_the_key";
+    let server = FakeHttp::start([]).await;
+    let mut config = config_with(&base(&server), key);
+    config.strict_tools = true;
+    let mut provider = AnthropicProvider::new(config).expect("provider");
+    let tools = [kiln_harness::provider::ToolDefinition {
+        name: key.to_string(),
+        description: "open".to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+    }];
+    let messages = [Message::User {
+        text: "hi".to_string(),
+    }];
+    let error = provider
+        .complete(ModelRequest {
+            session_id: "hs-review",
+            turn: 1,
+            system: "",
+            tools: &tools,
+            messages: &messages,
+            max_output_tokens: 8,
+        })
+        .await
+        .expect_err("cannot be strict");
+    assert_eq!(error.kind, ProviderErrorKind::Rejected);
+    assert_eq!(error.message, "");
+    assert_eq!(server.state().connections, 0);
+}
+
+#[test]
+fn short_keys_are_refused_but_keyless_mode_is_not() {
+    for short in ["HTTP", "sk-ant-19-bytes-key"] {
+        let error = AnthropicConfig::new(
+            "https://api.anthropic.com",
+            "claude-opus-5-5",
+            Some(SecretString::new(short)),
+        )
+        .expect("parses")
+        .validate()
+        .expect_err(short);
+        assert_eq!(
+            error.to_string(),
+            "invalid anthropic configuration: API key looks truncated: under 20 bytes"
+        );
+    }
+    config_with("https://api.anthropic.com", "sk-ant-20-bytes-key!")
+        .validate()
+        .expect("20 bytes");
+    AnthropicConfig::new("http://127.0.0.1:9", "claude-opus-5-5", None)
+        .expect("parses")
+        .validate()
+        .expect("keyless");
 }
 
 // D3: opaque numbers must echo exactly, or the response is refused.
@@ -564,7 +738,7 @@ fn the_envelope_and_stop_reason_are_required() {
 // D5: strict tools send schemas strict mode accepts.
 
 #[test]
-fn strict_schemas_drop_unsupported_keywords() {
+fn strict_schemas_strip_only_enforced_bounds() {
     let registry = ToolRegistry::new(ToolLimits::default());
     let tools = registry.definitions();
     let exec = tools.iter().find(|tool| tool.name == "exec").expect("exec");
@@ -575,7 +749,7 @@ fn strict_schemas_drop_unsupported_keywords() {
             "required": ["argv"],
             "additionalProperties": false,
             "properties": {
-                "argv": {"type": "array", "items": {"type": "string"}},
+                "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                 "stdin": {"type": "string"},
                 "timeout_ms": {"type": "integer"}
             }
@@ -594,39 +768,77 @@ fn strict_schemas_drop_unsupported_keywords() {
     for tool in tools {
         let strict = strict_input_schema(&tool.input_schema).expect(&tool.name);
         let text = strict.to_string();
-        for keyword in ["maxItems", "minItems", "minimum", "maxLength", "pattern"] {
+        for keyword in ["maxItems", "minimum", "maximum"] {
             assert!(!text.contains(keyword), "{}: {text}", tool.name);
         }
     }
 
-    // Keywords go at any depth; a property named like one stays.
+    // Bounds go at any depth; minItems 0 or 1 stays; a property named like
+    // a keyword stays.
     let nested = json!({
-        "type": "object", "additionalProperties": false, "required": ["pattern"],
+        "type": "object", "additionalProperties": false, "required": ["maxItems"],
         "properties": {
-            "pattern": {"type": "string", "pattern": "^a", "maxLength": 9},
-            "list": {"type": "array", "maxItems": 2, "items": {
+            "maxItems": {"type": "string", "maxLength": 9},
+            "list": {"type": "array", "minItems": 2, "maxItems": 4, "items": {
                 "type": "object", "additionalProperties": false,
                 "properties": {"n": {"type": "number", "exclusiveMinimum": 0, "maximum": 9}}}},
+            "maybe": {"type": "array", "minItems": 0, "items": {"type": "string"}},
             "either": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "integer", "minimum": 0}]}
         }
     });
     assert_eq!(
         strict_input_schema(&nested).expect("strict"),
         json!({
-            "type": "object", "additionalProperties": false, "required": ["pattern"],
+            "type": "object", "additionalProperties": false, "required": ["maxItems"],
             "properties": {
-                "pattern": {"type": "string"},
+                "maxItems": {"type": "string"},
                 "list": {"type": "array", "items": {
                     "type": "object", "additionalProperties": false, "required": [],
                     "properties": {"n": {"type": "number"}}}},
+                "maybe": {"type": "array", "minItems": 0, "items": {"type": "string"}},
                 "either": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
             }
         })
     );
-    let open = json!({"type": "object", "properties": {"inner": {"type": "object"}},
-                      "additionalProperties": false});
-    let error = strict_input_schema(&open).expect_err("inner object is open");
-    assert!(error.contains("input_schema.properties.inner"), "{error}");
+}
+
+#[test]
+fn unsupported_constructs_are_refused_with_their_path() {
+    let object = |properties: Value| json!({"type": "object", "additionalProperties": false, "properties": properties});
+    for (schema, expected) in [
+        // Daybreak r2-repro-04's custom bound.
+        (
+            object(json!({"n": {"type": "integer", "multipleOf": 2}})),
+            "input_schema.properties.n.multipleOf is not supported in strict mode",
+        ),
+        (
+            object(json!({"node": {"$ref": "#/$defs/node"}})),
+            "input_schema.properties.node.$ref is not supported in strict mode",
+        ),
+        (
+            json!({"type": "object", "additionalProperties": false, "properties": {},
+                   "$defs": {"node": {"type": "string"}}}),
+            "input_schema.$defs is not supported in strict mode",
+        ),
+        (
+            object(json!({"name": {"type": "string", "pattern": "^[a-z]+$"}})),
+            "input_schema.properties.name.pattern is not supported in strict mode",
+        ),
+        (
+            object(json!({"when": {"type": "string", "format": "date-time"}})),
+            "input_schema.properties.when.format is not supported in strict mode",
+        ),
+        (
+            object(json!({"pair": {"type": "array", "items": [{"type": "string"}]}})),
+            "input_schema.properties.pair.items is not a schema",
+        ),
+        (
+            object(json!({"inner": {"type": "object"}})),
+            "input_schema.properties.inner is an object schema without \"additionalProperties\": false",
+        ),
+    ] {
+        assert_eq!(strict_input_schema(&schema).expect_err(expected), expected);
+    }
 }
 
 #[test]
@@ -715,5 +927,46 @@ async fn strict_requests_keep_a_stable_prefix() {
         assert_eq!(&second[..prefix], &first[..prefix]);
         assert_eq!(pair[0].json()["tools"], pair[1].json()["tools"]);
         assert!(pair[1].json()["tools"][0]["strict"] == true);
+    }
+}
+
+// E3: a tool_use stop and tool_use blocks come together.
+
+#[tokio::test]
+async fn a_tool_use_stop_without_calls_is_refused() {
+    // Daybreak r2-repro-03.
+    let body = message(
+        &json!([{"type": "text", "text": "accepted mismatch"}]),
+        "tool_use",
+        &usage(10, 2),
+    );
+    assert_eq!(invalid(&body), "tool_use stop with no tool_use block");
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let mut harness = harness_for(provider, short_lifecycle_config());
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, HarnessError::Provider(_)), "{error}");
+}
+
+#[test]
+fn tool_blocks_without_a_tool_use_stop_are_refused() {
+    let call = json!([{"type": "tool_use", "id": "toolu_1", "name": "list_dir", "input": {}}]);
+    for stop in ["end_turn", "stop_sequence"] {
+        assert_eq!(
+            invalid(&message(&call, stop, &usage(10, 10))),
+            "tool_use blocks without a tool_use stop",
+            "{stop}"
+        );
+    }
+    // A truncated or refused turn may hold blocks; the engine refuses those.
+    for (stop, expected) in [
+        ("max_tokens", kiln_harness::provider::StopReason::MaxTokens),
+        ("refusal", kiln_harness::provider::StopReason::Refusal),
+    ] {
+        let parsed = parse_response(&message(&call, stop, &usage(10, 10))).expect(stop);
+        assert_eq!(parsed.stop_reason, expected);
     }
 }

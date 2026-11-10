@@ -505,7 +505,7 @@ fn parse_response_quoting(
         usage: parse_usage(value.get("usage"))?,
         provider_content: None,
     };
-    check_completion_tokens(&response)?;
+    check_completion_tokens(&response, response.usage.output_tokens)?;
     Ok(response)
 }
 

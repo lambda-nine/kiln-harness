@@ -1078,3 +1078,34 @@ fn harness_defaults_for_run_pass_validation() {
     };
     config.validate().expect("run defaults");
 }
+
+#[tokio::test]
+async fn tool_calls_finish_with_zero_calls_fails_closed() {
+    // finish_reason "tool_calls" with no calls maps to ToolUse, which the
+    // engine refuses as a protocol fault rather than a final answer.
+    let server = FakeHttp::start([Reply::json(
+        200,
+        &completion(
+            &json!({"role": "assistant", "content": "done?", "tool_calls": []}),
+            "tool_calls",
+        ),
+    )])
+    .await;
+    let api = FakeApi::default();
+    let mut harness = Harness::new(
+        api.clone(),
+        provider(config(&server.base_url())),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("fails closed");
+    assert!(
+        matches!(&error, HarnessError::InvalidModelCall(reason) if reason == "tool_use stop with no tool calls"),
+        "{error}"
+    );
+    assert_eq!(api.state().deleted, ["sb-0000000000000001"]);
+}

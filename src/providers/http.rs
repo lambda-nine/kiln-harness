@@ -624,7 +624,8 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
     (era * 146_097 + day_of_era).checked_sub(719_468)
 }
 
-/// Refuse a completion count that cannot be right for the output kept: zero
+/// Refuse `completion`, the output-token count of the attempt that produced
+/// `response`'s content, when it cannot be right for the output kept: zero
 /// for non-empty output (opaque content blocks included), or fewer than one
 /// token per [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of
 /// [`ModelResponse::token_floor_bytes`]. Real tokenizers average a few bytes
@@ -632,9 +633,11 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
 /// under-reporting. Opaque content stays out of the floor, since a thinking
 /// signature is large and unrelated to completion tokens; the engine bounds
 /// all output, opaque content included, separately in bytes.
-pub(crate) fn check_completion_tokens(response: &ModelResponse) -> Result<(), ProviderError> {
+pub(crate) fn check_completion_tokens(
+    response: &ModelResponse,
+    completion: u64,
+) -> Result<(), ProviderError> {
     let output_bytes = response.token_floor_bytes();
-    let completion = response.usage.output_tokens;
     let opaque = response.provider_content.as_ref().is_some_and(|content| {
         content
             .blocks

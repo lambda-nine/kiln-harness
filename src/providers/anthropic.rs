@@ -56,15 +56,18 @@
 //!
 //! | `stop_reason` | [`StopReason`] |
 //! |---|---|
-//! | `end_turn`, `stop_sequence` | `EndTurn` (`ToolUse` with tool calls) |
-//! | `tool_use` | `ToolUse` |
+//! | `end_turn`, `stop_sequence` | `EndTurn`; `InvalidResponse` with `tool_use` blocks |
+//! | `tool_use` | `ToolUse`; `InvalidResponse` without `tool_use` blocks |
 //! | `max_tokens`, `model_context_window_exceeded` | `MaxTokens` |
 //! | `refusal` | `Refusal` |
 //! | `pause_turn` | `InvalidResponse`: it needs server tools, never sent |
 //! | missing or anything else | `InvalidResponse` |
 //!
 //! The adapter never produces [`StopReason::Other`], so nothing it does not
-//! understand ends a session as a final answer.
+//! understand ends a session as a final answer. With client tools only, a
+//! `tool_use` stop and `tool_use` blocks come together, and a mismatch is
+//! refused rather than normalized; a `max_tokens` or `refusal` turn may
+//! still hold blocks, and the engine refuses it as truncated or refused.
 //!
 //! Opaque content must echo value for value, and `serde_json` holds only
 //! 64-bit integers exactly: a float, or an integer outside `i64` and `u64`,
@@ -78,16 +81,21 @@
 //!
 //! `usage` is required. Its `input_tokens`, `cache_read_input_tokens`, and
 //! `cache_creation_input_tokens` are already disjoint, as the provider
-//! contract wants; a missing or null counter is 0. With a server-side
-//! fallback, `usage.iterations` records every attempt and the top level
-//! only the serving one: then every entry is checked the same way and their
-//! saturating sum is the usage, without the top level counted again. So
-//! the per-request output cap covers one model call with all its
+//! contract wants; a missing or null counter is 0. The top-level counters
+//! are always checked; they describe the attempt that produced the returned
+//! message. With a server-side fallback, `usage.iterations` records every
+//! attempt: each entry must have a known `type` ([`ITERATION_TYPES`]), a
+//! valid `model`, valid counters, and nonzero input, and the last must be
+//! the serving attempt, with the response's `model` and exactly the
+//! top-level counters, or the response is `InvalidResponse`. The usage is
+//! then the saturating sum of every entry, without the top level counted
+//! again, so the per-request output cap covers one model call with all its
 //! attempts; `--no-fallbacks` gives a strict per-attempt cap. Zero total
-//! input, zero output tokens for non-empty content, or more than
+//! input (overall and for the serving attempt), and zero output tokens for
+//! non-empty content or more than
 //! [`MAX_OUTPUT_BYTES_PER_TOKEN`](super::http::MAX_OUTPUT_BYTES_PER_TOKEN)
-//! bytes of text and calls per output token, all on that sum, is
-//! `InvalidResponse`. Opaque blocks count toward the engine's byte budget
+//! bytes of text and calls per output token, judged on the serving
+//! attempt's output since it produced the content, are `InvalidResponse`. Opaque blocks count toward the engine's byte budget
 //! but not the token floor: a thinking signature is large and unrelated to
 //! completion tokens.
 //!
@@ -102,10 +110,12 @@
 //!   declined partial, so no block before a `fallback` block needs dropping.
 //! - **Strict tools off by default.** Strict mode refuses `maxItems` and
 //!   similar bounds, which the harness's schemas use. With `strict_tools`,
-//!   each schema is sent through [`strict_input_schema`]: those keywords
-//!   removed and `"required": []` added where absent. The canonical schemas
-//!   stay in [`crate::provider::ToolDefinition`], and the typed tools still
-//!   enforce every bound locally.
+//!   each schema is sent through [`strict_input_schema`]: supported keywords
+//!   kept, `minItems` of 0 or 1 kept, other size and range bounds removed
+//!   (the typed tools enforce them), `"required": []` added where absent,
+//!   and anything else (`pattern`, `multipleOf`, `$ref`, ...) refused with
+//!   its path rather than silently dropped. The canonical schemas stay in
+//!   [`crate::provider::ToolDefinition`].
 //! - **Non-streaming only.** `run`'s 16,384-token default suits it.
 //! - **No reordering**, for a stable prompt-cache prefix.
 //!
@@ -125,7 +135,12 @@
 //! success containing the key, exactly or JSON-escaped, anywhere in the raw
 //! body or a decoded string, opaque blocks included, is refused as
 //! `Rejected`. The key goes only into the `x-api-key` header, over `https`
-//! unless the host is a loopback IP literal.
+//! unless the host is a loopback IP literal, and must be at least
+//! [`MIN_API_KEY_BYTES`] long. Every error is finally passed through
+//! `scrub`: if the finished message contains the key in either spelling,
+//! whether from an endpoint field or by colliding with the adapter's own
+//! wording, the message becomes empty and the kind is kept. Empty is the
+//! only replacement no accepted key can occur in.
 //!
 //! # Credential-proxy mode
 //!
@@ -169,6 +184,9 @@ pub const API_VERSION: &str = "2026-10-21";
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
+/// Documented `usage.iterations` entry types: a requested-model attempt and
+/// a server-side fallback attempt.
+pub const ITERATION_TYPES: [&str; 2] = ["message", "fallback_message"];
 /// Error types quoted in error messages; anything else is `unknown`.
 pub const KNOWN_ERROR_TYPES: [&str; 10] = [
     "invalid_request_error",
@@ -183,6 +201,8 @@ pub const KNOWN_ERROR_TYPES: [&str; 10] = [
     "overloaded_error",
 ];
 const MAX_REQUEST_ID_BYTES: usize = 64;
+/// Shortest API key accepted.
+pub const MIN_API_KEY_BYTES: usize = 20;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("invalid anthropic configuration: {0}")]
@@ -302,6 +322,13 @@ impl AnthropicConfig {
         match &self.api_key {
             Some(key) => {
                 http::check_key(key, &self.base_url, https).map_err(AnthropicError)?;
+                // Real keys are far longer; a short one is an operator
+                // mistake and could collide with ordinary words.
+                if key.expose().len() < MIN_API_KEY_BYTES {
+                    return Err(AnthropicError(format!(
+                        "API key looks truncated: under {MIN_API_KEY_BYTES} bytes"
+                    )));
+                }
             }
             None if self.targets_the_api() => {
                 return Err(AnthropicError(
@@ -467,6 +494,17 @@ impl Provider for AnthropicProvider {
         &mut self,
         request: ModelRequest<'_>,
     ) -> Result<ModelResponse, ProviderError> {
+        // Every error this adapter returns passes here once, fully formatted.
+        let result = self.complete_unscrubbed(request).await;
+        result.map_err(|error| scrub(error, self.config.api_key.as_ref()))
+    }
+}
+
+impl AnthropicProvider {
+    async fn complete_unscrubbed(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
         let body = serde_json::to_vec(&request_body(&self.config, &request)?).map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::InvalidResponse,
@@ -475,11 +513,23 @@ impl Provider for AnthropicProvider {
         })?;
         let transport = self.config.transport();
         transport.check_request(&body)?;
-        let this = &*self;
         transport
-            .with_retries(request.session_id, request.turn, || this.attempt(&body))
+            .with_retries(request.session_id, request.turn, || self.attempt(&body))
             .await
     }
+}
+
+/// The last step for every error of an authenticated request: when the
+/// finished message contains the key in either spelling, whether through an
+/// endpoint field or by colliding with the harness's own wording, the
+/// message is replaced by the empty string and the kind is kept. Only the
+/// empty string is safe for every key: any fixed replacement phrase could
+/// itself contain an accepted key. Errors without a key are returned as is.
+pub(crate) fn scrub(mut error: ProviderError, key: Option<&SecretString>) -> ProviderError {
+    if key.is_some_and(|key| Credential::new(key).in_text(&error.message)) {
+        error.message = String::new();
+    }
+    error
 }
 
 /// The request body for one completion.
@@ -592,48 +642,70 @@ pub fn request_body(
     Ok(Value::Object(body))
 }
 
-/// JSON Schema keywords Anthropic's strict tool mode refuses.
-pub const STRICT_UNSUPPORTED_KEYWORDS: [&str; 9] = [
-    "maxItems",
+/// Schema keywords sent unchanged in strict mode.
+pub const STRICT_KEPT_KEYWORDS: [&str; 11] = [
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "anyOf",
+    "enum",
+    "const",
+    "description",
+    "title",
+    "default",
+];
+
+/// Bounds strict mode refuses that the transform removes. `minItems` is
+/// removed only above 1; 0 and 1 are supported and kept. Whoever enforces
+/// tool arguments must enforce these locally: the built-in tools' typed
+/// validation does.
+pub const STRICT_STRIPPED_KEYWORDS: [&str; 8] = [
     "minItems",
+    "maxItems",
     "minimum",
     "maximum",
     "exclusiveMinimum",
     "exclusiveMaximum",
-    "maxLength",
     "minLength",
-    "pattern",
+    "maxLength",
 ];
 
-/// `schema` as strict tool mode accepts it: every keyword in
-/// [`STRICT_UNSUPPORTED_KEYWORDS`] removed wherever it is a keyword, at any
-/// depth (a property that happens to be named `pattern` is kept), and
-/// `"required": []` added to an object schema that has no `required`, which
-/// means the same thing. Bounds removed here are still enforced by the
-/// harness's typed tool validation.
+/// `schema` as strict tool mode accepts it.
+///
+/// Each subschema is rewritten by keyword: [`STRICT_KEPT_KEYWORDS`] pass
+/// through, with `properties`, `items`, `additionalProperties`, and `anyOf`
+/// rewritten recursively; [`STRICT_STRIPPED_KEYWORDS`] are removed, except
+/// `minItems` of 0 or 1; an object schema without `required` gets
+/// `"required": []`, which means the same thing. A property merely named
+/// like a keyword is kept.
 ///
 /// # Errors
 ///
-/// Returns a description of the first object schema without
-/// `"additionalProperties": false`, which strict mode requires and which
-/// cannot be added without changing what the schema accepts.
+/// Any other keyword (`pattern`, `multipleOf`, `$ref`, `$defs`, `format`,
+/// `oneOf`, ...) is refused with its path rather than dropped, since
+/// dropping a constraint nothing enforces locally would weaken validation;
+/// so are tuple `items` and an object schema without
+/// `"additionalProperties": false`, which strict mode requires.
 pub fn strict_input_schema(schema: &Value) -> Result<Value, String> {
     strict_schema_at(schema, "input_schema")
 }
 
 fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
     let Some(map) = schema.as_object() else {
-        return Ok(schema.clone());
+        return match schema {
+            Value::Bool(_) => Ok(schema.clone()),
+            _ => Err(format!("{path} is not a schema")),
+        };
     };
     let mut out = Map::new();
     for (keyword, value) in map {
-        if STRICT_UNSUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
-            continue;
-        }
         let here = format!("{path}.{keyword}");
         let value = match keyword.as_str() {
-            // Maps from names to subschemas.
-            "properties" | "patternProperties" | "$defs" | "definitions" => match value {
+            "minItems" if value.as_u64().is_some_and(|items| items <= 1) => value.clone(),
+            keyword if STRICT_STRIPPED_KEYWORDS.contains(&keyword) => continue,
+            "properties" => match value {
                 Value::Object(entries) => Value::Object(
                     entries
                         .iter()
@@ -645,30 +717,21 @@ fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
                         })
                         .collect::<Result<Map<_, _>, String>>()?,
                 ),
-                other => other.clone(),
+                _ => return Err(format!("{here} is not an object")),
             },
-            // One subschema, or a list of them.
-            "items"
-            | "additionalProperties"
-            | "not"
-            | "contains"
-            | "if"
-            | "then"
-            | "else"
-            | "anyOf"
-            | "oneOf"
-            | "allOf"
-            | "prefixItems" => match value {
-                Value::Array(items) => Value::Array(
-                    items
+            "items" | "additionalProperties" => strict_schema_at(value, &here)?,
+            "anyOf" => match value {
+                Value::Array(options) => Value::Array(
+                    options
                         .iter()
                         .enumerate()
                         .map(|(index, sub)| strict_schema_at(sub, &format!("{here}[{index}]")))
                         .collect::<Result<Vec<_>, String>>()?,
                 ),
-                other => strict_schema_at(other, &here)?,
+                _ => return Err(format!("{here} is not an array")),
             },
-            _ => value.clone(),
+            keyword if STRICT_KEPT_KEYWORDS.contains(&keyword) => value.clone(),
+            _ => return Err(format!("{here} is not supported in strict mode")),
         };
         out.insert(keyword.clone(), value);
     }
@@ -752,11 +815,18 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
     let text = texts.join("\n");
     let text = (!text.is_empty()).then_some(text);
     // Only the stop reasons this API version defines for a request without
-    // server tools; nothing unknown is taken as a final answer.
+    // server tools; nothing unknown is taken as a final answer. With client
+    // tools only, a tool_use stop and tool_use blocks come together: either
+    // without the other is a malformed response, not something to normalize.
+    // A truncated or refused turn may hold blocks; the engine refuses it.
+    let calls = !tool_calls.is_empty();
     let stop_reason = match value.get("stop_reason").and_then(Value::as_str) {
-        Some("end_turn" | "stop_sequence") if !tool_calls.is_empty() => StopReason::ToolUse,
+        Some("tool_use") if calls => StopReason::ToolUse,
+        Some("tool_use") => return Err(invalid("tool_use stop with no tool_use block")),
+        Some("end_turn" | "stop_sequence") if calls => {
+            return Err(invalid("tool_use blocks without a tool_use stop"));
+        }
         Some("end_turn" | "stop_sequence") => StopReason::EndTurn,
-        Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens" | "model_context_window_exceeded") => StopReason::MaxTokens,
         Some("refusal") => StopReason::Refusal,
         Some("pause_turn") => {
@@ -780,11 +850,12 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
     if let Some(details) = &stop_details {
         check_exact_numbers(details)?;
     }
+    let (usage, serving_output) = parse_usage(value.get("usage"), &model)?;
     let response = ModelResponse {
         text,
         tool_calls,
         stop_reason,
-        usage: parse_usage(value.get("usage"))?,
+        usage,
         provider_content: Some(ProviderContent {
             provider: PROVIDER_NAME.to_string(),
             model: Some(model),
@@ -792,7 +863,9 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
             stop_details,
         }),
     };
-    check_completion_tokens(&response)?;
+    // The serving attempt produced the returned content, so its own output
+    // count must account for it; declined attempts' output cannot.
+    check_completion_tokens(&response, serving_output)?;
     Ok(response)
 }
 
@@ -849,36 +922,67 @@ fn model_id_is_valid(model: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:@/-".contains(&byte))
 }
 
-/// The response's usage. With `usage.iterations`, the per-attempt billing
-/// record a server-side fallback produces, it is the saturating sum of
-/// every attempt, each checked like the top level; the top-level counters
-/// then describe only the serving attempt, already in the sum, and are not
-/// added again. Without it, the top-level counters.
-fn parse_usage(usage: Option<&Value>) -> Result<Usage, ProviderError> {
+/// The response's usage, and the output count of the serving attempt.
+///
+/// The top-level counters are always checked; they describe the attempt
+/// that produced the returned message. With `usage.iterations`, the
+/// per-attempt billing record a server-side fallback produces, every entry
+/// must have a known `type`, a valid `model`, valid counters, and nonzero
+/// input, and the last entry must be the serving attempt: the response's
+/// `model` and exactly the top-level counters. Any disagreement is
+/// `InvalidResponse`, never resolved by picking a side. The usage is then
+/// the saturating sum of every entry, without the top level added again.
+fn parse_usage(usage: Option<&Value>, model: &str) -> Result<(Usage, u64), ProviderError> {
     let usage = usage
         .filter(|usage| usage.is_object())
         .ok_or_else(|| invalid("response has no usage; token budgets cannot be enforced"))?;
-    let usage = match usage.get("iterations") {
-        None | Some(Value::Null) => counters(usage, "usage")?,
-        Some(Value::Array(attempts)) if !attempts.is_empty() => attempts
-            .iter()
-            .enumerate()
-            .try_fold(Usage::default(), |sum, (index, attempt)| {
+    let serving = counters(usage, "usage")?;
+    let total = match usage.get("iterations") {
+        None | Some(Value::Null) => serving,
+        Some(Value::Array(attempts)) if !attempts.is_empty() => {
+            let mut sum = Usage::default();
+            let mut last = None;
+            for (index, attempt) in attempts.iter().enumerate() {
+                let what = format!("usage iterations[{index}]");
                 if !attempt.is_object() {
-                    return Err(invalid(format!(
-                        "usage iterations[{index}] is not an object"
-                    )));
+                    return Err(invalid(format!("{what} is not an object")));
                 }
-                Ok(sum + counters(attempt, &format!("usage iterations[{index}]"))?)
-            })?,
+                if !attempt
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|tag| ITERATION_TYPES.contains(&tag))
+                {
+                    return Err(invalid(format!("{what} has no known type")));
+                }
+                let attempt_model = attempt
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|model| model_id_is_valid(model))
+                    .ok_or_else(|| invalid(format!("{what} has no valid model")))?;
+                let counted = counters(attempt, &what)?;
+                if counted.total_input_tokens() == 0 {
+                    return Err(invalid(format!("{what} reports zero input tokens")));
+                }
+                sum = sum + counted;
+                last = Some((attempt_model, counted));
+            }
+            match last {
+                Some((last_model, counted)) if last_model == model && counted == serving => sum,
+                _ => {
+                    return Err(invalid(
+                        "usage iterations do not end with the serving attempt the top level reports",
+                    ));
+                }
+            }
+        }
         Some(_) => return Err(invalid("usage iterations is not a non-empty array")),
     };
     // Every request carries at least the user's task, cached or not; a
     // fully cached prompt has zero uncached input.
-    if usage.total_input_tokens() == 0 {
+    if serving.total_input_tokens() == 0 || total.total_input_tokens() == 0 {
         return Err(invalid("usage reports zero input tokens"));
     }
-    Ok(usage)
+    Ok((total, serving.output_tokens))
 }
 
 /// The four disjoint counters of one usage object; a missing or null
@@ -932,7 +1036,9 @@ fn classify_status(status: StatusCode, body: &[u8], key: Option<&Credential<'_>>
     let id_part = id.map(|id| format!(", request {id}")).unwrap_or_default();
     let message = match key {
         None => format!("HTTP {code} {kind}{id_part}: {}", excerpt(body)),
-        // Even fixed text is checked: a key may be spelled like a type.
+        // The quoted endpoint fields are checked here, and the finished
+        // message once more by `scrub`, since fixed wording around them can
+        // complete a key too.
         Some(key) if key.in_text(kind) || id.is_some_and(|id| key.in_text(id)) => {
             format!("HTTP {code} (body withheld: authenticated request)")
         }
@@ -980,8 +1086,12 @@ mod tests {
     use super::*;
 
     fn config(base: &str) -> AnthropicConfig {
-        AnthropicConfig::new(base, DEFAULT_MODEL, Some(SecretString::new("sk-ant-test")))
-            .expect("url")
+        AnthropicConfig::new(
+            base,
+            DEFAULT_MODEL,
+            Some(SecretString::new("sk-ant-test-key-0123456789")),
+        )
+        .expect("url")
     }
 
     #[test]
@@ -1029,6 +1139,40 @@ mod tests {
             assert_eq!(id(bad), None, "{bad:?}");
         }
         assert!(id(&format!("req_{}", "a".repeat(60))).is_some());
+    }
+
+    #[test]
+    fn every_error_message_is_scrubbed_of_the_key() {
+        // Keys this short are refused by validation; here they stand in for
+        // any key that collides with fixed wording.
+        let echo = http::credential_echo().error;
+        let key = SecretString::new("request credential");
+        let scrubbed = scrub(echo.clone(), Some(&key));
+        assert_eq!(scrubbed.message, "");
+        assert_eq!(
+            scrubbed.kind,
+            ProviderErrorKind::Rejected,
+            "the kind is kept"
+        );
+        assert_eq!(
+            scrub(echo.clone(), None),
+            echo,
+            "keyless errors are unchanged"
+        );
+        let other = SecretString::new("sk-ant-unrelated-key-1234");
+        assert_eq!(scrub(echo.clone(), Some(&other)), echo);
+
+        let parse = parse_response(&json!({"type": "completion"})).expect_err("invalid");
+        let scrubbed = scrub(parse, Some(&SecretString::new("is not")));
+        assert_eq!(
+            (scrubbed.kind, scrubbed.message.as_str()),
+            (ProviderErrorKind::InvalidResponse, "")
+        );
+        // The JSON-escaped spelling counts too.
+        let quoted = invalid("message holds a\\\\b only escaped");
+        assert!(!quoted.message.contains("a\\b"));
+        let scrubbed = scrub(quoted, Some(&SecretString::new("a\\b")));
+        assert_eq!(scrubbed.message, "");
     }
 
     #[test]

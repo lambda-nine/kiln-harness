@@ -84,7 +84,12 @@ it is not a hostile multi-tenant boundary.
   object. Error messages for authenticated anthropic requests interpolate
   only the allowlisted error type and a syntactically validated request ID,
   and each is checked against both spellings of the key first; a match
-  leaves just the status. The claim is
+  leaves just the status. Every anthropic error then passes one final
+  scan of its finished message, whatever built it (status, credential
+  echo, parse, or request errors): on a match, including a key that only
+  appears where fixed wording meets a field, the message is emptied and the
+  kind kept, since any non-empty replacement could itself contain some
+  accepted key. Anthropic keys under 20 bytes are refused as truncated. The claim is
   therefore exact: the harness never writes the key, or a JSON-escaped form
   of it, to the journal, the audit, or an error. An endpoint that holds the
   key can still return a transformed or split form of it (base64, reversed,
@@ -140,7 +145,10 @@ it is not a hostile multi-tenant boundary.
   cost accounting, not for safety. For anthropic, every server-side attempt
   in `usage.iterations` is counted, so a declined fallback attempt cannot
   spend tokens outside the budgets; the per-request cap applies to the
-  whole call. Usage that cannot be right (zero prompt
+  whole call. The top-level serving counters are validated too and must
+  equal the last iteration exactly, so a response cannot report one usage
+  and be accounted at another; the output floor runs on the serving
+  attempt that produced the content. Usage that cannot be right (zero prompt
   tokens, zero completion tokens for non-empty output, or more than 64 bytes
   of output per completion token) is refused, but a plausible lie is not
   detectable without the model's tokenizer. Size is bounded locally

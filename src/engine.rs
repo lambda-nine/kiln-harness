@@ -901,7 +901,13 @@ where
     match stop_reason {
         StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
         StopReason::Refusal => return Err(HarnessError::ModelRefused),
-        StopReason::EndTurn | StopReason::ToolUse | StopReason::Other => {}
+        // A provider protocol fault, never a final answer.
+        StopReason::ToolUse => {
+            return Err(HarnessError::InvalidModelCall(
+                "tool_use stop with no tool calls".to_string(),
+            ));
+        }
+        StopReason::EndTurn | StopReason::Other => {}
     }
     let text = text.unwrap_or_default();
     let rejected = text.is_empty() || text.len() > context.config.max_final_answer_bytes;

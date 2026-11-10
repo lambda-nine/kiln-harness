@@ -184,8 +184,11 @@ one that was declined, so `--max-output-tokens` limits one model call with
 all its attempts; `--no-fallbacks` turns fallbacks off and makes it a
 per-attempt cap. `--strict-tools` marks the tool schemas `strict` and
 sends them without the bounds strict mode refuses (`maxItems`, `minimum`,
-and the like); the harness still enforces those bounds itself. It is off by
-default. `--temperature` and `--seed` are
+and `minItems` above 1); the harness still enforces those bounds itself. A
+schema construct strict mode does not support and the harness would not
+enforce, such as `pattern` or `multipleOf`, is refused before the session
+starts rather than dropped. It is off by default. An API key must be at
+least 20 bytes. `--temperature` and `--seed` are
 refused for this provider, and `--effort`, `--strict-tools`, and
 `--no-fallbacks` for openai-compat. `--base-url` defaults to
 `https://api.anthropic.com` and must be `https` unless its host is a

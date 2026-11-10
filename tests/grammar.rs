@@ -861,6 +861,14 @@ async fn engine_refusals_verify_and_forged_continuations_do_not() {
             short(),
         ),
         (
+            "tool_use stop with no tool calls",
+            vec![ModelResponse {
+                stop_reason: StopReason::ToolUse,
+                ..ModelResponse::final_text("done")
+            }],
+            short(),
+        ),
+        (
             "over the total output budget",
             vec![ModelResponse {
                 usage: Usage {

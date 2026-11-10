@@ -6,6 +6,20 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Second review round for the anthropic provider. Top-level usage is
+  always validated, and with `usage.iterations` every entry needs a known
+  type, a valid model, valid counters, and nonzero input, and the last must
+  equal the serving model and top-level counters exactly; the output floor
+  runs on the serving attempt. Every error passes a final scan of its
+  finished message for the key and is emptied on a match, keeping its kind,
+  and keys under 20 bytes are refused as truncated. A `tool_use` stop must
+  come with `tool_use` blocks and `end_turn` without them; the engine and
+  grammar now treat any `tool_use` stop with no calls as a protocol fault
+  (`InvalidModelCall`), which also covers openai-compat's
+  `finish_reason: "tool_calls"` with no calls. The strict-tools transform
+  keeps supported keywords and `minItems` 0 or 1, removes only size and
+  range bounds the typed tools enforce, and refuses anything else, such as
+  `pattern`, `multipleOf`, or `$ref`, with its path.
 - Review fixes for the anthropic provider. Usage after a server-side
   fallback is the sum of every attempt in `usage.iterations`, each
   validated, so declined attempts count against all token budgets, and the

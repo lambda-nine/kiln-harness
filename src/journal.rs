@@ -667,6 +667,7 @@ fn engine_accepts(
             response.stop_reason,
             StopReason::MaxTokens | StopReason::Refusal
         )
+        || (response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty())
     {
         return false;
     }

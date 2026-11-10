@@ -2247,3 +2247,35 @@ async fn every_engine_exit_path_writes_a_grammatical_journal() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_tool_use_stop_without_calls_fails_closed() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("tool-use-stop.jsonl");
+    let api = FakeApi::default();
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new([ModelResponse {
+            stop_reason: StopReason::ToolUse,
+            ..ModelResponse::final_text("not an answer")
+        }]),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("a protocol fault");
+    assert!(
+        matches!(&error, HarnessError::InvalidModelCall(reason) if reason == "tool_use stop with no tool calls"),
+        "{error}"
+    );
+    assert_eq!(api.state().deleted, ["sb-0000000000000001"]);
+    let journal = read_journal(&path).expect("verifies");
+    assert!(matches!(
+        journal.records.last().map(|record| &record.event),
+        Some(JournalEvent::SessionEnded { work_outcome, final_answer: None, sandbox_deleted: true, .. })
+            if work_outcome == "failed"
+    ));
+}

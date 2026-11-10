@@ -223,13 +223,20 @@ model name. Replay answers from the journal and never contacts the server.
 `top_p`, `top_k`, `thinking`, or `stream`: sampling parameters are refused
 on this API version, and without `thinking` current models think
 adaptively. Tools are `{"name", "description", "input_schema"}`. With
-`--strict-tools` each also carries `"strict": true`, and its schema is sent
-with the keywords strict mode refuses removed wherever they are keywords
-(`maxItems`, `minItems`, `minimum`, `maximum`, `exclusiveMinimum`,
-`exclusiveMaximum`, `maxLength`, `minLength`, `pattern`) and
-`"required": []` added to an object schema without `required`. An object
-schema without `"additionalProperties": false` cannot be made strict and is
-refused when the provider is built. The canonical schemas in
+`--strict-tools` each also carries `"strict": true`, and its schema is
+rewritten keyword by keyword. Supported keywords (`type`, `properties`,
+`required`, `additionalProperties`, `items`, `anyOf`, `enum`, `const`,
+`description`, `title`, `default`) are kept, and `minItems` of 0 or 1.
+Size and range bounds strict mode refuses (`minItems` above 1, `maxItems`,
+`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `minLength`,
+`maxLength`) are removed, because the typed tools enforce them; for the
+built-in tools that is `exec.argv.maxItems`, `exec.timeout_ms.minimum`, and
+`read_file.max_bytes.minimum`, while `exec.argv.minItems: 1` stays. An
+object schema without `required` gets `"required": []`. Any other keyword
+(`pattern`, `multipleOf`, `$ref`, `$defs`, `format`, `oneOf`, ...), tuple
+`items`, or an object schema without `"additionalProperties": false` is
+refused with its path rather than dropped, since nothing would enforce it,
+and the built-in tools are checked this way when the provider is built. The canonical schemas in
 `ToolDefinition`, the journal, and the request hash are unchanged, and the
 typed tools still enforce every removed bound.
 
@@ -260,33 +267,48 @@ opaque content. A `tool_use` must have an `id` that passes the engine's
 call-ID rule (the echoed block keeps it, so it cannot be replaced by a
 positional ID), a name of at most 256 bytes, and an object `input`;
 otherwise the response is `InvalidResponse`. `end_turn` and `stop_sequence`
-are `end_turn` (`tool_use` when calls are present), `tool_use` is
-`tool_use`, `max_tokens` and `model_context_window_exceeded` are
-`max_tokens`, and `refusal` is `refusal`. `pause_turn` is `InvalidResponse`:
+are `end_turn`, `tool_use` is `tool_use`, `max_tokens` and
+`model_context_window_exceeded` are `max_tokens`, and `refusal` is
+`refusal`. Since only client tools are sent, a `tool_use` stop must come
+with at least one `tool_use` block and `end_turn` or `stop_sequence` with
+none; either mismatch is `InvalidResponse`, not normalized. A truncated or
+refused turn may still hold blocks, and the engine refuses it. Provider
+neutrally, the engine and the grammar treat a `tool_use` stop with no tool
+calls as a protocol fault (`InvalidModelCall`), never a final answer; an
+openai-compat `finish_reason: "tool_calls"` with no calls ends that way. `pause_turn` is `InvalidResponse`:
 it needs server tools, which the harness never sends, and treating it as a
 final answer would end the turn early. A missing or unknown stop reason is
 `InvalidResponse` too; the adapter never produces `other`. Stop details are recorded in the provider content, never sent
 back, and never shown.
 
 Anthropic's usage counters are already disjoint. A missing or null counter
-is 0. After a server-side fallback, `usage.iterations` lists every attempt,
-each billed, and the top level describes only the serving attempt. When
-the array is present, every entry is checked like the top level and the
-usage is the saturating sum of all of them, without adding the top level
-again; otherwise it is the top level. A malformed entry is
-`InvalidResponse`. The per-request output cap therefore covers one model
+is 0. The top-level counters are always validated: they describe the
+attempt that produced the returned message. After a server-side fallback,
+`usage.iterations` lists every attempt, each billed. When the array is
+present, every entry needs a known `type` (`message` or
+`fallback_message`), a valid `model`, valid counters, and nonzero input,
+and the last entry must be the serving attempt: the response's `model` and
+exactly the top-level counters. A response whose two views of the serving
+attempt disagree is `InvalidResponse`; neither side is picked. The usage is
+then the saturating sum of every entry, without adding the top level
+again; without the array it is the top level. The per-request output cap therefore covers one model
 call including its server-side attempts; an operator who needs a strict
 per-attempt cap runs with `--no-fallbacks`. A missing `usage` object, zero
 total input (not zero uncached input: a fully cached prompt has none), zero
 output tokens for non-empty content, or more than 64 bytes of neutral
-output per output token, all judged on the sum, is `InvalidResponse`.
+output per output token is `InvalidResponse`. The output checks use the
+serving attempt's count, since it produced the returned content; the
+budgets use the sum.
 
 With a key, error messages are the status, the `error.type` from a closed
 list of known types (`unknown` otherwise), and a `request_id` only when it
 is `req_` and ASCII letters and digits, 64 bytes at most, and each only
 when it does not contain the key in either spelling (a key can be shaped
 like a request ID or even a type name); otherwise just the status. Never the
-message. Without one (below), the same is followed by the unauthenticated
+message. Every finished error message is then scanned once more: if fixed
+wording around those fields, or any other local text, completes the key,
+the message is emptied and the kind kept. Keys under 20 bytes are refused
+at configuration, which keeps ordinary words out of that collision class. Without one (below), the same is followed by the unauthenticated
 excerpt: at most 512 bytes of the body, without control characters. 408, 409, 429, 500, 502, 503, 504, 529, other
 5xx without a JSON body, and transport failures are retried as above. 413
 and an `invalid_request_error` about the prompt's length or the context

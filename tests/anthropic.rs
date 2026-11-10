@@ -395,12 +395,11 @@ fn thinking_and_two_tool_calls_keep_their_blocks() {
 }
 
 #[test]
-fn stop_reasons_map_and_normalize() {
+fn stop_reasons_map() {
     let call = json!([tool_use("toolu_1", "list_dir", &json!({}))]);
     let say = json!([text("x")]);
     for (content, stop, expected) in [
-        (&call, "end_turn", StopReason::ToolUse),
-        (&call, "stop_sequence", StopReason::ToolUse),
+        (&call, "tool_use", StopReason::ToolUse),
         (&say, "end_turn", StopReason::EndTurn),
         (&say, "stop_sequence", StopReason::EndTurn),
         (&say, "max_tokens", StopReason::MaxTokens),
