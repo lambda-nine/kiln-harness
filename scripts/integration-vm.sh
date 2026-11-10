@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+# The Linux ACL tests skip without these tools; this run must not. Install
+# nothing here: package changes on the shared VM go through its owner.
+if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then
+    echo "setfacl/getfacl not found: install Ubuntu's acl package (sudo apt-get install acl) so the Linux ACL tests run" >&2
+    exit 1
+fi
+
 # Linux clippy and the host suite first, as the invoking user rather than
 # root: the suite once with that user's umask and once with Ubuntu's
 # user-private-group default, under which a careless test directory would be

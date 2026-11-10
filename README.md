@@ -155,6 +155,10 @@ The installed-service test is opt-in and must run inside the kiln VM:
 scripts/integration-vm.sh
 ```
 
+Guest prerequisites: a Rust toolchain at MSRV 1.88 or newer, `python3`, `sudo`,
+the installed kilnd and kiln, and Ubuntu's `acl` package (`setfacl` and
+`getfacl`, which the script requires so the Linux ACL tests run).
+
 It requires no active sandboxes or running executions, verifies all five tool
 results and execution links, replays the recorded journal against a second
 sandbox, and runs the `demo`, `journal verify`, and `replay` commands.
