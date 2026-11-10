@@ -401,7 +401,7 @@ fn provider_specific_flags_are_refused_for_the_other_provider() {
 }
 
 #[test]
-fn anthropic_needs_a_key_variable_and_a_valid_effort() {
+fn anthropic_needs_a_key_or_a_proxy_and_a_valid_effort() {
     let temp = common::private_tempdir().expect("tempdir");
     let dir = temp.path();
     let mut without_key = Run::anthropic(dir).arg("--prompt", "hi");
@@ -409,7 +409,8 @@ fn anthropic_needs_a_key_variable_and_a_valid_effort() {
     refused(
         dir,
         &without_key.output(),
-        "--provider anthropic needs --api-key-env VAR",
+        "--provider anthropic needs --api-key-env, or --base-url pointing at a \
+         credential-injecting proxy",
     );
     let unset = Run::anthropic(dir).arg("--prompt", "hi").output();
     refused(dir, &unset, "KILN_TEST_KEY is not set");
@@ -445,4 +446,45 @@ fn openai_compat_still_needs_a_base_url_and_model() {
             "--provider openai-compat needs --base-url and --model",
         );
     }
+}
+
+#[test]
+fn keyless_anthropic_needs_a_proxy_and_may_use_plain_http() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    let keyless = |base_url: Option<&str>| {
+        let mut run = Run::anthropic(dir).arg("--prompt", "hi");
+        run.args.drain(2..4);
+        match base_url {
+            Some(url) => run.arg("--base-url", url),
+            None => run,
+        }
+    };
+    let needle = "--provider anthropic needs --api-key-env, or --base-url pointing at a \
+                  credential-injecting proxy";
+    for direct in [
+        None,
+        Some("https://api.anthropic.com"),
+        Some("https://API.anthropic.com./"),
+    ] {
+        refused(dir, &keyless(direct).output(), needle);
+    }
+    // A keyless proxy over plain http, even off loopback, passes every check
+    // and fails only at the missing kilnd socket, after the outputs open.
+    for proxy in ["http://host.lima.internal:8788", "http://127.0.0.1:8788"] {
+        let output = keyless(Some(proxy)).output();
+        let text = stderr(&output);
+        assert!(!output.status.success());
+        assert!(!text.contains(needle), "{text}");
+        assert!(text.contains("kilnd"), "{text}");
+        assert!(!text.contains("https"), "{text}");
+        assert!(!text.contains("configuration"), "{text}");
+    }
+    // A key over plain http to a non-loopback host is still refused.
+    let keyed = Run::anthropic(dir)
+        .env("KILN_TEST_KEY", SENTINEL_KEY)
+        .arg("--prompt", "hi")
+        .arg("--base-url", "http://host.lima.internal:8788")
+        .output();
+    refused(dir, &keyed, "requires an https base URL");
 }

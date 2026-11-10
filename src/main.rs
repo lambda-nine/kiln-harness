@@ -109,7 +109,8 @@ struct RunArgs {
     #[arg(long)]
     system_file: Option<PathBuf>,
     /// Environment variable holding the API key; the key is never a flag.
-    /// Required for anthropic.
+    /// Without it, anthropic needs a `--base-url` naming a host-side proxy
+    /// that adds the key.
     #[arg(long, value_name = "VAR")]
     api_key_env: Option<String>,
     /// Sampling temperature, 0.0 to 2.0 (openai-compat; default 0).
@@ -185,7 +186,7 @@ async fn main() -> Result<ExitCode> {
             let audit = args.audit.clone();
             // Everything is checked, and the key read, before any output is
             // opened or kilnd is contacted.
-            let prepared = prepare_run(*args)?;
+            let prepared = prepare_run(&args)?;
             run(cli.socket, prepared, &audit, &journal).await
         }
         Command::Replay {
@@ -272,8 +273,8 @@ fn check_limit<T: Copy + PartialOrd + Default + std::fmt::Display>(
     Ok(())
 }
 
-fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
-    check_provider_flags(&args)?;
+fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
+    check_provider_flags(args)?;
     check_limit("--max-steps", args.max_steps, MAX_STEPS)?;
     check_limit("--max-tool-calls", args.max_tool_calls, MAX_TOOL_CALLS)?;
     check_limit(
@@ -328,8 +329,8 @@ fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
     };
     config.validate()?;
 
-    let prompt = match (args.prompt, &args.prompt_file) {
-        (Some(prompt), None) => prompt,
+    let prompt = match (&args.prompt, &args.prompt_file) {
+        (Some(prompt), None) => prompt.clone(),
         (None, Some(path)) => read_text_file("--prompt-file", path)?,
         _ => bail!("give exactly one of --prompt and --prompt-file"),
     };
@@ -344,7 +345,18 @@ fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
         None => default_system_prompt(&config.tool_limits),
     };
 
-    let provider = match args.provider {
+    let provider = build_provider(args)?;
+    Ok(PreparedRun {
+        task: SessionTask { system, prompt },
+        config,
+        provider,
+    })
+}
+
+/// The provider `run` was asked for, from its flags. Errors name flags and
+/// variables, never a key.
+fn build_provider(args: &RunArgs) -> Result<RunProvider> {
+    Ok(match args.provider {
         ProviderKind::OpenAiCompat => {
             let (Some(base_url), Some(model)) = (&args.base_url, &args.model) else {
                 bail!("--provider openai-compat needs --base-url and --model");
@@ -356,24 +368,24 @@ fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
             RunProvider::OpenAiCompat(OpenAiCompatProvider::new(provider_config)?)
         }
         ProviderKind::Anthropic => {
-            let Some(var) = &args.api_key_env else {
-                bail!("--provider anthropic needs --api-key-env VAR");
-            };
+            // Without a key the harness relies on a credential-injecting
+            // proxy; the API itself would only answer 401.
             let mut provider_config = AnthropicConfig::new(
                 args.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL),
                 args.model.as_deref().unwrap_or(DEFAULT_MODEL),
-                read_api_key(var)?,
+                args.api_key_env.as_deref().map(read_api_key).transpose()?,
             )?;
+            if provider_config.api_key.is_none() && provider_config.targets_the_api() {
+                bail!(
+                    "--provider anthropic needs --api-key-env, or --base-url pointing at a \
+                     credential-injecting proxy"
+                );
+            }
             provider_config.effort = args.effort.unwrap_or_default();
             provider_config.fallbacks = !args.no_fallbacks;
             provider_config.strict_tools = args.strict_tools;
             RunProvider::Anthropic(AnthropicProvider::new(provider_config)?)
         }
-    };
-    Ok(PreparedRun {
-        task: SessionTask { system, prompt },
-        config,
-        provider,
     })
 }
 

@@ -30,9 +30,12 @@ fn base(server: &FakeHttp) -> String {
 }
 
 fn config(base_url: &str) -> AnthropicConfig {
-    let mut config =
-        AnthropicConfig::new(base_url, "claude-opus-5-5", SecretString::new(SENTINEL_KEY))
-            .expect("config");
+    let mut config = AnthropicConfig::new(
+        base_url,
+        "claude-opus-5-5",
+        Some(SecretString::new(SENTINEL_KEY)),
+    )
+    .expect("config");
     config.retry_base_delay = Duration::from_millis(5);
     config.retry_max_delay = Duration::from_millis(40);
     config
@@ -1089,7 +1092,7 @@ async fn the_key_never_reaches_the_journal_audit_or_errors() {
 
 #[test]
 fn https_is_required_except_for_loopback_ip_literals() {
-    let key = || SecretString::new(SENTINEL_KEY);
+    let key = || Some(SecretString::new(SENTINEL_KEY));
     for refused in [
         "http://api.example.com",
         "http://localhost:8080",
@@ -1113,9 +1116,12 @@ fn https_is_required_except_for_loopback_ip_literals() {
             .expect(accepted);
     }
     for bad_key in ["", "sk ant", "sk-\u{e9}"] {
-        let config =
-            AnthropicConfig::new("https://api.anthropic.com", "m", SecretString::new(bad_key))
-                .expect("parses");
+        let config = AnthropicConfig::new(
+            "https://api.anthropic.com",
+            "m",
+            Some(SecretString::new(bad_key)),
+        )
+        .expect("parses");
         assert!(config.validate().is_err(), "{bad_key:?}");
     }
 }
@@ -1157,4 +1163,160 @@ async fn a_refusal_ends_the_session_as_refused() {
             .and_then(|details| details.get("category").cloned()),
         Some(json!("cyber"))
     );
+}
+
+// 8. Credential-proxy mode: no key in the harness at all.
+
+fn keyless(base_url: &str) -> AnthropicConfig {
+    let mut config = AnthropicConfig::new(base_url, "claude-opus-5-5", None).expect("config");
+    config.retry_base_delay = Duration::from_millis(5);
+    config.retry_max_delay = Duration::from_millis(40);
+    config
+}
+
+#[tokio::test]
+async fn a_keyless_request_sends_no_credential_header() {
+    let server = FakeHttp::start([ok(&json!([text("via proxy")]), "end_turn")]).await;
+    let config = keyless(&base(&server));
+    assert!(format!("{config:?}").contains("api_key: None"));
+    let provider = provider(config);
+    assert!(format!("{provider:?}").contains("none: credential proxy"));
+    let response = complete_with(keyless(&base(&server)))
+        .await
+        .expect("response");
+    assert_eq!(response.text.as_deref(), Some("via proxy"));
+    let request = &server.requests()[0];
+    assert_eq!(request.header("x-api-key"), None);
+    assert_eq!(request.header("authorization"), None);
+    assert_eq!(request.header("anthropic-version"), Some(API_VERSION));
+    assert_eq!(request.header("anthropic-beta"), Some(FALLBACK_BETA));
+}
+
+#[test]
+fn keyless_mode_allows_plain_http_but_not_the_api_itself() {
+    for proxy in [
+        "http://host.lima.internal:8788",
+        "http://192.168.5.2:8788",
+        "http://127.0.0.1:8788",
+        "https://proxy.example.com",
+    ] {
+        keyless(proxy).validate().expect(proxy);
+    }
+    for direct in [
+        "https://api.anthropic.com",
+        "https://API.Anthropic.com./v1-root",
+        "http://api.anthropic.com",
+    ] {
+        let error = keyless(direct).validate().expect_err(direct);
+        assert!(
+            error.to_string().contains("credential-injecting proxy"),
+            "{error}"
+        );
+    }
+    // A key still needs https off loopback, proxy or not.
+    let error = config("http://host.lima.internal:8788")
+        .validate()
+        .expect_err("cleartext key");
+    assert!(
+        error.to_string().contains("requires an https base URL"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn keyless_errors_quote_a_bounded_sanitized_excerpt() {
+    let relayed = format!(
+        "{{\"type\":\"error\",\"error\":{{\"type\":\"rate_limit_error\",\
+         \"message\":\"slow \\u001b[31mdown {}\"}},\"request_id\":\"req_7\"}}",
+        "x".repeat(2000)
+    );
+    let server = FakeHttp::start([
+        Reply::status(429, &relayed),
+        Reply::status(401, "proxy: \u{1b}[2Jupstream refused"),
+    ])
+    .await;
+    let mut config = keyless(&base(&server));
+    config.max_attempts = 1;
+    let error = complete_with(config.clone())
+        .await
+        .expect_err("rate limited");
+    assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+    assert!(error.retryable);
+    let message = &error.message;
+    assert!(
+        message.starts_with("HTTP 429 rate_limit_error, request req_7: {"),
+        "{message}"
+    );
+    assert!(message.contains("slow"), "the excerpt is quoted: {message}");
+    assert!(!message.chars().any(char::is_control), "{message}");
+    assert!(message.len() < 512 + 64, "{}", message.len());
+
+    let error = complete_with(config).await.expect_err("proxy refused");
+    assert_eq!(error.kind, ProviderErrorKind::Rejected);
+    assert_eq!(
+        error.message,
+        "HTTP 401 unknown: proxy: [2Jupstream refused"
+    );
+
+    let server = FakeHttp::start([Reply::json(
+        200,
+        &json!({"type": "error", "error": {"type": "overloaded_error", "message": "detail"}}),
+    )])
+    .await;
+    let error = complete_with(keyless(&base(&server)))
+        .await
+        .expect_err("no content");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(
+        error
+            .message
+            .starts_with("server reported overloaded_error: {"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("detail"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn a_keyless_session_verifies_and_replays() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let recorded = temp.path().join("proxy.jsonl");
+    let server = FakeHttp::start(session_script()).await;
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider(keyless(&base(&server))),
+        MemoryAudit::default(),
+        JsonlJournal::open(&recorded).expect("journal"),
+        short_lifecycle_config(),
+    );
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("session completes");
+    assert_eq!(outcome.final_answer, "a.txt contains hello.");
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.header("x-api-key").is_none())
+    );
+    server.stop();
+    let journal = read_journal(&recorded).expect("journal verifies");
+    let replay = ReplayProvider::from_journal(&journal).expect("replayable");
+    let mut config = short_lifecycle_config();
+    config.apply_limits(&replay.limits());
+    let replay_task = replay.task();
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        replay,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let replayed = harness
+        .run(&replay_task, CancellationToken::new())
+        .await
+        .expect("replay completes");
+    assert_eq!(replayed.final_answer, outcome.final_answer);
+    assert!(harness.provider().exhausted());
 }

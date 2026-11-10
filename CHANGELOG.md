@@ -6,10 +6,19 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Anthropic credential-proxy mode: `AnthropicConfig::api_key` is optional,
+  and `run --provider anthropic` no longer requires `--api-key-env`.
+  Without a key no `x-api-key` or `Authorization` header is sent, a
+  host-side proxy adds the key, the harness skips the credential scan (the
+  proxy owns it), and errors are quoted as bounded, sanitized excerpts as
+  for an unauthenticated local server. Keyless use is accepted over plain
+  `http` to any host and refused when the base URL is missing or is
+  `api.anthropic.com`, with "needs --api-key-env, or --base-url pointing at
+  a credential-injecting proxy". With a key, nothing changes.
 - Add an `anthropic` provider for Anthropic's Messages API over raw HTTP
   (`anthropic-version: 2026-10-21`; no SDK, no new dependency), and
   `run --provider anthropic [--base-url] [--model] [--effort]
-  [--no-fallbacks] [--strict-tools] --api-key-env VAR`. It defaults to
+  [--no-fallbacks] [--strict-tools] [--api-key-env VAR]`. It defaults to
   `claude-opus-5-5` at high effort, non-streaming, with top-level automatic
   prompt caching and server-side fallbacks (`fallbacks: "default"`); it
   never sends sampling parameters, `thinking`, or `stream`. Each turn's tool

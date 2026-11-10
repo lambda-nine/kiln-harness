@@ -196,6 +196,28 @@ else. The key is sent only as the `x-api-key` header, error bodies are never
 quoted, and a response containing the key is refused whole. `journal
 verify` and `replay` work on these journals without the network.
 
+### Credential proxy
+
+The key does not have to reach the harness at all, and when the harness
+runs inside a VM it should not. Run a credential-injecting proxy on the host
+that forwards to `https://api.anthropic.com`, adds the `x-api-key` header,
+and strips any credential headers the client sends; then point the harness
+at it and leave out `--api-key-env`:
+
+```sh
+cargo run --locked -- run --provider anthropic \
+  --base-url http://host.lima.internal:8788 --prompt-file task.txt
+```
+
+Without a key the harness sends no `x-api-key` or `Authorization` header and
+never sees the key, so the proxy owns the job of keeping it out of what the
+harness receives. Error bodies the proxy relays are quoted as for a local
+model server: at most 512 bytes, without control characters. Plain `http`
+is accepted to any host here, since no secret crosses that hop, but prompts
+and tool results do: keep the proxy on a loopback or host-only route.
+Without `--api-key-env`, a missing or default `--base-url` is refused, since
+the API itself would only answer 401.
+
 ## Journal and replay
 
 The audit stays metadata-only. The journal is its content-bearing counterpart:

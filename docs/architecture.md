@@ -257,10 +257,11 @@ a fully cached prompt has none), zero output tokens for non-empty content,
 or more than 64 bytes of neutral output per output token is
 `InvalidResponse`.
 
-Every request is authenticated, so error messages are the status, the
-`error.type` from a closed list of known types (`unknown` otherwise), and a
-`request_id` only when it is `req_` and ASCII letters and digits, 64 bytes
-at most; never the message. 408, 409, 429, 500, 502, 503, 504, 529, other
+With a key, error messages are the status, the `error.type` from a closed
+list of known types (`unknown` otherwise), and a `request_id` only when it
+is `req_` and ASCII letters and digits, 64 bytes at most; never the
+message. Without one (below), the same is followed by the unauthenticated
+excerpt: at most 512 bytes of the body, without control characters. 408, 409, 429, 500, 502, 503, 504, 529, other
 5xx without a JSON body, and transport failures are retried as above. 413
 and an `invalid_request_error` about the prompt's length or the context
 window are `ContextOverflow`; every other status is `Rejected`.
@@ -272,6 +273,17 @@ request's prompt extends the previous one, and top-level `cache_control`
 puts the breakpoint on the last cacheable block. Cache reads and writes come
 back as `cache_read_input_tokens` and `cache_creation_input_tokens` and count
 against the input budget.
+
+Credential-proxy mode. `AnthropicConfig::api_key` is optional. Without a
+key the adapter sends no `x-api-key` or `Authorization` header: a
+credential-injecting proxy on the host adds the key, so neither the harness
+nor the VM it runs in holds it. The credential scan then has nothing to look
+for and is skipped; it lives in the proxy, which holds the key and must
+keep it out of what it relays. Plain `http` is accepted to any host in this
+mode, and a keyless configuration whose host is `api.anthropic.com` is
+refused (`run` says to pass `--api-key-env` or a proxy `--base-url`). With
+a key, nothing changes: `https` unless the host is a loopback IP literal,
+the key in `x-api-key`, and the scan.
 
 Fallbacks. With `fallbacks: "default"`, a safety decline is rerun server-side
 on a suitable model in the same call. The response then holds `fallback`

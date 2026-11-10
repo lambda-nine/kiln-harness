@@ -82,10 +82,12 @@
 //!
 //! # Errors and credentials
 //!
-//! Every request is authenticated, so nothing the endpoint sends is ever
-//! quoted. An error is its status, its `error.type` from a closed list of
-//! known types (anything else is `unknown`), and a `request_id` that is
-//! `req_` plus at most 60 ASCII letters and digits. Connect errors,
+//! With a key, nothing the endpoint sends is quoted. An error is its status,
+//! its `error.type` from a closed list of known types (anything else is
+//! `unknown`), and a `request_id` that is `req_` plus at most 60 ASCII
+//! letters and digits; without a key, the same followed by at most
+//! [`ERROR_EXCERPT_BYTES`](super::http::ERROR_EXCERPT_BYTES) of the body,
+//! UTF-8-lossy and without control characters. Connect errors,
 //! timeouts, and HTTP 408, 409, 429, 500, 502, 503, 504, and 529 are retried
 //! (as are other 5xx without a JSON body), honoring a capped `retry-after`;
 //! 413, and 400 whose message is about the prompt's length or the context
@@ -94,6 +96,18 @@
 //! body or a decoded string, opaque blocks included, is refused as
 //! `Rejected`. The key goes only into the `x-api-key` header, over `https`
 //! unless the host is a loopback IP literal.
+//!
+//! # Credential-proxy mode
+//!
+//! Without a key the adapter sends no `x-api-key` (and no `Authorization`)
+//! header at all: a credential-injecting proxy on the host adds the key, so
+//! the harness, and the guest it runs in, never hold it. The proxy then
+//! owns the credential scan, since the harness has no key to look for, and
+//! errors are quoted under the unauthenticated rules above. Plain `http` is
+//! allowed to any host because no secret crosses that hop, but prompts and
+//! tool results do, so the proxy belongs on a loopback or host-only route.
+//! A keyless configuration aimed at `api.anthropic.com` itself is refused:
+//! it could only fail with an authentication error.
 
 use std::fmt;
 use std::str::FromStr;
@@ -107,7 +121,8 @@ use thiserror::Error;
 
 use super::SecretString;
 use super::http::{
-    self, Credential, Failure, MAX_TOOL_NAME_BYTES, Transport, check_completion_tokens, invalid,
+    self, Credential, Failure, MAX_TOOL_NAME_BYTES, Transport, check_completion_tokens, excerpt,
+    invalid,
 };
 use crate::engine::call_id_is_valid;
 use crate::provider::{
@@ -195,7 +210,8 @@ pub struct AnthropicConfig {
     /// `<base_url>/v1/messages`.
     pub base_url: Url,
     pub model: String,
-    pub api_key: SecretString,
+    /// `None` for credential-proxy mode: no key header is sent.
+    pub api_key: Option<SecretString>,
     pub effort: Effort,
     /// Send `fallbacks: "default"` and its beta header.
     pub fallbacks: bool,
@@ -220,7 +236,7 @@ impl AnthropicConfig {
     pub fn new(
         base_url: &str,
         model: impl Into<String>,
-        api_key: SecretString,
+        api_key: Option<SecretString>,
     ) -> Result<Self, AnthropicError> {
         let base_url =
             Url::parse(base_url).map_err(|error| AnthropicError(format!("base URL: {error}")))?;
@@ -245,14 +261,37 @@ impl AnthropicConfig {
     /// # Errors
     ///
     /// Returns an error for a base URL that is not plain `http` or `https`
-    /// with a host, plain `http` to anything but a loopback IP literal, a
-    /// model name that is not 1..=256 printable ASCII bytes, an empty or
-    /// non-printable key, or a bound or retry value out of range.
+    /// with a host, a key over plain `http` to anything but a loopback IP
+    /// literal, no key with `api.anthropic.com` as the host, a model name
+    /// that is not 1..=256 printable ASCII bytes, an empty or non-printable
+    /// key, or a bound or retry value out of range.
     pub fn validate(&self) -> Result<(), AnthropicError> {
         let https = http::check_base_url(&self.base_url).map_err(AnthropicError)?;
         http::check_model(&self.model).map_err(AnthropicError)?;
-        http::check_key(&self.api_key, &self.base_url, https).map_err(AnthropicError)?;
+        match &self.api_key {
+            Some(key) => {
+                http::check_key(key, &self.base_url, https).map_err(AnthropicError)?;
+            }
+            None if self.targets_the_api() => {
+                return Err(AnthropicError(
+                    "without an API key the base URL must be a credential-injecting proxy, \
+                     not the Anthropic API itself"
+                        .to_string(),
+                ));
+            }
+            None => {}
+        }
         self.transport().check().map_err(AnthropicError)
+    }
+
+    /// Whether the base URL's host is Anthropic's own API host, where a
+    /// keyless request can only fail.
+    #[must_use]
+    pub fn targets_the_api(&self) -> bool {
+        self.base_url.host_str().is_some_and(|host| {
+            host.trim_end_matches('.')
+                .eq_ignore_ascii_case("api.anthropic.com")
+        })
     }
 
     fn transport(&self) -> Transport {
@@ -290,7 +329,14 @@ impl fmt::Debug for AnthropicProvider {
             .debug_struct("AnthropicProvider")
             .field("endpoint", &self.endpoint.as_str())
             .field("model", &self.config.model)
-            .field("x-api-key", &"[redacted]")
+            .field(
+                "x-api-key",
+                &if self.config.api_key.is_some() {
+                    "[redacted]"
+                } else {
+                    "none: credential proxy"
+                },
+            )
             .finish_non_exhaustive()
     }
 }
@@ -308,10 +354,13 @@ impl AnthropicProvider {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        let mut key = HeaderValue::try_from(config.api_key.expose())
-            .map_err(|_| AnthropicError("API key is not a valid header value".to_string()))?;
-        key.set_sensitive(true);
-        headers.insert(HeaderName::from_static("x-api-key"), key);
+        // Credential-proxy mode sends no key header at all.
+        if let Some(api_key) = &config.api_key {
+            let mut key = HeaderValue::try_from(api_key.expose())
+                .map_err(|_| AnthropicError("API key is not a valid header value".to_string()))?;
+            key.set_sensitive(true);
+            headers.insert(HeaderName::from_static("x-api-key"), key);
+        }
         headers.insert(
             HeaderName::from_static("anthropic-version"),
             HeaderValue::from_static(API_VERSION),
@@ -347,16 +396,20 @@ impl AnthropicProvider {
             limit,
         )
         .await?;
-        let key = Credential::new(&self.config.api_key);
+        // With a key, the endpoint holds a credential: nothing it sends is
+        // quoted, and a response that contains the key is refused whole.
+        // Without one, a proxy holds the key and owns that scan.
+        let key = self.config.api_key.as_ref().map(Credential::new);
+        let key = key.as_ref();
         if exchange.status.is_success() {
-            let value = http::decode_success(&exchange, limit, Some(&key))?;
-            let parsed = parse_response(&value)?;
-            if key.in_response(&parsed) {
+            let value = http::decode_success(&exchange, limit, key)?;
+            let parsed = parse_response_quoting(&value, key.is_none())?;
+            if key.is_some_and(|key| key.in_response(&parsed)) {
                 return Err(http::credential_echo());
             }
             return Ok(parsed);
         }
-        let mut failure = classify_status(exchange.status, &exchange.body);
+        let mut failure = classify_status(exchange.status, &exchange.body, key.is_none());
         failure.retry_after = exchange.retry_after;
         Err(failure)
     }
@@ -490,14 +543,24 @@ pub fn request_body(config: &AnthropicConfig, request: &ModelRequest<'_>) -> Val
 /// Returns `InvalidResponse` for a body without a content array or usage,
 /// a malformed block, a `tool_use` whose ID, name, or input breaks the
 /// rules in the module documentation, a malformed `model` or
-/// `stop_details`, or implausible usage.
+/// `stop_details`, or implausible usage. An error object in the body is
+/// reported by its allowlisted type only, as for an authenticated request.
 pub fn parse_response(value: &Value) -> Result<ModelResponse, ProviderError> {
+    parse_response_quoting(value, false)
+}
+
+/// [`parse_response`], quoting an error object in the body only when
+/// `quote` (a request without a key).
+fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, ProviderError> {
     let Some(blocks) = value.get("content").and_then(Value::as_array) else {
         if value.get("type").and_then(Value::as_str) == Some("error") {
             let kind = error_type(value);
-            return Err(invalid(format!(
-                "server reported {kind} (body withheld: authenticated request)"
-            )));
+            return Err(invalid(if quote {
+                let error = value.get("error").map(Value::to_string).unwrap_or_default();
+                format!("server reported {kind}: {}", excerpt(error.as_bytes()))
+            } else {
+                format!("server reported {kind} (body withheld: authenticated request)")
+            }));
         }
         return Err(invalid("response has no content array"));
     };
@@ -642,9 +705,11 @@ fn request_id(body: &Value) -> Option<&str> {
     })
 }
 
-/// Classify an error status. The body decides the class but is never
-/// quoted: only the allowlisted error type and a validated request ID are.
-fn classify_status(status: StatusCode, body: &[u8]) -> Failure {
+/// Classify an error status. With `quote` false (an authenticated request)
+/// the body decides the class but is never quoted: only the allowlisted
+/// error type and a validated request ID are. With `quote`, a bounded,
+/// sanitized excerpt of the body follows them.
+fn classify_status(status: StatusCode, body: &[u8], quote: bool) -> Failure {
     let code = status.as_u16();
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let kind = parsed.as_ref().map_or("unknown", error_type);
@@ -653,7 +718,11 @@ fn classify_status(status: StatusCode, body: &[u8]) -> Failure {
         .and_then(request_id)
         .map(|id| format!(", request {id}"))
         .unwrap_or_default();
-    let message = format!("HTTP {code} {kind}{id} (body withheld: authenticated request)");
+    let message = if quote {
+        format!("HTTP {code} {kind}{id}: {}", excerpt(body))
+    } else {
+        format!("HTTP {code} {kind}{id} (body withheld: authenticated request)")
+    };
     match code {
         408 => Failure::retryable(ProviderErrorKind::Timeout, message),
         429 => Failure::retryable(ProviderErrorKind::RateLimited, message),
@@ -696,7 +765,8 @@ mod tests {
     use super::*;
 
     fn config(base: &str) -> AnthropicConfig {
-        AnthropicConfig::new(base, DEFAULT_MODEL, SecretString::new("sk-ant-test")).expect("url")
+        AnthropicConfig::new(base, DEFAULT_MODEL, Some(SecretString::new("sk-ant-test")))
+            .expect("url")
     }
 
     #[test]
@@ -858,8 +928,11 @@ mod tests {
             (302, String::new(), ProviderErrorKind::Rejected, false),
         ];
         for (code, body, kind, retryable) in cases {
-            let failure =
-                classify_status(StatusCode::from_u16(code).expect("status"), body.as_bytes());
+            let failure = classify_status(
+                StatusCode::from_u16(code).expect("status"),
+                body.as_bytes(),
+                false,
+            );
             assert_eq!(failure.error.kind, kind, "{code} {body}");
             assert_eq!(failure.error.retryable, retryable, "{code} {body}");
             let message = &failure.error.message;

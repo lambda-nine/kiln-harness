@@ -71,7 +71,7 @@ it is not a hostile multi-tenant boundary.
   refuses an empty one. It is held in a `SecretString` whose `Debug` is
   redacted and which cannot be displayed or serialized, and is used only to
   build one header, marked sensitive: `Authorization` for openai-compat,
-  `x-api-key` for anthropic, which always has a key. Nothing puts it in
+  `x-api-key` for anthropic. Nothing puts it in
   `ModelRequest` or `ModelResponse`. The endpoint receives the key, so its
   responses may echo it: with a key, error bodies are never quoted (the
   message is the status and `body withheld: authenticated request`), and a
@@ -97,6 +97,19 @@ it is not a hostile multi-tenant boundary.
   adapter does not do), only a signature. The served model name is the one
   endpoint string the audit carries; it must be 1..=256 bytes of letters,
   digits, and `._:@/-` or the response is refused.
+- In anthropic's credential-proxy mode the harness holds no key at all:
+  without `--api-key-env` it sends no credential header, and a host-side
+  proxy adds `x-api-key` and strips any client credential headers. A
+  harness running in a guest therefore cannot leak the key, whatever the
+  model or sandbox does. The credential scan moves with the key: the
+  harness has nothing to scan for, so the proxy, which holds the key, is
+  responsible for refusing or scrubbing responses that echo it. Error bodies
+  the proxy relays are endpoint data, quoted only as bounded, sanitized
+  excerpts. The proxy hop may be plain `http`, since no secret crosses it,
+  but it carries prompts, tool results, and model output in cleartext:
+  operators should keep it on a loopback or host-only route, such as the
+  VM's host gateway, never across a shared network. A keyless
+  configuration aimed at `api.anthropic.com` is refused.
 - Plain `http://` to a model server on the LAN is acceptable for local models
   without a key: the traffic is prompts and tool results the operator already
   sees, and a hostile LAN peer can at worst feed the loop responses, which
