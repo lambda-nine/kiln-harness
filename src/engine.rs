@@ -504,18 +504,6 @@ where
             return Err(HarnessError::Deadline);
         }
         progress.steps = turn;
-        journal.append(
-            session_id,
-            JournalEvent::ModelRequested {
-                turn,
-                request_sha256: request_sha256(
-                    &context.task.system,
-                    context.definitions,
-                    &messages,
-                ),
-                message_count: messages.len(),
-            },
-        )?;
         let request = ModelRequest {
             session_id,
             turn,
@@ -524,6 +512,14 @@ where
             messages: &messages,
             max_output_tokens: config.max_output_tokens_per_request,
         };
+        journal.append(
+            session_id,
+            JournalEvent::ModelRequested {
+                turn,
+                request_sha256: request_sha256(&request),
+                message_count: messages.len(),
+            },
+        )?;
         let requested_at = Instant::now();
         let response = tokio::select! {
             () = cancel.cancelled() => return Err(HarnessError::Canceled),

@@ -213,10 +213,7 @@ impl Provider for ReplayProvider {
                 format!("recording has no response for turn {}", request.turn),
             ));
         };
-        if request.turn != recorded.turn
-            || request_sha256(request.system, request.tools, request.messages)
-                != recorded.request_sha256
-        {
+        if request.turn != recorded.turn || request_sha256(&request) != recorded.request_sha256 {
             self.diverged_at = Some(request.turn);
             return Err(ProviderError::new(
                 ProviderErrorKind::ReplayDiverged,

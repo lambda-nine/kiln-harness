@@ -19,7 +19,7 @@ use thiserror::Error;
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::provider::{
-    Message, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall, ToolDefinition, Usage,
+    ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall, ToolDefinition, Usage,
 };
 
 pub const JOURNAL_SCHEMA: u32 = 1;
@@ -483,7 +483,14 @@ fn parse_journal(bytes: &[u8], max_line_bytes: usize) -> Result<LoadedJournal, J
     Ok(LoadedJournal { records, complete })
 }
 
-/// SHA-256 hex of the canonical JSON encoding of a model request's content.
+/// Version of the request-hash input layout.
+pub const REQUEST_HASH_VERSION: u32 = 1;
+
+/// SHA-256 hex of the canonical JSON encoding of a model request's content:
+/// `{"v", "system", "tools", "messages", "max_output_tokens"}`.
+///
+/// `session_id` is deliberately excluded because a replay runs under a fresh
+/// session. `turn` is excluded because replay compares it separately.
 ///
 /// The encoding is deterministic because `json!` builds a `serde_json::Map`,
 /// which is a sorted `BTreeMap` unless `serde_json`'s `preserve_order`
@@ -495,11 +502,13 @@ fn parse_journal(bytes: &[u8], max_line_bytes: usize) -> Result<LoadedJournal, J
 ///
 /// Never in practice: encoding an in-memory JSON value cannot fail.
 #[must_use]
-pub fn request_sha256(system: &str, tools: &[ToolDefinition], messages: &[Message]) -> String {
+pub fn request_sha256(request: &ModelRequest<'_>) -> String {
     let request = json!({
-        "system": system,
-        "tools": tools,
-        "messages": messages,
+        "v": REQUEST_HASH_VERSION,
+        "system": request.system,
+        "tools": request.tools,
+        "messages": request.messages,
+        "max_output_tokens": request.max_output_tokens,
     });
     let encoded = serde_json::to_vec(&request).expect("JSON values always serialize");
     sha256_hex(&encoded)

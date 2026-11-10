@@ -11,8 +11,8 @@ use kiln_harness::journal::{
     read_journal, read_journal_with_limits, request_sha256,
 };
 use kiln_harness::provider::{
-    DEMO_CONTENT, Message, ModelResponse, ProviderErrorKind, ScriptedProvider, ToolCall,
-    ToolDefinition,
+    DEMO_CONTENT, Message, ModelRequest, ModelResponse, Provider, ProviderErrorKind,
+    ScriptedProvider, ToolCall, ToolDefinition,
 };
 use kiln_harness::replay::ReplayProvider;
 use serde_json::{Map, Value, json};
@@ -45,6 +45,26 @@ async fn record_demo(dir: &Path, name: &str) -> (PathBuf, SessionOutcome) {
         .await
         .expect("demo succeeds");
     (path, outcome)
+}
+
+fn hash(system: &str, tools: &[ToolDefinition], messages: &[Message]) -> String {
+    hash_with_cap(system, tools, messages, 4096)
+}
+
+fn hash_with_cap(
+    system: &str,
+    tools: &[ToolDefinition],
+    messages: &[Message],
+    max_output_tokens: u32,
+) -> String {
+    request_sha256(&ModelRequest {
+        session_id: "hs-any",
+        turn: 1,
+        system,
+        tools,
+        messages,
+        max_output_tokens,
+    })
 }
 
 fn lines(path: &Path) -> Vec<String> {
@@ -545,12 +565,12 @@ fn request_hash_is_independent_of_object_insertion_order() {
         r#"{"alpha":1,"beta":{"x":1,"y":2}}"#
     );
     assert_eq!(
-        request_sha256("system", &tools, &messages(forward)),
-        request_sha256("system", &tools, &messages(reverse.clone()))
+        hash("system", &tools, &messages(forward)),
+        hash("system", &tools, &messages(reverse.clone()))
     );
     assert_ne!(
-        request_sha256("system", &tools, &messages(reverse.clone())),
-        request_sha256("other", &tools, &messages(reverse))
+        hash("system", &tools, &messages(reverse.clone())),
+        hash("other", &tools, &messages(reverse))
     );
 }
 
@@ -583,10 +603,7 @@ fn request_hash_survives_a_journal_round_trip() {
     let decoded: Vec<Message> = serde_json::from_str(&encoded).expect("decode");
 
     assert_eq!(serde_json::to_string(&decoded).expect("re-encode"), encoded);
-    assert_eq!(
-        request_sha256("s", &[], &messages),
-        request_sha256("s", &[], &decoded)
-    );
+    assert_eq!(hash("s", &[], &messages), hash("s", &[], &decoded));
 }
 
 #[tokio::test]
@@ -747,4 +764,55 @@ async fn replay_reproduces_recorded_provider_failures_and_stops_at_a_missing_tai
             if provider.kind == ProviderErrorKind::Script && provider.message.contains("turn 3")),
         "{error}"
     );
+}
+
+#[test]
+fn request_hash_covers_the_output_cap_but_not_session_or_turn() {
+    let messages = vec![Message::User {
+        text: "task".to_string(),
+    }];
+    let request = |session_id, turn, max_output_tokens| ModelRequest {
+        session_id,
+        turn,
+        system: "system",
+        tools: &[],
+        messages: &messages,
+        max_output_tokens,
+    };
+    let base = request_sha256(&request("hs-a", 1, 4096));
+    assert_ne!(base, request_sha256(&request("hs-a", 1, 1)));
+    assert_eq!(base, request_sha256(&request("hs-b", 1, 4096)));
+    assert_eq!(base, request_sha256(&request("hs-a", 7, 4096)));
+    assert_eq!(base, hash_with_cap("system", &[], &messages, 4096));
+}
+
+#[tokio::test]
+async fn replay_diverges_when_only_the_output_cap_differs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
+    let journal = read_journal(&path).expect("journal verifies");
+    let mut provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    let task = provider.task();
+    let messages = vec![Message::User {
+        text: task.prompt.clone(),
+    }];
+    let tools = kiln_harness::tools::ToolRegistry::new(kiln_harness::tools::ToolLimits::default())
+        .definitions()
+        .to_vec();
+
+    let error = provider
+        .complete(ModelRequest {
+            session_id: "hs-new",
+            turn: 1,
+            system: &task.system,
+            tools: &tools,
+            messages: &messages,
+            // The recording used the default cap of 4096.
+            max_output_tokens: 1,
+        })
+        .await
+        .expect_err("a different output cap is a different request");
+
+    assert_eq!(error.kind, ProviderErrorKind::ReplayDiverged);
+    assert_eq!(provider.diverged_at(), Some(1));
 }
