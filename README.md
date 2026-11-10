@@ -9,9 +9,10 @@ journal that replays deterministically, and verified sandbox deletion after
 every session.
 
 **Status: experimental.** Besides a deterministic scripted provider, which
-needs no model account, API key or network access, it has one live provider:
-an adapter for the OpenAI-compatible `/v1/chat/completions` API that the MLX
-server, Ollama, llama.cpp, and vLLM speak, for running local models. kiln is
+needs no model account, API key or network access, it has two live
+providers: an adapter for the OpenAI-compatible `/v1/chat/completions` API
+that the MLX server, Ollama, llama.cpp, and vLLM speak, for running local
+models, and an adapter for Anthropic's Messages API. kiln is
 experimental shared-kernel isolation and **not a boundary for hostile
 multi-tenant workloads**. Report
 vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
@@ -157,6 +158,44 @@ with jittered backoff, honoring `Retry-After`. `--prompt-file` and
 `--system-file` must be regular files; a symlink as the last path component
 is refused. The final answer is printed with control characters escaped.
 
+## Running against the Anthropic API
+
+`--provider anthropic` talks to Anthropic's Messages API directly over
+HTTPS. Running it costs money on the account that owns the key. Set the key
+in an environment variable yourself (the name is up to you) and name the
+variable:
+
+```sh
+export ANTHROPIC_API_KEY=...   # set by the operator, never a flag
+cargo run --locked -- run --provider anthropic --api-key-env ANTHROPIC_API_KEY \
+  --prompt "Write a POSIX sh script in /workspace/fib.sh that prints the first ten Fibonacci numbers, run it, and report the output."
+```
+
+The model defaults to `claude-opus-5-5` (`--model` picks another) at
+`--effort high` (`low`, `medium`, `high`, `xhigh`, or `max`). Requests are
+not streamed. Automatic prompt caching is on, and since each request
+extends the previous one unchanged, later turns read most of their prompt
+from the cache; cache reads and writes are reported in usage and count
+against the input budget. Server-side fallbacks are on: if a safety check
+declines a request, the API reruns it on a suitable fallback model in the
+same call, and the audit records which model served each turn as
+`served_model`. `--no-fallbacks` turns that off. `--strict-tools` marks the
+tool schemas `strict`; it is off by default because the schemas use
+constraints strict mode may not accept. `--temperature` and `--seed` are
+refused for this provider, and `--effort`, `--strict-tools`, and
+`--no-fallbacks` for openai-compat. `--base-url` defaults to
+`https://api.anthropic.com` and must be `https` unless its host is a
+loopback address. The budget flags and defaults are the same as above.
+
+Claude's replies come back in blocks, some of them opaque (thinking blocks
+carry a signature, and a fallback leaves a marker). The harness stores each
+reply's blocks exactly as received and sends them back unchanged on the
+next request, as the API requires; they count toward
+`--max-total-output-bytes` and are scanned for the key like everything
+else. The key is sent only as the `x-api-key` header, error bodies are never
+quoted, and a response containing the key is refused whole. `journal
+verify` and `replay` work on these journals without the network.
+
 ## Journal and replay
 
 The audit stays metadata-only. The journal is its content-bearing counterpart:
@@ -236,13 +275,13 @@ a snapshot taken before the run, since a node may keep sandboxes the test does
 not own. kiln's registry, run directories, cgroups, and shim/init processes are
 checked before and after. It does not run benchmark campaigns.
 
-## Next step: hosted providers
+## Adding providers
 
-Hosted APIs come next, as further adapters under `src/providers/` with the
-same contracts: translate `ModelRequest` and `ModelResponse`, own the retry
-policy (the loop treats every provider error as fatal), bound response bodies,
-normalize usage, keep keys host-side, and cancel HTTP work at the session
-deadline.
+Further adapters go under `src/providers/` with the same contracts:
+translate `ModelRequest` and `ModelResponse`, own the retry policy (the loop
+treats every provider error as fatal), bound response bodies, normalize
+usage, keep keys host-side, and cancel HTTP work at the session deadline.
+The shared HTTP layer in `src/providers/http.rs` provides most of that.
 
 See `docs/architecture.md` and `docs/threat-model.md` for lifecycle and trust
 details.

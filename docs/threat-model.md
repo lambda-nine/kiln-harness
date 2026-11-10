@@ -70,7 +70,8 @@ it is not a hostile multi-tenant boundary.
   `--api-key-env` (never a flag, so never in argv), once at startup, and
   refuses an empty one. It is held in a `SecretString` whose `Debug` is
   redacted and which cannot be displayed or serialized, and is used only to
-  build the `Authorization` header, marked sensitive. Nothing puts it in
+  build one header, marked sensitive: `Authorization` for openai-compat,
+  `x-api-key` for anthropic, which always has a key. Nothing puts it in
   `ModelRequest` or `ModelResponse`. The endpoint receives the key, so its
   responses may echo it: with a key, error bodies are never quoted (the
   message is the status and `body withheld: authenticated request`), and a
@@ -85,6 +86,17 @@ it is not a hostile multi-tenant boundary.
   of it, to the journal, the audit, or an error. An endpoint that holds the
   key can still return a transformed or split form of it (base64, reversed,
   one half per field), and that cannot be detected.
+- Anthropic's opaque content blocks (`thinking`, `redacted_thinking`,
+  `fallback`, and unknown types) are untrusted endpoint data like any other
+  response: bounded by the response cap, scanned for the key at every
+  decoded layer, counted against `max_total_model_output_bytes`, and never
+  interpreted. They reach the next request unchanged and the journal as
+  recorded, but never a tool, the audit, or the terminal. On current models
+  a `thinking` block holds no chain-of-thought text by default (its
+  `thinking` field is empty unless a summary is requested, which this
+  adapter does not do), only a signature. The served model name is the one
+  endpoint string the audit carries; it must be 1..=256 bytes of letters,
+  digits, and `._:@/-` or the response is refused.
 - Plain `http://` to a model server on the LAN is acceptable for local models
   without a key: the traffic is prompts and tool results the operator already
   sees, and a hostile LAN peer can at worst feed the loop responses, which

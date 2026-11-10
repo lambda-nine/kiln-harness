@@ -18,9 +18,13 @@ use kiln_harness::journal::{
     JournalEvent, JournalLimits, JsonlJournal, LoadedJournal, open_journal_source, read_journal,
     read_open_journal,
 };
-use kiln_harness::provider::{ScriptedProvider, Usage};
+use kiln_harness::provider::{
+    ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, Usage,
+};
+use kiln_harness::providers::anthropic::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 use kiln_harness::providers::{
-    OpenAiCompatConfig, OpenAiCompatProvider, SecretString, default_system_prompt,
+    AnthropicConfig, AnthropicProvider, Effort, OpenAiCompatConfig, OpenAiCompatProvider,
+    SecretString, default_system_prompt,
 };
 use kiln_harness::replay::ReplayProvider;
 use kiln_harness::tools::ToolLimits;
@@ -74,18 +78,23 @@ enum ProviderKind {
     /// llama.cpp, vLLM).
     #[value(name = "openai-compat")]
     OpenAiCompat,
+    /// Anthropic's Messages API.
+    #[value(name = "anthropic")]
+    Anthropic,
 }
 
 #[derive(clap::Args)]
 struct RunArgs {
     #[arg(long, value_enum)]
     provider: ProviderKind,
-    /// API root, such as `http://192.168.1.20:11434/v1`.
+    /// API root, such as `http://192.168.1.20:11434/v1`. Required for
+    /// openai-compat; anthropic defaults to `https://api.anthropic.com`.
     #[arg(long)]
-    base_url: String,
-    /// Model name as the server knows it.
+    base_url: Option<String>,
+    /// Model name as the server knows it. Required for openai-compat;
+    /// anthropic defaults to `claude-opus-5-5`.
     #[arg(long)]
-    model: String,
+    model: Option<String>,
     /// The task.
     #[arg(
         long,
@@ -100,14 +109,24 @@ struct RunArgs {
     #[arg(long)]
     system_file: Option<PathBuf>,
     /// Environment variable holding the API key; the key is never a flag.
+    /// Required for anthropic.
     #[arg(long, value_name = "VAR")]
     api_key_env: Option<String>,
-    /// Sampling temperature, 0.0 to 2.0.
-    #[arg(long, default_value_t = 0.0)]
-    temperature: f32,
-    /// Sampling seed, forwarded when set.
+    /// Sampling temperature, 0.0 to 2.0 (openai-compat; default 0).
+    #[arg(long)]
+    temperature: Option<f32>,
+    /// Sampling seed, forwarded when set (openai-compat).
     #[arg(long)]
     seed: Option<u64>,
+    /// Effort: low, medium, high, xhigh, or max (anthropic; default high).
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort)]
+    effort: Option<Effort>,
+    /// Do not send `fallbacks: "default"` (anthropic).
+    #[arg(long)]
+    no_fallbacks: bool,
+    /// Mark every tool schema `strict` (anthropic).
+    #[arg(long)]
+    strict_tools: bool,
     /// Model turns per session.
     #[arg(long, default_value_t = 40)]
     max_steps: u32,
@@ -208,7 +227,37 @@ async fn demo(socket: PathBuf, audit_path: &Path, journal_path: &Path) -> Result
 struct PreparedRun {
     task: SessionTask,
     config: HarnessConfig,
-    provider: OpenAiCompatProvider,
+    provider: RunProvider,
+}
+
+/// The provider `run` was asked for.
+enum RunProvider {
+    OpenAiCompat(OpenAiCompatProvider),
+    Anthropic(AnthropicProvider),
+}
+
+#[async_trait::async_trait]
+impl Provider for RunProvider {
+    fn info(&self) -> ProviderInfo {
+        match self {
+            Self::OpenAiCompat(provider) => provider.info(),
+            Self::Anthropic(provider) => provider.info(),
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        match self {
+            Self::OpenAiCompat(provider) => provider.complete(request).await,
+            Self::Anthropic(provider) => provider.complete(request).await,
+        }
+    }
+}
+
+fn parse_effort(value: &str) -> Result<Effort, String> {
+    value.parse()
 }
 
 /// Unsigned limits must be positive and at most their hard ceiling.
@@ -224,7 +273,7 @@ fn check_limit<T: Copy + PartialOrd + Default + std::fmt::Display>(
 }
 
 fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
-    let ProviderKind::OpenAiCompat = args.provider;
+    check_provider_flags(&args)?;
     check_limit("--max-steps", args.max_steps, MAX_STEPS)?;
     check_limit("--max-tool-calls", args.max_tool_calls, MAX_TOOL_CALLS)?;
     check_limit(
@@ -295,16 +344,63 @@ fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
         None => default_system_prompt(&config.tool_limits),
     };
 
-    let mut provider_config = OpenAiCompatConfig::new(&args.base_url, args.model)?;
-    provider_config.api_key = args.api_key_env.as_deref().map(read_api_key).transpose()?;
-    provider_config.temperature = args.temperature;
-    provider_config.seed = args.seed;
-    let provider = OpenAiCompatProvider::new(provider_config)?;
+    let provider = match args.provider {
+        ProviderKind::OpenAiCompat => {
+            let (Some(base_url), Some(model)) = (&args.base_url, &args.model) else {
+                bail!("--provider openai-compat needs --base-url and --model");
+            };
+            let mut provider_config = OpenAiCompatConfig::new(base_url, model)?;
+            provider_config.api_key = args.api_key_env.as_deref().map(read_api_key).transpose()?;
+            provider_config.temperature = args.temperature.unwrap_or(0.0);
+            provider_config.seed = args.seed;
+            RunProvider::OpenAiCompat(OpenAiCompatProvider::new(provider_config)?)
+        }
+        ProviderKind::Anthropic => {
+            let Some(var) = &args.api_key_env else {
+                bail!("--provider anthropic needs --api-key-env VAR");
+            };
+            let mut provider_config = AnthropicConfig::new(
+                args.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL),
+                args.model.as_deref().unwrap_or(DEFAULT_MODEL),
+                read_api_key(var)?,
+            )?;
+            provider_config.effort = args.effort.unwrap_or_default();
+            provider_config.fallbacks = !args.no_fallbacks;
+            provider_config.strict_tools = args.strict_tools;
+            RunProvider::Anthropic(AnthropicProvider::new(provider_config)?)
+        }
+    };
     Ok(PreparedRun {
         task: SessionTask { system, prompt },
         config,
         provider,
     })
+}
+
+/// Refuse flags that mean nothing to the chosen provider, before anything
+/// else is checked.
+fn check_provider_flags(args: &RunArgs) -> Result<()> {
+    let (name, foreign): (&str, &[(&str, bool)]) = match args.provider {
+        ProviderKind::OpenAiCompat => (
+            "openai-compat",
+            &[
+                ("--effort", args.effort.is_some()),
+                ("--strict-tools", args.strict_tools),
+                ("--no-fallbacks", args.no_fallbacks),
+            ],
+        ),
+        ProviderKind::Anthropic => (
+            "anthropic",
+            &[
+                ("--temperature", args.temperature.is_some()),
+                ("--seed", args.seed.is_some()),
+            ],
+        ),
+    };
+    if let Some((flag, _)) = foreign.iter().find(|(_, given)| *given) {
+        bail!("{flag} does not apply to --provider {name}");
+    }
+    Ok(())
 }
 
 /// Read the API key from the named environment variable. Errors name the

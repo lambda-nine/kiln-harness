@@ -6,6 +6,38 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Add an `anthropic` provider for Anthropic's Messages API over raw HTTP
+  (`anthropic-version: 2026-10-21`; no SDK, no new dependency), and
+  `run --provider anthropic [--base-url] [--model] [--effort]
+  [--no-fallbacks] [--strict-tools] --api-key-env VAR`. It defaults to
+  `claude-opus-5-5` at high effort, non-streaming, with top-level automatic
+  prompt caching and server-side fallbacks (`fallbacks: "default"`); it
+  never sends sampling parameters, `thinking`, or `stream`. Each turn's tool
+  results go in one user message. Errors quote only the status, an
+  allowlisted error type, and a validated request ID. `--temperature` and
+  `--seed` are refused with it, and `--effort`, `--strict-tools`, and
+  `--no-fallbacks` with openai-compat; `--base-url` and `--model` become
+  optional flags that openai-compat still requires.
+- Add opaque provider content to the turn model: `ModelResponse` and
+  `Message::Assistant` carry an optional `ProviderContent` (provider,
+  served model, the response's content blocks as received, stop details)
+  that the engine and the journal grammar put back into the history
+  unchanged and the adapter that produced it echoes verbatim, as preserved
+  thinking requires. It is skipped when absent, so earlier journals,
+  request hashes, and openai-compat sessions are byte-identical; a recorded
+  openai-compat journal is kept as a test fixture that must still verify,
+  re-encode line for line, and replay. The audit's `model_responded`
+  gains `served_model` when a provider reports one.
+- Split the byte measures: `ModelResponse::output_bytes` (the session byte
+  budget and the grammar) now also counts opaque content, and the new
+  `token_floor_bytes` (adapters' 64-bytes-per-token usage floor) counts
+  only the text and tool calls, since thinking signatures are unrelated to
+  completion tokens. Zero output tokens for opaque content alone is still
+  invalid usage. The credential scan covers opaque content.
+- Factor the HTTP layer the adapters share (locked-down client, bounded
+  bodies and error excerpts, seeded retries with capped `Retry-After`, the
+  credential scan, the https-unless-loopback rule) into
+  `src/providers/http.rs`, with openai-compat's behavior unchanged.
 - Add the first network provider, `openai-compat`, for the OpenAI-compatible
   `/v1/chat/completions` API (MLX server, Ollama, llama.cpp, vLLM), and a
   `run` command that carries out a real task with it. Requests and responses

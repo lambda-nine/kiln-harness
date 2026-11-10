@@ -347,3 +347,102 @@ fn an_oversized_prompt_file_is_refused_without_reading_it() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     refused(dir, &output, "is larger than 65536 bytes");
 }
+
+impl<'a> Run<'a> {
+    /// `run --provider anthropic` with only its required key variable.
+    fn anthropic(dir: &'a Path) -> Self {
+        Self {
+            dir,
+            args: ["--provider", "anthropic", "--api-key-env", "KILN_TEST_KEY"]
+                .map(str::to_string)
+                .to_vec(),
+            env: Vec::new(),
+        }
+    }
+
+    fn flag(mut self, flag: &str) -> Self {
+        self.args.push(flag.to_string());
+        self
+    }
+}
+
+#[test]
+fn provider_specific_flags_are_refused_for_the_other_provider() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    for (flag, value) in [
+        ("--effort", Some("high")),
+        ("--strict-tools", None),
+        ("--no-fallbacks", None),
+    ] {
+        let run = Run::new(dir).arg("--prompt", "hi");
+        let run = match value {
+            Some(value) => run.arg(flag, value),
+            None => run.flag(flag),
+        };
+        refused(
+            dir,
+            &run.output(),
+            &format!("{flag} does not apply to --provider openai-compat"),
+        );
+    }
+    for (flag, value) in [("--temperature", "0.5"), ("--seed", "7")] {
+        let output = Run::anthropic(dir)
+            .env("KILN_TEST_KEY", SENTINEL_KEY)
+            .arg("--prompt", "hi")
+            .arg(flag, value)
+            .output();
+        refused(
+            dir,
+            &output,
+            &format!("{flag} does not apply to --provider anthropic"),
+        );
+    }
+}
+
+#[test]
+fn anthropic_needs_a_key_variable_and_a_valid_effort() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    let mut without_key = Run::anthropic(dir).arg("--prompt", "hi");
+    without_key.args.drain(2..4);
+    refused(
+        dir,
+        &without_key.output(),
+        "--provider anthropic needs --api-key-env VAR",
+    );
+    let unset = Run::anthropic(dir).arg("--prompt", "hi").output();
+    refused(dir, &unset, "KILN_TEST_KEY is not set");
+
+    let bad_effort = Run::anthropic(dir)
+        .env("KILN_TEST_KEY", SENTINEL_KEY)
+        .arg("--prompt", "hi")
+        .arg("--effort", "extreme")
+        .output();
+    assert_eq!(bad_effort.status.code(), Some(2), "{}", stderr(&bad_effort));
+    assert!(stderr(&bad_effort).contains("effort must be low, medium, high, xhigh, or max"));
+
+    // A key over plain http to a remote host is refused like openai-compat.
+    let cleartext = Run::anthropic(dir)
+        .env("KILN_TEST_KEY", SENTINEL_KEY)
+        .arg("--prompt", "hi")
+        .arg("--base-url", "http://api.example.com")
+        .output();
+    refused(dir, &cleartext, "requires an https base URL");
+}
+
+#[test]
+fn openai_compat_still_needs_a_base_url_and_model() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    for flag in ["--base-url", "--model"] {
+        let mut run = Run::new(dir).arg("--prompt", "hi");
+        let position = run.args.iter().position(|arg| arg == flag).expect("flag");
+        run.args.drain(position..position + 2);
+        refused(
+            dir,
+            &run.output(),
+            "--provider openai-compat needs --base-url and --model",
+        );
+    }
+}

@@ -16,9 +16,11 @@ use std::time::Duration;
 
 use crate::tools::ToolLimits;
 
+pub mod anthropic;
 pub mod http;
 pub mod openai_compat;
 
+pub use anthropic::{AnthropicConfig, AnthropicError, AnthropicProvider, Effort};
 pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatError, OpenAiCompatProvider};
 
 /// A credential that must never be printed, serialized, or journaled.
