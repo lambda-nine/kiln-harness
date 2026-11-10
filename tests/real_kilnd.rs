@@ -85,6 +85,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         .await
         .expect("replay reproduces against installed kilnd");
     assert_eq!(replay.provider().diverged_at(), None);
+    assert!(replay.provider().exhausted());
     assert_eq!(replayed.final_answer, outcome.final_answer);
 
     let after = api.health().await.expect("health after");

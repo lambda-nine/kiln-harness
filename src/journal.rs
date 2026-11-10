@@ -176,6 +176,8 @@ pub enum JournalError {
     ChainMismatch { sequence: u64 },
     #[error("journal record {sequence} follows session_ended")]
     RecordAfterEnd { sequence: u64 },
+    #[error("journal record {sequence} breaks the session grammar: {reason}")]
+    Grammar { sequence: u64, reason: String },
     #[error("journal sink is closed after a failed write or a finished session")]
     Closed,
 }
@@ -200,11 +202,13 @@ struct Chain {
     session_id: Option<String>,
     bytes: u64,
     closed: bool,
+    grammar: Grammar,
 }
 
 struct Encoded {
     record: JournalRecord,
     line: String,
+    grammar: Grammar,
 }
 
 impl Chain {
@@ -213,13 +217,8 @@ impl Chain {
             return Err(JournalError::Closed);
         }
         let sequence = self.next_sequence;
-        let starting = matches!(event, JournalEvent::SessionStarted { .. });
-        if sequence == 0 && !starting {
-            return Err(JournalError::MissingSessionStarted { sequence });
-        }
-        if sequence > 0 && starting {
-            return Err(JournalError::DuplicateSessionStarted { sequence });
-        }
+        let mut grammar = self.grammar.clone();
+        grammar.feed(sequence, &event)?;
         if let Some(expected) = &self.session_id
             && expected != session_id
         {
@@ -255,10 +254,15 @@ impl Chain {
                 limit: MAX_JOURNAL_BYTES,
             });
         }
-        Ok(Encoded { record, line })
+        Ok(Encoded {
+            record,
+            line,
+            grammar,
+        })
     }
 
-    fn commit(&mut self, encoded: &Encoded) {
+    fn commit(&mut self, encoded: Encoded) -> JournalRecord {
+        self.grammar = encoded.grammar;
         self.next_sequence = encoded.record.sequence + 1;
         self.prev_sha256 = Some(sha256_hex(encoded.line.as_bytes()));
         self.session_id = Some(encoded.record.session_id.clone());
@@ -267,6 +271,7 @@ impl Chain {
             .saturating_add(encoded.line.len() as u64)
             .saturating_add(1);
         self.closed = matches!(encoded.record.event, JournalEvent::SessionEnded { .. });
+        encoded.record
     }
 }
 
@@ -318,7 +323,7 @@ impl JournalSink for JsonlJournal {
             self.chain.closed = true;
             return Err(error.into());
         }
-        self.chain.commit(&encoded);
+        self.chain.commit(encoded);
         Ok(())
     }
 }
@@ -334,9 +339,9 @@ pub struct MemoryJournal {
 impl JournalSink for MemoryJournal {
     fn append(&mut self, session_id: &str, event: JournalEvent) -> Result<(), JournalError> {
         let encoded = self.chain.encode(session_id, event)?;
-        self.chain.commit(&encoded);
-        self.records.push(encoded.record);
-        self.lines.push(encoded.line);
+        let line = encoded.line.clone();
+        self.records.push(self.chain.commit(encoded));
+        self.lines.push(line);
         Ok(())
     }
 }
@@ -418,6 +423,7 @@ fn parse_journal(bytes: &[u8], max_line_bytes: usize) -> Result<LoadedJournal, J
     }
     let mut records: Vec<JournalRecord> = Vec::new();
     let mut prev_sha256 = GENESIS_SHA256.to_string();
+    let mut grammar = Grammar::default();
     let mut rest = bytes;
     let mut line_number = 0u64;
     while !rest.is_empty() {
@@ -460,43 +466,16 @@ fn parse_journal(bytes: &[u8], max_line_bytes: usize) -> Result<LoadedJournal, J
                 sequence: record.sequence,
             });
         }
-        match (records.first(), &record.event) {
-            (None, JournalEvent::SessionStarted { schema, .. }) => {
-                if *schema != JOURNAL_SCHEMA {
-                    return Err(JournalError::UnsupportedSchema {
-                        found: *schema,
-                        expected: JOURNAL_SCHEMA,
-                    });
-                }
-            }
-            (None, _) => {
-                return Err(JournalError::MissingSessionStarted {
-                    sequence: record.sequence,
-                });
-            }
-            (Some(_), JournalEvent::SessionStarted { .. }) => {
-                return Err(JournalError::DuplicateSessionStarted {
-                    sequence: record.sequence,
-                });
-            }
-            (Some(first), _) => {
-                if first.session_id != record.session_id {
-                    return Err(JournalError::SessionMismatch {
-                        sequence: record.sequence,
-                        found: record.session_id,
-                        expected: first.session_id.clone(),
-                    });
-                }
-            }
-        }
-        if records
-            .last()
-            .is_some_and(|last| matches!(last.event, JournalEvent::SessionEnded { .. }))
+        if let Some(first) = records.first()
+            && first.session_id != record.session_id
         {
-            return Err(JournalError::RecordAfterEnd {
+            return Err(JournalError::SessionMismatch {
                 sequence: record.sequence,
+                found: record.session_id,
+                expected: first.session_id.clone(),
             });
         }
+        grammar.feed(record.sequence, &record.event)?;
         prev_sha256 = sha256_hex(line);
         records.push(record);
     }
@@ -504,6 +483,252 @@ fn parse_journal(bytes: &[u8], max_line_bytes: usize) -> Result<LoadedJournal, J
         .last()
         .is_some_and(|last| matches!(last.event, JournalEvent::SessionEnded { .. }));
     Ok(LoadedJournal { records, complete })
+}
+
+/// Work outcomes the engine writes in `session_ended`.
+const WORK_OUTCOMES: [&str; 5] = [
+    "completed",
+    "canceled",
+    "deadline",
+    "failed",
+    "create_failed",
+];
+const CLEANUP_FAILED: &str = "cleanup_failed";
+
+/// The event grammar of one session journal.
+///
+/// Writers feed every event before appending it and readers feed every
+/// event they load, so both accept exactly the same journals:
+///
+/// - `session_started` comes first, once, with schema 1.
+/// - `sandbox_ready` appears at most once, before any model request; no
+///   request is allowed without it.
+/// - `model_requested` turns run 1, 2, … and each is answered by exactly one
+///   `model_responded` or `model_failed` for that turn before the next
+///   request. Nothing but `session_ended` follows a failure or a response
+///   without tool calls.
+/// - After a response with n tool calls, up to n `tool_executed` records
+///   follow for that turn with indexes 1, 2, … and the response's call IDs
+///   in order. Fewer than n only when the session then ends.
+/// - `session_ended` matches what came before: its tool-call count, last
+///   turn, and usage sum; `completed` work needs a final response without
+///   tool calls whose text is the final answer; a completed outcome needs
+///   confirmed deletion; `cleanup_failed` means deletion was not confirmed;
+///   and a request may be left unanswered only when the work did not
+///   complete.
+#[derive(Debug, Clone, Default)]
+pub struct Grammar {
+    phase: Phase,
+    sandbox_ready: bool,
+    last_turn: u32,
+    pending: Option<u32>,
+    last_response: Option<RespondedTurn>,
+    turn_failed: bool,
+    tool_calls: u32,
+    usage: Usage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Empty,
+    Open,
+    Ended,
+}
+
+#[derive(Debug, Clone)]
+struct RespondedTurn {
+    turn: u32,
+    text: Option<String>,
+    call_ids: Vec<String>,
+    executed: u32,
+}
+
+impl Grammar {
+    /// Advance by one event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `event` cannot follow the events fed so far.
+    pub fn feed(&mut self, sequence: u64, event: &JournalEvent) -> Result<(), JournalError> {
+        if self.phase == Phase::Ended {
+            return Err(JournalError::RecordAfterEnd { sequence });
+        }
+        if self.phase == Phase::Empty {
+            let JournalEvent::SessionStarted { schema, .. } = event else {
+                return Err(JournalError::MissingSessionStarted { sequence });
+            };
+            if *schema != JOURNAL_SCHEMA {
+                return Err(JournalError::UnsupportedSchema {
+                    found: *schema,
+                    expected: JOURNAL_SCHEMA,
+                });
+            }
+            self.phase = Phase::Open;
+            return Ok(());
+        }
+        if matches!(event, JournalEvent::SessionStarted { .. }) {
+            return Err(JournalError::DuplicateSessionStarted { sequence });
+        }
+        self.advance(event).map_err(|reason| JournalError::Grammar {
+            sequence,
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Apply one event after `session_started`.
+    fn advance(&mut self, event: &JournalEvent) -> Result<(), &'static str> {
+        match event {
+            JournalEvent::SessionStarted { .. } => unreachable!("handled by feed"),
+            JournalEvent::SandboxReady { .. } => {
+                if self.sandbox_ready {
+                    return Err("second sandbox_ready");
+                }
+                if self.last_turn > 0 {
+                    return Err("sandbox_ready after a model request");
+                }
+                self.sandbox_ready = true;
+            }
+            JournalEvent::ModelRequested { turn, .. } => {
+                if !self.sandbox_ready {
+                    return Err("model_requested before sandbox_ready");
+                }
+                if self.pending.is_some() {
+                    return Err("model_requested before the previous turn was answered");
+                }
+                if self.turn_failed {
+                    return Err("model_requested after model_failed");
+                }
+                if let Some(last) = &self.last_response {
+                    if last.call_ids.is_empty() {
+                        return Err("model_requested after a final response");
+                    }
+                    if last.executed as usize != last.call_ids.len() {
+                        return Err("model_requested before every tool call of the turn ran");
+                    }
+                }
+                if Some(*turn) != self.last_turn.checked_add(1) {
+                    return Err("model_requested turns must run 1, 2, ...");
+                }
+                self.last_turn = *turn;
+                self.pending = Some(*turn);
+            }
+            JournalEvent::ModelResponded { turn, response, .. } => {
+                if self.pending != Some(*turn) {
+                    return Err("model_responded without a matching request");
+                }
+                self.pending = None;
+                self.usage = self.usage + response.usage;
+                self.last_response = Some(RespondedTurn {
+                    turn: *turn,
+                    text: response.text.clone(),
+                    call_ids: response
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.call_id.clone())
+                        .collect(),
+                    executed: 0,
+                });
+            }
+            JournalEvent::ModelFailed { turn, .. } => {
+                if self.pending != Some(*turn) {
+                    return Err("model_failed without a matching request");
+                }
+                self.pending = None;
+                self.turn_failed = true;
+            }
+            JournalEvent::ToolExecuted {
+                turn, index, call, ..
+            } => {
+                let Some(last) = self
+                    .last_response
+                    .as_mut()
+                    .filter(|_| self.pending.is_none())
+                else {
+                    return Err("tool_executed without a model response");
+                };
+                if self.turn_failed || last.turn != *turn {
+                    return Err("tool_executed for a turn other than the last response");
+                }
+                if last.executed.checked_add(1) != Some(*index) {
+                    return Err("tool_executed indexes must run 1, 2, ...");
+                }
+                let Some(expected) = last.call_ids.get(last.executed as usize) else {
+                    return Err("more tool_executed records than tool calls");
+                };
+                if *expected != call.call_id {
+                    return Err("tool_executed call_id differs from the response");
+                }
+                last.executed += 1;
+                self.tool_calls = self.tool_calls.saturating_add(1);
+            }
+            JournalEvent::SessionEnded { .. } => {
+                self.check_end(event)?;
+                self.phase = Phase::Ended;
+            }
+        }
+        Ok(())
+    }
+
+    /// True once `session_ended` has been fed.
+    #[must_use]
+    pub fn ended(&self) -> bool {
+        self.phase == Phase::Ended
+    }
+
+    /// Check `session_ended` against everything fed before it.
+    fn check_end(&self, event: &JournalEvent) -> Result<(), &'static str> {
+        let JournalEvent::SessionEnded {
+            outcome,
+            work_outcome,
+            final_answer,
+            steps,
+            tool_calls,
+            usage,
+            sandbox_deleted,
+        } = event
+        else {
+            return Err("not a session_ended record");
+        };
+        if !WORK_OUTCOMES.contains(&work_outcome.as_str()) {
+            return Err("unknown work_outcome");
+        }
+        if outcome != work_outcome && outcome != CLEANUP_FAILED {
+            return Err("outcome must be work_outcome or cleanup_failed");
+        }
+        if outcome == CLEANUP_FAILED && *sandbox_deleted {
+            return Err("cleanup_failed with confirmed deletion");
+        }
+        if outcome == "completed" && !*sandbox_deleted {
+            return Err("completed without confirmed deletion");
+        }
+        if *tool_calls != self.tool_calls {
+            return Err("tool_calls differs from the tool_executed records");
+        }
+        if *steps != self.last_turn {
+            return Err("steps differs from the last turn");
+        }
+        if *usage != self.usage {
+            return Err("usage differs from the sum of responses");
+        }
+        if work_outcome == "completed" {
+            let final_response = self
+                .last_response
+                .as_ref()
+                .filter(|last| last.turn == self.last_turn && last.call_ids.is_empty());
+            if self.pending.is_some() || self.turn_failed || final_response.is_none() {
+                return Err("completed work needs a final response in the last turn");
+            }
+            if final_answer.is_none()
+                || final_response.and_then(|last| last.text.as_ref()) != final_answer.as_ref()
+            {
+                return Err("final_answer differs from the final response text");
+            }
+        } else if final_answer.is_some() {
+            return Err("final_answer without completed work");
+        }
+        Ok(())
+    }
 }
 
 /// Version of the request-hash input layout.

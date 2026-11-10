@@ -592,7 +592,6 @@ where
         if Instant::now() >= deadline {
             return Err(HarnessError::Deadline);
         }
-        progress.steps = turn;
         let request = ModelRequest {
             session_id,
             turn,
@@ -609,6 +608,9 @@ where
                 message_count: messages.len(),
             },
         )?;
+        // Progress counts only what the journal holds, so session_ended
+        // always agrees with the records before it.
+        progress.steps = turn;
         let requested_at = Instant::now();
         let response = tokio::select! {
             () = cancel.cancelled() => return Err(HarnessError::Canceled),
@@ -639,6 +641,7 @@ where
                 latency_ms,
             },
         )?;
+        progress.usage = progress.usage + response.usage;
         audit.append(
             session_id,
             Some(sandbox_id),
@@ -650,7 +653,6 @@ where
                 latency_ms,
             },
         )?;
-        progress.usage = progress.usage + response.usage;
         if response.usage.output_tokens > u64::from(config.max_output_tokens_per_request)
             || progress.usage.total_input_tokens() > config.max_total_input_tokens
             || progress.usage.output_tokens > config.max_total_output_tokens
@@ -752,7 +754,6 @@ where
             if over_budget {
                 return Err(HarnessError::ToolBudget(config.max_tool_calls));
             }
-            progress.tool_calls = next_tool_calls;
 
             let mut run = if call.arguments.is_none() {
                 rejected_tool_run("model_arguments_too_large")
@@ -810,6 +811,7 @@ where
                     execution_ids: run.execution_ids,
                 },
             )?;
+            progress.tool_calls = next_tool_calls;
             results.push(ToolResult {
                 call_id: call.visible.call_id,
                 tool: call.visible.tool,

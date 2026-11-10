@@ -5,11 +5,13 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use common::{DeleteBehavior, FakeApi, short_lifecycle_config};
+use common::{DeleteBehavior, FakeApi, chained_lines, short_lifecycle_config, write_journal_lines};
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
-use kiln_harness::engine::{Harness, HarnessError, SessionTask};
-use kiln_harness::journal::{JournalEvent, JsonlJournal, read_journal};
+use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionTask};
+use kiln_harness::journal::{JOURNAL_SCHEMA, JournalEvent, JsonlJournal, read_journal};
 use kiln_harness::provider::{ModelResponse, ScriptedProvider};
+use kiln_harness::provider::{ProviderInfo, ToolCall, Usage};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 fn cli(args: &[&std::ffi::OsStr]) -> Output {
@@ -95,4 +97,87 @@ async fn verify_prints_confirmed_deletion() {
     assert!(ok, "{stdout}");
     assert!(stdout.contains("status: complete (completed)"), "{stdout}");
     assert!(stdout.contains("sandbox deleted: yes"), "{stdout}");
+}
+
+fn started() -> JournalEvent {
+    JournalEvent::SessionStarted {
+        schema: JOURNAL_SCHEMA,
+        harness_version: "0.1.0".to_string(),
+        provider: ProviderInfo {
+            name: "test".to_string(),
+            model: "test".to_string(),
+        },
+        system: "system".to_string(),
+        task: "task".to_string(),
+        tools: Vec::new(),
+        limits: HarnessConfig::default().limits(),
+    }
+}
+
+fn completed(steps: u32) -> JournalEvent {
+    JournalEvent::SessionEnded {
+        outcome: "completed".to_string(),
+        work_outcome: "completed".to_string(),
+        final_answer: Some("done".to_string()),
+        steps,
+        tool_calls: 0,
+        usage: Usage::default(),
+        sandbox_deleted: true,
+    }
+}
+
+#[test]
+fn verify_rejects_a_complete_journal_with_a_request_after_the_final_answer() {
+    let request = |turn| JournalEvent::ModelRequested {
+        turn,
+        request_sha256: format!("{turn:064x}"),
+        message_count: 1,
+    };
+    let lines = chained_lines(
+        "hs-pending",
+        vec![
+            started(),
+            JournalEvent::SandboxReady {
+                sandbox_id: "sb-1".to_string(),
+                baseline_file_count: 0,
+            },
+            request(1),
+            JournalEvent::ModelResponded {
+                turn: 1,
+                response: ModelResponse::final_text("done"),
+                latency_ms: 0,
+            },
+            request(2),
+            completed(2),
+        ],
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("pending.jsonl");
+    write_journal_lines(&path, &lines);
+
+    let (ok, stdout) = verify(&path);
+
+    assert!(!ok, "{stdout}");
+    assert!(read_journal(&path).is_err());
+}
+
+#[test]
+fn verify_rejects_tools_before_the_sandbox_or_their_response() {
+    let ghost = JournalEvent::ToolExecuted {
+        turn: 99,
+        index: 7,
+        audit_call_id: "call-99-7".to_string(),
+        call: ToolCall::new("ghost", "workspace_diff", json!({})),
+        ok: true,
+        result: json!({"ok": true}),
+        execution_ids: vec!["ex-ghost".to_string()],
+    };
+    let lines = chained_lines("hs-ghost", vec![started(), ghost, completed(0)]);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("ghost.jsonl");
+    write_journal_lines(&path, &lines);
+
+    let (ok, stdout) = verify(&path);
+
+    assert!(!ok, "{stdout}");
 }

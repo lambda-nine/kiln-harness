@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::engine::SessionTask;
-use crate::journal::{JournalEvent, LoadedJournal, SessionLimits, request_sha256};
+use crate::journal::{Grammar, JournalEvent, LoadedJournal, SessionLimits, request_sha256};
 use crate::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo,
 };
@@ -20,6 +20,8 @@ use crate::provider::{
 pub enum ReplayError {
     #[error("journal does not start with session_started")]
     MissingSessionStarted,
+    #[error("journal is not a valid session: {0}")]
+    Grammar(String),
     #[error(
         "journal record {sequence} answers turn {found} without a matching request ({expected:?})"
     )]
@@ -74,6 +76,14 @@ impl ReplayProvider {
     /// Returns an error if the journal does not start a session or its model
     /// turns are out of order or unpaired.
     pub fn from_journal(journal: &LoadedJournal) -> Result<Self, ReplayError> {
+        // `LoadedJournal` fields are public, so check the grammar here too
+        // rather than trusting that the records came from `read_journal`.
+        let mut grammar = Grammar::default();
+        for record in &journal.records {
+            grammar
+                .feed(record.sequence, &record.event)
+                .map_err(|error| ReplayError::Grammar(error.to_string()))?;
+        }
         let mut records = journal.records.iter();
         let Some(JournalEvent::SessionStarted {
             provider,
@@ -188,6 +198,12 @@ impl ReplayProvider {
     #[must_use]
     pub fn recorded_outcome(&self) -> Option<&str> {
         self.outcome.as_deref()
+    }
+
+    /// True once every recorded model turn has been replayed.
+    #[must_use]
+    pub fn exhausted(&self) -> bool {
+        self.turns.is_empty()
     }
 
     /// The first turn whose request differed from the recording.

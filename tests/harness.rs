@@ -10,7 +10,9 @@ use kiln_harness::audit::{AuditError, AuditEvent, AuditSink, MemoryAudit};
 use kiln_harness::engine::{
     Harness, HarnessConfig, HarnessError, MAX_TASK_TEXT_BYTES, SessionTask,
 };
-use kiln_harness::journal::{JournalError, JournalEvent, JournalSink, MemoryJournal};
+use kiln_harness::journal::{
+    JournalError, JournalEvent, JournalSink, JsonlJournal, MemoryJournal, read_journal,
+};
 use kiln_harness::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider,
     StopReason, ToolCall, Usage,
@@ -1886,4 +1888,184 @@ async fn cancellation_interrupts_an_active_baseline_and_cleans_up() {
         Some(JournalEvent::SessionEnded { outcome, sandbox_deleted: true, .. })
             if outcome == "canceled"
     ));
+}
+
+/// Run one session into a file journal and require that the reader accepts
+/// it as complete, whatever the session's outcome.
+async fn assert_engine_journal_is_grammatical<P: Provider>(
+    name: &str,
+    api: FakeApi,
+    provider: P,
+    config: HarnessConfig,
+    cancel_after: Option<Duration>,
+) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("session.jsonl");
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        config,
+    );
+    let cancel = CancellationToken::new();
+    if let Some(after) = cancel_after {
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            trigger.cancel();
+        });
+    }
+    let _ = harness.run(&task(), cancel).await;
+    let journal = read_journal(&path).unwrap_or_else(|error| panic!("{name}: {error}"));
+    assert!(journal.complete, "{name}: journal is incomplete");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn every_engine_exit_path_writes_a_grammatical_journal() {
+    let diff = |id: &str| ToolCall::new(id, "workspace_diff", json!({}));
+    assert_engine_journal_is_grammatical(
+        "demo",
+        FakeApi::default(),
+        ScriptedProvider::demo(),
+        short_lifecycle_config(),
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "provider failure",
+        FakeApi::default(),
+        ScriptedProvider::new([]),
+        short_lifecycle_config(),
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "session call budget mid-turn",
+        FakeApi::default(),
+        ScriptedProvider::new([ModelResponse::tool_use([diff("a"), diff("b")])]),
+        HarnessConfig {
+            max_tool_calls: 1,
+            ..short_lifecycle_config()
+        },
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "per-turn budget",
+        FakeApi::default(),
+        ScriptedProvider::new([ModelResponse::tool_use([diff("a"), diff("b")])]),
+        HarnessConfig {
+            max_tool_calls_per_turn: 1,
+            ..short_lifecycle_config()
+        },
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "step budget",
+        FakeApi::default(),
+        ScriptedProvider::new([
+            ModelResponse::tool_use([diff("a")]),
+            ModelResponse::tool_use([diff("b")]),
+        ]),
+        HarnessConfig {
+            max_steps: 2,
+            ..short_lifecycle_config()
+        },
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "token budget",
+        FakeApi::default(),
+        ScriptedProvider::new([ModelResponse {
+            usage: Usage {
+                input_tokens: 10,
+                ..Usage::default()
+            },
+            ..ModelResponse::tool_use([diff("a")])
+        }]),
+        HarnessConfig {
+            max_total_input_tokens: 5,
+            ..short_lifecycle_config()
+        },
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "provider deadline",
+        FakeApi::default(),
+        SlowProvider {
+            delay: Duration::from_secs(1),
+        },
+        HarnessConfig {
+            session_timeout: Duration::from_millis(30),
+            ..short_lifecycle_config()
+        },
+        None,
+    )
+    .await;
+    let slow_exec = FakeApi::default();
+    slow_exec.state().tool_exec_delay = Duration::from_secs(1);
+    assert_engine_journal_is_grammatical(
+        "cancel during exec",
+        slow_exec,
+        ScriptedProvider::new([ModelResponse::tool_use([ToolCall::new(
+            "slow",
+            "exec",
+            json!({"argv": ["/bin/slow"]}),
+        )])]),
+        short_lifecycle_config(),
+        Some(Duration::from_millis(20)),
+    )
+    .await;
+    let stuck = FakeApi::default();
+    stuck.state().delete_behavior = DeleteBehavior::AcknowledgeOnly;
+    assert_engine_journal_is_grammatical(
+        "cleanup failure",
+        stuck,
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
+        HarnessConfig {
+            lifecycle_timeout: Duration::from_millis(25),
+            ..short_lifecycle_config()
+        },
+        None,
+    )
+    .await;
+    let rejected = FakeApi::default();
+    rejected.state().create_rejection = Some(ApiError::from(Status::new(
+        Code::InvalidArgument,
+        "rejected",
+    )));
+    assert_engine_journal_is_grammatical(
+        "create rejection",
+        rejected,
+        ScriptedProvider::demo(),
+        short_lifecycle_config(),
+        None,
+    )
+    .await;
+    let failing_baseline = FakeApi::default();
+    failing_baseline.state().fail_baseline = true;
+    assert_engine_journal_is_grammatical(
+        "baseline failure",
+        failing_baseline,
+        ScriptedProvider::demo(),
+        short_lifecycle_config(),
+        None,
+    )
+    .await;
+    assert_engine_journal_is_grammatical(
+        "truncated tool turn",
+        FakeApi::default(),
+        ScriptedProvider::new([ModelResponse {
+            stop_reason: StopReason::MaxTokens,
+            ..ModelResponse::tool_use([diff("a")])
+        }]),
+        short_lifecycle_config(),
+        None,
+    )
+    .await;
 }

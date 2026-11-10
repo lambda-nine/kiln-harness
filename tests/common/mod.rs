@@ -300,3 +300,40 @@ pub fn short_lifecycle_config() -> HarnessConfig {
         ..HarnessConfig::default()
     }
 }
+
+/// Encode `events` as a correctly chained journal, bypassing the writer's
+/// grammar, so readers can be tested on journals no sink would write.
+pub fn chained_lines(
+    session_id: &str,
+    events: Vec<kiln_harness::journal::JournalEvent>,
+) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let mut prev = kiln_harness::journal::GENESIS_SHA256.to_string();
+    let mut lines = Vec::new();
+    for (sequence, event) in events.into_iter().enumerate() {
+        let record = kiln_harness::journal::JournalRecord {
+            sequence: sequence as u64,
+            unix_ms: 0,
+            session_id: session_id.to_string(),
+            prev_sha256: prev,
+            event,
+        };
+        let line = serde_json::to_string(&record).expect("encode record");
+        prev = Sha256::digest(line.as_bytes())
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                use std::fmt::Write as _;
+                write!(hex, "{byte:02x}").expect("write to String");
+                hex
+            });
+        lines.push(line);
+    }
+    lines
+}
+
+/// Write `lines` as a newline-terminated journal file.
+pub fn write_journal_lines(path: &std::path::Path, lines: &[String]) {
+    let mut text = lines.join("\n");
+    text.push('\n');
+    std::fs::write(path, text).expect("write journal");
+}

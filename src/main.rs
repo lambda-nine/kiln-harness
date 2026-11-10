@@ -108,11 +108,14 @@ async fn replay(
         read_journal(from).with_context(|| format!("read journal {}", from.display()))?;
     let provider = ReplayProvider::from_journal(&recorded)
         .with_context(|| format!("load recorded turns from {}", from.display()))?;
-    let Some(expected) = provider.recorded_final_answer().map(str::to_string) else {
+    let recorded_outcome = provider.recorded_outcome().unwrap_or("incomplete");
+    let (Some(expected), "completed") = (
+        provider.recorded_final_answer().map(str::to_string),
+        recorded_outcome,
+    ) else {
         bail!(
-            "{} has no recorded final answer to reproduce (outcome: {})",
+            "{} did not record a completed session to reproduce (outcome: {recorded_outcome})",
             from.display(),
-            provider.recorded_outcome().unwrap_or("incomplete")
         );
     };
     let task = provider.task();
@@ -126,15 +129,24 @@ async fn replay(
     check_health(&api).await?;
     println!("journal: {}", journal_path.display());
     match result {
-        Ok(outcome) if outcome.final_answer == expected => {
-            print_outcome(&outcome);
-            println!("reproduced");
-            Ok(ExitCode::SUCCESS)
-        }
         Ok(outcome) => {
             print_outcome(&outcome);
-            println!("diverged: final answer differs from the recording");
-            Ok(ExitCode::FAILURE)
+            let replay = harness.provider();
+            // Reproduction needs the same answer, no divergence, and every
+            // recorded turn consumed.
+            if outcome.final_answer != expected {
+                println!("diverged: final answer differs from the recording");
+                Ok(ExitCode::FAILURE)
+            } else if let Some(turn) = replay.diverged_at() {
+                println!("diverged at turn {turn}");
+                Ok(ExitCode::FAILURE)
+            } else if !replay.exhausted() {
+                println!("diverged: recorded turns were left unreplayed");
+                Ok(ExitCode::FAILURE)
+            } else {
+                println!("reproduced");
+                Ok(ExitCode::SUCCESS)
+            }
         }
         Err(error) => {
             match harness.provider().diverged_at() {

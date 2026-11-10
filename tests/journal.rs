@@ -618,6 +618,7 @@ async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
     let (path, recorded) = record_demo(temp.path(), "demo.jsonl").await;
     let journal = read_journal(&path).expect("journal verifies");
     let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    assert!(!provider.exhausted());
     assert_eq!(provider.task(), SessionTask::demo());
     assert_eq!(provider.limits(), HarnessConfig::default().limits());
     assert_eq!(
@@ -647,6 +648,7 @@ async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
     assert_eq!(replayed.steps, recorded.steps);
     assert_eq!(replayed.tool_calls, recorded.tool_calls);
     assert_eq!(harness.provider().diverged_at(), None);
+    assert!(harness.provider().exhausted());
     assert_eq!(observer.state().deleted.len(), 1);
     let hashes = |records: &[JournalRecord]| {
         records
