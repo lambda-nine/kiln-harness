@@ -192,7 +192,7 @@ fn write_all(events: &[JournalEvent]) -> Result<(), JournalError> {
 }
 
 fn read_all(events: Vec<JournalEvent>) -> Result<LoadedJournal, JournalError> {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("journal.jsonl");
     write_journal_lines(&path, &chained_lines(SESSION, events));
     read_journal(&path)

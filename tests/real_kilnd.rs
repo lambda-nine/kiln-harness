@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -32,7 +34,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     // what existed before rather than against zero.
     let sandboxes_before = non_deleted_ids(&api).await;
 
-    let temp = tempfile::tempdir().expect("temporary audit directory");
+    let temp = common::private_tempdir().expect("temporary audit directory");
     let audit_path = temp.path().join("integration.jsonl");
     let audit = JsonlAudit::open(&audit_path).expect("open audit");
     let journal_path = temp.path().join("integration-journal.jsonl");

@@ -446,9 +446,19 @@ fn print_outcome(outcome: &SessionOutcome) {
 mod tests {
     use super::*;
 
+    /// A temporary directory with mode 0700 whatever the umask.
+    fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        Ok(dir)
+    }
+
     #[test]
     fn descriptor_check_refuses_an_audit_that_is_the_source() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = private_tempdir().expect("tempdir");
         let source_path = temp.path().join("source.jsonl");
         std::fs::write(&source_path, b"recorded\n").expect("source");
         let source = File::open(&source_path).expect("open source");
@@ -469,7 +479,7 @@ mod tests {
 
     #[test]
     fn one_new_path_for_both_outputs_is_refused_and_cleaned_up() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = private_tempdir().expect("tempdir");
         let path = temp.path().join("both.jsonl");
 
         let error = open_sinks(None, &path, &path)
@@ -482,7 +492,7 @@ mod tests {
 
     #[test]
     fn distinct_outputs_open_without_writing() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = private_tempdir().expect("tempdir");
         let source_path = temp.path().join("source.jsonl");
         std::fs::write(&source_path, b"recorded\n").expect("source");
         let source = File::open(&source_path).expect("open source");

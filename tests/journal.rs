@@ -105,7 +105,7 @@ fn event_names(journal: &LoadedJournal) -> Vec<&'static str> {
 
 #[tokio::test]
 async fn demo_journal_chain_verifies_and_records_the_whole_session() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, outcome) = record_demo(temp.path(), "demo.jsonl").await;
 
     let journal = read_journal(&path).expect("journal verifies");
@@ -203,7 +203,7 @@ async fn memory_journal_lines_form_the_same_chain() {
 
 #[tokio::test]
 async fn edited_middle_byte_breaks_the_chain() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let mut raw = lines(&path);
     // Keep the JSON valid so only the hash chain can catch the edit.
@@ -222,7 +222,7 @@ async fn edited_middle_byte_breaks_the_chain() {
 
 #[tokio::test]
 async fn dropped_middle_record_is_detected() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let mut raw = lines(&path);
     raw.remove(4);
@@ -246,7 +246,7 @@ async fn dropped_middle_record_is_detected() {
 
 #[tokio::test]
 async fn dropped_tail_reads_as_incomplete() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let mut raw = lines(&path);
     raw.truncate(raw.len() - 3);
@@ -261,7 +261,7 @@ async fn dropped_tail_reads_as_incomplete() {
 
 #[tokio::test]
 async fn torn_final_line_is_rejected() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let mut bytes = std::fs::read(&path).expect("read");
     bytes.truncate(bytes.len() - 10);
@@ -278,7 +278,7 @@ async fn torn_final_line_is_rejected() {
 
 #[tokio::test]
 async fn records_after_session_end_and_second_sessions_are_rejected() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let raw = lines(&path);
     let last = raw.last().expect("last line").clone();
@@ -312,7 +312,7 @@ async fn records_after_session_end_and_second_sessions_are_rejected() {
 
 #[test]
 fn existing_journal_path_is_refused() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let path = temp.path().join("existing.jsonl");
     std::fs::write(&path, b"keep me\n").expect("write");
 
@@ -332,7 +332,7 @@ fn existing_journal_path_is_refused() {
 fn journal_file_is_private_and_parents_are_created() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let path = temp.path().join("nested/dir/journal.jsonl");
     let _journal = JsonlJournal::open(&path).expect("open journal");
 
@@ -352,7 +352,7 @@ fn file_and_line_limits_are_enforced() {
             max_line_bytes: 8 << 20,
         }
     );
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
 
     // A sparse file one byte over the default size limit.
     let large = temp.path().join("large.jsonl");
@@ -400,7 +400,7 @@ fn file_and_line_limits_are_enforced() {
 
 #[test]
 fn non_regular_and_empty_journals_are_rejected() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let error = read_journal(temp.path()).expect_err("directory");
     assert!(matches!(error, JournalError::NotRegularFile), "{error}");
 
@@ -422,7 +422,7 @@ fn first_record_must_start_the_session() {
             baseline_file_count: 0,
         },
     };
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let path = temp.path().join("headless.jsonl");
     write_lines(&path, &[serde_json::to_string(&record).expect("encode")]);
 
@@ -463,7 +463,7 @@ fn unsupported_schema_is_rejected() {
             limits: HarnessConfig::default().limits(),
         },
     };
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let path = temp.path().join("future.jsonl");
     write_lines(&path, &[serde_json::to_string(&record).expect("encode")]);
 
@@ -614,7 +614,7 @@ fn request_hash_survives_a_journal_round_trip() {
 
 #[tokio::test]
 async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, recorded) = record_demo(temp.path(), "demo.jsonl").await;
     let journal = read_journal(&path).expect("journal verifies");
     let provider = ReplayProvider::from_journal(&journal).expect("replayable");
@@ -664,7 +664,7 @@ async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
 
 #[tokio::test]
 async fn replay_against_a_different_sandbox_diverges_and_cleans_up() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let journal = read_journal(&path).expect("journal verifies");
     let provider = ReplayProvider::from_journal(&journal).expect("replayable");
@@ -708,7 +708,7 @@ async fn replay_against_a_different_sandbox_diverges_and_cleans_up() {
 
 #[tokio::test]
 async fn replay_reproduces_recorded_provider_failures_and_stops_at_a_missing_tail() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
 
     // A recorded provider failure is returned again at the same turn.
     let failed_path = temp.path().join("failed.jsonl");
@@ -798,7 +798,7 @@ fn request_hash_covers_the_output_cap_but_not_session_or_turn() {
 
 #[tokio::test]
 async fn replay_diverges_when_only_the_output_cap_differs() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let journal = read_journal(&path).expect("journal verifies");
     let mut provider = ReplayProvider::from_journal(&journal).expect("replayable");
@@ -945,7 +945,7 @@ async fn replay_restores_a_recorded_argument_limit_and_reproduces() {
 
 #[tokio::test]
 async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let journal = read_journal(&path).expect("journal verifies");
     let over: [fn(&mut kiln_harness::journal::SessionLimits); 8] = [
@@ -1056,12 +1056,12 @@ fn set_mode(path: &Path, mode: u32) {
 
 #[test]
 fn journal_is_created_in_the_resolved_parent_only_when_it_is_safe() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let base = temp.path();
 
     // A symlinked parent resolves to its operator-owned target, which passes.
     let redirected = base.join("redirected");
-    std::fs::create_dir(&redirected).expect("target");
+    common::dir_all_with_mode(&redirected, 0o700);
     std::os::unix::fs::symlink(&redirected, base.join("link")).expect("symlink");
     let _journal = JsonlJournal::open(&base.join("link/session.jsonl")).expect("safe target");
     assert!(redirected.join("session.jsonl").is_file());
@@ -1069,8 +1069,7 @@ fn journal_is_created_in_the_resolved_parent_only_when_it_is_safe() {
     // A symlinked parent that resolves somewhere writable by others fails,
     // and nothing is left behind.
     let shared = base.join("shared");
-    std::fs::create_dir(&shared).expect("shared");
-    set_mode(&shared, 0o777);
+    common::dir_all_with_mode(&shared, 0o777);
     std::os::unix::fs::symlink(&shared, base.join("shared-link")).expect("symlink");
     let error = JsonlJournal::open(&base.join("shared-link/session.jsonl"))
         .err()
@@ -1083,8 +1082,7 @@ fn journal_is_created_in_the_resolved_parent_only_when_it_is_safe() {
 
     for (mode, safe) in [(0o700, true), (0o750, true), (0o770, false), (0o702, false)] {
         let parent = base.join(format!("parent-{mode:o}"));
-        std::fs::create_dir(&parent).expect("parent");
-        set_mode(&parent, mode);
+        common::dir_all_with_mode(&parent, mode);
         let result = JsonlJournal::open(&parent.join("session.jsonl"));
         assert_eq!(result.is_ok(), safe, "parent mode {mode:o}");
         assert_eq!(parent.join("session.jsonl").exists(), safe);
@@ -1094,12 +1092,11 @@ fn journal_is_created_in_the_resolved_parent_only_when_it_is_safe() {
 
 #[test]
 fn writable_ancestors_need_the_sticky_bit() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     for (mode, safe) in [(0o777, false), (0o1777, true), (0o755, true)] {
         let ancestor = temp.path().join(format!("ancestor-{mode:o}"));
         let parent = ancestor.join("private");
-        std::fs::create_dir_all(&parent).expect("dirs");
-        set_mode(&parent, 0o700);
+        common::dir_all_with_mode(&parent, 0o700);
         set_mode(&ancestor, mode);
 
         let result = JsonlJournal::open(&parent.join("session.jsonl"));
@@ -1112,7 +1109,7 @@ fn writable_ancestors_need_the_sticky_bit() {
 
 #[test]
 fn journal_path_must_name_a_file() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let error = JsonlJournal::open(&temp.path().join(".."))
         .err()
         .expect("no file name");
@@ -1124,12 +1121,13 @@ fn swapped_parents_never_place_a_journal_in_an_unsafe_tree() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let pivot = temp.path().join("pivot");
     let alternate = temp.path().join("alternate");
     let relative = (0..32).fold(PathBuf::new(), |path, level| path.join(format!("l{level}")));
     for (root, marker, mode) in [(&pivot, "safe", 0o700), (&alternate, "unsafe", 0o777)] {
-        std::fs::create_dir_all(root.join(&relative)).expect("tree");
+        // Every directory gets an explicit mode; only the leaf differs.
+        common::dir_all_with_mode(&root.join(&relative), 0o700);
         std::fs::write(root.join("marker"), marker).expect("marker");
         set_mode(&root.join(&relative), mode);
     }
@@ -1190,7 +1188,7 @@ fn swapped_parents_never_place_a_journal_in_an_unsafe_tree() {
 
 #[test]
 fn journal_sources_must_be_regular_files_reached_without_links() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let fifo = temp.path().join("fifo.jsonl");
     let status = std::process::Command::new("mkfifo")
         .arg(&fifo)
@@ -1258,7 +1256,7 @@ async fn a_tool_record_that_differs_from_the_model_call_is_refused_everywhere() 
     );
 
     // A rechained file fails verification.
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = common::private_tempdir().expect("temp dir");
     let path = temp.path().join("forged.jsonl");
     let session = records[0].session_id.clone();
     let lines = common::chained_lines(

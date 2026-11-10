@@ -33,7 +33,7 @@ fn verify(path: &Path) -> (bool, String) {
 
 #[tokio::test]
 async fn unconfirmed_cleanup_is_recorded_and_printed_as_cleanup_failed() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("cleanup-failed.jsonl");
     let api = FakeApi::default();
     api.state().delete_behavior = DeleteBehavior::AcknowledgeOnly;
@@ -80,7 +80,7 @@ async fn unconfirmed_cleanup_is_recorded_and_printed_as_cleanup_failed() {
 
 #[tokio::test]
 async fn verify_prints_confirmed_deletion() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("demo.jsonl");
     let mut harness = Harness::new(
         FakeApi::default(),
@@ -164,7 +164,7 @@ fn verify_rejects_a_complete_journal_with_a_request_after_the_final_answer() {
             completed(2),
         ],
     );
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("pending.jsonl");
     write_journal_lines(&path, &lines);
 
@@ -186,7 +186,7 @@ fn verify_rejects_tools_before_the_sandbox_or_their_response() {
         execution_ids: vec!["ex-ghost".to_string()],
     };
     let lines = chained_lines("hs-ghost", vec![started(), ghost, completed(0)]);
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("ghost.jsonl");
     write_journal_lines(&path, &lines);
 
@@ -227,7 +227,7 @@ fn replay_cli(dir: &Path, from: &Path, audit: &Path, journal: &Path) -> Output {
 
 #[tokio::test]
 async fn replay_refuses_outputs_that_alias_its_source_before_contacting_kilnd() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let dir = temp.path();
     let source = recorded_demo(dir).await;
     let original = std::fs::read(&source).expect("read source");
@@ -235,7 +235,7 @@ async fn replay_refuses_outputs_that_alias_its_source_before_contacting_kilnd() 
     std::fs::hard_link(&source, &hard_link).expect("hard link");
     let symlink = dir.join("symlink.jsonl");
     std::os::unix::fs::symlink(&source, &symlink).expect("symlink");
-    std::fs::create_dir(dir.join("sub")).expect("subdir");
+    common::dir_all_with_mode(&dir.join("sub"), 0o700);
     let dotted = dir.join("sub/../source.jsonl");
     let fresh_journal = dir.join("replay.jsonl");
     let fresh_audit = dir.join("replay-audit.jsonl");
@@ -283,7 +283,7 @@ async fn replay_refuses_outputs_that_alias_its_source_before_contacting_kilnd() 
 
 #[test]
 fn demo_refuses_an_audit_that_is_its_journal() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let dir = temp.path();
     let output = cli(&[
         "--socket".as_ref(),
@@ -306,7 +306,7 @@ fn demo_refuses_an_audit_that_is_its_journal() {
 
 #[tokio::test]
 async fn verify_rejects_a_tool_record_that_differs_from_the_model_call() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("recorded.jsonl");
     let mut harness = Harness::new(
         FakeApi::default(),

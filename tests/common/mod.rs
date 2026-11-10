@@ -337,3 +337,32 @@ pub fn write_journal_lines(path: &std::path::Path, lines: &[String]) {
     text.push('\n');
     std::fs::write(path, text).expect("write journal");
 }
+
+/// A temporary directory with mode 0700 whatever the umask, so it passes the
+/// journal's directory rules (a umask such as 0002 would make it
+/// group-writable).
+pub fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+/// Create `path` and any missing parents, setting every directory this
+/// creates to `mode` explicitly instead of relying on the umask.
+pub fn dir_all_with_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        current = current.parent().expect("an existing ancestor");
+    }
+    for directory in missing.iter().rev() {
+        std::fs::create_dir(directory).expect("create directory");
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+            .expect("set directory mode");
+    }
+}

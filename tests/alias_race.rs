@@ -86,7 +86,7 @@ impl KilndService for GatedKilnd {
 async fn relinking_an_output_to_the_source_after_the_checks_cannot_touch_it() {
     use tonic::codegen::tokio_stream::wrappers::UnixListenerStream;
 
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let source = temp.path().join("source.jsonl");
     let mut recording = Harness::new(
         FakeApi::default(),

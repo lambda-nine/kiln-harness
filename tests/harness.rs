@@ -1953,7 +1953,7 @@ async fn assert_engine_journal_is_grammatical<P: Provider>(
     config: HarnessConfig,
     cancel_after: Option<Duration>,
 ) {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("session.jsonl");
     let mut harness = Harness::new(
         api,
