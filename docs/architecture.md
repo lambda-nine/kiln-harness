@@ -1,7 +1,7 @@
 # Architecture
 
 ```text
-scripted or replay provider (live adapter later)
+scripted, replay, or network provider (openai-compat over HTTP)
         │ ModelRequest ▲ ModelResponse (text, tool calls, stop reason, usage)
         ▼              │
 agent loop ── steps/calls/tokens/deadline ──┬─ append-only audit
@@ -90,6 +90,67 @@ arguments are replaced in the history by an `omitted` marker and rejected the
 same way. One `tool_results` message carries every result of the turn under the
 provider's call IDs.
 
+## Provider adapters
+
+Network providers live under `src/providers/`, one module per wire API. Each
+translates `ModelRequest` and `ModelResponse`, bounds what it reads, owns its
+retry policy, and normalizes usage; the engine sees only the trait. The first
+is `openai_compat`, for the `/v1/chat/completions` API of the MLX server,
+Ollama, llama.cpp, and vLLM. `run` builds it from its flags.
+
+Requests are non-streaming: `{"model", "messages", "tools", "tool_choice":
+"auto", "max_tokens", "temperature", "seed"?, "stream": false}`, posted to
+`<base_url>/chat/completions`. The system prompt is the first message unless
+it is empty. An assistant turn sends its text (or `null`) and its tool calls,
+with arguments as compact JSON strings; each tool result becomes one `tool`
+message with the provider's call ID and the result as compact JSON, in order.
+A request without tools omits `tool_choice` as well. The serialized body is
+checked against `max_request_bytes` (8 MiB by default) before anything is
+sent, and a larger one is a non-retryable `ContextOverflow`.
+
+The first choice of the response maps back. Empty content is no text. A tool
+call keeps the server's `id` if it passes the engine's call-ID rule and is
+otherwise named `call-<turn>-<index>`; the engine still refuses duplicates.
+Arguments that parse to a JSON object are used as is; any other string is
+kept raw, so the typed tool rejects it as `invalid_arguments` and the model
+sees the error and can retry. `finish_reason` `stop` is `end_turn`, or
+`tool_use` when tool calls are present (Ollama reports them that way);
+`tool_calls` and `function_call` are `tool_use`, `length` is `max_tokens`,
+`content_filter` is `refusal`, and anything else is `other`. Reasoning
+side-channels (`reasoning_content`, `reasoning`) are not part of the
+transcript and are dropped; their tokens still count through usage.
+
+Usage follows the disjoint contract: `input_tokens` is `prompt_tokens` minus
+`prompt_tokens_details.cached_tokens` (saturating), the cached count is
+`cache_read_input_tokens`, and `output_tokens` is `completion_tokens`. A
+response without `usage`, or without either count, is `InvalidResponse`: a
+budget that cannot be measured is not enforced, so the session fails closed.
+
+The body is read chunk by chunk and abandoned at `max_response_bytes` (4 MiB
+by default, at most 64 MiB); a declared `Content-Length` over the cap is
+refused before reading. Error bodies are read to at most 64 KiB, and messages
+quote the status and at most 512 bytes of the body, UTF-8-lossy and without
+control characters. The client follows no redirects, uses no proxy, and
+enables no decompression, so the cap applies to wire bytes from the
+configured endpoint only.
+
+Connect errors, timeouts, other transport failures, HTTP 408, 409, 429, 500,
+502, 503 and 504, and other 5xx responses whose body is not JSON are retried,
+up to `max_attempts` (default 3, at most 8). The delay before attempt n+1 is
+uniform in `[0, min(retry_max_delay, retry_base_delay × 2^(n-1))]` (500 ms
+base, 8 s cap by default), drawn from a xorshift generator seeded from the
+session ID and turn so the schedule is reproducible. `Retry-After`, as
+seconds or an IMF-fixdate, replaces the jittered delay and is capped at
+`retry_max_delay`. When attempts run out, the last error is returned with
+`retryable: true`; the engine still ends the session on it. HTTP 400 that
+mentions the context length, and 413, are `ContextOverflow`; other 4xx and
+3xx are `Rejected`. None of these are retried. The engine runs `complete`
+under the session deadline and cancellation, and dropping the future aborts
+the request, closes its connection, and ends any backoff sleep.
+
+The provider is recorded in `session_started` as `openai-compat` with the
+model name. Replay answers from the journal and never contacts the server.
+
 ## Tool mapping
 
 | Tool | kilnd executions | Validation |
@@ -104,14 +165,18 @@ No model string is interpolated into a host command. Fixed helper programs and
 validated model values are separate sandbox argv entries. A model can request
 `sh -c` only as explicit sandbox argv through `exec`; network remains disabled.
 
-Defaults are eight model steps, six tool calls per session and eight per
-turn, 4,096 output tokens per request, 2,000,000 input and 200,000 output
-tokens per session, a 30-second session wall deadline, a 5-second tool wall deadline, a 10-second lifecycle cleanup window,
-64 KiB model arguments, and 128 KiB encoded tool results. A tool reserves 250
-ms of its wall budget for kilnd settlement; exceeding the wall deadline drops
-the RPC to request cancellation. kilnd independently bounds retained output
-and owns execution cleanup. Configured lifecycle windows are rejected above 60
-seconds so deadline construction cannot overflow after a sandbox exists.
+`HarnessConfig` defaults (used by `demo`) are eight model steps, six tool
+calls per session and eight per turn, 4,096 output tokens per request,
+2,000,000 input and 200,000 output tokens per session, a 30-second session
+wall deadline, a 5-second tool wall deadline, a 10-second lifecycle cleanup
+window, 64 KiB model arguments, and 128 KiB encoded tool results. `run`
+raises the step, call, and time defaults for real tasks: 40 steps, 120 tool
+calls, a 900-second session, and a 30-second tool timeout, well under kilnd's
+one-hour execution ceiling. A tool reserves 250 ms of its wall budget for
+kilnd settlement; exceeding the wall deadline drops the RPC to request
+cancellation. kilnd independently bounds retained output and owns execution
+cleanup. Configured lifecycle windows are rejected above 60 seconds so
+deadline construction cannot overflow after a sandbox exists.
 
 Every configuration, including limits loaded from a journal, must also stay
 under hard ceilings: 1,000 steps, 10,000 tool calls and 64 per turn, a 6-hour

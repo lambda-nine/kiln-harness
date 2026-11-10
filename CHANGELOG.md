@@ -6,6 +6,24 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Add the first network provider, `openai-compat`, for the OpenAI-compatible
+  `/v1/chat/completions` API (MLX server, Ollama, llama.cpp, vLLM), and a
+  `run` command that carries out a real task with it. Requests and responses
+  map onto the harness's turn model; usage is normalized to the disjoint
+  counters and a response without usage fails the session; request and
+  response bodies are bounded; rate limits, overload, and transport failures
+  are retried with seeded full-jitter backoff that honors `Retry-After`. An
+  API key comes only from an environment variable named by `--api-key-env`,
+  stays out of the journal, audit, and errors, and requires `https` unless
+  the host is a loopback address. Journals from `run` replay without the
+  model server. `reqwest` (rustls with ring, no native TLS) becomes a
+  dependency.
+- `HarnessConfig::validate` exposes the engine's limit checks so a command
+  can refuse a bad configuration before opening outputs or contacting kilnd.
+- A command that refuses its outputs, or cannot reach kilnd, now discards the
+  journal before the audit, so a new directory the audit created for both is
+  removed as well.
+
 - Replace the one-action provider trait with `Provider::complete`: a
   `ModelRequest` (system, tools, message history, output-token cap) answered by
   a `ModelResponse` with text, any number of tool calls, a stop reason, and

@@ -2,7 +2,10 @@
 
 The model, its arguments, tool results, sandbox output, and files are untrusted.
 The host operator, kilnd socket owner/group, harness binary, and configured
-provider credential source are trusted. Anyone who can reach the kilnd socket
+provider credential source are trusted. A configured model endpoint is
+trusted for availability only: it can stall or refuse a session, but every
+response it sends is untrusted input that is bounded and validated before it
+reaches the loop, and what the model asks for is checked exactly as before. Anyone who can reach the kilnd socket
 has near-root sandbox-control capability on this development node.
 
 kiln supplies namespace, cgroup, quota, seccomp, Landlock, and network
@@ -13,8 +16,8 @@ it is not a hostile multi-tenant boundary.
 
 - Only `kilnd.v1` is used. Production code never starts `kiln`, reads its
   filesystem state, or runs a host shell.
-- Every session requests network none. This milestone has no live provider and
-  handles no API key.
+- Every session requests network none. The harness itself talks to the model
+  endpoint from the host; the sandbox never gets a network or a credential.
 - Typed JSON arguments reject unknown fields. File helpers accept only strict
   relative `/workspace` paths; `exec` remains a deliberately general sandbox
   argv primitive.
@@ -61,9 +64,29 @@ it is not a hostile multi-tenant boundary.
   made and empty. A name could change between that check and `unlinkat`, but
   only by someone who can write the parent, which the walk verified is only
   the operator.
-- Provider credentials must never be journaled. No provider handles one yet;
-  adapters must keep keys out of `ModelRequest`, `ModelResponse`, and provider
-  error messages.
+- Provider credentials stay host-side and are never journaled or audited.
+  `run` reads a key only from the environment variable named by
+  `--api-key-env` (never a flag, so never in argv), once at startup, and
+  refuses an empty one. It is held in a `SecretString` whose `Debug` is
+  redacted and which cannot be displayed or serialized, and is used only to
+  build the `Authorization` header, marked sensitive. Nothing puts it in
+  `ModelRequest`, `ModelResponse`, the journal, or the audit, and an error
+  body that echoes it has it replaced by `[redacted]` before the message is
+  recorded.
+- Plain `http://` to a model server on the LAN is acceptable for local models
+  without a key: the traffic is prompts and tool results the operator already
+  sees, and a hostile LAN peer can at worst feed the loop responses, which
+  are untrusted anyway. A key requires `https` unless the base URL's host is a
+  loopback IP literal; host names, `localhost` included, are not treated as
+  loopback. The client follows no redirects and ignores proxy environment
+  variables, so the key and the transcript go only to the configured
+  endpoint. Base URLs with userinfo, a query, or a fragment are refused.
+- Provider responses are bounded on the wire: requests over
+  `max_request_bytes` are not sent, response bodies are read only up to
+  `max_response_bytes` (4 MiB by default, 64 MiB at most) with no
+  decompression, error bodies to 64 KiB, and error messages quote at most 512
+  bytes, without control characters. Malformed responses, including one
+  without token usage, fail the session instead of being guessed at.
 - Every response is bounded before it reaches kilnd: per-turn and per-session
   call budgets, per-request and cumulative token budgets (cached input
   included), argument and
@@ -79,6 +102,11 @@ it is not a hostile multi-tenant boundary.
   blocks helper writes outside approved writable paths, and the sandbox—not the
   workspace prefix—is the host boundary. General `exec` can read any path the
   sandbox policy permits.
+- A model endpoint is trusted for availability only. A slow or hanging server
+  delays the session until its deadline, and retries (at most 8 attempts,
+  each backoff capped) spend session time, not extra budget. Dropping the
+  provider future at the deadline or on cancellation closes the HTTP
+  connection; the server may still finish generating.
 - Cancellation races active provider and tool RPCs. Dropping an Exec RPC asks
   kilnd to cancel its daemon-owned execution; sandbox deletion then provides
   the cleanup barrier. Create response loss is recovered by unique session

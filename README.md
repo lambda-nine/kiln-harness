@@ -8,10 +8,12 @@ turns, hard budgets, a metadata-only audit log, a content-bearing session
 journal that replays deterministically, and verified sandbox deletion after
 every session.
 
-**Status: experimental.** This milestone has only a deterministic scripted
-provider, so it needs no model account, API key or network access; no live
-model provider is implemented yet. kiln is experimental shared-kernel
-isolation and **not a boundary for hostile multi-tenant workloads**. Report
+**Status: experimental.** Besides a deterministic scripted provider, which
+needs no model account, API key or network access, it has one live provider:
+an adapter for the OpenAI-compatible `/v1/chat/completions` API that the MLX
+server, Ollama, llama.cpp, and vLLM speak, for running local models. kiln is
+experimental shared-kernel isolation and **not a boundary for hostile
+multi-tenant workloads**. Report
 vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 Licensed under [Apache-2.0](LICENSE).
 
@@ -26,9 +28,11 @@ Licensed under [Apache-2.0](LICENSE).
 
 ## Quickstart
 
-Host-side tests use a fake kilnd and run on Linux or macOS with rustup
-(`rust-toolchain.toml` selects Rust 1.88) and `protoc`
-(`sudo apt-get install protobuf-compiler` or `brew install protobuf`):
+Host-side tests use a fake kilnd and a local fake model server, and run on
+Linux or macOS with rustup (`rust-toolchain.toml` selects Rust 1.88), `protoc`
+(`sudo apt-get install protobuf-compiler` or `brew install protobuf`), and a C
+compiler for the `ring` TLS crate (`build-essential` on Ubuntu; the Xcode
+command line tools on macOS):
 
 ```sh
 git clone https://github.com/lambda-nine/kiln-harness
@@ -87,6 +91,55 @@ running the harness and writable by no one else. Ctrl-C and wall deadlines stop
 waiting on an active RPC, including sandbox create and the workspace baseline;
 kilnd is asked to cancel it, then deletion is retried and verified within a
 separate bounded cleanup window.
+
+## Running against a local model
+
+`run` carries out one task with a real model through any server that speaks
+the OpenAI-compatible chat-completions API with tool calling. The harness runs
+inside the Linux VM next to kilnd, so `HOST` below is the Mac's LAN address
+or the VM's address for its host (on Lima, `host.lima.internal`), not
+`localhost`. The model server must listen on that interface, not only on
+loopback.
+
+With Ollama (`OLLAMA_HOST=0.0.0.0 ollama serve` on the Mac):
+
+```sh
+cargo run --locked -- run --provider openai-compat \
+  --base-url http://HOST:11434/v1 --model qwen3:8b \
+  --prompt "Write a Python script that prints the first ten primes, run it, and report the output."
+```
+
+With MLX (`mlx_lm.server --host 0.0.0.0 --port 8080 --model <model>` on the
+Mac):
+
+```sh
+cargo run --locked -- run --provider openai-compat \
+  --base-url http://HOST:8080/v1 --model <model> \
+  --prompt-file task.txt
+```
+
+The model must support tool calling through the API. `--system-file`
+replaces the default system prompt, which describes the sandbox and the
+tools. Limits default to 40 steps, 120 tool calls (8 per turn), a 900-second
+session, a 30-second tool timeout, 4,096 output tokens per request, and
+2,000,000 input and 200,000 output tokens per session; each has a flag, and
+the hard ceilings in `docs/architecture.md` still apply. `--temperature`
+(default 0) and `--seed` are forwarded. Output matches `demo`. The audit
+defaults to `audit/run.jsonl` and the journal to
+`journal/run-<unix_ms>.jsonl`, which `replay` reruns without the model
+server.
+
+A server that needs a key gets it from an environment variable named by
+`--api-key-env VAR`, never from a flag. The key is sent only in the
+`Authorization` header and never reaches the journal, the audit, or error
+messages. Plain `http` is accepted for a model server on the LAN without a
+key; with a key, the base URL must be `https` unless its host is a loopback
+IP address.
+
+Responses must report token `usage`, or the session fails: budgets cannot be
+enforced without it. Response bodies are capped at 4 MiB and requests at 8
+MiB; rate limits, overload, and transport failures are retried up to three
+attempts with jittered backoff, honoring `Retry-After`.
 
 ## Journal and replay
 
@@ -167,15 +220,13 @@ a snapshot taken before the run, since a node may keep sandboxes the test does
 not own. kiln's registry, run directories, cgroups, and shim/init processes are
 checked before and after. It does not run benchmark campaigns.
 
-## Next step: live provider
+## Next step: hosted providers
 
-Add one provider adapter in a separate change. It should translate
-`ModelRequest` and `ModelResponse` to a chosen model API, own its retry policy
-(the loop treats every provider error as fatal), keep credentials in the host
-vault or environment and out of requests, responses, and the journal, report
-token usage, cancel HTTP work at the session deadline, and retain the same
-tool, audit, and journal contracts. No paid provider is selected or called in
-this milestone.
+Hosted APIs come next, as further adapters under `src/providers/` with the
+same contracts: translate `ModelRequest` and `ModelResponse`, own the retry
+policy (the loop treats every provider error as fatal), bound response bodies,
+normalize usage, keep keys host-side, and cancel HTTP work at the session
+deadline.
 
 See `docs/architecture.md` and `docs/threat-model.md` for lifecycle and trust
 details.

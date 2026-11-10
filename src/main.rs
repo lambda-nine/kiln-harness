@@ -1,20 +1,29 @@
 use std::fs::File;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Parser, Subcommand, ValueEnum};
 use kiln_harness::api::{SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
-use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionOutcome, SessionTask};
+use kiln_harness::engine::{
+    Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST, MAX_SESSION_TIMEOUT,
+    MAX_STEPS, MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
+    MAX_TOTAL_TOKENS, SessionOutcome, SessionTask,
+};
 use kiln_harness::journal::{
     JournalEvent, JournalLimits, JsonlJournal, LoadedJournal, open_journal_source, read_journal,
     read_open_journal,
 };
 use kiln_harness::provider::{ScriptedProvider, Usage};
+use kiln_harness::providers::{
+    OpenAiCompatConfig, OpenAiCompatProvider, SecretString, default_system_prompt,
+};
 use kiln_harness::replay::ReplayProvider;
+use kiln_harness::tools::ToolLimits;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -38,6 +47,8 @@ enum Command {
         #[arg(long)]
         journal: Option<PathBuf>,
     },
+    /// Run one task against a model server and kilnd.
+    Run(Box<RunArgs>),
     /// Replay a recorded session against kilnd and compare its final answer.
     Replay {
         /// Journal of the session to replay.
@@ -57,6 +68,78 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ProviderKind {
+    /// An OpenAI-compatible `/v1/chat/completions` server (MLX, Ollama,
+    /// llama.cpp, vLLM).
+    #[value(name = "openai-compat")]
+    OpenAiCompat,
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    #[arg(long, value_enum)]
+    provider: ProviderKind,
+    /// API root, such as `http://192.168.1.20:11434/v1`.
+    #[arg(long)]
+    base_url: String,
+    /// Model name as the server knows it.
+    #[arg(long)]
+    model: String,
+    /// The task.
+    #[arg(
+        long,
+        conflicts_with = "prompt_file",
+        required_unless_present = "prompt_file"
+    )]
+    prompt: Option<String>,
+    /// Read the task from a UTF-8 file.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+    /// Read the system prompt from a UTF-8 file instead of the default.
+    #[arg(long)]
+    system_file: Option<PathBuf>,
+    /// Environment variable holding the API key; the key is never a flag.
+    #[arg(long, value_name = "VAR")]
+    api_key_env: Option<String>,
+    /// Sampling temperature, 0.0 to 2.0.
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+    /// Sampling seed, forwarded when set.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Model turns per session.
+    #[arg(long, default_value_t = 40)]
+    max_steps: u32,
+    /// Tool calls per session.
+    #[arg(long, default_value_t = 120)]
+    max_tool_calls: u32,
+    /// Tool calls in one model turn.
+    #[arg(long, default_value_t = 8)]
+    max_tool_calls_per_turn: u32,
+    /// Wall-clock limit for the session, including sandbox creation.
+    #[arg(long, default_value_t = 900)]
+    session_timeout_secs: u64,
+    /// Wall-clock limit for each sandbox execution.
+    #[arg(long, default_value_t = 30)]
+    tool_timeout_secs: u64,
+    /// Output tokens per model request.
+    #[arg(long, default_value_t = 4096)]
+    max_output_tokens: u32,
+    /// Input tokens per session, cached input included.
+    #[arg(long, default_value_t = 2_000_000)]
+    max_total_input_tokens: u64,
+    /// Output tokens per session.
+    #[arg(long, default_value_t = 200_000)]
+    max_total_output_tokens: u64,
+    /// Append-only metadata audit destination.
+    #[arg(long, default_value = "audit/run.jsonl")]
+    audit: PathBuf,
+    /// New session journal; defaults to `journal/run-<unix_ms>.jsonl`.
+    #[arg(long)]
+    journal: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum JournalCommand {
     /// Verify a journal's limits, order, and hash chain without contacting kilnd.
@@ -70,6 +153,17 @@ async fn main() -> Result<ExitCode> {
         Command::Demo { audit, journal } => {
             let journal = journal.unwrap_or_else(|| default_journal("demo"));
             demo(cli.socket, &audit, &journal).await
+        }
+        Command::Run(args) => {
+            let journal = args
+                .journal
+                .clone()
+                .unwrap_or_else(|| default_journal("run"));
+            let audit = args.audit.clone();
+            // Everything is checked, and the key read, before any output is
+            // opened or kilnd is contacted.
+            let prepared = prepare_run(*args)?;
+            run(cli.socket, prepared, &audit, &journal).await
         }
         Command::Replay {
             from,
@@ -100,6 +194,181 @@ async fn demo(socket: PathBuf, audit_path: &Path, journal_path: &Path) -> Result
         HarnessConfig::default(),
     );
     let outcome = harness.run(&SessionTask::demo(), interrupt()).await?;
+    check_health(&api).await?;
+    print_outcome(&outcome);
+    println!("audit: {}", audit_path.display());
+    println!("journal: {}", journal_path.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+struct PreparedRun {
+    task: SessionTask,
+    config: HarnessConfig,
+    provider: OpenAiCompatProvider,
+}
+
+/// Unsigned limits must be positive and at most their hard ceiling.
+fn check_limit<T: Copy + PartialOrd + Default + std::fmt::Display>(
+    flag: &str,
+    value: T,
+    max: T,
+) -> Result<()> {
+    if value <= T::default() || value > max {
+        bail!("{flag} must be between 1 and {max}");
+    }
+    Ok(())
+}
+
+fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
+    let ProviderKind::OpenAiCompat = args.provider;
+    check_limit("--max-steps", args.max_steps, MAX_STEPS)?;
+    check_limit("--max-tool-calls", args.max_tool_calls, MAX_TOOL_CALLS)?;
+    check_limit(
+        "--max-tool-calls-per-turn",
+        args.max_tool_calls_per_turn,
+        MAX_TOOL_CALLS_PER_TURN,
+    )?;
+    check_limit(
+        "--session-timeout-secs",
+        args.session_timeout_secs,
+        MAX_SESSION_TIMEOUT.as_secs(),
+    )?;
+    check_limit(
+        "--tool-timeout-secs",
+        args.tool_timeout_secs,
+        MAX_TOOL_TIMEOUT.as_secs(),
+    )?;
+    check_limit(
+        "--max-output-tokens",
+        args.max_output_tokens,
+        MAX_OUTPUT_TOKENS_PER_REQUEST,
+    )?;
+    check_limit(
+        "--max-total-input-tokens",
+        args.max_total_input_tokens,
+        MAX_TOTAL_TOKENS,
+    )?;
+    check_limit(
+        "--max-total-output-tokens",
+        args.max_total_output_tokens,
+        MAX_TOTAL_TOKENS,
+    )?;
+    let config = HarnessConfig {
+        max_steps: args.max_steps,
+        max_tool_calls: args.max_tool_calls,
+        max_tool_calls_per_turn: args.max_tool_calls_per_turn,
+        session_timeout: Duration::from_secs(args.session_timeout_secs),
+        max_output_tokens_per_request: args.max_output_tokens,
+        max_total_input_tokens: args.max_total_input_tokens,
+        max_total_output_tokens: args.max_total_output_tokens,
+        tool_limits: ToolLimits {
+            timeout: Duration::from_secs(args.tool_timeout_secs),
+            ..ToolLimits::default()
+        },
+        ..HarnessConfig::default()
+    };
+    config.validate()?;
+
+    let prompt = match (args.prompt, &args.prompt_file) {
+        (Some(prompt), None) => prompt,
+        (None, Some(path)) => read_text_file("--prompt-file", path)?,
+        _ => bail!("give exactly one of --prompt and --prompt-file"),
+    };
+    if prompt.trim().is_empty() {
+        bail!("the prompt is empty");
+    }
+    if prompt.len() > MAX_TASK_TEXT_BYTES {
+        bail!("the prompt is longer than {MAX_TASK_TEXT_BYTES} bytes");
+    }
+    let system = match &args.system_file {
+        Some(path) => read_text_file("--system-file", path)?,
+        None => default_system_prompt(&config.tool_limits),
+    };
+
+    let mut provider_config = OpenAiCompatConfig::new(&args.base_url, args.model)?;
+    provider_config.api_key = args.api_key_env.as_deref().map(read_api_key).transpose()?;
+    provider_config.temperature = args.temperature;
+    provider_config.seed = args.seed;
+    let provider = OpenAiCompatProvider::new(provider_config)?;
+    Ok(PreparedRun {
+        task: SessionTask { system, prompt },
+        config,
+        provider,
+    })
+}
+
+/// Read the API key from the named environment variable. Errors name the
+/// variable, never its value.
+fn read_api_key(var: &str) -> Result<SecretString> {
+    let mut bytes = var.bytes();
+    let valid_name = bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid_name {
+        bail!("--api-key-env must name an environment variable ([A-Za-z_][A-Za-z0-9_]*)");
+    }
+    match std::env::var_os(var) {
+        None => bail!("--api-key-env: {var} is not set"),
+        Some(value) if value.is_empty() => bail!("--api-key-env: {var} is set but empty"),
+        Some(value) => value
+            .into_string()
+            .map(SecretString::new)
+            .map_err(|_| anyhow!("--api-key-env: {var} is not UTF-8")),
+    }
+}
+
+/// Read a UTF-8 task file of at most `MAX_TASK_TEXT_BYTES`.
+fn read_text_file(flag: &str, path: &Path) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("{flag} {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_TASK_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("{flag} {}", path.display()))?;
+    if bytes.len() > MAX_TASK_TEXT_BYTES {
+        bail!(
+            "{flag} {} is larger than {MAX_TASK_TEXT_BYTES} bytes",
+            path.display()
+        );
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow!("{flag} {} is not UTF-8", path.display()))
+}
+
+async fn run(
+    socket: PathBuf,
+    prepared: PreparedRun,
+    audit_path: &Path,
+    journal_path: &Path,
+) -> Result<ExitCode> {
+    refuse_aliases(&[
+        ("--audit", FileIdentity::of_path(audit_path)?),
+        ("--journal", FileIdentity::of_path(journal_path)?),
+    ])?;
+    let (audit, journal) = open_sinks(None, audit_path, journal_path)?;
+    let api = match connect(socket).await {
+        Ok(api) => api,
+        Err(error) => {
+            // Nothing has been written; leave no empty outputs behind.
+            // The journal was opened last, so it goes first: the audit may
+            // have created the directory they share.
+            journal.discard();
+            audit.discard();
+            return Err(error);
+        }
+    };
+    let PreparedRun {
+        task,
+        config,
+        provider,
+    } = prepared;
+    let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
+    let outcome = match harness.run(&task, interrupt()).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("journal: {}", journal_path.display());
+            return Err(error.into());
+        }
+    };
     check_health(&api).await?;
     print_outcome(&outcome);
     println!("audit: {}", audit_path.display());
@@ -388,8 +657,10 @@ fn open_sinks(
         None
     };
     if let Some(flags) = clash {
-        audit.discard();
+        // Newest first, so a directory the audit created for both is empty
+        // by the time the audit's rollback reaches it.
         journal.discard();
+        audit.discard();
         bail!("{flags} refer to the same file");
     }
     Ok((audit, journal))
