@@ -771,6 +771,13 @@ impl Grammar {
                     expected: JOURNAL_SCHEMA,
                 });
             }
+            // Reject limits the engine itself would refuse to run under.
+            if !crate::engine::limits_are_valid(limits) {
+                return Err(JournalError::Grammar {
+                    sequence,
+                    reason: "recorded limits are not positive or exceed a hard ceiling".to_string(),
+                });
+            }
             self.context = Some(SessionContext {
                 system: system.clone(),
                 tools: tools.clone(),

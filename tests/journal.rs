@@ -959,8 +959,31 @@ async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
         |limits| limits.max_total_input_tokens = MAX_TOTAL_TOKENS + 1,
     ];
     for raise in over {
-        let _ = &journal;
-        // The engine refuses the limits themselves before any sandbox.
+        // A crafted journal with these limits fails verification and does not
+        // load for replay.
+        let mut crafted = journal.clone();
+        let JournalEvent::SessionStarted { limits, .. } = &mut crafted.records[0].event else {
+            panic!("first record starts the session");
+        };
+        raise(limits);
+        assert!(ReplayProvider::from_journal(&crafted).is_err());
+        let path = temp.path().join("crafted.jsonl");
+        let session = crafted.session_id().to_string();
+        let events = crafted
+            .records
+            .into_iter()
+            .map(|record| record.event)
+            .collect();
+        common::write_journal_lines(&path, &common::chained_lines(&session, events));
+        assert!(
+            matches!(
+                read_journal(&path),
+                Err(JournalError::Grammar { sequence: 0, .. })
+            ),
+            "over-ceiling limits verify"
+        );
+
+        // And the engine refuses the limits themselves before any sandbox.
         let mut limits = HarnessConfig::default().limits();
         raise(&mut limits);
         let mut config = short_lifecycle_config();

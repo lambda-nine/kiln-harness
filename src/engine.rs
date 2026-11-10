@@ -948,6 +948,15 @@ fn validate_task(task: &SessionTask) -> Result<(), HarnessError> {
     Ok(())
 }
 
+/// Whether recorded limits could have come from a valid configuration: every
+/// limit positive and under its hard ceiling. Lifecycle windows are not
+/// recorded, so the defaults stand in for them.
+pub(crate) fn limits_are_valid(limits: &SessionLimits) -> bool {
+    let mut config = HarnessConfig::default();
+    config.apply_limits(limits);
+    validate_config(&config).is_ok()
+}
+
 fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
     let tools = &config.tool_limits;
     let byte_limits = [
