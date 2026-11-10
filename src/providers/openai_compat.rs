@@ -76,16 +76,22 @@
 //! cancellation and drops the future when either fires. Dropping it aborts
 //! the HTTP request, closing its connection, and any backoff sleep.
 
-use std::net::IpAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use super::SecretString;
+use super::http::{
+    self, Credential, Failure, Transport, check_completion_tokens, excerpt, invalid,
+};
+pub use super::http::{
+    ERROR_EXCERPT_BYTES, MAX_ATTEMPTS, MAX_BODY_BYTES, MAX_CONFIG_DELAY,
+    MAX_OUTPUT_BYTES_PER_TOKEN, MAX_TOOL_NAME_BYTES,
+};
 use crate::engine::call_id_is_valid;
 use crate::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo,
@@ -94,21 +100,6 @@ use crate::provider::{
 
 /// The name recorded in journals for this adapter.
 pub const PROVIDER_NAME: &str = "openai-compat";
-/// Ceiling for `max_response_bytes` and `max_request_bytes`.
-pub const MAX_BODY_BYTES: usize = 64 << 20;
-/// Ceiling for `max_attempts`.
-pub const MAX_ATTEMPTS: u32 = 8;
-/// Ceiling for `connect_timeout`, `retry_base_delay`, and `retry_max_delay`.
-pub const MAX_CONFIG_DELAY: Duration = Duration::from_secs(300);
-/// Most bytes of an error body quoted in an error message.
-pub const ERROR_EXCERPT_BYTES: usize = 512;
-/// Longest tool name accepted from a response.
-pub const MAX_TOOL_NAME_BYTES: usize = 256;
-/// The most output bytes one reported completion token may account for.
-pub const MAX_OUTPUT_BYTES_PER_TOKEN: u64 = 64;
-/// Most bytes of an error response read to classify it.
-const ERROR_BODY_READ_BYTES: usize = 64 << 10;
-const MAX_MODEL_BYTES: usize = 256;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("invalid openai-compat configuration: {0}")]
@@ -171,86 +162,26 @@ impl OpenAiCompatConfig {
     /// `http` to anything but a loopback address, an empty or non-printable
     /// key, or a sampling, bound, or retry value out of range.
     pub fn validate(&self) -> Result<(), OpenAiCompatError> {
-        let url = &self.base_url;
-        let https = match url.scheme() {
-            "https" => true,
-            "http" => false,
-            other => {
-                return Err(config_error(format!(
-                    "base URL scheme must be http or https, not {other:?}"
-                )));
-            }
-        };
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(config_error(
-                "base URL must not contain userinfo; pass a key with --api-key-env",
-            ));
-        }
-        if url.query().is_some() {
-            return Err(config_error("base URL must not contain a query"));
-        }
-        if url.fragment().is_some() {
-            return Err(config_error("base URL must not contain a fragment"));
-        }
-        if url.host_str().is_none_or(str::is_empty) {
-            return Err(config_error("base URL must name a host"));
-        }
-        if self.model.is_empty()
-            || self.model.len() > MAX_MODEL_BYTES
-            || !self.model.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
-        {
-            return Err(config_error(
-                "model must be 1..=256 bytes of printable ASCII",
-            ));
-        }
+        let https = http::check_base_url(&self.base_url).map_err(OpenAiCompatError)?;
+        http::check_model(&self.model).map_err(OpenAiCompatError)?;
         if let Some(key) = &self.api_key {
-            if key.is_empty() || !key.expose().bytes().all(|byte| byte.is_ascii_graphic()) {
-                return Err(config_error(
-                    "API key must be non-empty printable ASCII without spaces",
-                ));
-            }
-            if !https && !host_is_loopback(url) {
-                return Err(config_error(
-                    "an API key requires an https base URL unless the host is a loopback address",
-                ));
-            }
+            http::check_key(key, &self.base_url, https).map_err(OpenAiCompatError)?;
         }
         if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
             return Err(config_error("temperature must be within 0.0..=2.0"));
         }
-        for (name, bytes) in [
-            ("max_response_bytes", self.max_response_bytes),
-            ("max_request_bytes", self.max_request_bytes),
-        ] {
-            if bytes == 0 || bytes > MAX_BODY_BYTES {
-                return Err(config_error(format!(
-                    "{name} must be within 1..={MAX_BODY_BYTES}"
-                )));
-            }
+        self.transport().check().map_err(OpenAiCompatError)
+    }
+
+    pub(crate) fn transport(&self) -> Transport {
+        Transport {
+            connect_timeout: self.connect_timeout,
+            max_response_bytes: self.max_response_bytes,
+            max_request_bytes: self.max_request_bytes,
+            max_attempts: self.max_attempts,
+            retry_base_delay: self.retry_base_delay,
+            retry_max_delay: self.retry_max_delay,
         }
-        if !(1..=MAX_ATTEMPTS).contains(&self.max_attempts) {
-            return Err(config_error(format!(
-                "max_attempts must be within 1..={MAX_ATTEMPTS}"
-            )));
-        }
-        for (name, delay) in [
-            ("connect_timeout", self.connect_timeout),
-            ("retry_base_delay", self.retry_base_delay),
-            ("retry_max_delay", self.retry_max_delay),
-        ] {
-            if delay.is_zero() || delay > MAX_CONFIG_DELAY {
-                return Err(config_error(format!(
-                    "{name} must be positive and at most {} s",
-                    MAX_CONFIG_DELAY.as_secs()
-                )));
-            }
-        }
-        if self.retry_max_delay < self.retry_base_delay {
-            return Err(config_error(
-                "retry_max_delay must be at least retry_base_delay",
-            ));
-        }
-        Ok(())
     }
 
     /// The URL requests are sent to.
@@ -264,15 +195,6 @@ impl OpenAiCompatConfig {
         endpoint.set_path(&path);
         endpoint
     }
-}
-
-/// Whether the URL's host is a loopback IP literal. Names, `localhost`
-/// included, are not trusted to resolve to loopback.
-fn host_is_loopback(url: &Url) -> bool {
-    url.host_str()
-        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
-        .and_then(|host| host.parse::<IpAddr>().ok())
-        .is_some_and(|address| address.is_loopback())
 }
 
 /// A provider for one OpenAI-compatible endpoint and model.
@@ -320,13 +242,7 @@ impl OpenAiCompatProvider {
                 Ok::<_, OpenAiCompatError>(value)
             })
             .transpose()?;
-        let client = Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .user_agent(concat!("kiln-harness/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| config_error(format!("HTTP client: {error}")))?;
+        let client = config.transport().client().map_err(OpenAiCompatError)?;
         Ok(Self {
             client,
             endpoint: config.endpoint(),
@@ -348,140 +264,24 @@ impl OpenAiCompatProvider {
         if let Some(authorization) = &self.authorization {
             headers.insert(AUTHORIZATION, authorization.clone());
         }
-        let mut response = self
-            .client
-            .post(self.endpoint.clone())
-            .headers(headers)
-            .body(body.to_vec())
-            .send()
-            .await
-            .map_err(|error| Failure::transport(&error, "send request"))?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| parse_retry_after(value, SystemTime::now()));
+        let limit = self.config.max_response_bytes;
+        let exchange = http::post(&self.client, &self.endpoint, headers, body, limit).await?;
         // With a key, the endpoint holds a credential: nothing it sends is
         // quoted, and a response that contains the key is refused whole.
         let key = self.config.api_key.as_ref().map(Credential::new);
         let key = key.as_ref();
-        if status.is_success() {
-            let limit = self.config.max_response_bytes;
-            let (bytes, complete) = read_bounded(&mut response, limit).await?;
-            if !complete {
-                return Err(Failure::fatal(
-                    ProviderErrorKind::InvalidResponse,
-                    format!("response exceeds {limit} bytes"),
-                ));
-            }
-            if key.is_some_and(|key| key.in_bytes(&bytes)) {
-                return Err(credential_echo());
-            }
-            let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
-                Failure::fatal(
-                    ProviderErrorKind::InvalidResponse,
-                    format!("response is not JSON: {error}"),
-                )
-            })?;
-            // Decoded strings catch the key behind the outer JSON layer.
-            if key.is_some_and(|key| key.in_value(&value)) {
-                return Err(credential_echo());
-            }
-            let parsed =
-                parse_response_quoting(&value, turn, key.is_none()).map_err(|error| Failure {
-                    error,
-                    retry_after: None,
-                })?;
+        if exchange.status.is_success() {
+            let value = http::decode_success(&exchange, limit, key)?;
+            let parsed = parse_response_quoting(&value, turn, key.is_none())?;
             // Tool arguments are JSON inside a JSON string: a second layer.
             if key.is_some_and(|key| key.in_response(&parsed)) {
-                return Err(credential_echo());
+                return Err(http::credential_echo());
             }
             return Ok(parsed);
         }
-        let limit = self.config.max_response_bytes.min(ERROR_BODY_READ_BYTES);
-        let (bytes, _) = read_bounded(&mut response, limit).await?;
-        let mut failure = classify_status(status, &bytes, key.is_none());
-        failure.retry_after = retry_after;
+        let mut failure = classify_status(exchange.status, &exchange.body, key.is_none());
+        failure.retry_after = exchange.retry_after;
         Err(failure)
-    }
-}
-
-/// The refusal for a response that contains the request's credential.
-/// Nothing from the response is kept.
-fn credential_echo() -> Failure {
-    Failure::fatal(
-        ProviderErrorKind::Rejected,
-        "response contained the request credential",
-    )
-}
-
-/// The request's API key as the response scans look for it: its exact
-/// bytes and its JSON-escaped spelling (which differs when the key holds
-/// `"` or `\\`). Both must be absent from every layer the protocol decodes.
-struct Credential<'a> {
-    needles: Vec<std::borrow::Cow<'a, str>>,
-}
-
-impl<'a> Credential<'a> {
-    fn new(key: &'a SecretString) -> Self {
-        let exact = key.expose();
-        let mut needles = vec![std::borrow::Cow::Borrowed(exact)];
-        // Encoding a str cannot fail; strip the surrounding quotes.
-        let encoded = serde_json::to_string(exact).unwrap_or_default();
-        let escaped = encoded
-            .strip_prefix('"')
-            .and_then(|inner| inner.strip_suffix('"'))
-            .unwrap_or(exact);
-        if escaped != exact {
-            needles.push(std::borrow::Cow::Owned(escaped.to_string()));
-        }
-        needles.retain(|needle| !needle.is_empty());
-        Self { needles }
-    }
-
-    fn in_text(&self, text: &str) -> bool {
-        self.needles
-            .iter()
-            .any(|needle| text.contains(needle.as_ref()))
-    }
-
-    fn in_bytes(&self, bytes: &[u8]) -> bool {
-        self.needles.iter().any(|needle| {
-            let needle = needle.as_bytes();
-            bytes.windows(needle.len()).any(|window| window == needle)
-        })
-    }
-
-    /// Any string or object key in `value`.
-    fn in_value(&self, value: &Value) -> bool {
-        match value {
-            Value::String(text) => self.in_text(text),
-            Value::Array(items) => items.iter().any(|item| self.in_value(item)),
-            Value::Object(map) => map
-                .iter()
-                .any(|(name, item)| self.in_text(name) || self.in_value(item)),
-            Value::Null | Value::Bool(_) | Value::Number(_) => false,
-        }
-    }
-
-    /// Anything kept from `response`. Arguments kept as a raw string are
-    /// also decoded when they are JSON of any kind (a string, array, number
-    /// or null as well as an object), so the protocol's nested JSON layer
-    /// cannot carry the key in its encoded spelling.
-    fn in_response(&self, response: &ModelResponse) -> bool {
-        response
-            .text
-            .as_ref()
-            .is_some_and(|text| self.in_text(text))
-            || response.tool_calls.iter().any(|call| {
-                self.in_text(&call.call_id)
-                    || self.in_text(&call.tool)
-                    || self.in_value(&call.arguments)
-                    || matches!(&call.arguments, Value::String(raw)
-                        if serde_json::from_str::<Value>(raw)
-                            .is_ok_and(|decoded| self.in_value(&decoded)))
-            })
     }
 }
 
@@ -504,134 +304,15 @@ impl Provider for OpenAiCompatProvider {
                 format!("encode request: {error}"),
             )
         })?;
-        if body.len() > self.config.max_request_bytes {
-            return Err(ProviderError::new(
-                ProviderErrorKind::ContextOverflow,
-                format!(
-                    "request is {} bytes; the limit is {}",
-                    body.len(),
-                    self.config.max_request_bytes
-                ),
-            ));
-        }
-        let mut jitter = Jitter::new(request.session_id, request.turn);
-        let mut attempt = 1;
-        loop {
-            let failure = match self.attempt(&body, request.turn).await {
-                Ok(response) => return Ok(response),
-                Err(failure) => failure,
-            };
-            if !failure.error.retryable || attempt >= self.config.max_attempts {
-                return Err(failure.error);
-            }
-            let delay = retry_delay(&self.config, attempt, failure.retry_after, &mut jitter);
-            tokio::time::sleep(delay).await;
-            attempt += 1;
-        }
+        let transport = self.config.transport();
+        transport.check_request(&body)?;
+        let this = &*self;
+        transport
+            .with_retries(request.session_id, request.turn, || {
+                this.attempt(&body, request.turn)
+            })
+            .await
     }
-}
-
-/// A failed attempt and the server's `Retry-After`, if it sent one.
-#[derive(Debug)]
-struct Failure {
-    error: ProviderError,
-    retry_after: Option<Duration>,
-}
-
-impl Failure {
-    fn fatal(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            error: ProviderError::new(kind, message),
-            retry_after: None,
-        }
-    }
-
-    fn retryable(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
-        let mut error = ProviderError::new(kind, message);
-        error.retryable = true;
-        Self {
-            error,
-            retry_after: None,
-        }
-    }
-
-    /// Every transport failure is retryable: the request may not have
-    /// reached the server, and a completion has no side effects to repeat.
-    fn transport(error: &reqwest::Error, action: &str) -> Self {
-        let kind = if error.is_timeout() {
-            ProviderErrorKind::Timeout
-        } else {
-            ProviderErrorKind::Transport
-        };
-        let what = if error.is_connect() {
-            "connect"
-        } else {
-            action
-        };
-        Self::retryable(kind, excerpt(error_chain(error).as_bytes())).with_prefix(what)
-    }
-
-    fn with_prefix(mut self, prefix: &str) -> Self {
-        self.error.message = format!("{prefix} failed: {}", self.error.message);
-        self
-    }
-}
-
-/// An error and its sources, without the request URL.
-fn error_chain(error: &reqwest::Error) -> String {
-    let mut text = String::new();
-    let mut source: Option<&dyn std::error::Error> = Some(error);
-    let mut first = true;
-    while let Some(current) = source {
-        let part = if first {
-            // reqwest's own message names the URL, which is configuration,
-            // not something the journal needs.
-            match error.url() {
-                Some(url) => current.to_string().replace(url.as_str(), "<endpoint>"),
-                None => current.to_string(),
-            }
-        } else {
-            current.to_string()
-        };
-        if !text.contains(&part) {
-            if !first {
-                text.push_str(": ");
-            }
-            text.push_str(&part);
-        }
-        first = false;
-        source = current.source();
-    }
-    text
-}
-
-/// Read at most `limit` bytes of the body. Returns the bytes and whether the
-/// whole body fit; reading stops at the first chunk that would cross the
-/// limit, and a declared length over it is refused before any read.
-async fn read_bounded(
-    response: &mut reqwest::Response,
-    limit: usize,
-) -> Result<(Vec<u8>, bool), Failure> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Ok((Vec::new(), false));
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| Failure::transport(&error, "read response"))?
-    {
-        let room = limit - bytes.len();
-        if chunk.len() > room {
-            bytes.extend_from_slice(&chunk[..room]);
-            return Ok((bytes, false));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok((bytes, true))
 }
 
 /// Classify an error status. With `quote` false (an authenticated request)
@@ -666,144 +347,6 @@ fn mentions_context_length(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body).to_lowercase();
     text.contains("context")
         && (text.contains("length") || text.contains("too long") || text.contains("maximum"))
-}
-
-/// At most [`ERROR_EXCERPT_BYTES`] of `bytes`, UTF-8-lossy, without control
-/// characters.
-fn excerpt(bytes: &[u8]) -> String {
-    let head = &bytes[..bytes.len().min(ERROR_EXCERPT_BYTES)];
-    let mut text = String::new();
-    for character in String::from_utf8_lossy(head).chars() {
-        if character.is_control() {
-            continue;
-        }
-        if text.len() + character.len_utf8() > ERROR_EXCERPT_BYTES {
-            break;
-        }
-        text.push(character);
-    }
-    text
-}
-
-/// The delay before attempt `attempt + 1`: the server's `Retry-After` when it
-/// sent one, otherwise full jitter over exponential backoff, both capped at
-/// `retry_max_delay`.
-fn retry_delay(
-    config: &OpenAiCompatConfig,
-    attempt: u32,
-    retry_after: Option<Duration>,
-    jitter: &mut Jitter,
-) -> Duration {
-    if let Some(retry_after) = retry_after {
-        return retry_after.min(config.retry_max_delay);
-    }
-    let factor = 1_u32
-        .checked_shl(attempt.saturating_sub(1))
-        .unwrap_or(u32::MAX);
-    let ceiling = config
-        .retry_base_delay
-        .saturating_mul(factor)
-        .min(config.retry_max_delay);
-    let ceiling_ms = u64::try_from(ceiling.as_millis()).unwrap_or(u64::MAX);
-    Duration::from_millis(jitter.next() % ceiling_ms.saturating_add(1))
-}
-
-/// A xorshift64* generator seeded from the session ID and turn, so retry
-/// delays are reproducible within a session and differ between sessions.
-struct Jitter(u64);
-
-impl Jitter {
-    fn new(session_id: &str, turn: u32) -> Self {
-        // FNV-1a over the session ID, then the turn.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in session_id.bytes().chain(turn.to_le_bytes()) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        Self(if hash == 0 {
-            0x9e37_79b9_7f4a_7c15
-        } else {
-            hash
-        })
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut state = self.0;
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        self.0 = state;
-        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-}
-
-/// `Retry-After` as delta-seconds or an IMF-fixdate HTTP date. Other forms
-/// are ignored and the jittered backoff applies.
-fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
-    let value = value.trim();
-    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        // Anything too long for u64 is far beyond the cap anyway.
-        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
-    }
-    let at = parse_http_date(value)?;
-    let now = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(Duration::from_secs(at.saturating_sub(now)))
-}
-
-/// Seconds since the Unix epoch for an IMF-fixdate such as
-/// `Sun, 06 Nov 1994 08:49:37 GMT`.
-fn parse_http_date(value: &str) -> Option<u64> {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let mut parts = value.split(' ');
-    let weekday = parts.next()?;
-    let day = parts.next()?;
-    let month = parts.next()?;
-    let year = parts.next()?;
-    let time = parts.next()?;
-    if parts.next()? != "GMT" || parts.next().is_some() {
-        return None;
-    }
-    if weekday.len() != 4 || !weekday.ends_with(',') || day.len() != 2 || year.len() != 4 {
-        return None;
-    }
-    let digits = |text: &str| -> Option<u64> {
-        if text.bytes().all(|byte| byte.is_ascii_digit()) {
-            text.parse().ok()
-        } else {
-            None
-        }
-    };
-    let day = digits(day)?;
-    let month = MONTHS.iter().position(|name| *name == month)? as u64 + 1;
-    let year = digits(year)?;
-    let mut clock = time.split(':');
-    let (hour, minute, second) = (
-        digits(clock.next()?)?,
-        digits(clock.next()?)?,
-        digits(clock.next()?)?,
-    );
-    if clock.next().is_some() || time.len() != 8 {
-        return None;
-    }
-    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 || year < 1970 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day)?;
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
-}
-
-/// Days from 1970-01-01 to the given proleptic Gregorian date (Howard
-/// Hinnant's algorithm), for years from 1970.
-fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year / 400;
-    let year_of_era = year - era * 400;
-    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    (era * 146_097 + day_of_era).checked_sub(719_468)
 }
 
 /// The request body for one completion.
@@ -893,10 +436,6 @@ fn wire_temperature(temperature: f32) -> f64 {
         .unwrap_or_else(|_| f64::from(temperature))
 }
 
-fn invalid(message: impl Into<String>) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::InvalidResponse, message)
-}
-
 /// Map a parsed response body to the harness's response.
 ///
 /// # Errors
@@ -964,29 +503,6 @@ fn parse_response_quoting(
     };
     check_completion_tokens(&response)?;
     Ok(response)
-}
-
-/// Refuse a completion count that cannot be right for the output kept: zero
-/// for non-empty output, or fewer than one token per
-/// [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of it. Real tokenizers average a few
-/// bytes per token and rarely exceed 16, so the floor only catches gross
-/// under-reporting. Token counts are trusted for cost; the engine bounds
-/// output size separately in bytes.
-fn check_completion_tokens(response: &ModelResponse) -> Result<(), ProviderError> {
-    let output_bytes = response.output_bytes();
-    let completion = response.usage.output_tokens;
-    if output_bytes > 0 && completion == 0 {
-        return Err(invalid(
-            "usage reports zero completion tokens for non-empty output",
-        ));
-    }
-    if completion.saturating_mul(MAX_OUTPUT_BYTES_PER_TOKEN) < output_bytes {
-        return Err(invalid(format!(
-            "usage reports {completion} completion tokens for {output_bytes} bytes of output, \
-             more than {MAX_OUTPUT_BYTES_PER_TOKEN} bytes per token"
-        )));
-    }
-    Ok(())
 }
 
 fn parse_tool_call(call: &Value, turn: u32, position: usize) -> Result<ToolCall, ProviderError> {
@@ -1098,79 +614,6 @@ mod tests {
         https.api_key = Some(SecretString::new("sk test"));
         let error = https.validate().expect_err("space in key");
         assert!(!error.to_string().contains("sk test"));
-    }
-
-    #[test]
-    fn retry_after_accepts_seconds_and_http_dates() {
-        let now = UNIX_EPOCH + Duration::from_secs(784_111_777); // Sun, 06 Nov 1994 08:49:37 GMT
-        assert_eq!(parse_retry_after("7", now), Some(Duration::from_secs(7)));
-        assert_eq!(
-            parse_retry_after("Sun, 06 Nov 1994 08:49:47 GMT", now),
-            Some(Duration::from_secs(10))
-        );
-        assert_eq!(
-            parse_retry_after("Sun, 06 Nov 1994 08:49:00 GMT", now),
-            Some(Duration::ZERO),
-            "a date in the past means retry now"
-        );
-        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
-        assert_eq!(
-            parse_http_date("Tue, 29 Feb 2028 12:00:00 GMT"),
-            Some(1_835_438_400)
-        );
-        for bad in [
-            "",
-            "-1",
-            "1.5",
-            "Sunday, 06-Nov-94 08:49:37 GMT",
-            "Sun Nov  6 08:49:37 1994",
-            "Sun, 06 Nov 1994 08:49:37 UTC",
-            "Sun, 6 Nov 1994 08:49:37 GMT",
-            "Sun, 06 Foo 1994 08:49:37 GMT",
-            "Sun, 06 Nov 1994 24:00:00 GMT",
-        ] {
-            assert_eq!(parse_retry_after(bad, now), None, "{bad:?}");
-        }
-        assert_eq!(
-            parse_retry_after("99999999999999999999999", now),
-            Some(Duration::from_secs(u64::MAX))
-        );
-    }
-
-    #[test]
-    fn backoff_is_full_jitter_capped_and_reproducible() {
-        let config = config();
-        let delays = |session: &str| {
-            let mut jitter = Jitter::new(session, 1);
-            (1..=8)
-                .map(|attempt| retry_delay(&config, attempt, None, &mut jitter))
-                .collect::<Vec<_>>()
-        };
-        let first = delays("hs-1");
-        assert_eq!(first, delays("hs-1"));
-        assert_ne!(first, delays("hs-2"));
-        for (index, delay) in first.iter().enumerate() {
-            let ceiling = config
-                .retry_base_delay
-                .saturating_mul(1 << index)
-                .min(config.retry_max_delay);
-            assert!(*delay <= ceiling, "{delay:?} > {ceiling:?}");
-        }
-        let mut jitter = Jitter::new("hs-1", 1);
-        assert_eq!(
-            retry_delay(&config, 1, Some(Duration::from_secs(3600)), &mut jitter),
-            config.retry_max_delay
-        );
-    }
-
-    #[test]
-    fn excerpts_are_bounded_and_printable() {
-        let mut body = b"bad\x00\x1b[31m\r\nrequest ".to_vec();
-        body.extend(std::iter::repeat_n(0xe2_u8, 2000));
-        let text = excerpt(&body);
-        assert!(text.len() <= ERROR_EXCERPT_BYTES);
-        assert!(text.starts_with("bad[31mrequest "), "{text:?}");
-        assert!(!text.chars().any(char::is_control));
     }
 
     #[test]

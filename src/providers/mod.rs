@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use crate::tools::ToolLimits;
 
+pub mod http;
 pub mod openai_compat;
 
 pub use openai_compat::{OpenAiCompatConfig, OpenAiCompatError, OpenAiCompatProvider};
