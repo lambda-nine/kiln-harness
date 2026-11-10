@@ -27,7 +27,15 @@ change the CLI or audit format.
   alias its source.
 - The VM integration check compares residue against a pre-run snapshot of
   node reservations and non-deleted sandboxes instead of zero.
-
+- Second review round: the grammar binds tool calls, results, and request
+  hashes; replay diverges at the first tool result that differs; unconfirmed
+  create recovery ends `cleanup_failed`; journal directories are walked
+  through pinned descriptors and sources opened non-blocking; replay compares
+  outputs with its source by open descriptor; and verification checks recorded
+  limits against the hard ceilings. `rustix` becomes a direct Unix
+  dependency (already locked through `tempfile`).
+- Journals written before these review fixes do not load. `JOURNAL_SCHEMA`
+  stays 1 because the journal format has not been released.
 - Prepare the repository for public visibility: add the Apache-2.0 `LICENSE`
   (matching kiln and kilnd), `SECURITY.md` with private vulnerability
   reporting and scope, this changelog, and a README opening for new readers

@@ -37,12 +37,16 @@ it is not a hostile multi-tenant boundary.
   a trusted host-side file created new with mode 0600 and is never placed in or
   mounted into a sandbox. Readers and writers bound file and line sizes, and
   writers never buffer a record past the line limit.
-- The journal directory must be operator-owned, and the harness enforces this:
-  the resolved parent belongs to the current user and is writable by no one
-  else, and every ancestor belongs to root or that user and is sticky if
-  others can write it. `replay` refuses any audit or journal path that is the
-  same file as its source, including hard links and symlinks, and holds the
-  source open read-only.
+- The journal directory must be operator-owned, and the harness enforces this
+  through pinned descriptors: every directory from `/` down is opened without
+  following links and checked by `fstat`, the final one belongs to the
+  effective user and is writable by no one else, every ancestor belongs to
+  root or that user and is sticky if others can write it, and the file is
+  created relative to the verified directory. Journal sources are opened
+  without following links and non-blocking, then required to be regular files
+  by `fstat`. `replay` holds its source open read-only and refuses any output
+  whose open descriptor is the same file as the source or the other output,
+  so relinking a path after the checks cannot redirect a write.
 - Provider credentials must never be journaled. No provider handles one yet;
   adapters must keep keys out of `ModelRequest`, `ModelResponse`, and provider
   error messages.
@@ -76,15 +80,16 @@ it is not a hostile multi-tenant boundary.
 - The journal's hash chain detects accidental corruption, reordering, and
   dropped middle records. It is not tamper-proof: anyone who can write the file
   can rewrite the chain. A missing tail shows only as `complete: false`, and a
-  torn final line is rejected. The event grammar rejects impossible orders and
-  terminal records that contradict the session, but a rewriter who keeps both
-  consistent is not detected.
-- `read_journal` checks that the path is a regular file before opening it. A
-  user who can swap that path between the check and the open could substitute
-  a FIFO and block the reader; journal paths are trusted operator paths.
+  torn final line is rejected. The event grammar binds every tool call to the
+  model's sanitized call and every result that fed a later request to that
+  request's hash, and rejects impossible orders and terminal records that
+  contradict the session; a rewriter who forges a consistent session,
+  including its requests, is not detected. Results of a final tool turn are
+  bound only by replay.
 - Replay trusts the journal it reads, but replayed responses pass through the
   same loop checks and budgets as live ones. It reproduces model responses,
-  not sandbox state, and detects divergence by SHA-256 over request content.
+  not sandbox state, and detects divergence by comparing each tool call and
+  result with the recording and by SHA-256 over request content.
 - kilnd persists bounded command output in its root-only SQLite database. The
   harness audit excludes it, but callers must still avoid printing host secrets
   into a sandbox command.

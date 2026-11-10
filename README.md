@@ -99,19 +99,25 @@ cargo run --locked -- journal verify journal/demo-<unix_ms>.jsonl
 cargo run --locked -- replay --from journal/demo-<unix_ms>.jsonl --audit audit/replay.jsonl
 ```
 
-`journal verify` runs offline. It checks limits, the hash chain, and the event
-grammar (pairing, order, and a terminal record consistent with the session),
-then prints the session, record count, outcome, whether the sandbox was
-deleted, turns, tool calls, and token usage. A session whose sandbox deletion
-was not confirmed ends `cleanup_failed`. `replay` reruns the recorded task
-under every recorded model-visible limit in a fresh sandbox and answers each
-model request from the journal, after checking that the request, including its
-output-token cap, hashes the same as the recorded one. It refuses output paths
-that are the same file as the source. It prints `reproduced` only when a
-completed recording replays to the same final answer with every turn
-consumed. Otherwise it prints `diverged at turn N`, the
-first turn whose request differed because the sandbox returned different tool
-results, and exits non-zero.
+`journal verify` runs offline. It checks size limits, the hash chain, the
+recorded limits against the hard ceilings, and the event grammar: pairing,
+order, each tool record against the model's sanitized call, each request's
+message count and hash against the history rebuilt from the records, and a
+terminal record consistent with the session. It then prints the session,
+record count, outcome, whether the sandbox was deleted, turns, tool calls, and
+token usage. A session whose sandbox deletion was not confirmed ends
+`cleanup_failed`.
+
+`replay` reruns the recorded task under every recorded model-visible limit in
+a fresh sandbox. It answers each model request from the journal after
+checking that the request, including its output-token cap, hashes the same as
+the recorded one, and compares each tool call and result with the recording as
+it completes. Before contacting kilnd it opens its outputs and refuses if any
+of them is the same open file as the source. It prints `reproduced` only when a
+completed recording replays to the same final answer with every turn and tool
+call consumed. Otherwise it prints `diverged at turn N`, the first turn where
+a tool result or a request differed because the sandbox answered differently,
+and exits non-zero.
 
 ## Checks
 

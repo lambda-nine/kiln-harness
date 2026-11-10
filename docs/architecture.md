@@ -40,7 +40,8 @@ No harness code depends on kiln files, process layout, or CLI behavior.
 6. Write audit `session_finished` and journal `session_ended` with the outcome,
    the work outcome, counters, usage, and whether deletion was confirmed. When
    deletion is unconfirmed the outcome is `cleanup_failed`, never the work's
-   own result. Every path after step 1 does this, including create failure.
+   own result. Every path after step 1 does this, including create failure,
+   cancellation, and a create deadline whose sandbox was never observed.
 
 Create shares the 30-second session wall deadline. Every request has unique
 `owner` and `session` labels. If its response is lost or times out, the harness
@@ -153,33 +154,45 @@ exact line bytes (64 zeros for the first). Events are `session_started`,
 model-visible limit (steps, calls, timeouts, token budgets, argument and
 final-answer bounds, and all tool limits); lifecycle windows are not recorded.
 
-`JsonlJournal` canonicalizes the parent and creates a new 0600 file inside the
-resolved directory, refusing an existing path. That directory must be owned by
-the current user and writable by no one else, and every ancestor must be owned
-by root or that user and be sticky if group- or world-writable. The handle
-must match the path's device and inode afterwards. It syncs data after every
-record, serializes each record through a writer that stops at the line limit,
+`JsonlJournal` resolves the parent once to an absolute starting path, then
+walks it from `/` through pinned descriptors: each component is opened
+relative to the previous directory with `O_DIRECTORY | O_NOFOLLOW`, created
+with mode 0700 if missing, and checked with `fstat`. Every directory must be
+owned by root or the effective user and be sticky if group- or world-writable,
+and the final one must be owned by the effective user and writable by no one
+else. The file is created relative to that verified descriptor with
+`O_CREAT | O_EXCL | O_NOFOLLOW` and mode 0600, so swapping a directory by path
+cannot redirect it. It syncs data after every record, serializes each record through a writer that stops at the line limit,
 and refuses further writes after `session_ended` or a failed write. A journal write failure
 ends work exactly like an audit failure; cleanup still runs.
 
-`read_journal` reads at most 64 MiB through a bounded reader and accepts lines
-up to 8 MiB. It requires schema 1, `session_started` first and only once, one
-session ID, contiguous sequences, an intact chain, a newline after every
-record, and nothing after `session_ended`. Writers enforce the same limits.
-`complete` is true when the last record is `session_ended`.
+`read_journal` opens the source with `O_NOFOLLOW | O_NONBLOCK`, requires a
+regular file by `fstat` on that descriptor, and only then makes it blocking, so
+a FIFO cannot stall it. It reads at most 64 MiB through a bounded reader and
+accepts lines up to 8 MiB. It requires schema 1, `session_started` first and
+only once, one session ID, contiguous sequences, an intact chain, a newline
+after every record, and nothing after `session_ended`. Writers enforce the same
+limits. `complete` is true when the last record is `session_ended`.
 
-Writers and readers also run one `Grammar` over the events. `sandbox_ready`
-appears at most once, before any request, and a request needs it. Requests
-run turn 1, 2, … and each is answered by exactly one `model_responded` or
-`model_failed` before the next; nothing but `session_ended` follows a failure
-or a response without tool calls. After a response with n calls, up to n
-`tool_executed` records follow with indexes 1, 2, … and the response's call
-IDs in order; fewer only when the session then ends. `session_ended` must
-agree with the records: its tool-call count, last turn, and usage sum. Work
-outcome `completed` needs a final response in the last turn whose text is the
-final answer, the outcome `completed` needs confirmed deletion,
-`cleanup_failed` means deletion was not confirmed, and a request may stay
-unanswered only if the work did not complete.
+Writers and readers also run one `Grammar` over the events. Recorded limits
+must pass the engine's hard ceilings. `sandbox_ready` appears at most once,
+before any request, and a request needs it. Requests run turn 1, 2, … and each
+is answered by exactly one `model_responded` or `model_failed` before the next;
+nothing but `session_ended` follows a failure or a response without tool calls.
+After a response with n calls, up to n `tool_executed` records follow with
+indexes 1, 2, …, and each call must equal the response's call after the shared
+`sanitize_call` (unregistered names become `unknown`, oversized arguments the
+`omitted` marker); fewer only when the session then ends. The grammar rebuilds
+the message history from the task, each response, and each tool result exactly
+as the engine does, and every `model_requested` must carry that history's
+message count and request hash, so every result that fed a later request is
+bound to its record. Results of a final tool turn feed no later request; only
+replay checks those. `session_ended` must agree with the records: its tool-call
+count, last turn, and usage sum. Work outcome `completed` needs a final
+response in the last turn whose text is the final answer, the outcome
+`completed` needs confirmed deletion, `cleanup_failed` is required exactly when
+deletion was not confirmed, and a request may stay unanswered only if the work
+did not complete.
 
 `request_sha256` hashes the versioned layout `{"v", "system", "tools",
 "messages", "max_output_tokens"}` encoded by serde_json. The session ID is
@@ -195,10 +208,17 @@ Equal requests therefore hash equally before and after a journal round trip.
 failure. For each request it checks the turn number and recomputes the hash;
 on a mismatch it records `diverged_at` and returns a non-retryable
 `ReplayDiverged` error, otherwise it returns the recorded response or rebuilt
-error. Running out of recorded turns is a `Script` error. It rechecks the
-grammar when loading and reports `exhausted()` once every turn was replayed.
-The CLI prints `reproduced` only for a completed recording replayed to the
-same final answer with no divergence and every turn consumed. The recorded
+error. Running out of recorded turns is a `Script` error. After each tool call
+the engine calls `Provider::tool_completed`; replay compares the sanitized call,
+`ok`, and result with the next recorded `tool_executed` and diverges at that
+turn on a mismatch, before the result reaches another request. It rechecks the
+grammar when loading and reports `exhausted()` once every turn and tool call
+was matched. The CLI prints `reproduced` only for a completed recording
+replayed to the same final answer with no divergence and everything consumed.
+Before contacting kilnd it opens the source read-only and both outputs, and
+compares device and inode by `fstat` on the open descriptors; path checks
+before that are diagnostics only. On a clash it removes only the outputs it
+created that are still empty. The recorded
 task and limits, which must pass the same ceilings, drive the replayed
 session, which uses a new sandbox, session ID,
 audit, and journal. Since the model side is fixed, a divergence means kilnd
