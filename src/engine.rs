@@ -999,6 +999,22 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
             "harness budgets must be positive and within their hard ceilings".to_string(),
         ));
     }
+    // Journals record durations in whole milliseconds. Refuse anything finer
+    // so a recorded limit always restores to exactly the value that ran.
+    let durations = [
+        config.session_timeout,
+        tools.timeout,
+        config.lifecycle_timeout,
+        config.lifecycle_retry_delay,
+    ];
+    if durations
+        .iter()
+        .any(|duration| duration.subsec_nanos() % 1_000_000 != 0)
+    {
+        return Err(HarnessError::InvalidModelCall(
+            "session, tool, and lifecycle durations must be whole milliseconds".to_string(),
+        ));
+    }
     Ok(())
 }
 

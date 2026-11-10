@@ -1345,3 +1345,49 @@ async fn a_forged_result_in_the_last_tool_turn_diverges_at_that_tool() {
     assert!(!replay.provider().exhausted());
     assert_eq!(observer.state().deleted.len(), 1);
 }
+
+#[tokio::test]
+async fn sub_millisecond_durations_are_refused_before_anything_is_journaled() {
+    for micros in [1_500, 500] {
+        for which in ["tool", "session"] {
+            let mut config = short_lifecycle_config();
+            match which {
+                "tool" => config.tool_limits.timeout = Duration::from_micros(micros),
+                _ => config.session_timeout = Duration::from_micros(micros),
+            }
+            let api = FakeApi::default();
+            let observer = api.clone();
+            let mut harness = Harness::new(
+                api,
+                ScriptedProvider::demo(),
+                MemoryAudit::default(),
+                MemoryJournal::default(),
+                config,
+            );
+
+            let error = harness
+                .run(&SessionTask::demo(), CancellationToken::new())
+                .await
+                .expect_err("a fractional millisecond cannot be recorded exactly");
+
+            assert!(
+                matches!(&error, HarnessError::InvalidModelCall(message)
+                    if message.contains("whole milliseconds")),
+                "{which} {micros}us: {error}"
+            );
+            assert!(
+                harness.journal().records.is_empty(),
+                "nothing was journaled"
+            );
+            assert!(harness.audit().records.is_empty());
+            assert!(observer.state().creates.is_empty());
+        }
+    }
+
+    // Whole milliseconds round-trip exactly.
+    let mut config = HarnessConfig::default();
+    config.tool_limits.timeout = Duration::from_millis(1_234);
+    let mut restored = HarnessConfig::default();
+    restored.apply_limits(&config.limits());
+    assert_eq!(restored.tool_limits.timeout, Duration::from_millis(1_234));
+}
