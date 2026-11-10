@@ -150,6 +150,12 @@ pub(crate) enum Existing {
 /// A device and inode, from rustix's `stat` on every side of a comparison.
 type Identity = (u64, u64);
 
+/// `st_mode` is `u16` on macOS and `u32` on Linux.
+#[allow(clippy::useless_conversion)]
+fn mode_bits(stat: &rustix::fs::Stat) -> u32 {
+    u32::from(stat.st_mode)
+}
+
 #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
 fn identity(stat: &rustix::fs::Stat) -> Identity {
     (stat.st_dev as u64, stat.st_ino as u64)
@@ -379,7 +385,7 @@ fn walk_error(path: &Path, entry: Option<(&OwnedFd, &OsStr)>, error: Errno) -> O
         entry.and_then(|(parent, name)| {
             rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
                 .ok()
-                .map(|stat| u32::from(stat.st_mode))
+                .map(|stat| mode_bits(&stat))
         })
     };
     let problem = match error {
@@ -402,7 +408,7 @@ fn check_directory(
     is_final: bool,
 ) -> Result<(), OutputError> {
     let stat = rustix::fs::fstat(directory)?;
-    let mode = u32::from(stat.st_mode);
+    let mode = mode_bits(&stat);
     let owner = stat.st_uid;
     let problem = if is_final {
         if owner != euid {
