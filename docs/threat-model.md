@@ -37,19 +37,30 @@ it is not a hostile multi-tenant boundary.
   a trusted host-side file created new with mode 0600 and is never placed in or
   mounted into a sandbox. Readers and writers bound file and line sizes, and
   writers never buffer a record past the line limit.
-- The journal directory must be operator-owned, and the harness enforces this
-  through pinned descriptors: every directory from `/` down is opened without
-  following links and checked by `fstat`, the final one belongs to the
-  effective user and is writable by no one else, every ancestor belongs to
-  root or that user and is sticky if others can write it, and the file is
-  created relative to the verified directory. Journal sources are opened
+- The journal and audit directories must be operator-owned, and the harness
+  enforces this through pinned descriptors: every directory from `/` down is
+  opened without following links (so it must be readable and searchable by
+  the operator) and checked by `fstat`, the final one belongs to the effective
+  user and is writable by no one else, every ancestor belongs to root or that
+  user and is sticky if others can write it, and the file is created relative
+  to the verified directory. On Linux, POSIX ACL entries for named users and
+  groups show in the group mode bits as the ACL mask and are refused with
+  them, and the explicit modes of created files and directories reset the
+  mask, capping an inherited default ACL. On macOS the directory rule checks
+  ownership and mode bits only; extended ACLs are not inspected. Do not place
+  journals under a directory with inheritable ACLs. Journal sources are opened
   without following links and non-blocking, then required to be regular files
   by `fstat`. `replay` holds its source open read-only and refuses any output
   whose open descriptor is the same file as the source or the other output,
   so relinking a path after the checks cannot redirect a write. A
   group-writable directory is refused even when its group is the user's own:
   on macOS that group is the shared `staff`. Directories and files the harness
-  creates get 0700 and 0600 explicitly, whatever the umask.
+  creates get 0700 and 0600 explicitly, whatever the umask. A failed or
+  refused open removes what it created through the pinned parent
+  descriptors, checking with `fstatat` that each entry is still the one it
+  made and empty. A name could change between that check and `unlinkat`, but
+  only by someone who can write the parent, which the walk verified is only
+  the operator.
 - Provider credentials must never be journaled. No provider handles one yet;
   adapters must keep keys out of `ModelRequest`, `ModelResponse`, and provider
   error messages.
@@ -88,7 +99,9 @@ it is not a hostile multi-tenant boundary.
   request's hash, and rejects impossible orders and terminal records that
   contradict the session; a rewriter who forges a consistent session,
   including its requests, is not detected. Results of a final tool turn are
-  bound only by replay.
+  bound only by replay. The grammar also applies the recorded limits as the
+  engine does, so a journal cannot continue past a step, call, token, or
+  text budget, or past a refused response.
 - Replay trusts the journal it reads, but replayed responses pass through the
   same loop checks and budgets as live ones. It reproduces model responses,
   not sandbox state, and detects divergence by comparing each tool call and

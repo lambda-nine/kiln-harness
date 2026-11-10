@@ -154,20 +154,30 @@ exact line bytes (64 zeros for the first). Events are `session_started`,
 model-visible limit (steps, calls, timeouts, token budgets, argument and
 final-answer bounds, and all tool limits); lifecycle windows are not recorded.
 
-`JsonlJournal` resolves the parent once to an absolute starting path, then
-walks it from `/` through pinned descriptors: each component is opened relative
-to the previous directory with `O_DIRECTORY | O_NOFOLLOW`, created with mode
-0700 if missing (set again with `fchmod`, so neither the umask nor a default
-ACL widens it), and checked with `fstat`. Every directory must be owned by root
-or the effective user and be sticky if group- or world-writable, and the final
-one must be owned by the effective user and writable by no one else. The file
-is created relative to that verified descriptor with `O_CREAT | O_EXCL |
-O_NOFOLLOW` and mode 0600 (also set with `fchmod`), so swapping a directory by
-path cannot redirect it. A refusal names the directory, its mode, and the fix.
-It syncs data after every record, serializes each record through a writer that
-stops at the line limit, and refuses further writes after `session_ended` or a
-failed write. A journal write failure ends work exactly like an audit failure;
-cleanup still runs.
+The journal and the audit share one opener. It refuses a path whose raw bytes
+are empty, end in `/`, or end in `.` or `..`, resolves the parent once to an
+absolute starting path, then walks it from `/` through pinned descriptors: each
+component is opened relative to the previous directory with `O_RDONLY |
+O_DIRECTORY | O_NOFOLLOW`, created with mode 0700 if missing (set again with
+`fchmod`), and checked with `fstat`. Every directory must be readable and
+searchable by the effective user (the walk opens it), owned by root or that
+user, and sticky if group- or world-writable, and the final one must be owned
+by that user and writable by no one else. The file is created relative to that
+verified descriptor with `O_CREAT | O_EXCL | O_NOFOLLOW` (an existing audit is
+reopened for appending) and mode 0600, also set with `fchmod`, so swapping a
+directory by path cannot redirect it. On Linux, ACL entries for named users and
+groups appear in the group mode bits as the ACL mask, so the mode check covers
+them, and the explicit modes reset the mask of what is created, capping an
+inherited default ACL. On macOS the rule checks ownership and mode bits only;
+extended ACLs are not inspected. A refusal names the directory, its mode, and
+the fix. The opener records each directory it creates with its pinned parent
+descriptor, name, and identity; if anything later fails, it removes the new
+file and then the new directories, newest first, through those descriptors and
+only if `fstatat` still shows the same empty entry. `discard` does the same for
+an output nobody has written to yet. The journal syncs data after every record,
+serializes each record through a writer that stops at the line limit, and
+refuses further writes after `session_ended` or a failed write. A journal write
+failure ends work exactly like an audit failure; cleanup still runs.
 
 `read_journal` opens the source with `O_NOFOLLOW | O_NONBLOCK`, requires a
 regular file by `fstat` on that descriptor, and only then makes it blocking, so
@@ -197,6 +207,15 @@ response in the last turn whose text is the final answer, the outcome
 deletion was not confirmed, and a request may stay unanswered only if the work
 did not complete.
 
+The grammar also applies the engine's acceptance rules with the recorded
+limits. Requests stop at `max_steps`, and tool records at `max_tool_calls` in
+total and `max_tool_calls_per_turn` in a turn. A response the engine refuses (a
+token budget or the per-request output cap exceeded, a `max_tokens` or
+`refusal` stop, invalid or repeated call IDs, too many calls, or text over its
+byte bound) may be recorded, because the engine records it before refusing it,
+but nothing but `session_ended` may follow it and it cannot complete the
+session.
+
 `request_sha256` hashes the versioned layout `{"v", "system", "tools",
 "messages", "max_output_tokens"}` encoded by serde_json. The session ID is
 excluded because a replay runs under a fresh session; the turn is compared
@@ -212,16 +231,18 @@ failure. For each request it checks the turn number and recomputes the hash;
 on a mismatch it records `diverged_at` and returns a non-retryable
 `ReplayDiverged` error, otherwise it returns the recorded response or rebuilt
 error. Running out of recorded turns is a `Script` error. After each tool call
-the engine calls `Provider::tool_completed`; replay compares the sanitized call,
-`ok`, and result with the next recorded `tool_executed` and diverges at that
-turn on a mismatch, before the result reaches another request. It rechecks the
-grammar when loading and reports `exhausted()` once every turn and tool call
-was matched. The CLI prints `reproduced` only for a completed recording
+is journaled, an interrupted one included, the engine calls
+`Provider::tool_completed`; replay compares the sanitized call, `ok`, and
+result with the next recorded `tool_executed` and diverges at that turn on a
+mismatch, before the result reaches another request. A call or request the
+recording does not match counts as unexpected. It rechecks the grammar when
+loading, and `exhausted()` is true only when every turn and tool call was
+matched and nothing unexpected happened. The CLI prints `reproduced` only for a completed recording
 replayed to the same final answer with no divergence and everything consumed.
 Before contacting kilnd it opens the source read-only and both outputs, and
 compares device and inode by `fstat` on the open descriptors; path checks
-before that are diagnostics only. On a clash it removes only the outputs it
-created that are still empty. The recorded
+before that are diagnostics only. On a clash it discards both outputs, which
+removes only what their opens created, through the pinned parent descriptors. The recorded
 task and limits, which must pass the same ceilings, drive the replayed
 session, which uses a new sandbox, session ID,
 audit, and journal. Since the model side is fixed, a divergence means kilnd

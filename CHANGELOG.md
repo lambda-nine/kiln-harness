@@ -34,6 +34,14 @@ change the CLI or audit format.
   outputs with its source by open descriptor; and verification checks recorded
   limits against the hard ceilings. `rustix` becomes a direct Unix
   dependency (already locked through `tempfile`).
+- Third review round: the grammar enforces the engine's acceptance limits
+  (steps, call budgets, token budgets, refused responses); interrupted tools
+  reach `Provider::tool_completed` and replay counts unexpected calls;
+  durations must be whole milliseconds; output paths must name a file; the
+  audit uses the journal's directory walk and policy; unreadable ancestors are
+  refused by name; failed or refused opens roll back what they created through
+  pinned descriptors; and clippy is clean for Linux targets. On macOS,
+  extended ACLs are not inspected, which is documented.
 - Journals written before these review fixes do not load. `JOURNAL_SCHEMA`
   stays 1 because the journal format has not been released.
 - Prepare the repository for public visibility: add the Apache-2.0 `LICENSE`

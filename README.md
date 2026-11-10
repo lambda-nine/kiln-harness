@@ -119,15 +119,24 @@ call consumed. Otherwise it prints `diverged at turn N`, the first turn where
 a tool result or a request differed because the sandbox answered differently,
 and exits non-zero.
 
-Journal directories follow ssh's `StrictModes`: the journal's own directory
-must belong to you and be writable by no one else, and every directory above
-it must belong to you or root and be sticky if others can write it. On
-systems with a user-private-group umask of `0002`, such as Ubuntu, a checkout
-can be group-writable and is then refused as a journal ancestor. The error
-names the directory and its mode. Fix it with `chmod g-w <dir>`, or pass
-`--journal` a path under a private directory such as one made with
-`mkdir -m 700`. Directories the harness creates are always 0700 and journals
-0600, whatever the umask.
+Journal and audit directories follow ssh's `StrictModes`: the output's own
+directory must belong to you and be writable by no one else, and every
+directory above it must belong to you or root, be readable and searchable by
+you, and be sticky if others can write it. On systems with a
+user-private-group umask of `0002`, such as Ubuntu, a checkout can be
+group-writable and is then refused as an ancestor. The error names the
+directory and its mode. Fix it with `chmod g-w <dir>`, or pass `--journal` or
+`--audit` a path under a private directory such as one made with
+`mkdir -m 700`. Directories the harness creates are always 0700 and its files
+0600, whatever the umask, and a failed or refused open removes what it
+created. On Linux, POSIX ACL entries show in the mode bits and are checked
+with them. On macOS the directory rule checks ownership and mode bits only;
+extended ACLs are not inspected. Do not place journals under a directory with
+inheritable ACLs.
+
+Journal and audit paths must name a file: an empty path, a trailing `/`, or a
+final `.` or `..` is refused. Durations in the configuration must be whole
+milliseconds, the unit the journal records.
 
 ## Checks
 

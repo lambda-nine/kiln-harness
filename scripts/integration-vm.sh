@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
 
-# The host suite first, as the invoking user rather than root: once with
-# that user's umask and once with Ubuntu's user-private-group default, under
-# which a careless test directory would be group-writable.
+# Linux clippy and the host suite first, as the invoking user rather than
+# root: the suite once with that user's umask and once with Ubuntu's
+# user-private-group default, under which a careless test directory would be
+# group-writable.
 test "$(id -u)" != 0
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 (umask 0002 && cargo test --locked)
 
