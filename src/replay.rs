@@ -51,6 +51,8 @@ pub struct ReplayProvider {
     final_answer: Option<String>,
     outcome: Option<String>,
     diverged_at: Option<u32>,
+    /// Requests and tool calls the recording did not match.
+    unexpected: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +106,7 @@ impl ReplayProvider {
             final_answer: None,
             outcome: None,
             diverged_at: None,
+            unexpected: 0,
         };
         // The grammar has paired every request with one answer in turn order.
         let mut pending: Option<(u32, String)> = None;
@@ -189,7 +192,14 @@ impl ReplayProvider {
     /// True once every recorded model turn and tool call has been replayed.
     #[must_use]
     pub fn exhausted(&self) -> bool {
-        self.turns.is_empty() && self.tools.is_empty()
+        self.turns.is_empty() && self.tools.is_empty() && self.unexpected == 0
+    }
+
+    /// Record a request or tool call the recording does not match. The first
+    /// one sets `diverged_at`.
+    fn mark_unexpected(&mut self, turn: u32) {
+        self.unexpected = self.unexpected.saturating_add(1);
+        self.diverged_at.get_or_insert(turn);
     }
 
     /// The first turn whose request differed from the recording.
@@ -210,9 +220,9 @@ impl Provider for ReplayProvider {
         result: &Value,
     ) -> Result<(), ProviderError> {
         // A tool that answers differently diverges here, before its result
-        // reaches the next request.
-        // Only a matching call consumes its record, so a divergence leaves
-        // the replay unexhausted.
+        // reaches the next request. Only a matching call consumes its
+        // record; any other call, including one with no recorded
+        // counterpart, counts as unexpected and keeps the replay unexhausted.
         let matches = self.tools.front().is_some_and(|recorded| {
             recorded.turn == turn
                 && recorded.index == index
@@ -224,7 +234,7 @@ impl Provider for ReplayProvider {
             self.tools.pop_front();
             return Ok(());
         }
-        self.diverged_at = Some(turn);
+        self.mark_unexpected(turn);
         Err(ProviderError::new(
             ProviderErrorKind::ReplayDiverged,
             format!("turn {turn} tool call {index} differs from the recording"),
@@ -240,13 +250,14 @@ impl Provider for ReplayProvider {
         request: ModelRequest<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let Some(recorded) = self.turns.pop_front() else {
+            self.unexpected = self.unexpected.saturating_add(1);
             return Err(ProviderError::new(
                 ProviderErrorKind::Script,
                 format!("recording has no response for turn {}", request.turn),
             ));
         };
         if request.turn != recorded.turn || request_sha256(&request) != recorded.request_sha256 {
-            self.diverged_at = Some(request.turn);
+            self.mark_unexpected(request.turn);
             return Err(ProviderError::new(
                 ProviderErrorKind::ReplayDiverged,
                 format!("turn {} request differs from the recording", request.turn),

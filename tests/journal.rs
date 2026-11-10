@@ -1448,3 +1448,64 @@ fn output_paths_must_name_a_file() {
     assert!(temp.path().join("rel/audit.jsonl").is_file());
     assert!(temp.path().join("rel/journal.jsonl").is_file());
 }
+
+#[tokio::test]
+async fn an_interrupted_unrecorded_tool_diverges_and_leaves_replay_unexhausted() {
+    // The recording runs one call of two and stops at its call budget.
+    let mut recording_config = short_lifecycle_config();
+    recording_config.max_tool_calls = 1;
+    let response = ModelResponse::tool_use([
+        ToolCall::new("unknown", "not_registered", json!({})),
+        ToolCall::new("late", "exec", json!({"argv": ["/bin/true"]})),
+    ]);
+    let mut recording = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::new([response]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        recording_config,
+    );
+    let error = recording
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the second call exceeds the budget");
+    assert!(matches!(error, HarnessError::ToolBudget(1)), "{error}");
+
+    // Replayed with room for the second call, which then stalls into the
+    // session deadline: the interrupted call has no recorded counterpart.
+    let mut records = recording.journal().records.clone();
+    let JournalEvent::SessionStarted { limits, .. } = &mut records[0].event else {
+        panic!("session start");
+    };
+    limits.max_tool_calls = 2;
+    limits.session_timeout_ms = 20;
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("partial.jsonl");
+    let session = records[0].session_id.clone();
+    let events = records.iter().map(|record| record.event.clone()).collect();
+    common::write_journal_lines(&path, &common::chained_lines(&session, events));
+    let provider = ReplayProvider::from_journal(&read_journal(&path).expect("verifies"))
+        .expect("partial turn loads");
+    let task = provider.task();
+    let mut config = short_lifecycle_config();
+    config.apply_limits(&provider.limits());
+    let api = FakeApi::default();
+    api.state().tool_exec_delay = Duration::from_millis(100);
+    let mut replay = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    let error = replay
+        .run(&task, CancellationToken::new())
+        .await
+        .expect_err("the unrecorded second tool hits the deadline");
+
+    // The interruption is still reported as itself.
+    assert!(matches!(error, HarnessError::Deadline), "{error}");
+    assert_eq!(replay.provider().diverged_at(), Some(1));
+    assert!(!replay.provider().exhausted());
+}

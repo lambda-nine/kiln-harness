@@ -824,12 +824,16 @@ where
                 },
             )?;
             progress.tool_calls = next_tool_calls;
+            // Every journaled tool reaches the provider, an interrupted one
+            // included, so replay compares exactly what was recorded. An
+            // interruption still ends the session as itself.
+            let observed = provider.tool_completed(turn, index, &call.visible, run.ok, &run.result);
             match stop {
                 Some(ToolStop::Deadline) => return Err(HarnessError::Deadline),
                 Some(ToolStop::Canceled) => return Err(HarnessError::Canceled),
                 None => {}
             }
-            provider.tool_completed(turn, index, &call.visible, run.ok, &run.result)?;
+            observed?;
             results.push(ToolResult {
                 call_id: call.visible.call_id,
                 tool: call.visible.tool,
