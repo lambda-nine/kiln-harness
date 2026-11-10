@@ -678,6 +678,10 @@ where
                 tool_calls: response.tool_calls.len(),
                 usage: response.usage,
                 latency_ms,
+                served_model: response
+                    .provider_content
+                    .as_ref()
+                    .and_then(|content| content.model.clone()),
             },
         )?;
         if response.usage.output_tokens > u64::from(config.max_output_tokens_per_request)
@@ -697,6 +701,7 @@ where
             text,
             tool_calls,
             stop_reason,
+            provider_content,
             ..
         } = response;
 
@@ -768,9 +773,12 @@ where
                 }
             })
             .collect::<Vec<_>>();
+        // The neutral text and calls are the sanitized view; the provider's
+        // opaque record of the turn goes back to it unmodified.
         messages.push(Message::Assistant {
             text,
             tool_calls: prepared.iter().map(|call| call.visible.clone()).collect(),
+            provider_content,
         });
 
         let mut results = Vec::with_capacity(prepared.len());

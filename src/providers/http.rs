@@ -360,6 +360,17 @@ impl<'a> Credential<'a> {
                         if serde_json::from_str::<Value>(raw)
                             .is_ok_and(|decoded| self.in_value(&decoded)))
             })
+            || response.provider_content.as_ref().is_some_and(|content| {
+                content
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| self.in_text(model))
+                    || self.in_value(&content.blocks)
+                    || content
+                        .stop_details
+                        .as_ref()
+                        .is_some_and(|details| self.in_value(details))
+            })
     }
 }
 
@@ -614,15 +625,23 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
 }
 
 /// Refuse a completion count that cannot be right for the output kept: zero
-/// for non-empty output, or fewer than one token per
-/// [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of it. Real tokenizers average a few
-/// bytes per token and rarely exceed 16, so the floor only catches gross
-/// under-reporting. Token counts are trusted for cost; the engine bounds
-/// output size separately in bytes.
+/// for non-empty output (opaque content blocks included), or fewer than one
+/// token per [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of
+/// [`ModelResponse::token_floor_bytes`]. Real tokenizers average a few bytes
+/// per token and rarely exceed 16, so the floor only catches gross
+/// under-reporting. Opaque content stays out of the floor, since a thinking
+/// signature is large and unrelated to completion tokens; the engine bounds
+/// all output, opaque content included, separately in bytes.
 pub(crate) fn check_completion_tokens(response: &ModelResponse) -> Result<(), ProviderError> {
-    let output_bytes = response.output_bytes();
+    let output_bytes = response.token_floor_bytes();
     let completion = response.usage.output_tokens;
-    if output_bytes > 0 && completion == 0 {
+    let opaque = response.provider_content.as_ref().is_some_and(|content| {
+        content
+            .blocks
+            .as_array()
+            .is_none_or(|blocks| !blocks.is_empty())
+    });
+    if (output_bytes > 0 || opaque) && completion == 0 {
         return Err(invalid(
             "usage reports zero completion tokens for non-empty output",
         ));

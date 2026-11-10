@@ -41,6 +41,60 @@ pub struct ToolResult {
     pub result: Value,
 }
 
+/// A provider's own record of one assistant turn, kept opaque.
+///
+/// Some APIs require an assistant turn to come back exactly as they sent
+/// it: Anthropic's preserved thinking validates each `thinking` block's
+/// signature and the position of every `fallback` block. `blocks` is the
+/// response's whole content array as received, every block in its original
+/// order, and an adapter for the same `provider` echoes it byte for byte
+/// instead of rebuilding the turn from the neutral `text` and `tool_calls`,
+/// which stay the sanitized view the engine and the grammar use. Other
+/// adapters ignore it. It is untrusted endpoint data: bounded by the
+/// response cap, scanned for the credential, and counted by
+/// [`ModelResponse::output_bytes`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderContent {
+    /// The adapter that produced it, such as `anthropic`.
+    pub provider: String,
+    /// The model that actually served the turn, as the response names it.
+    pub model: Option<String>,
+    /// The response's content array, exactly as received.
+    pub blocks: Value,
+    /// Why the provider stopped, when it says more than the stop reason:
+    /// Anthropic's `stop_details` on a refusal. Recorded, never sent back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<Value>,
+}
+
+impl ProviderContent {
+    /// Compact JSON bytes of everything it holds that came from the
+    /// endpoint: the model name, the blocks, and the stop details.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        let mut count = ByteCount(self.model.as_ref().map_or(0, |model| model.len() as u64));
+        // Encoding a Value into a counter cannot fail.
+        let _ = serde_json::to_writer(&mut count, &self.blocks);
+        if let Some(details) = &self.stop_details {
+            let _ = serde_json::to_writer(&mut count, details);
+        }
+        count.0
+    }
+}
+
+/// A writer that only counts bytes, saturating.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len() as u64);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// One entry in the provider-neutral conversation sent to the model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -51,6 +105,10 @@ pub enum Message {
     Assistant {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// Absent for providers without opaque content, so their journals
+        /// and request hashes are unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_content: Option<ProviderContent>,
     },
     ToolResults {
         results: Vec<ToolResult>,
@@ -117,6 +175,10 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// The provider's opaque record of this turn, echoed verbatim by the
+    /// same adapter on later requests. See [`ProviderContent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_content: Option<ProviderContent>,
 }
 
 impl ModelResponse {
@@ -128,28 +190,32 @@ impl ModelResponse {
             tool_calls: Vec::new(),
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
+            provider_content: None,
         }
     }
 
-    /// Bytes of model output the harness keeps from this response: its text
-    /// plus, for each tool call, its call ID, its tool name, and the compact
-    /// JSON encoding of its arguments. The
-    /// engine's `max_total_model_output_bytes` budget, the journal grammar,
-    /// and adapters' usage plausibility checks all count with this, so they
-    /// agree on every response.
+    /// Bytes of model output the harness keeps from this response:
+    /// [`ModelResponse::token_floor_bytes`] plus [`ProviderContent::bytes`].
+    /// The engine's `max_total_model_output_bytes` budget and the journal
+    /// grammar both count with this, so they agree on every response.
     #[must_use]
     pub fn output_bytes(&self) -> u64 {
-        struct Count(u64);
-        impl std::io::Write for Count {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.saturating_add(bytes.len() as u64);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut count = Count(self.text.as_ref().map_or(0, |text| text.len() as u64));
+        self.token_floor_bytes().saturating_add(
+            self.provider_content
+                .as_ref()
+                .map_or(0, ProviderContent::bytes),
+        )
+    }
+
+    /// Bytes of the neutral view that completion tokens must account for:
+    /// its text plus, for each tool call, its call ID, its tool name, and
+    /// the compact JSON encoding of its arguments. Adapters' usage
+    /// plausibility floors count with this. Opaque provider content is left
+    /// out: a thinking block's signature can be large and is unrelated to
+    /// the completion tokens the model generated.
+    #[must_use]
+    pub fn token_floor_bytes(&self) -> u64 {
+        let mut count = ByteCount(self.text.as_ref().map_or(0, |text| text.len() as u64));
         for call in &self.tool_calls {
             count.0 = count
                 .0
@@ -169,6 +235,7 @@ impl ModelResponse {
             tool_calls: tool_calls.into_iter().collect(),
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),
+            provider_content: None,
         }
     }
 }

@@ -89,6 +89,10 @@ pub enum AuditEvent {
         tool_calls: usize,
         usage: Usage,
         latency_ms: u64,
+        /// The model that served the turn when the provider reports one
+        /// that may differ from the requested model, as after a fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
     },
     ModelTurn {
         turn: u32,

@@ -113,6 +113,7 @@ fn request_body_matches_the_golden_json() {
                 ),
                 ToolCall::new("call-1-2", "list_dir", json!({"path": "."})),
             ],
+            provider_content: None,
         },
         Message::ToolResults {
             results: vec![
@@ -135,6 +136,7 @@ fn request_body_matches_the_golden_json() {
                 "unknown",
                 Value::String("{bad".to_string()),
             )],
+            provider_content: None,
         },
     ];
     let request = ModelRequest {

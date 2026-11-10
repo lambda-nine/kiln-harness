@@ -21,8 +21,8 @@ use std::os::unix::fs::MetadataExt;
 pub use crate::outputs::DirectoryProblem;
 use crate::outputs::{Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{
-    Message, ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall,
-    ToolDefinition, ToolResult, Usage,
+    Message, ModelRequest, ModelResponse, ProviderContent, ProviderErrorKind, ProviderInfo,
+    ToolCall, ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::sanitize_call;
 
@@ -639,6 +639,8 @@ struct RespondedTurn {
     turn: u32,
     text: Option<String>,
     calls: Vec<ToolCall>,
+    /// Echoed into the history exactly as recorded, as the engine does.
+    provider_content: Option<ProviderContent>,
     results: Vec<ToolResult>,
     /// Whether the engine would go on from this response: run its calls, or
     /// accept it as the final answer. See [`engine_accepts`].
@@ -811,6 +813,7 @@ impl Grammar {
                     turn: *turn,
                     text: response.text.clone(),
                     calls,
+                    provider_content: response.provider_content.clone(),
                     results: Vec::new(),
                     accepted,
                 });
@@ -907,6 +910,7 @@ impl Grammar {
             context.messages.push(Message::Assistant {
                 text: last.text,
                 tool_calls: last.calls,
+                provider_content: last.provider_content,
             });
             context.messages.push(Message::ToolResults {
                 results: last.results,
@@ -934,7 +938,11 @@ impl Grammar {
             let results = context.messages.pop();
             let assistant = context.messages.pop();
             if let (
-                Some(Message::Assistant { text, tool_calls }),
+                Some(Message::Assistant {
+                    text,
+                    tool_calls,
+                    provider_content,
+                }),
                 Some(Message::ToolResults { results }),
             ) = (assistant, results)
             {
@@ -943,6 +951,7 @@ impl Grammar {
                     turn: last_turn,
                     text,
                     calls: tool_calls,
+                    provider_content,
                     results,
                     accepted: true,
                 });

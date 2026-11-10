@@ -60,6 +60,7 @@ fn history(turn: u32) -> Vec<Message> {
         messages.push(Message::Assistant {
             text: None,
             tool_calls: vec![diff_call("a"), diff_call("b")],
+            provider_content: None,
         });
         messages.push(Message::ToolResults {
             results: ["a", "b"]

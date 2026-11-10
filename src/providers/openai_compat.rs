@@ -359,7 +359,10 @@ pub fn request_body(config: &OpenAiCompatConfig, request: &ModelRequest<'_>) -> 
     for message in request.messages {
         match message {
             Message::User { text } => messages.push(json!({"role": "user", "content": text})),
-            Message::Assistant { text, tool_calls } => {
+            // Another provider's opaque content means nothing here.
+            Message::Assistant {
+                text, tool_calls, ..
+            } => {
                 let mut entry = Map::new();
                 entry.insert("role".to_string(), json!("assistant"));
                 entry.insert("content".to_string(), json!(text));
@@ -500,6 +503,7 @@ fn parse_response_quoting(
         tool_calls,
         stop_reason,
         usage: parse_usage(value.get("usage"))?,
+        provider_content: None,
     };
     check_completion_tokens(&response)?;
     Ok(response)

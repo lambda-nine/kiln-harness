@@ -565,6 +565,7 @@ fn request_hash_is_independent_of_object_insertion_order() {
             Message::Assistant {
                 text: None,
                 tool_calls: vec![ToolCall::new("c", "exec", Value::Object(arguments))],
+                provider_content: None,
             },
         ]
     };
@@ -609,6 +610,7 @@ fn request_hash_survives_a_journal_round_trip() {
     let messages = vec![Message::Assistant {
         text: Some("t".to_string()),
         tool_calls: vec![ToolCall::new("c", "exec", arguments)],
+        provider_content: None,
     }];
     let encoded = serde_json::to_string(&messages).expect("encode");
     let decoded: Vec<Message> = serde_json::from_str(&encoded).expect("decode");
