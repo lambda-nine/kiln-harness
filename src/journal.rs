@@ -397,7 +397,19 @@ pub fn read_journal_with_limits(
     path: &Path,
     limits: JournalLimits,
 ) -> Result<LoadedJournal, JournalError> {
-    // Refuse FIFOs and devices before open can block on them.
+    let file = open_journal_source(path)?;
+    read_open_journal(&file, limits)
+}
+
+/// Open an existing journal read-only, refusing anything but a regular file.
+///
+/// # Errors
+///
+/// Returns an error if the path is missing, not a regular file, or cannot
+/// be opened.
+pub fn open_journal_source(path: &Path) -> Result<File, JournalError> {
+    // Refuse FIFOs and devices before open can block on them. The path is a
+    // trusted operator path; see the threat model for the remaining race.
     if !std::fs::metadata(path)?.is_file() {
         return Err(JournalError::NotRegularFile);
     }
@@ -405,9 +417,28 @@ pub fn read_journal_with_limits(
     if !file.metadata()?.is_file() {
         return Err(JournalError::NotRegularFile);
     }
+    Ok(file)
+}
+
+/// Read and verify a journal from an already open handle, from its start.
+///
+/// # Errors
+///
+/// See [`read_journal`].
+pub fn read_open_journal(
+    file: &File,
+    limits: JournalLimits,
+) -> Result<LoadedJournal, JournalError> {
+    use std::io::{Seek, SeekFrom};
+    if !file.metadata()?.is_file() {
+        return Err(JournalError::NotRegularFile);
+    }
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0))?;
     // Never trust the metadata length: read at most one byte past the limit.
     let mut bytes = Vec::new();
-    file.take(limits.max_file_bytes.saturating_add(1))
+    reader
+        .take(limits.max_file_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limits.max_file_bytes {
         return Err(JournalError::FileTooLarge {

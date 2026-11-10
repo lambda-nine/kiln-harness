@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,7 +9,10 @@ use clap::{Parser, Subcommand};
 use kiln_harness::api::{SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionOutcome, SessionTask};
-use kiln_harness::journal::{JournalEvent, JsonlJournal, LoadedJournal, read_journal};
+use kiln_harness::journal::{
+    JournalEvent, JournalLimits, JsonlJournal, LoadedJournal, open_journal_source, read_journal,
+    read_open_journal,
+};
 use kiln_harness::provider::{ScriptedProvider, Usage};
 use kiln_harness::replay::ReplayProvider;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +86,10 @@ async fn main() -> Result<ExitCode> {
 }
 
 async fn demo(socket: PathBuf, audit_path: &Path, journal_path: &Path) -> Result<ExitCode> {
+    refuse_aliases(&[
+        ("--audit", FileIdentity::of_path(audit_path)?),
+        ("--journal", FileIdentity::of_path(journal_path)?),
+    ])?;
     let api = connect(socket).await?;
     let (audit, journal) = open_sinks(audit_path, journal_path)?;
     let mut harness = Harness::new(
@@ -104,8 +113,17 @@ async fn replay(
     audit_path: &Path,
     journal_path: &Path,
 ) -> Result<ExitCode> {
-    let recorded =
-        read_journal(from).with_context(|| format!("read journal {}", from.display()))?;
+    // Hold the source open read-only for the whole replay and refuse any
+    // output path that names the same file, before kilnd is contacted.
+    let source =
+        open_journal_source(from).with_context(|| format!("open journal {}", from.display()))?;
+    refuse_aliases(&[
+        ("--from", FileIdentity::of_file(from, &source)?),
+        ("--audit", FileIdentity::of_path(audit_path)?),
+        ("--journal", FileIdentity::of_path(journal_path)?),
+    ])?;
+    let recorded = read_open_journal(&source, JournalLimits::default())
+        .with_context(|| format!("read journal {}", from.display()))?;
     let provider = ReplayProvider::from_journal(&recorded)
         .with_context(|| format!("load recorded turns from {}", from.display()))?;
     let recorded_outcome = provider.recorded_outcome().unwrap_or("incomplete");
@@ -162,6 +180,83 @@ async fn replay(
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// What a command-line path refers to: the file's device and inode when it
+/// exists, and its canonical location either way.
+struct FileIdentity {
+    inode: Option<(u64, u64)>,
+    canonical: PathBuf,
+}
+
+impl FileIdentity {
+    fn of_file(path: &Path, file: &File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            inode: Some((metadata.dev(), metadata.ino())),
+            canonical: std::fs::canonicalize(path)?,
+        })
+    }
+
+    fn of_path(path: &Path) -> Result<Self> {
+        if let Ok(metadata) = std::fs::metadata(path) {
+            return Ok(Self {
+                inode: Some((metadata.dev(), metadata.ino())),
+                canonical: std::fs::canonicalize(path)?,
+            });
+        }
+        Ok(Self {
+            inode: None,
+            canonical: canonical_new_path(path)?,
+        })
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        matches!((self.inode, other.inode), (Some(left), Some(right)) if left == right)
+            || self.canonical == other.canonical
+    }
+}
+
+/// Canonicalize the deepest existing ancestor of a path that does not exist
+/// yet, then apply the remaining components. Those name nothing on disk yet,
+/// so `.` and `..` among them resolve lexically.
+fn canonical_new_path(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut existing = absolute.clone();
+    let mut rest = Vec::new();
+    let mut resolved = loop {
+        if let Ok(canonical) = std::fs::canonicalize(&existing) {
+            break canonical;
+        }
+        let Some(last) = existing.components().next_back() else {
+            bail!("cannot resolve {}", path.display());
+        };
+        rest.push(last.as_os_str().to_os_string());
+        if !existing.pop() {
+            bail!("cannot resolve {}", path.display());
+        }
+    };
+    for component in rest.iter().rev() {
+        match Path::new(component).components().next() {
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            _ => resolved.push(component),
+        }
+    }
+    Ok(resolved)
+}
+
+fn refuse_aliases(paths: &[(&str, FileIdentity)]) -> Result<()> {
+    for (index, (left_flag, left)) in paths.iter().enumerate() {
+        for (right_flag, right) in &paths[index + 1..] {
+            if left.same_file(right) {
+                bail!("{left_flag} and {right_flag} refer to the same file");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn verify(path: &Path) -> ExitCode {

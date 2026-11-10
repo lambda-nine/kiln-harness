@@ -181,3 +181,112 @@ fn verify_rejects_tools_before_the_sandbox_or_their_response() {
 
     assert!(!ok, "{stdout}");
 }
+
+async fn recorded_demo(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("source.jsonl");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("demo succeeds");
+    path
+}
+
+fn replay_cli(dir: &Path, from: &Path, audit: &Path, journal: &Path) -> Output {
+    cli(&[
+        "--socket".as_ref(),
+        dir.join("no-kilnd.sock").as_os_str(),
+        "replay".as_ref(),
+        "--from".as_ref(),
+        from.as_os_str(),
+        "--audit".as_ref(),
+        audit.as_os_str(),
+        "--journal".as_ref(),
+        journal.as_os_str(),
+    ])
+}
+
+#[tokio::test]
+async fn replay_refuses_outputs_that_alias_its_source_before_contacting_kilnd() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path();
+    let source = recorded_demo(dir).await;
+    let original = std::fs::read(&source).expect("read source");
+    let hard_link = dir.join("hard-link.jsonl");
+    std::fs::hard_link(&source, &hard_link).expect("hard link");
+    let symlink = dir.join("symlink.jsonl");
+    std::os::unix::fs::symlink(&source, &symlink).expect("symlink");
+    std::fs::create_dir(dir.join("sub")).expect("subdir");
+    let dotted = dir.join("sub/../source.jsonl");
+    let fresh_journal = dir.join("replay.jsonl");
+    let fresh_audit = dir.join("replay-audit.jsonl");
+
+    for (name, audit, journal) in [
+        ("audit is the source", source.clone(), fresh_journal.clone()),
+        (
+            "audit is a hard link",
+            hard_link.clone(),
+            fresh_journal.clone(),
+        ),
+        ("audit is a symlink", symlink.clone(), fresh_journal.clone()),
+        ("journal is the source", fresh_audit.clone(), dotted.clone()),
+        (
+            "audit and journal are one new file",
+            dir.join("new/out.jsonl"),
+            dir.join("new/./x/../out.jsonl"),
+        ),
+    ] {
+        let output = replay_cli(dir, &source, &audit, &journal);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "{name}: {stderr}");
+        assert!(
+            stderr.contains("refer to the same file"),
+            "{name}: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read source"),
+            original,
+            "{name}: source changed"
+        );
+        assert!(read_journal(&source).is_ok(), "{name}");
+        assert!(!dir.join("new").exists(), "{name}: created an output");
+    }
+
+    // Distinct paths pass the check and fail only on the missing socket.
+    let output = replay_cli(dir, &source, &fresh_audit, &fresh_journal);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(!stderr.contains("same file"), "{stderr}");
+    assert!(stderr.contains("connect"), "{stderr}");
+    assert_eq!(std::fs::read(&source).expect("read source"), original);
+}
+
+#[test]
+fn demo_refuses_an_audit_that_is_its_journal() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dir = temp.path();
+    let output = cli(&[
+        "--socket".as_ref(),
+        dir.join("no-kilnd.sock").as_os_str(),
+        "demo".as_ref(),
+        "--audit".as_ref(),
+        dir.join("out.jsonl").as_os_str(),
+        "--journal".as_ref(),
+        dir.join("./out.jsonl").as_os_str(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("--audit and --journal refer to the same file"),
+        "{stderr}"
+    );
+    assert!(!dir.join("out.jsonl").exists());
+}
