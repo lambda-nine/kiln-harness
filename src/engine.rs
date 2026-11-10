@@ -1022,13 +1022,17 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
     Ok(())
 }
 
-fn validate_call_id(call_id: &str) -> Result<(), HarnessError> {
-    if call_id.is_empty()
-        || call_id.len() > 64
-        || !call_id
+/// The provider call-ID rule, shared with the journal grammar.
+pub(crate) fn call_id_is_valid(call_id: &str) -> bool {
+    !call_id.is_empty()
+        && call_id.len() <= 64
+        && call_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
+}
+
+fn validate_call_id(call_id: &str) -> Result<(), HarnessError> {
+    if !call_id_is_valid(call_id) {
         return Err(HarnessError::InvalidModelCall(
             "call_id must be 1..=64 ASCII letters, digits, '.', '_' or '-'".to_string(),
         ));

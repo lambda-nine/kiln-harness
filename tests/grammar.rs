@@ -544,3 +544,349 @@ fn out_of_order_and_inconsistent_journals_are_rejected() {
         assert_rejected(name, events);
     }
 }
+
+/// Like `assert_rejected`, and the writer's and reader's reason must
+/// mention `reason`, so the rule under test is the one that fired.
+fn assert_rejected_because(name: &str, events: Vec<JournalEvent>, reason: &str) {
+    let written = write_all(&events);
+    assert!(
+        matches!(&written, Err(JournalError::Grammar { reason: found, .. }) if found.contains(reason)),
+        "{name}: writer gave {written:?}, expected {reason:?}"
+    );
+    let read = read_all(events.clone());
+    assert!(
+        matches!(&read, Err(JournalError::Grammar { reason: found, .. }) if found.contains(reason)),
+        "{name}: reader gave {read:?}, expected {reason:?}"
+    );
+    assert_rejected(name, events);
+}
+
+fn with_limits(
+    mut events: Vec<JournalEvent>,
+    change: impl FnOnce(&mut kiln_harness::journal::SessionLimits),
+) -> Vec<JournalEvent> {
+    let JournalEvent::SessionStarted { limits, .. } = &mut events[0] else {
+        panic!("session start");
+    };
+    change(limits);
+    events
+}
+
+#[test]
+fn recorded_limits_bound_what_may_follow() {
+    assert_rejected_because(
+        "a second turn under max_steps 1",
+        with_limits(valid(), |limits| limits.max_steps = 1),
+        "beyond max_steps",
+    );
+    assert_rejected_because(
+        "a second tool call under max_tool_calls 1",
+        with_limits(valid(), |limits| limits.max_tool_calls = 1),
+        "beyond max_tool_calls",
+    );
+    assert_rejected_because(
+        "two calls in a turn under max_tool_calls_per_turn 1",
+        with_limits(valid(), |limits| limits.max_tool_calls_per_turn = 1),
+        "after a response the engine refuses",
+    );
+    assert_rejected_because(
+        "tools after the input budget was exceeded",
+        with_limits(valid(), |limits| limits.max_total_input_tokens = 5),
+        "after a response the engine refuses",
+    );
+    assert_rejected_because(
+        "completion after the output budget was exceeded",
+        with_limits(valid(), |limits| limits.max_total_output_tokens = 1),
+        "completed after a response the engine refuses",
+    );
+    assert_rejected_because(
+        "completion with a final answer over its byte bound",
+        with_limits(valid(), |limits| limits.max_final_answer_bytes = 3),
+        "completed after a response the engine refuses",
+    );
+
+    // One response over the per-request output cap.
+    let mut over_cap = valid();
+    let JournalEvent::ModelResponded { response, .. } = &mut over_cap[3] else {
+        panic!("response");
+    };
+    response.usage.output_tokens = 5000;
+    let JournalEvent::SessionEnded { usage, .. } = over_cap.last_mut().expect("end") else {
+        panic!("end");
+    };
+    usage.output_tokens = 5001;
+    assert_rejected_because(
+        "tools after a response over the per-request cap",
+        over_cap,
+        "after a response the engine refuses",
+    );
+
+    // The same journals are fine when the limits allow them.
+    assert_accepted(
+        "exactly at the limits",
+        with_limits(valid(), |limits| {
+            limits.max_steps = 2;
+            limits.max_tool_calls = 2;
+            limits.max_tool_calls_per_turn = 2;
+            limits.max_total_input_tokens = 30;
+            limits.max_total_output_tokens = 2;
+            limits.max_final_answer_bytes = 4;
+        }),
+    );
+}
+
+/// The engine's own journal for a refused response, from a real run.
+async fn engine_events(responses: Vec<ModelResponse>, config: HarnessConfig) -> Vec<JournalEvent> {
+    let mut harness = kiln_harness::engine::Harness::new(
+        common::FakeApi::default(),
+        kiln_harness::provider::ScriptedProvider::new(responses),
+        kiln_harness::audit::MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let _ = harness
+        .run(
+            &kiln_harness::engine::SessionTask::demo(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    harness
+        .journal()
+        .records
+        .iter()
+        .map(|record| record.event.clone())
+        .collect()
+}
+
+/// Continue an engine journal past its refused response: run the first call.
+fn forge_tool_after(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
+    let Some(JournalEvent::SessionEnded {
+        tool_calls,
+        steps,
+        usage,
+        ..
+    }) = events.pop()
+    else {
+        panic!("the engine journal ends the session");
+    };
+    let JournalEvent::SessionStarted { tools, limits, .. } = &events[0] else {
+        panic!("session start");
+    };
+    let (tools, limits) = (tools.clone(), *limits);
+    let Some(JournalEvent::ModelResponded { turn, response, .. }) = events.last().cloned() else {
+        panic!("the refused response is the last record");
+    };
+    let call = kiln_harness::tools::sanitize_call(&response.tool_calls[0], &tools, &limits);
+    events.push(JournalEvent::ToolExecuted {
+        turn,
+        index: 1,
+        audit_call_id: format!("call-{turn}-1"),
+        call,
+        ok: true,
+        result: json!({"ok": true}),
+        execution_ids: Vec::new(),
+    });
+    events.push(JournalEvent::SessionEnded {
+        outcome: "failed".to_string(),
+        work_outcome: "failed".to_string(),
+        final_answer: None,
+        steps,
+        tool_calls: tool_calls + 1,
+        usage,
+        sandbox_deleted: true,
+    });
+    events
+}
+
+/// Turn an engine journal ending in a refused final response into a
+/// completed one.
+fn forge_completion(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
+    let Some(JournalEvent::SessionEnded {
+        tool_calls,
+        steps,
+        usage,
+        ..
+    }) = events.pop()
+    else {
+        panic!("the engine journal ends the session");
+    };
+    let Some(JournalEvent::ModelResponded { response, .. }) = events.last().cloned() else {
+        panic!("the refused response is the last record");
+    };
+    events.push(JournalEvent::SessionEnded {
+        outcome: "completed".to_string(),
+        work_outcome: "completed".to_string(),
+        final_answer: response.text,
+        steps,
+        tool_calls,
+        usage,
+        sandbox_deleted: true,
+    });
+    events
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn engine_refusals_verify_and_forged_continuations_do_not() {
+    use kiln_harness::provider::StopReason;
+    let short = common::short_lifecycle_config;
+    let diff = |id: &str| ToolCall::new(id, "workspace_diff", json!({}));
+
+    let refused_tool_turns = [
+        (
+            "assistant text over its bound",
+            vec![ModelResponse {
+                text: Some("much too long".to_string()),
+                ..ModelResponse::tool_use([diff("a")])
+            }],
+            HarnessConfig {
+                max_final_answer_bytes: 4,
+                ..short()
+            },
+        ),
+        (
+            "truncated tool turn",
+            vec![ModelResponse {
+                stop_reason: StopReason::MaxTokens,
+                ..ModelResponse::tool_use([diff("a")])
+            }],
+            short(),
+        ),
+        (
+            "invalid call ID",
+            vec![ModelResponse::tool_use([diff("not valid!")])],
+            short(),
+        ),
+        (
+            "repeated call ID",
+            vec![ModelResponse::tool_use([diff("a"), diff("a")])],
+            short(),
+        ),
+        (
+            "over the per-request output cap",
+            vec![ModelResponse {
+                usage: Usage {
+                    output_tokens: 9,
+                    ..Usage::default()
+                },
+                ..ModelResponse::tool_use([diff("a")])
+            }],
+            HarnessConfig {
+                max_output_tokens_per_request: 8,
+                ..short()
+            },
+        ),
+    ];
+    for (name, responses, config) in refused_tool_turns {
+        let events = engine_events(responses, config).await;
+        assert_accepted(name, events.clone());
+        assert_rejected_because(
+            name,
+            forge_tool_after(events),
+            "after a response the engine refuses",
+        );
+    }
+
+    let refused_final_answers = [
+        (
+            "final answer over its bound",
+            vec![ModelResponse::final_text("much too long")],
+            HarnessConfig {
+                max_final_answer_bytes: 4,
+                ..short()
+            },
+        ),
+        (
+            "refusal",
+            vec![ModelResponse {
+                stop_reason: StopReason::Refusal,
+                ..ModelResponse::final_text("no")
+            }],
+            short(),
+        ),
+        (
+            "truncated final answer",
+            vec![ModelResponse {
+                stop_reason: StopReason::MaxTokens,
+                ..ModelResponse::final_text("half")
+            }],
+            short(),
+        ),
+        (
+            "over the total output budget",
+            vec![ModelResponse {
+                usage: Usage {
+                    output_tokens: 11,
+                    ..Usage::default()
+                },
+                ..ModelResponse::final_text("done")
+            }],
+            HarnessConfig {
+                max_total_output_tokens: 10,
+                ..short()
+            },
+        ),
+    ];
+    for (name, responses, config) in refused_final_answers {
+        let events = engine_events(responses, config).await;
+        assert_accepted(name, events.clone());
+        assert_rejected_because(
+            name,
+            forge_completion(events),
+            "completed after a response the engine refuses",
+        );
+    }
+
+    // The step and call budgets, from real runs: the journals verify and a
+    // further request or call is refused.
+    let step = engine_events(
+        vec![
+            ModelResponse::tool_use([diff("a")]),
+            ModelResponse::final_text("done"),
+        ],
+        HarnessConfig {
+            max_steps: 1,
+            ..short()
+        },
+    )
+    .await;
+    assert_accepted("step budget", step);
+    let calls = engine_events(
+        vec![ModelResponse::tool_use([diff("a"), diff("b")])],
+        HarnessConfig {
+            max_tool_calls: 1,
+            ..short()
+        },
+    )
+    .await;
+    assert_accepted("call budget", calls.clone());
+    let mut over_calls = calls;
+    let Some(JournalEvent::SessionEnded {
+        tool_calls,
+        steps,
+        usage,
+        ..
+    }) = over_calls.pop()
+    else {
+        panic!("end");
+    };
+    over_calls.push(JournalEvent::ToolExecuted {
+        turn: 1,
+        index: 2,
+        audit_call_id: "call-1-2".to_string(),
+        call: diff("b"),
+        ok: true,
+        result: json!({"ok": true}),
+        execution_ids: Vec::new(),
+    });
+    over_calls.push(JournalEvent::SessionEnded {
+        outcome: "failed".to_string(),
+        work_outcome: "failed".to_string(),
+        final_answer: None,
+        steps,
+        tool_calls: tool_calls + 1,
+        usage,
+        sandbox_deleted: true,
+    });
+    assert_rejected_because("past the call budget", over_calls, "beyond max_tool_calls");
+}

@@ -385,3 +385,41 @@ fn a_permissive_umask_cannot_widen_what_the_harness_creates() {
     assert_eq!(mode(&dir.join("audit-dir")), 0o700);
     assert_eq!(mode(&dir.join("audit-dir/nested")), 0o700);
 }
+
+#[tokio::test]
+async fn verify_rejects_completion_beyond_the_recorded_step_limit() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("recorded.jsonl");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::new([
+            ModelResponse::tool_use([ToolCall::new("call", "workspace_diff", json!({}))]),
+            ModelResponse::final_text("done"),
+        ]),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("two-turn recording");
+    let recorded = read_journal(&path).expect("recording verifies");
+
+    // Only max_steps changes; no request hash depends on it.
+    let mut events = recorded
+        .records
+        .iter()
+        .map(|record| record.event.clone())
+        .collect::<Vec<_>>();
+    let JournalEvent::SessionStarted { limits, .. } = &mut events[0] else {
+        panic!("session start");
+    };
+    limits.max_steps = 1;
+    let forged = temp.path().join("forged.jsonl");
+    write_journal_lines(&forged, &chained_lines(recorded.session_id(), events));
+
+    let (ok, stdout) = verify(&forged);
+
+    assert!(!ok, "{stdout}");
+}

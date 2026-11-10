@@ -812,6 +812,38 @@ struct RespondedTurn {
     text: Option<String>,
     calls: Vec<ToolCall>,
     results: Vec<ToolResult>,
+    /// Whether the engine would go on from this response: run its calls, or
+    /// accept it as the final answer. See [`engine_accepts`].
+    accepted: bool,
+}
+
+/// Mirror of the engine's checks on one response, in the engine's order.
+/// A refused response is still journaled (the engine records it before
+/// refusing it), but nothing may follow from it except `session_ended`.
+fn engine_accepts(response: &ModelResponse, usage_after: Usage, limits: &SessionLimits) -> bool {
+    use crate::provider::StopReason;
+    let within_budget = response.usage.output_tokens
+        <= u64::from(limits.max_output_tokens_per_request)
+        && usage_after.total_input_tokens() <= limits.max_total_input_tokens
+        && usage_after.output_tokens <= limits.max_total_output_tokens;
+    if !within_budget
+        || matches!(
+            response.stop_reason,
+            StopReason::MaxTokens | StopReason::Refusal
+        )
+    {
+        return false;
+    }
+    let text_bytes = response.text.as_ref().map_or(0, String::len);
+    if response.tool_calls.is_empty() {
+        return text_bytes > 0 && text_bytes <= limits.max_final_answer_bytes;
+    }
+    let mut call_ids = std::collections::BTreeSet::new();
+    response.tool_calls.len() <= limits.max_tool_calls_per_turn as usize
+        && response.tool_calls.iter().all(|call| {
+            crate::engine::call_id_is_valid(&call.call_id) && call_ids.insert(&call.call_id)
+        })
+        && text_bytes <= limits.max_final_answer_bytes
 }
 
 impl Grammar {
@@ -895,6 +927,9 @@ impl Grammar {
                     return Err("model_requested after model_failed");
                 }
                 if let Some(last) = &self.last_response {
+                    if !last.accepted {
+                        return Err("model_requested after a response the engine refuses");
+                    }
                     if last.calls.is_empty() {
                         return Err("model_requested after a final response");
                     }
@@ -904,6 +939,10 @@ impl Grammar {
                 }
                 if Some(*turn) != self.last_turn.checked_add(1) {
                     return Err("model_requested turns must run 1, 2, ...");
+                }
+                let max_steps = self.context.as_ref().map_or(0, |ctx| ctx.limits.max_steps);
+                if *turn > max_steps {
+                    return Err("model_requested beyond max_steps");
                 }
                 self.check_request(*turn, request_sha256, *message_count)?;
                 self.last_turn = *turn;
@@ -922,12 +961,15 @@ impl Grammar {
                     .iter()
                     .map(|call| sanitize_call(call, &context.tools, &context.limits))
                     .collect();
-                self.usage = self.usage + response.usage;
+                let usage_after = self.usage + response.usage;
+                let accepted = engine_accepts(response, usage_after, &context.limits);
+                self.usage = usage_after;
                 self.last_response = Some(RespondedTurn {
                     turn: *turn,
                     text: response.text.clone(),
                     calls,
                     results: Vec::new(),
+                    accepted,
                 });
             }
             JournalEvent::ModelFailed { turn, .. } => {
@@ -976,6 +1018,16 @@ impl Grammar {
         };
         if self.turn_failed || last.turn != turn {
             return Err("tool_executed for a turn other than the last response");
+        }
+        if !last.accepted {
+            return Err("tool_executed after a response the engine refuses");
+        }
+        let limits = self.context.as_ref().ok_or("no session context")?.limits;
+        if index > limits.max_tool_calls_per_turn {
+            return Err("tool_executed beyond max_tool_calls_per_turn");
+        }
+        if self.tool_calls >= limits.max_tool_calls {
+            return Err("tool_executed beyond max_tool_calls");
         }
         let executed = last.results.len();
         if u32::try_from(executed + 1).ok() != Some(index) {
@@ -1043,11 +1095,13 @@ impl Grammar {
                 Some(Message::ToolResults { results }),
             ) = (assistant, results)
             {
+                // Only an accepted turn reaches this check.
                 self.last_response = Some(RespondedTurn {
                     turn: last_turn,
                     text,
                     calls: tool_calls,
                     results,
+                    accepted: true,
                 });
             }
         }
@@ -1096,6 +1150,9 @@ impl Grammar {
                 .filter(|last| last.turn == self.last_turn && last.calls.is_empty());
             if self.pending.is_some() || self.turn_failed || final_response.is_none() {
                 return Err("completed work needs a final response in the last turn");
+            }
+            if final_response.is_some_and(|last| !last.accepted) {
+                return Err("completed after a response the engine refuses");
             }
             if final_answer.is_none()
                 || final_response.and_then(|last| last.text.as_ref()) != final_answer.as_ref()
