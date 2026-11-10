@@ -117,7 +117,7 @@ async fn replay(
     };
     let task = provider.task();
     let mut config = HarnessConfig::default();
-    config.apply_budgets(&provider.budgets());
+    config.apply_limits(&provider.limits());
 
     let api = connect(socket).await?;
     let (audit, journal) = open_sinks(audit_path, journal_path)?;

@@ -72,7 +72,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     let provider = ReplayProvider::from_journal(&recorded).expect("replayable journal");
     let task = provider.task();
     let mut config = HarnessConfig::default();
-    config.apply_budgets(&provider.budgets());
+    config.apply_limits(&provider.limits());
     let mut replay = Harness::new(
         api.clone(),
         provider,

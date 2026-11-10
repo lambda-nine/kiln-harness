@@ -40,7 +40,7 @@ pub enum JournalEvent {
         system: String,
         task: String,
         tools: Vec<ToolDefinition>,
-        budgets: BudgetSnapshot,
+        limits: SessionLimits,
     },
     SandboxReady {
         sandbox_id: String,
@@ -80,9 +80,12 @@ pub enum JournalEvent {
     },
 }
 
-/// The budgets a session ran under, recorded so replay can reuse them.
+/// Every limit that can change model-visible behavior, recorded so replay
+/// runs under exactly the same ones. Lifecycle cleanup windows are not
+/// model-visible and are not recorded.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BudgetSnapshot {
+#[serde(deny_unknown_fields)]
+pub struct SessionLimits {
     pub max_steps: u32,
     pub max_tool_calls: u32,
     pub max_tool_calls_per_turn: u32,
@@ -90,6 +93,22 @@ pub struct BudgetSnapshot {
     pub max_output_tokens_per_request: u32,
     pub max_total_input_tokens: u64,
     pub max_total_output_tokens: u64,
+    pub max_model_arguments_bytes: usize,
+    pub max_final_answer_bytes: usize,
+    pub tool_limits: RecordedToolLimits,
+}
+
+/// The recorded form of [`crate::tools::ToolLimits`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedToolLimits {
+    pub timeout_ms: u64,
+    pub max_argv_bytes: usize,
+    pub max_stdin_bytes: usize,
+    pub max_file_bytes: usize,
+    pub max_result_bytes: usize,
+    pub max_manifest_bytes: usize,
+    pub max_manifest_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

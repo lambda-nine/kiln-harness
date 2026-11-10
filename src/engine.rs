@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{ApiError, SandboxApi, SandboxRequest};
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
-    BudgetSnapshot, JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, request_sha256,
+    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedToolLimits, SessionLimits,
+    request_sha256,
 };
 use crate::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderError, StopReason, ToolCall,
@@ -23,6 +24,18 @@ use crate::tools::{
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard ceilings for every configuration, including recorded ones.
+pub const MAX_STEPS: u32 = 1000;
+pub const MAX_TOOL_CALLS: u32 = 10_000;
+pub const MAX_TOOL_CALLS_PER_TURN: u32 = 64;
+pub const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+pub const MAX_TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Ceiling for each byte limit.
+pub const MAX_BYTE_LIMIT: usize = 16 << 20;
+pub const MAX_OUTPUT_TOKENS_PER_REQUEST: u32 = 1_000_000;
+/// Ceiling for each cumulative token budget.
+pub const MAX_TOTAL_TOKENS: u64 = 1_000_000_000;
+pub const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// Largest accepted system prompt or task prompt.
 pub const MAX_TASK_TEXT_BYTES: usize = 64 << 10;
 const UNKNOWN_TOOL: &str = "unknown";
@@ -85,10 +98,11 @@ impl Default for HarnessConfig {
 }
 
 impl HarnessConfig {
-    /// The budgets recorded in a session journal.
+    /// The limits recorded in a session journal.
     #[must_use]
-    pub fn budgets(&self) -> BudgetSnapshot {
-        BudgetSnapshot {
+    pub fn limits(&self) -> SessionLimits {
+        let tools = &self.tool_limits;
+        SessionLimits {
             max_steps: self.max_steps,
             max_tool_calls: self.max_tool_calls,
             max_tool_calls_per_turn: self.max_tool_calls_per_turn,
@@ -96,18 +110,43 @@ impl HarnessConfig {
             max_output_tokens_per_request: self.max_output_tokens_per_request,
             max_total_input_tokens: self.max_total_input_tokens,
             max_total_output_tokens: self.max_total_output_tokens,
+            max_model_arguments_bytes: self.max_model_arguments_bytes,
+            max_final_answer_bytes: self.max_final_answer_bytes,
+            tool_limits: RecordedToolLimits {
+                timeout_ms: duration_ms(tools.timeout),
+                max_argv_bytes: tools.max_argv_bytes,
+                max_stdin_bytes: tools.max_stdin_bytes,
+                max_file_bytes: tools.max_file_bytes,
+                max_result_bytes: tools.max_result_bytes,
+                max_manifest_bytes: tools.max_manifest_bytes,
+                max_manifest_entries: tools.max_manifest_entries,
+            },
         }
     }
 
-    /// Replace this configuration's budgets with recorded ones.
-    pub fn apply_budgets(&mut self, budgets: &BudgetSnapshot) {
-        self.max_steps = budgets.max_steps;
-        self.max_tool_calls = budgets.max_tool_calls;
-        self.max_tool_calls_per_turn = budgets.max_tool_calls_per_turn;
-        self.session_timeout = Duration::from_millis(budgets.session_timeout_ms);
-        self.max_output_tokens_per_request = budgets.max_output_tokens_per_request;
-        self.max_total_input_tokens = budgets.max_total_input_tokens;
-        self.max_total_output_tokens = budgets.max_total_output_tokens;
+    /// Replace every recorded limit with the given ones. Lifecycle windows
+    /// are kept. `Harness::run` validates the result before any sandbox
+    /// exists, so recorded limits cannot exceed the hard ceilings.
+    pub fn apply_limits(&mut self, limits: &SessionLimits) {
+        self.max_steps = limits.max_steps;
+        self.max_tool_calls = limits.max_tool_calls;
+        self.max_tool_calls_per_turn = limits.max_tool_calls_per_turn;
+        self.session_timeout = Duration::from_millis(limits.session_timeout_ms);
+        self.max_output_tokens_per_request = limits.max_output_tokens_per_request;
+        self.max_total_input_tokens = limits.max_total_input_tokens;
+        self.max_total_output_tokens = limits.max_total_output_tokens;
+        self.max_model_arguments_bytes = limits.max_model_arguments_bytes;
+        self.max_final_answer_bytes = limits.max_final_answer_bytes;
+        let tools = &limits.tool_limits;
+        self.tool_limits = ToolLimits {
+            timeout: Duration::from_millis(tools.timeout_ms),
+            max_argv_bytes: tools.max_argv_bytes,
+            max_stdin_bytes: tools.max_stdin_bytes,
+            max_file_bytes: tools.max_file_bytes,
+            max_result_bytes: tools.max_result_bytes,
+            max_manifest_bytes: tools.max_manifest_bytes,
+            max_manifest_entries: tools.max_manifest_entries,
+        };
     }
 }
 
@@ -248,7 +287,7 @@ where
                 system: task.system.clone(),
                 task: task.prompt.clone(),
                 tools: self.registry.definitions().to_vec(),
-                budgets: self.config.budgets(),
+                limits: self.config.limits(),
             },
         );
         if let Err(error) = started {
@@ -857,28 +896,45 @@ fn validate_task(task: &SessionTask) -> Result<(), HarnessError> {
 }
 
 fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
-    if config.max_steps == 0
-        || config.max_tool_calls == 0
-        || config.max_tool_calls_per_turn == 0
-        || config.max_output_tokens_per_request == 0
-        || config.max_total_input_tokens == 0
-        || config.max_total_output_tokens == 0
-        || config.session_timeout.is_zero()
-        || config.lifecycle_timeout.is_zero()
-        || config.lifecycle_timeout > MAX_LIFECYCLE_TIMEOUT
-        || config.lifecycle_retry_delay.is_zero()
-        || config.tool_limits.timeout.is_zero()
-        || config.tool_limits.max_argv_bytes == 0
-        || config.tool_limits.max_stdin_bytes == 0
-        || config.tool_limits.max_file_bytes == 0
-        || config.tool_limits.max_result_bytes < 64
-        || config.tool_limits.max_manifest_bytes == 0
-        || config.tool_limits.max_manifest_entries == 0
-        || config.max_model_arguments_bytes == 0
-        || config.max_final_answer_bytes == 0
-    {
+    let tools = &config.tool_limits;
+    let byte_limits = [
+        config.max_model_arguments_bytes,
+        config.max_final_answer_bytes,
+        tools.max_argv_bytes,
+        tools.max_stdin_bytes,
+        tools.max_file_bytes,
+        tools.max_result_bytes,
+        tools.max_manifest_bytes,
+    ];
+    let positive = config.max_steps > 0
+        && config.max_tool_calls > 0
+        && config.max_tool_calls_per_turn > 0
+        && config.max_output_tokens_per_request > 0
+        && config.max_total_input_tokens > 0
+        && config.max_total_output_tokens > 0
+        && !config.session_timeout.is_zero()
+        && !config.lifecycle_timeout.is_zero()
+        && !config.lifecycle_retry_delay.is_zero()
+        && !tools.timeout.is_zero()
+        && tools.max_result_bytes >= 64
+        && tools.max_manifest_entries > 0
+        && byte_limits.iter().all(|limit| *limit > 0);
+    // Hard ceilings apply to every configuration, including limits loaded
+    // from a journal, so a crafted recording cannot request absurd budgets.
+    let bounded = config.max_steps <= MAX_STEPS
+        && config.max_tool_calls <= MAX_TOOL_CALLS
+        && config.max_tool_calls_per_turn <= MAX_TOOL_CALLS_PER_TURN
+        && config.session_timeout <= MAX_SESSION_TIMEOUT
+        && config.lifecycle_timeout <= MAX_LIFECYCLE_TIMEOUT
+        && tools.timeout <= MAX_TOOL_TIMEOUT
+        && config.max_output_tokens_per_request <= MAX_OUTPUT_TOKENS_PER_REQUEST
+        && config.max_total_input_tokens <= MAX_TOTAL_TOKENS
+        && config.max_total_output_tokens <= MAX_TOTAL_TOKENS
+        && tools.max_manifest_entries <= MAX_MANIFEST_ENTRIES
+        && byte_limits.iter().all(|limit| *limit <= MAX_BYTE_LIMIT);
+    if !positive || !bounded {
         return Err(HarnessError::InvalidModelCall(
-            "all harness budgets must be positive".to_string(),
+            "harness budgets must be positive and within their hard ceilings".to_string(),
         ));
     }
     Ok(())

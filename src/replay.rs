@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::engine::SessionTask;
-use crate::journal::{BudgetSnapshot, JournalEvent, LoadedJournal, request_sha256};
+use crate::journal::{JournalEvent, LoadedJournal, SessionLimits, request_sha256};
 use crate::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo,
 };
@@ -56,7 +56,7 @@ struct RecordedTurn {
 pub struct ReplayProvider {
     info: ProviderInfo,
     task: SessionTask,
-    budgets: BudgetSnapshot,
+    limits: SessionLimits,
     turns: VecDeque<RecordedTurn>,
     final_answer: Option<String>,
     outcome: Option<String>,
@@ -79,7 +79,7 @@ impl ReplayProvider {
             provider,
             system,
             task,
-            budgets,
+            limits,
             ..
         }) = records.next().map(|record| &record.event)
         else {
@@ -91,7 +91,7 @@ impl ReplayProvider {
                 system: system.clone(),
                 prompt: task.clone(),
             },
-            budgets: *budgets,
+            limits: *limits,
             turns: VecDeque::new(),
             final_answer: None,
             outcome: None,
@@ -172,10 +172,10 @@ impl ReplayProvider {
         self.task.clone()
     }
 
-    /// The recorded budgets.
+    /// The recorded limits.
     #[must_use]
-    pub fn budgets(&self) -> BudgetSnapshot {
-        self.budgets
+    pub fn limits(&self) -> SessionLimits {
+        self.limits
     }
 
     /// The recorded final answer, if the recording completed with one.

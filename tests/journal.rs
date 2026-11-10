@@ -1,10 +1,15 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use common::{FakeApi, short_lifecycle_config};
 use kiln_harness::audit::MemoryAudit;
-use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionOutcome, SessionTask};
+use kiln_harness::engine::{
+    Harness, HarnessConfig, HarnessError, MAX_BYTE_LIMIT, MAX_OUTPUT_TOKENS_PER_REQUEST,
+    MAX_SESSION_TIMEOUT, MAX_STEPS, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
+    MAX_TOTAL_TOKENS, SessionOutcome, SessionTask,
+};
 use kiln_harness::journal::{
     GENESIS_SHA256, JournalError, JournalEvent, JournalLimits, JournalRecord, JournalSink,
     JsonlJournal, LoadedJournal, MAX_JOURNAL_BYTES, MAX_JOURNAL_LINE_BYTES, MemoryJournal,
@@ -15,6 +20,7 @@ use kiln_harness::provider::{
     ScriptedProvider, ToolCall, ToolDefinition,
 };
 use kiln_harness::replay::ReplayProvider;
+use kiln_harness::tools::ToolLimits;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -117,10 +123,10 @@ async fn demo_journal_chain_verifies_and_records_the_whole_session() {
     assert_eq!(event_names(&journal), expected);
     assert!(matches!(
         &journal.records[0].event,
-        JournalEvent::SessionStarted { schema: 1, provider, tools, budgets, .. }
+        JournalEvent::SessionStarted { schema: 1, provider, tools, limits, .. }
             if provider.name == "scripted"
                 && tools.len() == 5
-                && *budgets == HarnessConfig::default().budgets()
+                && *limits == HarnessConfig::default().limits()
     ));
     assert!(matches!(
         &journal.records.last().expect("last").event,
@@ -454,7 +460,7 @@ fn unsupported_schema_is_rejected() {
             system: String::new(),
             task: "t".to_string(),
             tools: Vec::new(),
-            budgets: HarnessConfig::default().budgets(),
+            limits: HarnessConfig::default().limits(),
         },
     };
     let temp = tempfile::tempdir().expect("temp dir");
@@ -613,14 +619,14 @@ async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
     let journal = read_journal(&path).expect("journal verifies");
     let provider = ReplayProvider::from_journal(&journal).expect("replayable");
     assert_eq!(provider.task(), SessionTask::demo());
-    assert_eq!(provider.budgets(), HarnessConfig::default().budgets());
+    assert_eq!(provider.limits(), HarnessConfig::default().limits());
     assert_eq!(
         provider.recorded_final_answer(),
         Some(recorded.final_answer.as_str())
     );
     let task = provider.task();
     let mut config = short_lifecycle_config();
-    config.apply_budgets(&provider.budgets());
+    config.apply_limits(&provider.limits());
 
     let api = FakeApi::default();
     let observer = api.clone();
@@ -815,4 +821,205 @@ async fn replay_diverges_when_only_the_output_cap_differs() {
 
     assert_eq!(error.kind, ProviderErrorKind::ReplayDiverged);
     assert_eq!(provider.diverged_at(), Some(1));
+}
+
+fn distinct_config() -> HarnessConfig {
+    HarnessConfig {
+        max_steps: 9,
+        max_tool_calls: 11,
+        max_tool_calls_per_turn: 3,
+        session_timeout: Duration::from_millis(12_345),
+        lifecycle_timeout: Duration::from_millis(250),
+        lifecycle_retry_delay: Duration::from_millis(7),
+        max_model_arguments_bytes: 1,
+        max_final_answer_bytes: 1000,
+        max_output_tokens_per_request: 77,
+        max_total_input_tokens: 5555,
+        max_total_output_tokens: 666,
+        tool_limits: ToolLimits {
+            timeout: Duration::from_millis(1234),
+            max_argv_bytes: 101,
+            max_stdin_bytes: 102,
+            max_file_bytes: 103,
+            max_result_bytes: 1040,
+            max_manifest_bytes: 105,
+            max_manifest_entries: 106,
+        },
+    }
+}
+
+#[test]
+fn limits_round_trip_every_model_visible_setting() {
+    let recorded = distinct_config();
+    let mut restored = HarnessConfig::default();
+    let lifecycle = (restored.lifecycle_timeout, restored.lifecycle_retry_delay);
+    let limits = recorded.limits();
+
+    // Through JSON, as replay reads them.
+    let decoded =
+        serde_json::from_str(&serde_json::to_string(&limits).expect("encode")).expect("decode");
+    restored.apply_limits(&decoded);
+
+    assert_eq!(restored.limits(), limits);
+    assert_eq!(restored.max_model_arguments_bytes, 1);
+    assert_eq!(restored.max_final_answer_bytes, 1000);
+    assert_eq!(restored.session_timeout, recorded.session_timeout);
+    assert_eq!(restored.tool_limits.timeout, recorded.tool_limits.timeout);
+    assert_eq!(
+        restored.tool_limits.max_manifest_entries,
+        recorded.tool_limits.max_manifest_entries
+    );
+    assert_eq!(
+        (restored.lifecycle_timeout, restored.lifecycle_retry_delay),
+        lifecycle,
+        "lifecycle windows are not model-visible and are not replayed"
+    );
+    let mut unknown = serde_json::to_value(limits).expect("value");
+    unknown["surprise"] = json!(1);
+    assert!(serde_json::from_value::<kiln_harness::journal::SessionLimits>(unknown).is_err());
+}
+
+#[tokio::test]
+async fn replay_restores_a_recorded_argument_limit_and_reproduces() {
+    let responses = [
+        ModelResponse::tool_use([ToolCall::new("c", "workspace_diff", json!({}))]),
+        ModelResponse::final_text("done"),
+    ];
+    let recording_api = FakeApi::default();
+    let recording_observer = recording_api.clone();
+    let mut recording_config = short_lifecycle_config();
+    recording_config.max_model_arguments_bytes = 1;
+    let mut recording = Harness::new(
+        recording_api,
+        ScriptedProvider::new(responses),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        recording_config,
+    );
+    recording
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("recording succeeds with an oversized-argument rejection");
+    assert_eq!(
+        recording_observer.state().execs.len(),
+        1,
+        "only the baseline"
+    );
+
+    let loaded = LoadedJournal {
+        records: recording.journal().records.clone(),
+        complete: true,
+    };
+    let provider = ReplayProvider::from_journal(&loaded).expect("replayable");
+    let task = provider.task();
+    let mut config = short_lifecycle_config();
+    config.apply_limits(&provider.limits());
+    assert_eq!(config.max_model_arguments_bytes, 1);
+    let replay_api = FakeApi::default();
+    let replay_observer = replay_api.clone();
+    let mut replay = Harness::new(
+        replay_api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    let outcome = replay
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("replay reproduces under the recorded limit");
+
+    assert_eq!(outcome.final_answer, "done");
+    assert_eq!(replay.provider().diverged_at(), None);
+    assert_eq!(
+        replay_observer.state().execs.len(),
+        1,
+        "the tool stays rejected"
+    );
+}
+
+#[tokio::test]
+async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
+    let journal = read_journal(&path).expect("journal verifies");
+    let over: [fn(&mut kiln_harness::journal::SessionLimits); 8] = [
+        |limits| limits.max_steps = MAX_STEPS + 1,
+        |limits| limits.max_tool_calls = MAX_TOOL_CALLS + 1,
+        |limits| limits.max_tool_calls_per_turn = MAX_TOOL_CALLS_PER_TURN + 1,
+        |limits| limits.session_timeout_ms = 6 * 60 * 60 * 1000 + 1,
+        |limits| limits.tool_limits.timeout_ms = 10 * 60 * 1000 + 1,
+        |limits| limits.tool_limits.max_stdin_bytes = MAX_BYTE_LIMIT + 1,
+        |limits| limits.max_output_tokens_per_request = MAX_OUTPUT_TOKENS_PER_REQUEST + 1,
+        |limits| limits.max_total_input_tokens = MAX_TOTAL_TOKENS + 1,
+    ];
+    for raise in over {
+        let mut crafted = journal.clone();
+        let JournalEvent::SessionStarted { limits, .. } = &mut crafted.records[0].event else {
+            panic!("first record starts the session");
+        };
+        raise(limits);
+        let provider = ReplayProvider::from_journal(&crafted).expect("loads");
+        let task = provider.task();
+        let mut config = short_lifecycle_config();
+        config.apply_limits(&provider.limits());
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let mut replay = Harness::new(
+            api,
+            provider,
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config,
+        );
+
+        let error = replay
+            .run(&task, CancellationToken::new())
+            .await
+            .expect_err("limits above a ceiling are invalid");
+
+        assert!(
+            matches!(error, HarnessError::InvalidModelCall(_)),
+            "{error}"
+        );
+        assert!(observer.state().creates.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn limits_exactly_at_the_ceilings_are_accepted() {
+    let config = HarnessConfig {
+        max_steps: MAX_STEPS,
+        max_tool_calls: MAX_TOOL_CALLS,
+        max_tool_calls_per_turn: MAX_TOOL_CALLS_PER_TURN,
+        session_timeout: MAX_SESSION_TIMEOUT,
+        max_model_arguments_bytes: MAX_BYTE_LIMIT,
+        max_final_answer_bytes: MAX_BYTE_LIMIT,
+        max_output_tokens_per_request: MAX_OUTPUT_TOKENS_PER_REQUEST,
+        max_total_input_tokens: MAX_TOTAL_TOKENS,
+        max_total_output_tokens: MAX_TOTAL_TOKENS,
+        tool_limits: ToolLimits {
+            timeout: MAX_TOOL_TIMEOUT,
+            max_argv_bytes: MAX_BYTE_LIMIT,
+            max_stdin_bytes: MAX_BYTE_LIMIT,
+            max_file_bytes: MAX_BYTE_LIMIT,
+            max_result_bytes: MAX_BYTE_LIMIT,
+            max_manifest_bytes: MAX_BYTE_LIMIT,
+            max_manifest_entries: 512,
+        },
+        ..short_lifecycle_config()
+    };
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("ceilings are inclusive");
 }
