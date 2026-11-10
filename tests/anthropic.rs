@@ -178,7 +178,7 @@ fn request_body_matches_the_golden_json() {
         max_output_tokens: 16_384,
     };
 
-    let body = request_body(&config, &request);
+    let body = request_body(&config, &request).expect("body");
 
     let golden = json!({
         "model": "claude-opus-5-5",
@@ -232,17 +232,17 @@ fn optional_fields_follow_the_configuration() {
     let mut config = config("https://api.anthropic.com");
     config.fallbacks = false;
     config.strict_tools = true;
-    let bare = request_body(&config, &request(&[]));
+    let bare = request_body(&config, &request(&[])).expect("body");
     for absent in ["system", "tools", "tool_choice", "fallbacks"] {
         assert!(bare.get(absent).is_none(), "{absent}: {bare}");
     }
     assert_eq!(bare["output_config"], json!({"effort": "high"}));
-    let strict = request_body(&config, &request(&tools));
+    let strict = request_body(&config, &request(&tools)).expect("body");
     let schemas = strict["tools"].as_array().expect("tools");
     assert_eq!(schemas.len(), 5);
     assert!(schemas.iter().all(|tool| tool["strict"] == true));
     config.strict_tools = false;
-    let loose = request_body(&config, &request(&tools));
+    let loose = request_body(&config, &request(&tools)).expect("body");
     assert!(
         loose["tools"]
             .as_array()
@@ -288,7 +288,8 @@ fn a_transcript_from_another_provider_is_rebuilt_as_blocks() {
             messages: &messages,
             max_output_tokens: 8,
         },
-    );
+    )
+    .expect("body");
     assert_eq!(
         body["messages"][1],
         json!({"role": "assistant", "content": [
@@ -404,8 +405,6 @@ fn stop_reasons_map_and_normalize() {
         (&say, "stop_sequence", StopReason::EndTurn),
         (&say, "max_tokens", StopReason::MaxTokens),
         (&say, "model_context_window_exceeded", StopReason::MaxTokens),
-        (&say, "pause_turn", StopReason::Other),
-        (&say, "something_new", StopReason::Other),
     ] {
         assert_eq!(parsed(content, stop).stop_reason, expected, "{stop}");
     }
@@ -439,7 +438,7 @@ fn unknown_and_fallback_blocks_are_kept_only_as_opaque_content() {
     let blocks = json!([
         {"type": "redacted_thinking", "data": "opaque=="},
         {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
-        {"type": "brand_new_block", "payload": {"nested": [1, 2.5, "three"]}},
+        {"type": "brand_new_block", "payload": {"nested": [1, -2, "three"]}},
         text("answer"),
     ]);
     let mut body = message(&blocks, "end_turn", &usage(100, 400));

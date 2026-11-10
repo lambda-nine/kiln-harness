@@ -222,8 +222,16 @@ model name. Replay answers from the journal and never contacts the server.
 "ephemeral"}, "fallbacks": "default"?}`. It never carries `temperature`,
 `top_p`, `top_k`, `thinking`, or `stream`: sampling parameters are refused
 on this API version, and without `thinking` current models think
-adaptively. Tools are `{"name", "description", "input_schema"}`, plus
-`"strict": true` with `--strict-tools`.
+adaptively. Tools are `{"name", "description", "input_schema"}`. With
+`--strict-tools` each also carries `"strict": true`, and its schema is sent
+with the keywords strict mode refuses removed wherever they are keywords
+(`maxItems`, `minItems`, `minimum`, `maximum`, `exclusiveMinimum`,
+`exclusiveMaximum`, `maxLength`, `minLength`, `pattern`) and
+`"required": []` added to an object schema without `required`. An object
+schema without `"additionalProperties": false` cannot be made strict and is
+refused when the provider is built. The canonical schemas in
+`ToolDefinition`, the journal, and the request hash are unchanged, and the
+typed tools still enforce every removed bound.
 
 A user turn is a string. An assistant turn the adapter produced is its
 recorded blocks, verbatim and in order. One assistant turn from another
@@ -234,10 +242,17 @@ user message of `tool_result` blocks, in order, each with the result's
 compact JSON and `is_error` unless the result says `"ok": true`; splitting
 them across messages would teach the model to stop calling tools in
 parallel. Blocks are held as JSON values, so the echo is value-for-value:
-strings and numbers are exact, and object keys come out in the journal's
-canonical sorted order.
+strings are exact, object keys come out in the journal's canonical sorted
+order, and numbers are exact because a response whose opaque content holds
+one serde_json cannot hold exactly (a float, or an integer outside 64 bits)
+is refused. Current block types carry none. A `tool_use` block's `input`
+is the neutral arguments and is exempt: its numbers go through
+`float_roundtrip` and the typed tool.
 
-The response's `content` is kept whole as the opaque blocks, with its
+The response must be the success envelope: `type: "message"`,
+`role: "assistant"`, a valid `model` (now required), a `content` array, and
+a known `stop_reason`. A `type: "error"` body is an error even with a
+`content` array. The response's `content` is kept whole as the opaque blocks, with its
 `model` and `stop_details`. `text` blocks, joined with `"\n"`, are the
 neutral text; `tool_use` blocks are the tool calls; `thinking`,
 `redacted_thinking`, `fallback`, and unknown blocks exist only in the
@@ -247,19 +262,30 @@ positional ID), a name of at most 256 bytes, and an object `input`;
 otherwise the response is `InvalidResponse`. `end_turn` and `stop_sequence`
 are `end_turn` (`tool_use` when calls are present), `tool_use` is
 `tool_use`, `max_tokens` and `model_context_window_exceeded` are
-`max_tokens`, `refusal` is `refusal`, and `pause_turn` and anything else are
-`other`. Stop details are recorded in the provider content, never sent
+`max_tokens`, and `refusal` is `refusal`. `pause_turn` is `InvalidResponse`:
+it needs server tools, which the harness never sends, and treating it as a
+final answer would end the turn early. A missing or unknown stop reason is
+`InvalidResponse` too; the adapter never produces `other`. Stop details are recorded in the provider content, never sent
 back, and never shown.
 
 Anthropic's usage counters are already disjoint. A missing or null counter
-is 0; a missing `usage` object, zero total input (not zero uncached input:
-a fully cached prompt has none), zero output tokens for non-empty content,
-or more than 64 bytes of neutral output per output token is
-`InvalidResponse`.
+is 0. After a server-side fallback, `usage.iterations` lists every attempt,
+each billed, and the top level describes only the serving attempt. When
+the array is present, every entry is checked like the top level and the
+usage is the saturating sum of all of them, without adding the top level
+again; otherwise it is the top level. A malformed entry is
+`InvalidResponse`. The per-request output cap therefore covers one model
+call including its server-side attempts; an operator who needs a strict
+per-attempt cap runs with `--no-fallbacks`. A missing `usage` object, zero
+total input (not zero uncached input: a fully cached prompt has none), zero
+output tokens for non-empty content, or more than 64 bytes of neutral
+output per output token, all judged on the sum, is `InvalidResponse`.
 
 With a key, error messages are the status, the `error.type` from a closed
 list of known types (`unknown` otherwise), and a `request_id` only when it
-is `req_` and ASCII letters and digits, 64 bytes at most; never the
+is `req_` and ASCII letters and digits, 64 bytes at most, and each only
+when it does not contain the key in either spelling (a key can be shaped
+like a request ID or even a type name); otherwise just the status. Never the
 message. Without one (below), the same is followed by the unauthenticated
 excerpt: at most 512 bytes of the body, without control characters. 408, 409, 429, 500, 502, 503, 504, 529, other
 5xx without a JSON body, and transport failures are retried as above. 413

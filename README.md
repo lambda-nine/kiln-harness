@@ -179,9 +179,13 @@ from the cache; cache reads and writes are reported in usage and count
 against the input budget. Server-side fallbacks are on: if a safety check
 declines a request, the API reruns it on a suitable fallback model in the
 same call, and the audit records which model served each turn as
-`served_model`. `--no-fallbacks` turns that off. `--strict-tools` marks the
-tool schemas `strict`; it is off by default because the schemas use
-constraints strict mode may not accept. `--temperature` and `--seed` are
+`served_model`. Every attempt counts against the token budgets, including
+one that was declined, so `--max-output-tokens` limits one model call with
+all its attempts; `--no-fallbacks` turns fallbacks off and makes it a
+per-attempt cap. `--strict-tools` marks the tool schemas `strict` and
+sends them without the bounds strict mode refuses (`maxItems`, `minimum`,
+and the like); the harness still enforces those bounds itself. It is off by
+default. `--temperature` and `--seed` are
 refused for this provider, and `--effort`, `--strict-tools`, and
 `--no-fallbacks` for openai-compat. `--base-url` defaults to
 `https://api.anthropic.com` and must be `https` unless its host is a

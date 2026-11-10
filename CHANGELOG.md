@@ -6,6 +6,20 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Review fixes for the anthropic provider. Usage after a server-side
+  fallback is the sum of every attempt in `usage.iterations`, each
+  validated, so declined attempts count against all token budgets, and the
+  per-request output cap now covers one call with its attempts
+  (`--no-fallbacks` for a per-attempt cap). Authenticated error messages
+  drop the error type and request ID when either contains the key. Opaque
+  content holding a float or an integer outside 64 bits is refused, since
+  it could not be echoed exactly. Responses must be a `message` from the
+  `assistant` with a valid, now required, `model` and a known stop reason;
+  `pause_turn`, unknown, and missing stop reasons are `InvalidResponse`,
+  and the adapter no longer yields `StopReason::Other`. `--strict-tools`
+  sends schemas without the keywords strict mode refuses and with
+  `"required": []` where absent, after the live API refused `maxItems`;
+  the canonical schemas and local validation are unchanged.
 - Anthropic credential-proxy mode: `AnthropicConfig::api_key` is optional,
   and `run --provider anthropic` no longer requires `--api-key-env`.
   Without a key no `x-api-key` or `Authorization` header is sent, a

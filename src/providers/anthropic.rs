@@ -37,6 +37,11 @@
 //!
 //! # Response
 //!
+//! The body must be the non-streaming success envelope: `type: "message"`,
+//! `role: "assistant"`, a `model` that is 1..=256 bytes of letters, digits,
+//! and `._:@/-`, a `content` array, a known `stop_reason`, and `usage`. A
+//! `type: "error"` body is an error whatever else it carries.
+//!
 //! `content` is kept whole as [`ProviderContent::blocks`], with the
 //! response's `model` (the model that actually served the turn) and any
 //! `stop_details` (recorded, never sent back). From it, `text` blocks are
@@ -55,14 +60,33 @@
 //! | `tool_use` | `ToolUse` |
 //! | `max_tokens`, `model_context_window_exceeded` | `MaxTokens` |
 //! | `refusal` | `Refusal` |
-//! | `pause_turn`, anything else | `Other` |
+//! | `pause_turn` | `InvalidResponse`: it needs server tools, never sent |
+//! | missing or anything else | `InvalidResponse` |
+//!
+//! The adapter never produces [`StopReason::Other`], so nothing it does not
+//! understand ends a session as a final answer.
+//!
+//! Opaque content must echo value for value, and `serde_json` holds only
+//! 64-bit integers exactly: a float, or an integer outside `i64` and `u64`,
+//! anywhere in the blocks or `stop_details` is `InvalidResponse`. Current
+//! block types (`thinking`, `redacted_thinking`, `fallback`, `text`,
+//! `tool_use`) carry no such numbers, so this costs nothing in practice.
+//! A `tool_use` block's `input` is the neutral arguments rather than opaque
+//! content and is not checked; its numbers take `serde_json`'s
+//! `float_roundtrip` path, and the typed tool judges them.
 //!
 //! `usage` is required. Its `input_tokens`, `cache_read_input_tokens`, and
 //! `cache_creation_input_tokens` are already disjoint, as the provider
-//! contract wants; a missing or null counter is 0. Zero total input, zero
-//! output tokens for non-empty content, or more than
+//! contract wants; a missing or null counter is 0. With a server-side
+//! fallback, `usage.iterations` records every attempt and the top level
+//! only the serving one: then every entry is checked the same way and their
+//! saturating sum is the usage, without the top level counted again. So
+//! the per-request output cap covers one model call with all its
+//! attempts; `--no-fallbacks` gives a strict per-attempt cap. Zero total
+//! input, zero output tokens for non-empty content, or more than
 //! [`MAX_OUTPUT_BYTES_PER_TOKEN`](super::http::MAX_OUTPUT_BYTES_PER_TOKEN)
-//! bytes of text and calls per output token is `InvalidResponse`. Opaque blocks count toward the engine's byte budget
+//! bytes of text and calls per output token, all on that sum, is
+//! `InvalidResponse`. Opaque blocks count toward the engine's byte budget
 //! but not the token floor: a thinking signature is large and unrelated to
 //! completion tokens.
 //!
@@ -75,8 +99,12 @@
 //!   both are stored and echoed verbatim, and the serving model is recorded
 //!   as `served_model` in the audit. A non-streaming response omits a
 //!   declined partial, so no block before a `fallback` block needs dropping.
-//! - **Strict tools off by default.** The harness's schemas use `minItems`,
-//!   `maxItems`, and `minimum`, which strict mode may not accept.
+//! - **Strict tools off by default.** Strict mode refuses `maxItems` and
+//!   similar bounds, which the harness's schemas use. With `strict_tools`,
+//!   each schema is sent through [`strict_input_schema`]: those keywords
+//!   removed and `"required": []` added where absent. The canonical schemas
+//!   stay in [`crate::provider::ToolDefinition`], and the typed tools still
+//!   enforce every bound locally.
 //! - **Non-streaming only.** `run`'s 16,384-token default suits it.
 //! - **No reordering**, for a stable prompt-cache prefix.
 //!
@@ -85,7 +113,8 @@
 //! With a key, nothing the endpoint sends is quoted. An error is its status,
 //! its `error.type` from a closed list of known types (anything else is
 //! `unknown`), and a `request_id` that is `req_` plus at most 60 ASCII
-//! letters and digits; without a key, the same followed by at most
+//! letters and digits, each only when it does not contain the key in either
+//! spelling (otherwise the message is the bare status); without a key, the same followed by at most
 //! [`ERROR_EXCERPT_BYTES`](super::http::ERROR_EXCERPT_BYTES) of the body,
 //! UTF-8-lossy and without control characters. Connect errors,
 //! timeouts, and HTTP 408, 409, 429, 500, 502, 503, 504, and 529 are retried
@@ -129,6 +158,7 @@ use crate::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderContent, ProviderError,
     ProviderErrorKind, ProviderInfo, StopReason, ToolCall, Usage,
 };
+use crate::tools::{ToolLimits, ToolRegistry};
 
 /// The name recorded in journals and in [`ProviderContent::provider`].
 pub const PROVIDER_NAME: &str = "anthropic";
@@ -371,6 +401,14 @@ impl AnthropicProvider {
                 HeaderValue::from_static(FALLBACK_BETA),
             );
         }
+        if config.strict_tools {
+            // The harness's own tools must survive the strict transform, so
+            // --strict-tools fails here rather than mid-session.
+            for tool in ToolRegistry::new(ToolLimits::default()).definitions() {
+                strict_input_schema(&tool.input_schema)
+                    .map_err(|problem| AnthropicError(format!("tool {}: {problem}", tool.name)))?;
+            }
+        }
         let client = config.transport().client().map_err(AnthropicError)?;
         Ok(Self {
             client,
@@ -409,7 +447,7 @@ impl AnthropicProvider {
             }
             return Ok(parsed);
         }
-        let mut failure = classify_status(exchange.status, &exchange.body, key.is_none());
+        let mut failure = classify_status(exchange.status, &exchange.body, key);
         failure.retry_after = exchange.retry_after;
         Err(failure)
     }
@@ -428,7 +466,7 @@ impl Provider for AnthropicProvider {
         &mut self,
         request: ModelRequest<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        let body = serde_json::to_vec(&request_body(&self.config, &request)).map_err(|error| {
+        let body = serde_json::to_vec(&request_body(&self.config, &request)?).map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::InvalidResponse,
                 format!("encode request: {error}"),
@@ -444,8 +482,15 @@ impl Provider for AnthropicProvider {
 }
 
 /// The request body for one completion.
-#[must_use]
-pub fn request_body(config: &AnthropicConfig, request: &ModelRequest<'_>) -> Value {
+///
+/// # Errors
+///
+/// With `strict_tools`, returns `Rejected` when a tool schema cannot be made
+/// strict (see [`strict_input_schema`]).
+pub fn request_body(
+    config: &AnthropicConfig,
+    request: &ModelRequest<'_>,
+) -> Result<Value, ProviderError> {
     let mut messages = Vec::with_capacity(request.messages.len());
     for message in request.messages {
         match message {
@@ -514,13 +559,23 @@ pub fn request_body(config: &AnthropicConfig, request: &ModelRequest<'_>) -> Val
                 let mut entry = Map::new();
                 entry.insert("name".to_string(), json!(tool.name));
                 entry.insert("description".to_string(), json!(tool.description));
-                entry.insert("input_schema".to_string(), tool.input_schema.clone());
                 if config.strict_tools {
+                    // The canonical schema stays in ToolDefinition; the
+                    // typed tools still enforce every limit it states.
+                    let schema = strict_input_schema(&tool.input_schema).map_err(|problem| {
+                        ProviderError::new(
+                            ProviderErrorKind::Rejected,
+                            format!("tool {} cannot be strict: {problem}", tool.name),
+                        )
+                    })?;
+                    entry.insert("input_schema".to_string(), schema);
                     entry.insert("strict".to_string(), json!(true));
+                } else {
+                    entry.insert("input_schema".to_string(), tool.input_schema.clone());
                 }
-                Value::Object(entry)
+                Ok(Value::Object(entry))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ProviderError>>()?;
         body.insert("tools".to_string(), Value::Array(tools));
         body.insert("tool_choice".to_string(), json!({"type": "auto"}));
     }
@@ -533,18 +588,111 @@ pub fn request_body(config: &AnthropicConfig, request: &ModelRequest<'_>) -> Val
     if config.fallbacks {
         body.insert("fallbacks".to_string(), json!("default"));
     }
-    Value::Object(body)
+    Ok(Value::Object(body))
+}
+
+/// JSON Schema keywords Anthropic's strict tool mode refuses.
+pub const STRICT_UNSUPPORTED_KEYWORDS: [&str; 9] = [
+    "maxItems",
+    "minItems",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "maxLength",
+    "minLength",
+    "pattern",
+];
+
+/// `schema` as strict tool mode accepts it: every keyword in
+/// [`STRICT_UNSUPPORTED_KEYWORDS`] removed wherever it is a keyword, at any
+/// depth (a property that happens to be named `pattern` is kept), and
+/// `"required": []` added to an object schema that has no `required`, which
+/// means the same thing. Bounds removed here are still enforced by the
+/// harness's typed tool validation.
+///
+/// # Errors
+///
+/// Returns a description of the first object schema without
+/// `"additionalProperties": false`, which strict mode requires and which
+/// cannot be added without changing what the schema accepts.
+pub fn strict_input_schema(schema: &Value) -> Result<Value, String> {
+    strict_schema_at(schema, "input_schema")
+}
+
+fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
+    let Some(map) = schema.as_object() else {
+        return Ok(schema.clone());
+    };
+    let mut out = Map::new();
+    for (keyword, value) in map {
+        if STRICT_UNSUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
+            continue;
+        }
+        let here = format!("{path}.{keyword}");
+        let value = match keyword.as_str() {
+            // Maps from names to subschemas.
+            "properties" | "patternProperties" | "$defs" | "definitions" => match value {
+                Value::Object(entries) => Value::Object(
+                    entries
+                        .iter()
+                        .map(|(name, sub)| {
+                            Ok((
+                                name.clone(),
+                                strict_schema_at(sub, &format!("{here}.{name}"))?,
+                            ))
+                        })
+                        .collect::<Result<Map<_, _>, String>>()?,
+                ),
+                other => other.clone(),
+            },
+            // One subschema, or a list of them.
+            "items"
+            | "additionalProperties"
+            | "not"
+            | "contains"
+            | "if"
+            | "then"
+            | "else"
+            | "anyOf"
+            | "oneOf"
+            | "allOf"
+            | "prefixItems" => match value {
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, sub)| strict_schema_at(sub, &format!("{here}[{index}]")))
+                        .collect::<Result<Vec<_>, String>>()?,
+                ),
+                other => strict_schema_at(other, &here)?,
+            },
+            _ => value.clone(),
+        };
+        out.insert(keyword.clone(), value);
+    }
+    if out.get("type").and_then(Value::as_str) == Some("object") {
+        if out.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Err(format!(
+                "{path} is an object schema without \"additionalProperties\": false"
+            ));
+        }
+        out.entry("required").or_insert_with(|| json!([]));
+    }
+    Ok(Value::Object(out))
 }
 
 /// Map a parsed response body to the harness's response.
 ///
 /// # Errors
 ///
-/// Returns `InvalidResponse` for a body without a content array or usage,
-/// a malformed block, a `tool_use` whose ID, name, or input breaks the
-/// rules in the module documentation, a malformed `model` or
-/// `stop_details`, or implausible usage. An error object in the body is
-/// reported by its allowlisted type only, as for an authenticated request.
+/// Returns `InvalidResponse` for a body that is not a `message` from the
+/// `assistant` with a valid `model`, a content array, a known stop reason,
+/// and usage; a malformed block; a `tool_use` whose ID, name, or input
+/// breaks the rules in the module documentation; malformed `stop_details`;
+/// opaque content holding a number that cannot be echoed exactly; or
+/// implausible usage. An error object in the body is reported by its
+/// allowlisted type only, as for an authenticated request.
 pub fn parse_response(value: &Value) -> Result<ModelResponse, ProviderError> {
     parse_response_quoting(value, false)
 }
@@ -552,8 +700,11 @@ pub fn parse_response(value: &Value) -> Result<ModelResponse, ProviderError> {
 /// [`parse_response`], quoting an error object in the body only when
 /// `quote` (a request without a key).
 fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, ProviderError> {
-    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
-        if value.get("type").and_then(Value::as_str) == Some("error") {
+    // The success envelope comes first: an error object is never read as a
+    // message, whatever else it carries.
+    match value.get("type").and_then(Value::as_str) {
+        Some("message") => {}
+        Some("error") => {
             let kind = error_type(value);
             return Err(invalid(if quote {
                 let error = value.get("error").map(Value::to_string).unwrap_or_default();
@@ -562,6 +713,17 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
                 format!("server reported {kind} (body withheld: authenticated request)")
             }));
         }
+        _ => return Err(invalid("response type is not \"message\"")),
+    }
+    if value.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(invalid("response role is not \"assistant\""));
+    }
+    let model = match value.get("model") {
+        Some(Value::String(model)) if model_id_is_valid(model) => model.clone(),
+        None | Some(Value::Null) => return Err(invalid("response has no model")),
+        Some(_) => return Err(invalid("response model is not a model identifier")),
+    };
+    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
         return Err(invalid("response has no content array"));
     };
     let mut texts = Vec::new();
@@ -588,24 +750,35 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
     }
     let text = texts.join("\n");
     let text = (!text.is_empty()).then_some(text);
+    // Only the stop reasons this API version defines for a request without
+    // server tools; nothing unknown is taken as a final answer.
     let stop_reason = match value.get("stop_reason").and_then(Value::as_str) {
         Some("end_turn" | "stop_sequence") if !tool_calls.is_empty() => StopReason::ToolUse,
         Some("end_turn" | "stop_sequence") => StopReason::EndTurn,
         Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens" | "model_context_window_exceeded") => StopReason::MaxTokens,
         Some("refusal") => StopReason::Refusal,
-        _ => StopReason::Other,
-    };
-    let model = match value.get("model") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(model)) if model_id_is_valid(model) => Some(model.clone()),
-        Some(_) => return Err(invalid("response model is not a model identifier")),
+        Some("pause_turn") => {
+            return Err(invalid(
+                "pause_turn needs server tools, which this harness does not send",
+            ));
+        }
+        Some(_) => return Err(invalid("unknown stop_reason")),
+        None => return Err(invalid("response has no stop_reason")),
     };
     let stop_details = match value.get("stop_details") {
         None | Some(Value::Null) => None,
         Some(details @ Value::Object(_)) => Some(details.clone()),
         Some(_) => return Err(invalid("stop_details is not an object")),
     };
+    // Opaque content must come back value for value; serde_json holds
+    // only 64-bit integers exactly.
+    for block in blocks {
+        check_exact_numbers(block, true)?;
+    }
+    if let Some(details) = &stop_details {
+        check_exact_numbers(details, false)?;
+    }
     let response = ModelResponse {
         text,
         tool_calls,
@@ -613,13 +786,37 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
         usage: parse_usage(value.get("usage"))?,
         provider_content: Some(ProviderContent {
             provider: PROVIDER_NAME.to_string(),
-            model,
+            model: Some(model),
             blocks: Value::Array(blocks.clone()),
             stop_details,
         }),
     };
     check_completion_tokens(&response)?;
     Ok(response)
+}
+
+/// Refuse any JSON number `serde_json` does not hold exactly: a float, or an
+/// integer outside `i64` and `u64` (parsed through `f64`). A `tool_use`
+/// block's `input` is the neutral arguments, not opaque content, and is
+/// skipped when `block` is set: its numbers take the usual
+/// `float_roundtrip` path.
+fn check_exact_numbers(value: &Value, block: bool) -> Result<(), ProviderError> {
+    match value {
+        Value::Number(number) if number.as_i64().is_some() || number.as_u64().is_some() => Ok(()),
+        Value::Number(_) => Err(invalid(
+            "opaque content contains a number that cannot be echoed exactly",
+        )),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| check_exact_numbers(item, false)),
+        Value::Object(map) => {
+            let tool_use = block && map.get("type").and_then(Value::as_str) == Some("tool_use");
+            map.iter()
+                .filter(|(key, _)| !(tool_use && key.as_str() == "input"))
+                .try_for_each(|(_, item)| check_exact_numbers(item, false))
+        }
+        Value::Null | Value::Bool(_) | Value::String(_) => Ok(()),
+    }
 }
 
 fn parse_tool_use(block: &Value) -> Result<ToolCall, ProviderError> {
@@ -660,21 +857,29 @@ fn model_id_is_valid(model: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:@/-".contains(&byte))
 }
 
+/// The response's usage. With `usage.iterations`, the per-attempt billing
+/// record a server-side fallback produces, it is the saturating sum of
+/// every attempt, each checked like the top level; the top-level counters
+/// then describe only the serving attempt, already in the sum, and are not
+/// added again. Without it, the top-level counters.
 fn parse_usage(usage: Option<&Value>) -> Result<Usage, ProviderError> {
     let usage = usage
         .filter(|usage| usage.is_object())
         .ok_or_else(|| invalid("response has no usage; token budgets cannot be enforced"))?;
-    let count = |field: &str| match usage.get(field) {
-        None | Some(Value::Null) => Ok(0),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| invalid(format!("usage {field} is not a count"))),
-    };
-    let usage = Usage {
-        input_tokens: count("input_tokens")?,
-        output_tokens: count("output_tokens")?,
-        cache_read_input_tokens: count("cache_read_input_tokens")?,
-        cache_creation_input_tokens: count("cache_creation_input_tokens")?,
+    let usage = match usage.get("iterations") {
+        None | Some(Value::Null) => counters(usage, "usage")?,
+        Some(Value::Array(attempts)) if !attempts.is_empty() => attempts
+            .iter()
+            .enumerate()
+            .try_fold(Usage::default(), |sum, (index, attempt)| {
+                if !attempt.is_object() {
+                    return Err(invalid(format!(
+                        "usage iterations[{index}] is not an object"
+                    )));
+                }
+                Ok(sum + counters(attempt, &format!("usage iterations[{index}]"))?)
+            })?,
+        Some(_) => return Err(invalid("usage iterations is not a non-empty array")),
     };
     // Every request carries at least the user's task, cached or not; a
     // fully cached prompt has zero uncached input.
@@ -682,6 +887,23 @@ fn parse_usage(usage: Option<&Value>) -> Result<Usage, ProviderError> {
         return Err(invalid("usage reports zero input tokens"));
     }
     Ok(usage)
+}
+
+/// The four disjoint counters of one usage object; a missing or null
+/// counter is 0, and anything else that is not a `u64` is invalid.
+fn counters(usage: &Value, what: &str) -> Result<Usage, ProviderError> {
+    let count = |field: &str| match usage.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| invalid(format!("{what} {field} is not a count"))),
+    };
+    Ok(Usage {
+        input_tokens: count("input_tokens")?,
+        output_tokens: count("output_tokens")?,
+        cache_read_input_tokens: count("cache_read_input_tokens")?,
+        cache_creation_input_tokens: count("cache_creation_input_tokens")?,
+    })
 }
 
 /// `error.type` when it is a known type, otherwise `unknown`.
@@ -705,23 +927,24 @@ fn request_id(body: &Value) -> Option<&str> {
     })
 }
 
-/// Classify an error status. With `quote` false (an authenticated request)
-/// the body decides the class but is never quoted: only the allowlisted
-/// error type and a validated request ID are. With `quote`, a bounded,
-/// sanitized excerpt of the body follows them.
-fn classify_status(status: StatusCode, body: &[u8], quote: bool) -> Failure {
+/// Classify an error status. With a key (an authenticated request) the body
+/// decides the class but is never quoted: only the allowlisted error type
+/// and a validated request ID are, and only when neither holds the key in
+/// either spelling; otherwise the message is the bare status. Without a
+/// key, a bounded, sanitized excerpt of the body follows them.
+fn classify_status(status: StatusCode, body: &[u8], key: Option<&Credential<'_>>) -> Failure {
     let code = status.as_u16();
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let kind = parsed.as_ref().map_or("unknown", error_type);
-    let id = parsed
-        .as_ref()
-        .and_then(request_id)
-        .map(|id| format!(", request {id}"))
-        .unwrap_or_default();
-    let message = if quote {
-        format!("HTTP {code} {kind}{id}: {}", excerpt(body))
-    } else {
-        format!("HTTP {code} {kind}{id} (body withheld: authenticated request)")
+    let id = parsed.as_ref().and_then(request_id);
+    let id_part = id.map(|id| format!(", request {id}")).unwrap_or_default();
+    let message = match key {
+        None => format!("HTTP {code} {kind}{id_part}: {}", excerpt(body)),
+        // Even fixed text is checked: a key may be spelled like a type.
+        Some(key) if key.in_text(kind) || id.is_some_and(|id| key.in_text(id)) => {
+            format!("HTTP {code} (body withheld: authenticated request)")
+        }
+        Some(_) => format!("HTTP {code} {kind}{id_part} (body withheld: authenticated request)"),
     };
     match code {
         408 => Failure::retryable(ProviderErrorKind::Timeout, message),
@@ -828,6 +1051,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one row per status
     fn statuses_are_classified_without_quoting() {
+        let key = SecretString::new("sk-ant-test");
         let body = |kind: &str, message: &str| {
             json!({"type": "error", "error": {"type": kind, "message": message},
                    "request_id": "req_42"})
@@ -931,7 +1155,7 @@ mod tests {
             let failure = classify_status(
                 StatusCode::from_u16(code).expect("status"),
                 body.as_bytes(),
-                false,
+                Some(&Credential::new(&key)),
             );
             assert_eq!(failure.error.kind, kind, "{code} {body}");
             assert_eq!(failure.error.retryable, retryable, "{code} {body}");

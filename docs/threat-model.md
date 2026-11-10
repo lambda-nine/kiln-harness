@@ -81,7 +81,10 @@ it is not a hostile multi-tenant boundary.
   key; the parsed text, call IDs, and tool names; and the JSON nested inside
   `function.arguments`, decoded whatever its type (an object, string, array,
   number, or null), as well as the raw string kept when it is not an
-  object. The claim is
+  object. Error messages for authenticated anthropic requests interpolate
+  only the allowlisted error type and a syntactically validated request ID,
+  and each is checked against both spellings of the key first; a match
+  leaves just the status. The claim is
   therefore exact: the harness never writes the key, or a JSON-escaped form
   of it, to the journal, the audit, or an error. An endpoint that holds the
   key can still return a transformed or split form of it (base64, reversed,
@@ -96,7 +99,12 @@ it is not a hostile multi-tenant boundary.
   `thinking` field is empty unless a summary is requested, which this
   adapter does not do), only a signature. The served model name is the one
   endpoint string the audit carries; it must be 1..=256 bytes of letters,
-  digits, and `._:@/-` or the response is refused.
+  digits, and `._:@/-` or the response is refused. Opaque numbers that
+  could not be echoed exactly are refused rather than silently changed,
+  and only a well-formed `message` envelope with a known stop reason is
+  accepted: an error body or an unknown stop never becomes a final answer.
+  Strict tool schemas are a request-side transform only; every bound they
+  drop is still enforced by the harness's own argument validation.
 - In anthropic's credential-proxy mode the harness holds no key at all:
   without `--api-key-env` it sends no credential header, and a host-side
   proxy adds `x-api-key` and strips any client credential headers. A
@@ -129,7 +137,10 @@ it is not a hostile multi-tenant boundary.
   responses, including one without token usage or with plainly wrong usage,
   fail the session instead of being guessed at.
 - Reported token usage is an endpoint property the harness relies on for
-  cost accounting, not for safety. Usage that cannot be right (zero prompt
+  cost accounting, not for safety. For anthropic, every server-side attempt
+  in `usage.iterations` is counted, so a declined fallback attempt cannot
+  spend tokens outside the budgets; the per-request cap applies to the
+  whole call. Usage that cannot be right (zero prompt
   tokens, zero completion tokens for non-empty output, or more than 64 bytes
   of output per completion token) is refused, but a plausible lie is not
   detectable without the model's tokenizer. Size is bounded locally
