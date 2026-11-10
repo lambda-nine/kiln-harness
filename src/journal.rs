@@ -7,7 +7,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+// The harness reaches kilnd over a Unix socket and is Unix-only.
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use crate::provider::{
     ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall, ToolDefinition, Usage,
@@ -178,6 +178,12 @@ pub enum JournalError {
     RecordAfterEnd { sequence: u64 },
     #[error("journal record {sequence} breaks the session grammar: {reason}")]
     Grammar { sequence: u64, reason: String },
+    #[error("journal path {0:?} does not name a file")]
+    InvalidPath(PathBuf),
+    #[error("journal directory {path:?} is unsafe: {reason}")]
+    UnsafeDirectory { path: PathBuf, reason: &'static str },
+    #[error("journal file {0:?} changed while it was being created")]
+    Replaced(PathBuf),
     #[error("journal sink is closed after a failed write or a finished session")]
     Closed,
 }
@@ -238,13 +244,11 @@ impl Chain {
                 .unwrap_or_else(|| GENESIS_SHA256.to_string()),
             event,
         };
-        let line = serde_json::to_string(&record)?;
-        if line.len() > MAX_JOURNAL_LINE_BYTES {
-            return Err(JournalError::LineTooLarge {
+        let line =
+            encode_bounded(&record, MAX_JOURNAL_LINE_BYTES)?.ok_or(JournalError::LineTooLarge {
                 line: sequence.saturating_add(1),
                 limit: MAX_JOURNAL_LINE_BYTES,
-            });
-        }
+            })?;
         let total = self
             .bytes
             .saturating_add(line.len() as u64)
@@ -284,22 +288,54 @@ pub struct JsonlJournal {
 impl JsonlJournal {
     /// Create a new journal file with mode 0600, creating missing parents.
     ///
+    /// The parent is canonicalized and the file is created inside the
+    /// resolved directory. As with OpenSSH `StrictModes`, the resolved directory
+    /// must be owned by the current user and writable by no one else, and
+    /// every ancestor must be owned by root or the current user and, if
+    /// group- or world-writable, sticky. The new file is still empty when
+    /// these checks run and is removed if they fail.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the path already exists or cannot be created.
+    /// Returns an error if the path already exists, its directory is unsafe,
+    /// or the file cannot be created.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
-        if let Some(parent) = path
+        let name = path
+            .file_name()
+            .ok_or_else(|| JournalError::InvalidPath(path.to_path_buf()))?;
+        let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let directory = std::fs::canonicalize(parent)?;
+        let target = directory.join(name);
         let mut options = OpenOptions::new();
-        // create_new refuses existing files and symlinks.
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options.open(path)?;
+        // create_new refuses existing files and final-component symlinks.
+        options.write(true).create_new(true).mode(0o600);
+        let file = options.open(&target)?;
+        let created = file.metadata()?;
+        // A file this process just created is owned by its effective user.
+        let euid = created.uid();
+        let verified = check_directory_chain(&directory, euid).and_then(|()| {
+            let on_disk = std::fs::symlink_metadata(&target)?;
+            if on_disk.file_type().is_file()
+                && (on_disk.dev(), on_disk.ino()) == (created.dev(), created.ino())
+            {
+                Ok(())
+            } else {
+                Err(JournalError::Replaced(target.clone()))
+            }
+        });
+        if let Err(error) = verified {
+            // Remove only the empty file this call created.
+            if std::fs::symlink_metadata(&target)
+                .is_ok_and(|meta| (meta.dev(), meta.ino()) == (created.dev(), created.ino()))
+            {
+                let _ = std::fs::remove_file(&target);
+            }
+            return Err(error);
+        }
         Ok(Self {
             file,
             chain: Chain::default(),
@@ -326,6 +362,46 @@ impl JournalSink for JsonlJournal {
         self.chain.commit(encoded);
         Ok(())
     }
+}
+
+const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
+const STICKY: u32 = 0o1000;
+
+/// Check a canonical directory and each ancestor without following links.
+fn check_directory_chain(directory: &Path, euid: u32) -> Result<(), JournalError> {
+    let unsafe_directory = |path: &Path, reason| JournalError::UnsafeDirectory {
+        path: path.to_path_buf(),
+        reason,
+    };
+    for (depth, current) in directory.ancestors().enumerate() {
+        let metadata = std::fs::symlink_metadata(current)?;
+        if !metadata.file_type().is_dir() {
+            return Err(unsafe_directory(current, "not a directory"));
+        }
+        let mode = metadata.mode();
+        if depth == 0 {
+            if metadata.uid() != euid {
+                return Err(unsafe_directory(current, "not owned by the current user"));
+            }
+            if mode & GROUP_OR_WORLD_WRITABLE != 0 {
+                return Err(unsafe_directory(current, "group- or world-writable"));
+            }
+        } else {
+            if metadata.uid() != 0 && metadata.uid() != euid {
+                return Err(unsafe_directory(
+                    current,
+                    "ancestor not owned by root or the current user",
+                ));
+            }
+            if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
+                return Err(unsafe_directory(
+                    current,
+                    "ancestor is group- or world-writable without the sticky bit",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// An in-memory journal for tests. `lines` holds the exact encoded records.
@@ -801,6 +877,44 @@ fn sha256_hex(bytes: &[u8]) -> String {
         write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
     }
     encoded
+}
+
+/// Serialize without ever buffering more than `limit` bytes. `Ok(None)`
+/// means the encoding exceeded `limit` and serialization stopped early.
+fn encode_bounded<T: Serialize>(value: &T, limit: usize) -> Result<Option<String>, JournalError> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+        exceeded: bool,
+    }
+    impl Write for Bounded {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if buffer.len() > self.limit - self.bytes.len() {
+                self.exceeded = true;
+                return Err(std::io::Error::other("journal line limit exceeded"));
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Bounded {
+        bytes: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    let result = serde_json::to_writer(&mut writer, value);
+    if writer.exceeded {
+        return Ok(None);
+    }
+    result?;
+    // serde_json writes only valid UTF-8.
+    String::from_utf8(writer.bytes)
+        .map(Some)
+        .map_err(|error| JournalError::Io(std::io::Error::other(error)))
 }
 
 fn unix_ms() -> Result<u64, JournalError> {

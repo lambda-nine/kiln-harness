@@ -1025,3 +1025,73 @@ async fn limits_exactly_at_the_ceilings_are_accepted() {
         .await
         .expect("ceilings are inclusive");
 }
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+#[test]
+fn journal_is_created_in_the_resolved_parent_only_when_it_is_safe() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let base = temp.path();
+
+    // A symlinked parent resolves to its operator-owned target, which passes.
+    let redirected = base.join("redirected");
+    std::fs::create_dir(&redirected).expect("target");
+    std::os::unix::fs::symlink(&redirected, base.join("link")).expect("symlink");
+    let _journal = JsonlJournal::open(&base.join("link/session.jsonl")).expect("safe target");
+    assert!(redirected.join("session.jsonl").is_file());
+
+    // A symlinked parent that resolves somewhere writable by others fails,
+    // and nothing is left behind.
+    let shared = base.join("shared");
+    std::fs::create_dir(&shared).expect("shared");
+    set_mode(&shared, 0o777);
+    std::os::unix::fs::symlink(&shared, base.join("shared-link")).expect("symlink");
+    let error = JsonlJournal::open(&base.join("shared-link/session.jsonl"))
+        .err()
+        .expect("unsafe target");
+    assert!(
+        matches!(&error, JournalError::UnsafeDirectory { path, .. } if path.ends_with("shared")),
+        "{error}"
+    );
+    assert!(!shared.join("session.jsonl").exists());
+
+    for (mode, safe) in [(0o700, true), (0o750, true), (0o770, false), (0o702, false)] {
+        let parent = base.join(format!("parent-{mode:o}"));
+        std::fs::create_dir(&parent).expect("parent");
+        set_mode(&parent, mode);
+        let result = JsonlJournal::open(&parent.join("session.jsonl"));
+        assert_eq!(result.is_ok(), safe, "parent mode {mode:o}");
+        assert_eq!(parent.join("session.jsonl").exists(), safe);
+        set_mode(&parent, 0o700);
+    }
+}
+
+#[test]
+fn writable_ancestors_need_the_sticky_bit() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    for (mode, safe) in [(0o777, false), (0o1777, true), (0o755, true)] {
+        let ancestor = temp.path().join(format!("ancestor-{mode:o}"));
+        let parent = ancestor.join("private");
+        std::fs::create_dir_all(&parent).expect("dirs");
+        set_mode(&parent, 0o700);
+        set_mode(&ancestor, mode);
+
+        let result = JsonlJournal::open(&parent.join("session.jsonl"));
+
+        assert_eq!(result.is_ok(), safe, "ancestor mode {mode:o}");
+        assert_eq!(parent.join("session.jsonl").exists(), safe);
+        set_mode(&ancestor, 0o700);
+    }
+}
+
+#[test]
+fn journal_path_must_name_a_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let error = JsonlJournal::open(&temp.path().join(".."))
+        .err()
+        .expect("no file name");
+    assert!(matches!(error, JournalError::InvalidPath(_)), "{error}");
+}
