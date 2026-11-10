@@ -123,14 +123,14 @@ struct RunArgs {
     /// Wall-clock limit for each sandbox execution.
     #[arg(long, default_value_t = 30)]
     tool_timeout_secs: u64,
-    /// Output tokens per model request.
-    #[arg(long, default_value_t = 4096)]
+    /// Output tokens per model request, hidden reasoning included.
+    #[arg(long, default_value_t = 16_384)]
     max_output_tokens: u32,
     /// Input tokens per session, cached input included.
     #[arg(long, default_value_t = 2_000_000)]
     max_total_input_tokens: u64,
-    /// Output tokens per session.
-    #[arg(long, default_value_t = 200_000)]
+    /// Output tokens per session, hidden reasoning included.
+    #[arg(long, default_value_t = 600_000)]
     max_total_output_tokens: u64,
     /// Append-only metadata audit destination.
     #[arg(long, default_value = "audit/run.jsonl")]

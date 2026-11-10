@@ -18,6 +18,21 @@ change the CLI or audit format.
   the host is a loopback address. Journals from `run` replay without the
   model server. `reqwest` (rustls with ring, no native TLS) becomes a
   dependency.
+- `read_file`, `write_file`, and `list_dir` also accept paths under
+  `/workspace/` (and `list_dir` accepts `/workspace` itself), stripping the
+  prefix once; other absolute paths stay `invalid_path`. The default system
+  prompt says executions start in `/` and asks the model to report only what
+  tool results showed. `run` defaults to 16,384 output tokens per request and
+  600,000 per session, since hidden reasoning counts as output. Journals that
+  recorded a refused `/workspace/...` path now diverge on replay, because the
+  same call succeeds.
+- Live smoke (Nov 10), Ollama serving `qwen3:4b` to `run` in the VM: with the
+  old 4,096-token cap, the model's hidden reasoning filled the first turn and
+  the session ended truncated; with a larger cap it answered from memory
+  without calling a tool; with a prompt naming the tools it ran three turns
+  and four calls, tripped on a `/workspace/`-prefixed path and on `exec`
+  starting in `/`, and its journal verified and replayed as `reproduced` with
+  the model server stopped.
 - `HarnessConfig::validate` exposes the engine's limit checks so a command
   can refuse a bad configuration before opening outputs or contacting kilnd.
 - A command that refuses its outputs, or cannot reach kilnd, now discards the

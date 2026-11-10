@@ -677,24 +677,49 @@ fn manifest_error(execution: &Execution, message: impl Into<String>) -> ToolErro
     }
 }
 
+/// Resolve a model-supplied file path to an absolute `/workspace` path.
+///
+/// Models write workspace paths both ways, so `/workspace` and
+/// `/workspace/<rel>` are accepted as well as `<rel>`: the prefix is stripped
+/// exactly once and the remainder must then pass the relative rules (no
+/// empty, `.` or `..` component, no leading `/`). `/workspace` alone, like
+/// `.`, names the workspace itself, which only `list_dir` accepts. Every
+/// other absolute path, including `/workspacefoo` and `//workspace/x`, is
+/// refused.
 fn workspace_path(raw: &str, allow_root: bool) -> Result<String, String> {
-    if raw == "." && allow_root {
-        return Ok(WORKSPACE.to_string());
+    let relative = match raw.strip_prefix(WORKSPACE) {
+        Some("" | "/") => ".",
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(rest) => rest,
+            // `/workspacefoo` is a different directory.
+            None => raw,
+        },
+        None => raw,
+    };
+    if relative == "." {
+        return if allow_root {
+            Ok(WORKSPACE.to_string())
+        } else {
+            Err("path names the workspace directory, not a file".to_string())
+        };
     }
-    if raw.is_empty() || raw.len() > 1024 || raw.starts_with('/') {
-        return Err("path must be a relative workspace path of at most 1024 bytes".to_string());
+    if relative.is_empty() || relative.len() > 1024 || relative.starts_with('/') {
+        return Err(
+            "path must be relative to /workspace or start with /workspace/, at most 1024 bytes"
+                .to_string(),
+        );
     }
-    if raw.chars().any(char::is_control) {
+    if relative.chars().any(char::is_control) {
         return Err("path may not contain control characters".to_string());
     }
-    let components: Vec<_> = raw.split('/').collect();
+    let components: Vec<_> = relative.split('/').collect();
     if components
         .iter()
         .any(|part| part.is_empty() || *part == "." || *part == "..")
     {
         return Err("path components may not be empty, '.' or '..'".to_string());
     }
-    Ok(format!("{WORKSPACE}/{raw}"))
+    Ok(format!("{WORKSPACE}/{relative}"))
 }
 
 fn execution_run(execution: &Execution, text_limit: usize) -> ToolRun {
@@ -885,7 +910,9 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded prefix of one relative /workspace file.".to_string(),
+            description: "Read a bounded prefix of one /workspace file, given as a relative path \
+                          (notes.txt) or under /workspace/ (/workspace/notes.txt)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -898,9 +925,9 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "write_file".to_string(),
-            description:
-                "Overwrite one strictly relative /workspace file with bounded UTF-8 content."
-                    .to_string(),
+            description: "Overwrite one /workspace file with bounded UTF-8 content; the path is \
+                 relative (notes.txt) or under /workspace/ (/workspace/notes.txt)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path", "content"],
@@ -913,8 +940,9 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_dir".to_string(),
-            description: "List entry names in one strictly relative directory under \
-                          /workspace; directory names end in '/'."
+            description: "List entry names in one /workspace directory: '.' or \
+                          /workspace for the workspace itself, otherwise a relative path or \
+                          one under /workspace/. Directory names end in '/'."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -934,4 +962,65 @@ fn definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_path;
+
+    #[test]
+    fn workspace_prefixed_paths_resolve_like_relative_ones() {
+        for (raw, expected) in [
+            ("fib.sh", "/workspace/fib.sh"),
+            ("/workspace/fib.sh", "/workspace/fib.sh"),
+            ("src/main.rs", "/workspace/src/main.rs"),
+            ("/workspace/src/main.rs", "/workspace/src/main.rs"),
+            ("/workspace/workspace/x", "/workspace/workspace/x"),
+        ] {
+            assert_eq!(workspace_path(raw, false).as_deref(), Ok(expected), "{raw}");
+            assert_eq!(workspace_path(raw, true).as_deref(), Ok(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_workspace_itself_is_a_directory_only() {
+        for raw in [".", "/workspace", "/workspace/", "/workspace/."] {
+            assert_eq!(
+                workspace_path(raw, true).as_deref(),
+                Ok("/workspace"),
+                "{raw}"
+            );
+            assert!(workspace_path(raw, false).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn other_paths_stay_invalid() {
+        for raw in [
+            "",
+            "/",
+            "/etc/passwd",
+            "/workspace/../etc",
+            "/workspace/..",
+            "/workspace/./x",
+            "/workspace//x",
+            "/workspace/x/",
+            "/workspacefoo",
+            "/workspacefoo/x",
+            "//workspace/x",
+            "/tmp/workspace/x",
+            "workspace/../x",
+            "../x",
+            "a//b",
+            "./x",
+            "x/\u{7}",
+        ] {
+            assert!(workspace_path(raw, false).is_err(), "{raw:?}");
+            assert!(workspace_path(raw, true).is_err(), "{raw:?}");
+        }
+        let long = format!("/workspace/{}", "a".repeat(1025));
+        assert!(workspace_path(&long, false).is_err());
+        let fits = format!("/workspace/{}", "a".repeat(1024));
+        assert!(workspace_path(&fits, false).is_ok());
+    }
 }

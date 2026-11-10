@@ -174,6 +174,87 @@ async fn invalid_workspace_path_is_rejected_before_kilnd_exec() {
     )));
 }
 
+/// Captures each turn's tool results.
+struct ResultsProvider {
+    script: ScriptedProvider,
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl Provider for ResultsProvider {
+    fn info(&self) -> ProviderInfo {
+        test_info()
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        if let Some(Message::ToolResults { results }) = request.messages.last() {
+            let mut seen = self.seen.lock().expect("seen");
+            seen.extend(results.iter().map(|result| result.result.clone()));
+        }
+        self.script.complete(request).await
+    }
+}
+
+#[tokio::test]
+async fn workspace_prefixed_paths_name_the_same_files() {
+    let api = FakeApi::default();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider = ResultsProvider {
+        script: ScriptedProvider::new([
+            ModelResponse::tool_use([ToolCall::new(
+                "w",
+                "write_file",
+                json!({"path": "/workspace/fib.sh", "content": "echo 1\n"}),
+            )]),
+            ModelResponse::tool_use([
+                ToolCall::new("r", "read_file", json!({"path": "fib.sh"})),
+                ToolCall::new("l", "list_dir", json!({"path": "/workspace"})),
+                ToolCall::new("e", "read_file", json!({"path": "/etc/passwd"})),
+                ToolCall::new("x", "read_file", json!({"path": "/workspacefoo"})),
+            ]),
+            ModelResponse::final_text("done"),
+        ]),
+        seen: seen.clone(),
+    };
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+
+    harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("session completes");
+
+    assert_eq!(
+        api.state()
+            .files
+            .get("/workspace/fib.sh")
+            .map(Vec::as_slice),
+        Some(&b"echo 1\n"[..])
+    );
+    let seen = seen.lock().expect("seen");
+    assert_eq!(seen[0]["ok"], true, "{:?}", seen[0]);
+    assert_eq!(seen[1]["content"], "echo 1\n", "{:?}", seen[1]);
+    assert_eq!(seen[2]["ok"], true, "{:?}", seen[2]);
+    assert!(
+        seen[2]["listing"]
+            .as_str()
+            .is_some_and(|listing| listing.contains("fib.sh")),
+        "{:?}",
+        seen[2]
+    );
+    for refused in &seen[3..] {
+        assert_eq!(refused["error"], "invalid_path", "{refused:?}");
+    }
+}
+
 #[tokio::test]
 async fn provider_failure_still_deletes_the_sandbox() {
     let api = FakeApi::default();

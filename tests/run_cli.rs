@@ -284,4 +284,6 @@ fn help_lists_run() {
         assert!(text.contains(flag), "{text}");
     }
     assert!(text.contains("[default: 40]"), "{text}");
+    assert!(text.contains("[default: 16384]"), "{text}");
+    assert!(text.contains("[default: 600000]"), "{text}");
 }

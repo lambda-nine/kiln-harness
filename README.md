@@ -118,12 +118,18 @@ cargo run --locked -- run --provider openai-compat \
   --prompt-file task.txt
 ```
 
-The model must support tool calling through the API. `--system-file`
+The model must support tool calling through the API. Small local models do
+better when the prompt says to use the tools; otherwise some answer from
+memory, which the harness accepts as a final answer. `--system-file`
 replaces the default system prompt, which describes the sandbox and the
 tools. Limits default to 40 steps, 120 tool calls (8 per turn), a 900-second
-session, a 30-second tool timeout, 4,096 output tokens per request, and
-2,000,000 input and 200,000 output tokens per session; each has a flag, and
-the hard ceilings in `docs/architecture.md` still apply. `--temperature`
+session, a 30-second tool timeout, 16,384 output tokens per request, and
+2,000,000 input and 600,000 output tokens per session; each has a flag, and
+the hard ceilings in `docs/architecture.md` still apply. Reasoning tokens
+count toward the output budgets: a thinking model such as Qwen3 can spend
+thousands of hidden tokens per turn before it answers, and with too small a
+cap the turn is truncated and the session fails. Lower `--max-output-tokens`
+only for models that do not think. `--temperature`
 (default 0) and `--seed` are forwarded. Output matches `demo`. The audit
 defaults to `audit/run.jsonl` and the journal to
 `journal/run-<unix_ms>.jsonl`, which `replay` reruns without the model

@@ -18,8 +18,9 @@ it is not a hostile multi-tenant boundary.
   filesystem state, or runs a host shell.
 - Every session requests network none. The harness itself talks to the model
   endpoint from the host; the sandbox never gets a network or a credential.
-- Typed JSON arguments reject unknown fields. File helpers accept only strict
-  relative `/workspace` paths; `exec` remains a deliberately general sandbox
+- Typed JSON arguments reject unknown fields. File helpers accept only
+  `/workspace` paths, relative or with the `/workspace/` prefix stripped
+  once, and refuse every other absolute path and any `.` or `..` component; `exec` remains a deliberately general sandbox
   argv primitive.
 - Step, call, argv, stdin, file, manifest, result, per-execution, and session
   bounds are finite. kilnd supplies a second validation and capture boundary.

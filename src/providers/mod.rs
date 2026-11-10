@@ -49,6 +49,9 @@ impl fmt::Debug for SecretString {
     }
 }
 
+// TODO(kilnd M3): once kilnd's exec working directory ships, set it to
+// /workspace for every execution and change the sentence about working
+// directory / below.
 /// The system prompt `run` uses when no `--system-file` is given. `{...}`
 /// placeholders are filled from the session's tool limits by
 /// [`default_system_prompt`], so the model is told the limits that apply.
@@ -61,15 +64,19 @@ the sandbox.
 Tools:
 - exec: run argv (1 to 128 strings) with optional stdin, for example \
 [\"/bin/sh\", \"-c\", \"ls -la\"]. Each call is limited to {timeout_secs} s.
-- read_file: read up to {file_kib} KiB of a file under /workspace, by relative path.
-- write_file: replace a file under /workspace, by relative path, with at most \
-{file_kib} KiB of UTF-8 text.
-- list_dir: list entry names in a relative directory under /workspace.
+- read_file: read up to {file_kib} KiB of a file under /workspace.
+- write_file: replace a file under /workspace with at most {file_kib} KiB of \
+UTF-8 text.
+- list_dir: list entry names in a directory under /workspace.
 - workspace_diff: list files added or removed since the session started.
+
+Commands run with working directory /, so refer to workspace files by \
+absolute path, for example [\"/bin/sh\", \"/workspace/fib.sh\"]; the file \
+tools accept fib.sh or /workspace/fib.sh.
 
 Every result is JSON and at most {result_kib} KiB; longer output is truncated. \
 Use the tools to carry out the task. When it is done, answer in plain text \
-with no tool calls.";
+with no tool calls, and report only what tool results showed.";
 
 /// [`DEFAULT_SYSTEM_PROMPT`] with its placeholders filled from `limits`.
 #[must_use]
@@ -114,6 +121,11 @@ mod tests {
         assert!(prompt.contains("64 KiB"), "{prompt}");
         assert!(prompt.contains("128 KiB"), "{prompt}");
         assert!(!prompt.contains('{'), "{prompt}");
+        assert!(prompt.contains("working directory /"), "{prompt}");
+        assert!(
+            prompt.contains("report only what tool results showed"),
+            "{prompt}"
+        );
         assert!(prompt.len() < 2048);
     }
 }

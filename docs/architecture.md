@@ -156,10 +156,20 @@ model name. Replay answers from the journal and never contacts the server.
 | Tool | kilnd executions | Validation |
 |---|---:|---|
 | `exec` | 1 | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s |
-| `read_file` | 2 | relative `/workspace` path; fixed `stat` then bounded `head`; at most 64 KiB returned |
-| `write_file` | 1 | relative `/workspace` path; fixed `dd` argv and bounded stdin; at most 64 KiB |
-| `list_dir` | 1 | relative `/workspace` directory; fixed `ls -1Ap` argv, names only |
+| `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned |
+| `write_file` | 1 | `/workspace` file path; fixed `dd` argv and bounded stdin; at most 64 KiB |
+| `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |
 | `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline |
+
+File paths may be relative (`notes.txt`) or start with `/workspace/`
+(`/workspace/notes.txt`), the two forms models produce. The prefix is
+stripped exactly once, and the rest must have no empty, `.` or `..`
+component and no leading `/`. `/workspace` alone names the workspace, which
+only `list_dir` accepts. Any other absolute path, including `/workspacefoo`,
+`//workspace/x`, and `/workspace/../x`, is `invalid_path`. Executions start
+in `/`, so the default system prompt tells the model to give `exec`
+absolute paths; when kilnd's exec working directory ships, the harness will
+run executions in `/workspace` instead.
 
 No model string is interpolated into a host command. Fixed helper programs and
 validated model values are separate sandbox argv entries. A model can request
@@ -170,9 +180,10 @@ calls per session and eight per turn, 4,096 output tokens per request,
 2,000,000 input and 200,000 output tokens per session, a 30-second session
 wall deadline, a 5-second tool wall deadline, a 10-second lifecycle cleanup
 window, 64 KiB model arguments, and 128 KiB encoded tool results. `run`
-raises the step, call, and time defaults for real tasks: 40 steps, 120 tool
-calls, a 900-second session, and a 30-second tool timeout, well under kilnd's
-one-hour execution ceiling. A tool reserves 250 ms of its wall budget for
+raises the defaults for real tasks: 40 steps, 120 tool calls, a 900-second
+session, a 30-second tool timeout (well under kilnd's one-hour execution
+ceiling), and 16,384 output tokens per request and 600,000 per session,
+because reasoning models' hidden thinking counts as output. A tool reserves 250 ms of its wall budget for
 kilnd settlement; exceeding the wall deadline drops the RPC to request
 cancellation. kilnd independently bounds retained output and owns execution
 cleanup. Configured lifecycle windows are rejected above 60 seconds so
