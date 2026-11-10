@@ -36,6 +36,8 @@ pub const MAX_BYTE_LIMIT: usize = 16 << 20;
 pub const MAX_OUTPUT_TOKENS_PER_REQUEST: u32 = 1_000_000;
 /// Ceiling for each cumulative token budget.
 pub const MAX_TOTAL_TOKENS: u64 = 1_000_000_000;
+/// Ceiling for the cumulative model-output byte budget.
+pub const MAX_TOTAL_MODEL_OUTPUT_BYTES: u64 = 256 << 20;
 pub const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// Largest accepted system prompt or task prompt.
 pub const MAX_TASK_TEXT_BYTES: usize = 64 << 10;
@@ -74,6 +76,10 @@ pub struct HarnessConfig {
     pub max_output_tokens_per_request: u32,
     pub max_total_input_tokens: u64,
     pub max_total_output_tokens: u64,
+    /// Bytes of model output (text plus compact tool-call arguments, see
+    /// [`ModelResponse::output_bytes`]) per session. Bounded locally, so
+    /// a session stays bounded even when reported token usage is wrong.
+    pub max_total_model_output_bytes: u64,
     pub tool_limits: ToolLimits,
 }
 
@@ -91,6 +97,7 @@ impl Default for HarnessConfig {
             max_output_tokens_per_request: 4096,
             max_total_input_tokens: 2_000_000,
             max_total_output_tokens: 200_000,
+            max_total_model_output_bytes: 8 << 20,
             tool_limits: ToolLimits::default(),
         }
     }
@@ -109,6 +116,7 @@ impl HarnessConfig {
             max_output_tokens_per_request: self.max_output_tokens_per_request,
             max_total_input_tokens: self.max_total_input_tokens,
             max_total_output_tokens: self.max_total_output_tokens,
+            max_total_model_output_bytes: self.max_total_model_output_bytes,
             max_model_arguments_bytes: self.max_model_arguments_bytes,
             max_final_answer_bytes: self.max_final_answer_bytes,
             tool_limits: RecordedToolLimits {
@@ -145,6 +153,7 @@ impl HarnessConfig {
         self.max_output_tokens_per_request = limits.max_output_tokens_per_request;
         self.max_total_input_tokens = limits.max_total_input_tokens;
         self.max_total_output_tokens = limits.max_total_output_tokens;
+        self.max_total_model_output_bytes = limits.max_total_model_output_bytes;
         self.max_model_arguments_bytes = limits.max_model_arguments_bytes;
         self.max_final_answer_bytes = limits.max_final_answer_bytes;
         let tools = &limits.tool_limits;
@@ -196,6 +205,8 @@ pub enum HarnessError {
     TurnToolBudget(u32),
     #[error("model exceeded a token budget")]
     TokenBudget,
+    #[error("model output exceeded the {0}-byte session budget")]
+    OutputBytesBudget(u64),
     #[error("model output was truncated at its token limit")]
     ModelTruncated,
     #[error("model refused the request")]
@@ -225,6 +236,7 @@ struct Progress {
     steps: u32,
     tool_calls: u32,
     usage: Usage,
+    output_bytes: u64,
 }
 
 impl<A, P, S, J> Harness<A, P, S, J>
@@ -654,6 +666,9 @@ where
             },
         )?;
         progress.usage = progress.usage + response.usage;
+        progress.output_bytes = progress
+            .output_bytes
+            .saturating_add(response.output_bytes());
         audit.append(
             session_id,
             Some(sandbox_id),
@@ -670,6 +685,13 @@ where
             || progress.usage.output_tokens > config.max_total_output_tokens
         {
             return Err(HarnessError::TokenBudget);
+        }
+        // Reported usage is trusted only for cost; size is bounded here
+        // whatever the endpoint reports.
+        if progress.output_bytes > config.max_total_model_output_bytes {
+            return Err(HarnessError::OutputBytesBudget(
+                config.max_total_model_output_bytes,
+            ));
         }
         let ModelResponse {
             text,
@@ -996,6 +1018,7 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         && config.max_output_tokens_per_request > 0
         && config.max_total_input_tokens > 0
         && config.max_total_output_tokens > 0
+        && config.max_total_model_output_bytes > 0
         && !config.session_timeout.is_zero()
         && !config.lifecycle_timeout.is_zero()
         && !config.lifecycle_retry_delay.is_zero()
@@ -1014,6 +1037,7 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         && config.max_output_tokens_per_request <= MAX_OUTPUT_TOKENS_PER_REQUEST
         && config.max_total_input_tokens <= MAX_TOTAL_TOKENS
         && config.max_total_output_tokens <= MAX_TOTAL_TOKENS
+        && config.max_total_model_output_bytes <= MAX_TOTAL_MODEL_OUTPUT_BYTES
         && tools.max_manifest_entries <= MAX_MANIFEST_ENTRIES
         && byte_limits.iter().all(|limit| *limit <= MAX_BYTE_LIMIT);
     if !positive || !bounded {

@@ -166,6 +166,8 @@ fn budgets_over_their_ceilings_are_refused() {
         ("--max-output-tokens", "1000001"),
         ("--max-total-input-tokens", "1000000001"),
         ("--max-total-output-tokens", "1000000001"),
+        ("--max-total-output-bytes", "268435457"),
+        ("--max-total-output-bytes", "0"),
     ] {
         let output = Run::new(dir)
             .arg("--prompt", "hi")
@@ -286,4 +288,62 @@ fn help_lists_run() {
     assert!(text.contains("[default: 40]"), "{text}");
     assert!(text.contains("[default: 16384]"), "{text}");
     assert!(text.contains("[default: 600000]"), "{text}");
+    assert!(text.contains("--max-total-output-bytes"), "{text}");
+    assert!(text.contains("[default: 8388608]"), "{text}");
+}
+
+#[test]
+fn prompt_and_system_files_must_be_regular_files() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    let fifo = dir.join("prompt.fifo");
+    let made = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+    assert!(made.success());
+    for flag in ["--prompt-file", "--system-file"] {
+        let started = std::time::Instant::now();
+        let mut run = Run::new(dir);
+        if flag == "--system-file" {
+            run = run.arg("--prompt", "hi");
+        }
+        // A FIFO with no writer would block a plain open forever.
+        let output = run.arg(flag, fifo.to_str().expect("utf-8")).output();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        refused(dir, &output, "is not a regular file");
+    }
+
+    let target = dir.join("real.txt");
+    std::fs::write(&target, "a task").expect("target");
+    let link = dir.join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let output = Run::new(dir)
+        .arg("--prompt-file", link.to_str().expect("utf-8"))
+        .output();
+    refused(
+        dir,
+        &output,
+        "symlink as the last path component is refused",
+    );
+    let output = Run::new(dir)
+        .arg("--prompt", "hi")
+        .arg("--system-file", dir.to_str().expect("utf-8"))
+        .output();
+    refused(dir, &output, "is not a regular file");
+}
+
+#[test]
+fn an_oversized_prompt_file_is_refused_without_reading_it() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    // Sparse: 8 GiB by size, nothing on disk. Reading it whole would take
+    // far longer than the bound below.
+    let huge = dir.join("huge.txt");
+    std::fs::File::create(&huge)
+        .and_then(|file| file.set_len(8 << 30))
+        .expect("sparse file");
+    let started = std::time::Instant::now();
+    let output = Run::new(dir)
+        .arg("--prompt-file", huge.to_str().expect("utf-8"))
+        .output();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    refused(dir, &output, "is larger than 65536 bytes");
 }

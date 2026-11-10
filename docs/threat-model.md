@@ -71,9 +71,16 @@ it is not a hostile multi-tenant boundary.
   refuses an empty one. It is held in a `SecretString` whose `Debug` is
   redacted and which cannot be displayed or serialized, and is used only to
   build the `Authorization` header, marked sensitive. Nothing puts it in
-  `ModelRequest`, `ModelResponse`, the journal, or the audit, and an error
-  body that echoes it has it replaced by `[redacted]` before the message is
-  recorded.
+  `ModelRequest` or `ModelResponse`. The endpoint receives the key, so its
+  responses may echo it: with a key, error bodies are never quoted (the
+  message is the status and `body withheld: authenticated request`), and a
+  success whose raw body, decoded JSON strings or object keys, or parsed
+  text, call IDs, tool names, or arguments contain the exact key is refused
+  whole as `response contained the request credential`. The claim is
+  therefore exact: the harness never writes the key, or a JSON-escaped form
+  of it, to the journal, the audit, or an error. An endpoint that holds the
+  key can still return a transformed or split form of it (base64, reversed,
+  one half per field), and that cannot be detected.
 - Plain `http://` to a model server on the LAN is acceptable for local models
   without a key: the traffic is prompts and tool results the operator already
   sees, and a hostile LAN peer can at worst feed the loop responses, which
@@ -82,12 +89,32 @@ it is not a hostile multi-tenant boundary.
   loopback. The client follows no redirects and ignores proxy environment
   variables, so the key and the transcript go only to the configured
   endpoint. Base URLs with userinfo, a query, or a fragment are refused.
-- Provider responses are bounded on the wire: requests over
+- Provider responses are bounded in decoded HTTP payload bytes: requests over
   `max_request_bytes` are not sent, response bodies are read only up to
   `max_response_bytes` (4 MiB by default, 64 MiB at most) with no
-  decompression, error bodies to 64 KiB, and error messages quote at most 512
-  bytes, without control characters. Malformed responses, including one
-  without token usage, fail the session instead of being guessed at.
+  decompression, error bodies to 64 KiB, and unauthenticated error messages
+  quote at most 512 bytes, without control characters. Transfer framing
+  (chunk headers and extensions, HTTP/2 frames) is below that count; it is
+  bounded only by the session deadline and cancellation, and by hyper's own
+  limits, such as 16 KiB of chunk extensions per message. Malformed
+  responses, including one without token usage or with plainly wrong usage,
+  fail the session instead of being guessed at.
+- Reported token usage is an endpoint property the harness relies on for
+  cost accounting, not for safety. Usage that cannot be right (zero prompt
+  tokens, zero completion tokens for non-empty output, or more than 64 bytes
+  of output per completion token) is refused, but a plausible lie is not
+  detectable without the model's tokenizer. Size is bounded locally
+  regardless: `max_total_model_output_bytes` (8 MiB by default, 256 MiB at
+  most) caps the text and tool-call arguments a session accepts, counted by
+  the harness, and the journal grammar applies the same budget.
+- Model text printed by `run`, `demo`, and `replay` has C0 and C1 control
+  characters and DEL (other than newline and tab) shown as `\u{..}`, so a
+  final answer cannot drive the operator's terminal. The journal keeps the
+  raw text.
+- `--prompt-file` and `--system-file` are opened like journal sources:
+  without following a final symlink and non-blocking, then required to be
+  regular files by `fstat` and read only up to the task limit, so a FIFO
+  cannot stall `run` before its deadline exists and a symlink is refused.
 - Every response is bounded before it reaches kilnd: per-turn and per-session
   call budgets, per-request and cumulative token budgets (cached input
   included), argument and
@@ -129,8 +156,8 @@ it is not a hostile multi-tenant boundary.
   contradict the session; a rewriter who forges a consistent session,
   including its requests, is not detected. Results of a final tool turn are
   bound only by replay. The grammar also applies the recorded limits as the
-  engine does, so a journal cannot continue past a step, call, token, or
-  text budget, or past a refused response.
+  engine does, so a journal cannot continue past a step, call, token,
+  model-output byte, or text budget, or past a refused response.
 - Replay trusts the journal it reads, but replayed responses pass through the
   same loop checks and budgets as live ones. It reproduces model responses,
   not sandbox state, and detects divergence by comparing each tool call and

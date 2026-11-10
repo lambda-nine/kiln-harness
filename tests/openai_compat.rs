@@ -955,7 +955,10 @@ async fn the_api_key_reaches_only_the_authorization_header() {
         .await
         .expect_err("rejected");
     let message = error.to_string();
-    assert!(message.contains("invalid key [redacted]"), "{message}");
+    assert!(
+        message.contains("HTTP 401 (body withheld: authenticated request)"),
+        "{message}"
+    );
     assert!(!format!("{error:?}").contains(SENTINEL_KEY));
 
     for path in [&audit_path, &journal_path, &failed_path] {

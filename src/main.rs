@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -12,8 +11,9 @@ use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{
     Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST, MAX_SESSION_TIMEOUT,
     MAX_STEPS, MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
-    MAX_TOTAL_TOKENS, SessionOutcome, SessionTask,
+    MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, SessionOutcome, SessionTask,
 };
+use kiln_harness::files::read_regular_file;
 use kiln_harness::journal::{
     JournalEvent, JournalLimits, JsonlJournal, LoadedJournal, open_journal_source, read_journal,
     read_open_journal,
@@ -132,6 +132,10 @@ struct RunArgs {
     /// Output tokens per session, hidden reasoning included.
     #[arg(long, default_value_t = 600_000)]
     max_total_output_tokens: u64,
+    /// Bytes of model text and tool-call arguments per session, counted
+    /// locally whatever the server reports as usage.
+    #[arg(long, default_value_t = 8 << 20)]
+    max_total_output_bytes: u64,
     /// Append-only metadata audit destination.
     #[arg(long, default_value = "audit/run.jsonl")]
     audit: PathBuf,
@@ -253,6 +257,11 @@ fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
         args.max_total_output_tokens,
         MAX_TOTAL_TOKENS,
     )?;
+    check_limit(
+        "--max-total-output-bytes",
+        args.max_total_output_bytes,
+        MAX_TOTAL_MODEL_OUTPUT_BYTES,
+    )?;
     let config = HarnessConfig {
         max_steps: args.max_steps,
         max_tool_calls: args.max_tool_calls,
@@ -261,6 +270,7 @@ fn prepare_run(args: RunArgs) -> Result<PreparedRun> {
         max_output_tokens_per_request: args.max_output_tokens,
         max_total_input_tokens: args.max_total_input_tokens,
         max_total_output_tokens: args.max_total_output_tokens,
+        max_total_model_output_bytes: args.max_total_output_bytes,
         tool_limits: ToolLimits {
             timeout: Duration::from_secs(args.tool_timeout_secs),
             ..ToolLimits::default()
@@ -319,18 +329,13 @@ fn read_api_key(var: &str) -> Result<SecretString> {
 }
 
 /// Read a UTF-8 task file of at most `MAX_TASK_TEXT_BYTES`.
+///
+/// It must be a regular file: a FIFO or device would block before any
+/// deadline exists, so it is refused, and so is a symlink as the last path
+/// component.
 fn read_text_file(flag: &str, path: &Path) -> Result<String> {
-    let file = File::open(path).with_context(|| format!("{flag} {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_TASK_TEXT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("{flag} {}", path.display()))?;
-    if bytes.len() > MAX_TASK_TEXT_BYTES {
-        bail!(
-            "{flag} {} is larger than {MAX_TASK_TEXT_BYTES} bytes",
-            path.display()
-        );
-    }
+    let bytes = read_regular_file(path, MAX_TASK_TEXT_BYTES)
+        .map_err(|error| anyhow!("{flag} {} is {error}", path.display()))?;
     String::from_utf8(bytes).map_err(|_| anyhow!("{flag} {} is not UTF-8", path.display()))
 }
 
@@ -684,8 +689,24 @@ fn default_journal(kind: &str) -> PathBuf {
     PathBuf::from(format!("journal/{kind}-{unix_ms}.jsonl"))
 }
 
+/// Model text made safe for a terminal: C0 and C1 control characters and
+/// DEL, which can carry escape sequences, are shown as `\u{..}`, except for
+/// newline and tab. The journal keeps the raw text.
+fn terminal_safe(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() && character != '\n' && character != '\t' {
+            let _ = write!(safe, "\\u{{{:x}}}", u32::from(character));
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
 fn print_outcome(outcome: &SessionOutcome) {
-    println!("{}", outcome.final_answer);
+    println!("{}", terminal_safe(&outcome.final_answer));
     println!("session: {}", outcome.session_id);
     println!("sandbox: {} (deleted)", outcome.sandbox_id);
     println!(
@@ -710,6 +731,15 @@ mod tests {
             .tempdir()?;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
         Ok(dir)
+    }
+
+    #[test]
+    fn final_answers_cannot_drive_the_terminal() {
+        let answer = "done\n\tok \u{1b}[2J\u{1b}]0;title\u{7}\r\u{7f}\u{9b}31m \u{e9}";
+        assert_eq!(
+            terminal_safe(answer),
+            "done\n\tok \\u{1b}[2J\\u{1b}]0;title\\u{7}\\u{d}\\u{7f}\\u{9b}31m \u{e9}"
+        );
     }
 
     #[test]

@@ -29,6 +29,16 @@ pub enum Reply {
     Hang,
     /// Send a 200 with a chunked body that never ends, until writes fail.
     StreamForever,
+    /// Send a 200 whose chunked body carries one payload byte per chunk,
+    /// each chunk header padded with an `extension`-byte chunk extension,
+    /// waiting `interval` between chunks. With `endless`, spaces follow the
+    /// body until writes fail; otherwise the body ends normally.
+    Framed {
+        body: Vec<u8>,
+        extension: usize,
+        interval: Duration,
+        endless: bool,
+    },
 }
 
 impl Reply {
@@ -223,6 +233,12 @@ async fn serve(mut stream: TcpStream, state: Arc<Mutex<HttpState>>, changed: Arc
             state.lock().expect("state").client_closed += 1;
             changed.notify_waiters();
         }
+        Reply::Framed {
+            body,
+            extension,
+            interval,
+            endless,
+        } => serve_framed(stream, &state, &changed, body, extension, interval, endless).await,
         Reply::StreamForever => {
             let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
@@ -245,6 +261,48 @@ async fn serve(mut stream: TcpStream, state: Arc<Mutex<HttpState>>, changed: Arc
             state.lock().expect("state").streams_ended += 1;
             changed.notify_waiters();
         }
+    }
+}
+
+async fn serve_framed(
+    mut stream: TcpStream,
+    state: &Mutex<HttpState>,
+    changed: &Notify,
+    body: Vec<u8>,
+    extension: usize,
+    interval: Duration,
+    endless: bool,
+) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if stream.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    let pad = "a".repeat(extension);
+    let payload = body.into_iter().chain(std::iter::repeat_n(
+        b' ',
+        if endless { usize::MAX } else { 0 },
+    ));
+    let mut failed = false;
+    for byte in payload {
+        let mut chunk = format!("1;pad={pad}\r\n").into_bytes();
+        chunk.push(byte);
+        chunk.extend_from_slice(b"\r\n");
+        if stream.write_all(&chunk).await.is_err() {
+            failed = true;
+            break;
+        }
+        state.lock().expect("state").streamed_bytes += chunk.len() as u64;
+        if !interval.is_zero() {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    if failed {
+        state.lock().expect("state").streams_ended += 1;
+        changed.notify_waiters();
+    } else {
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+        let _ = stream.shutdown().await;
     }
 }
 

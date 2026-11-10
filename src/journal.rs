@@ -18,8 +18,6 @@ use thiserror::Error;
 // The harness reaches kilnd over a Unix socket and is Unix-only.
 use std::os::unix::fs::MetadataExt;
 
-use rustix::fs::{Mode, OFlags};
-
 pub use crate::outputs::DirectoryProblem;
 use crate::outputs::{Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{
@@ -103,9 +101,17 @@ pub struct SessionLimits {
     pub max_output_tokens_per_request: u32,
     pub max_total_input_tokens: u64,
     pub max_total_output_tokens: u64,
+    /// Absent from journals written before this limit existed; they load
+    /// with the engine's default.
+    #[serde(default = "default_max_total_model_output_bytes")]
+    pub max_total_model_output_bytes: u64,
     pub max_model_arguments_bytes: usize,
     pub max_final_answer_bytes: usize,
     pub tool_limits: RecordedToolLimits,
+}
+
+fn default_max_total_model_output_bytes() -> u64 {
+    crate::engine::HarnessConfig::default().max_total_model_output_bytes
 }
 
 /// The recorded form of [`crate::tools::ToolLimits`].
@@ -460,25 +466,11 @@ pub fn read_journal_with_limits(
 /// Returns an error if the path is missing, not a regular file, or cannot
 /// be opened.
 pub fn open_journal_source(path: &Path) -> Result<File, JournalError> {
-    // O_NONBLOCK keeps a FIFO or device from blocking the open itself;
-    // fstat on the descriptor then decides, so no path can be swapped in
-    // between. Reads are blocking again once the file is known to be regular.
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| match error {
-        rustix::io::Errno::LOOP => JournalError::NotRegularFile,
-        error => std::io::Error::from(error).into(),
-    })?;
-    let stat = rustix::fs::fstat(&fd).map_err(std::io::Error::from)?;
-    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
-        return Err(JournalError::NotRegularFile);
-    }
-    let flags = rustix::fs::fcntl_getfl(&fd).map_err(std::io::Error::from)?;
-    rustix::fs::fcntl_setfl(&fd, flags - OFlags::NONBLOCK).map_err(std::io::Error::from)?;
-    Ok(File::from(fd))
+    crate::files::open_regular_file(path).map_err(|error| match error {
+        crate::files::InputFileError::Io(error) => error.into(),
+        crate::files::InputFileError::NotRegularFile
+        | crate::files::InputFileError::TooLarge { .. } => JournalError::NotRegularFile,
+    })
 }
 
 /// Read and verify a journal from an already open handle, from its start.
@@ -619,6 +611,7 @@ pub struct Grammar {
     turn_failed: bool,
     tool_calls: u32,
     usage: Usage,
+    output_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -655,12 +648,18 @@ struct RespondedTurn {
 /// Mirror of the engine's checks on one response, in the engine's order.
 /// A refused response is still journaled (the engine records it before
 /// refusing it), but nothing may follow from it except `session_ended`.
-fn engine_accepts(response: &ModelResponse, usage_after: Usage, limits: &SessionLimits) -> bool {
+fn engine_accepts(
+    response: &ModelResponse,
+    usage_after: Usage,
+    output_bytes_after: u64,
+    limits: &SessionLimits,
+) -> bool {
     use crate::provider::StopReason;
     let within_budget = response.usage.output_tokens
         <= u64::from(limits.max_output_tokens_per_request)
         && usage_after.total_input_tokens() <= limits.max_total_input_tokens
-        && usage_after.output_tokens <= limits.max_total_output_tokens;
+        && usage_after.output_tokens <= limits.max_total_output_tokens
+        && output_bytes_after <= limits.max_total_model_output_bytes;
     if !within_budget
         || matches!(
             response.stop_reason,
@@ -803,8 +802,11 @@ impl Grammar {
                     .map(|call| sanitize_call(call, &context.tools, &context.limits))
                     .collect();
                 let usage_after = self.usage + response.usage;
-                let accepted = engine_accepts(response, usage_after, &context.limits);
+                let output_bytes_after = self.output_bytes.saturating_add(response.output_bytes());
+                let accepted =
+                    engine_accepts(response, usage_after, output_bytes_after, &context.limits);
                 self.usage = usage_after;
+                self.output_bytes = output_bytes_after;
                 self.last_response = Some(RespondedTurn {
                     turn: *turn,
                     text: response.text.clone(),

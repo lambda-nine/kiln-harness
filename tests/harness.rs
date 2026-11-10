@@ -256,6 +256,47 @@ async fn workspace_prefixed_paths_name_the_same_files() {
 }
 
 #[tokio::test]
+async fn model_output_bytes_are_bounded_whatever_usage_reports() {
+    // {"path":"."} is 12 bytes of arguments, then a 4-byte answer: 16 in
+    // all. Usage reports nothing, so only the byte budget can stop it.
+    let script = || {
+        ScriptedProvider::new([
+            ModelResponse::tool_use([ToolCall::new("l", "list_dir", json!({"path": "."}))]),
+            ModelResponse::final_text("done"),
+        ])
+    };
+    for (budget, completes) in [(16, true), (15, false), (11, false)] {
+        let api = FakeApi::default();
+        let mut config = short_lifecycle_config();
+        config.max_total_model_output_bytes = budget;
+        let mut harness = Harness::new(
+            api.clone(),
+            script(),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config,
+        );
+        let result = harness.run(&task(), CancellationToken::new()).await;
+        if completes {
+            assert_eq!(result.expect("at the budget").final_answer, "done");
+        } else {
+            let error = result.expect_err("over the budget");
+            assert!(
+                matches!(error, HarnessError::OutputBytesBudget(limit) if limit == budget),
+                "{error}"
+            );
+        }
+        // The journal went through the grammar, which applies the same
+        // budget, and the sandbox is gone either way.
+        assert!(matches!(
+            harness.journal().records.last().map(|record| &record.event),
+            Some(JournalEvent::SessionEnded { .. })
+        ));
+        assert_eq!(api.state().deleted.len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn provider_failure_still_deletes_the_sandbox() {
     let api = FakeApi::default();
     let observer = api.clone();

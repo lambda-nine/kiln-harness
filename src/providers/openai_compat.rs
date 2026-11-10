@@ -25,19 +25,37 @@
 //! # Usage fails closed
 //!
 //! A response without `usage` (or without its `prompt_tokens` and
-//! `completion_tokens`) is an `InvalidResponse` error. Token budgets are
-//! only as good as the counts they add up, so a server that does not report
-//! them cannot run a session. Cached prompt tokens
-//! (`prompt_tokens_details.cached_tokens`) are moved out of `input_tokens`
-//! into `cache_read_input_tokens`, which keeps the counters disjoint.
+//! `completion_tokens`) is an `InvalidResponse` error, and so is usage that
+//! is plainly wrong: zero prompt tokens, zero completion tokens for
+//! non-empty output, or more than [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of
+//! output per completion token. Reported counts are trusted only for cost
+//! accounting; the engine bounds output size in bytes on its own. Cached
+//! prompt tokens (`prompt_tokens_details.cached_tokens`) are moved out of
+//! `input_tokens` into `cache_read_input_tokens`, which keeps the counters
+//! disjoint.
+//!
+//! # Credentials
+//!
+//! With an API key, nothing the endpoint sends is quoted: an error is its
+//! status and `body withheld: authenticated request`. A success is refused
+//! as `Rejected` ("response contained the request credential") when the
+//! exact key appears in the raw body, in any decoded JSON string or object
+//! key, or in anything kept from the parsed response, arguments included,
+//! so neither the key nor its JSON-escaped form reaches a journal. An
+//! endpoint that holds the key can still return it transformed or split;
+//! that cannot be detected.
 //!
 //! # Bounds, retries, and cancellation
 //!
 //! The serialized request is checked against `max_request_bytes` before
 //! anything is sent; a larger one is a non-retryable `ContextOverflow`. The
 //! response body is read chunk by chunk and abandoned at
-//! `max_response_bytes`; it is never buffered unbounded. No decompression is
-//! enabled, so the cap applies to the bytes on the wire.
+//! `max_response_bytes`; it is never buffered unbounded. The cap counts
+//! decoded HTTP payload bytes. No decompression is enabled, so that is the
+//! body as sent; transfer framing (chunk headers and extensions, HTTP/2
+//! frames) is not counted and is bounded only by the session deadline and
+//! cancellation, and by hyper's own limits such as 16 KiB of chunk
+//! extensions per message.
 //!
 //! Connect errors, timeouts, other transport failures, HTTP 408, 409, 429,
 //! 500, 502, 503 and 504, and any other 5xx whose body is not JSON are
@@ -47,9 +65,9 @@
 //! jitter is a small xorshift generator seeded from the session ID and
 //! turn, so a session's retry schedule is reproducible. HTTP 400 that
 //! mentions the context length, and 413, are `ContextOverflow`; every other
-//! 4xx (and 3xx: redirects are not followed) is `Rejected`. Error messages
-//! carry the status and at most 512 bytes of the body, never a request
-//! header or the key.
+//! 4xx (and 3xx: redirects are not followed) is `Rejected`. Without a key,
+//! error messages carry the status and at most 512 bytes of the body; they
+//! never carry a request header.
 //!
 //! The engine calls [`Provider::complete`] under the session deadline and
 //! cancellation and drops the future when either fires. Dropping it aborts
@@ -81,6 +99,8 @@ pub const MAX_ATTEMPTS: u32 = 8;
 pub const MAX_CONFIG_DELAY: Duration = Duration::from_secs(300);
 /// Most bytes of an error body quoted in an error message.
 pub const ERROR_EXCERPT_BYTES: usize = 512;
+/// The most output bytes one reported completion token may account for.
+pub const MAX_OUTPUT_BYTES_PER_TOKEN: u64 = 64;
 /// Most bytes of an error response read to classify it.
 const ERROR_BODY_READ_BYTES: usize = 64 << 10;
 const MAX_MODEL_BYTES: usize = 256;
@@ -337,6 +357,9 @@ impl OpenAiCompatProvider {
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_retry_after(value, SystemTime::now()));
+        // With a key, the endpoint holds a credential: nothing it sends is
+        // quoted, and a response that contains the key is refused whole.
+        let key = self.config.api_key.as_ref().map(SecretString::expose);
         if status.is_success() {
             let limit = self.config.max_response_bytes;
             let (bytes, complete) = read_bounded(&mut response, limit).await?;
@@ -346,34 +369,77 @@ impl OpenAiCompatProvider {
                     format!("response exceeds {limit} bytes"),
                 ));
             }
+            if key.is_some_and(|key| contains_bytes(&bytes, key.as_bytes())) {
+                return Err(credential_echo());
+            }
             let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
                 Failure::fatal(
                     ProviderErrorKind::InvalidResponse,
                     format!("response is not JSON: {error}"),
                 )
             })?;
-            return parse_response(&value, turn).map_err(|error| Failure {
-                error: self.scrub(error),
-                retry_after: None,
-            });
+            // Decoded strings catch JSON-escaped forms of the key.
+            if key.is_some_and(|key| value_contains(&value, key)) {
+                return Err(credential_echo());
+            }
+            let parsed =
+                parse_response_quoting(&value, turn, key.is_none()).map_err(|error| Failure {
+                    error,
+                    retry_after: None,
+                })?;
+            // Arguments decoded from their string form are a second layer.
+            if key.is_some_and(|key| response_contains(&parsed, key)) {
+                return Err(credential_echo());
+            }
+            return Ok(parsed);
         }
         let limit = self.config.max_response_bytes.min(ERROR_BODY_READ_BYTES);
         let (bytes, _) = read_bounded(&mut response, limit).await?;
-        let mut failure = classify_status(status, &bytes);
-        failure.error = self.scrub(failure.error);
+        let mut failure = classify_status(status, &bytes, key.is_none());
         failure.retry_after = retry_after;
         Err(failure)
     }
+}
 
-    /// Remove the key from a message, in case a server echoed it back.
-    fn scrub(&self, mut error: ProviderError) -> ProviderError {
-        if let Some(key) = &self.config.api_key
-            && !key.is_empty()
-        {
-            error.message = error.message.replace(key.expose(), "[redacted]");
-        }
-        error
+/// The refusal for a response that contains the request's credential.
+/// Nothing from the response is kept.
+fn credential_echo() -> Failure {
+    Failure::fatal(
+        ProviderErrorKind::Rejected,
+        "response contained the request credential",
+    )
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Whether any string or object key in `value` contains `key`.
+fn value_contains(value: &Value, key: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(key),
+        Value::Array(items) => items.iter().any(|item| value_contains(item, key)),
+        Value::Object(map) => map
+            .iter()
+            .any(|(name, item)| name.contains(key) || value_contains(item, key)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
+}
+
+/// Whether anything the harness would keep from `response` contains `key`.
+fn response_contains(response: &ModelResponse, key: &str) -> bool {
+    response
+        .text
+        .as_ref()
+        .is_some_and(|text| text.contains(key))
+        || response.tool_calls.iter().any(|call| {
+            call.call_id.contains(key)
+                || call.tool.contains(key)
+                || value_contains(&call.arguments, key)
+        })
 }
 
 #[async_trait]
@@ -525,9 +591,15 @@ async fn read_bounded(
     Ok((bytes, true))
 }
 
-fn classify_status(status: StatusCode, body: &[u8]) -> Failure {
+/// Classify an error status. With `quote` false (an authenticated request)
+/// the body still decides the class but is never quoted.
+fn classify_status(status: StatusCode, body: &[u8], quote: bool) -> Failure {
     let code = status.as_u16();
-    let message = format!("HTTP {code}: {}", excerpt(body));
+    let message = if quote {
+        format!("HTTP {code}: {}", excerpt(body))
+    } else {
+        format!("HTTP {code} (body withheld: authenticated request)")
+    };
     match code {
         408 => Failure::retryable(ProviderErrorKind::Timeout, message),
         429 => Failure::retryable(ProviderErrorKind::RateLimited, message),
@@ -789,12 +861,25 @@ fn invalid(message: impl Into<String>) -> ProviderError {
 /// Returns `InvalidResponse` when the body has no choices, no message,
 /// malformed tool calls, or no usage.
 pub fn parse_response(value: &Value, turn: u32) -> Result<ModelResponse, ProviderError> {
+    parse_response_quoting(value, turn, true)
+}
+
+/// [`parse_response`], quoting a server-reported error only when `quote`.
+fn parse_response_quoting(
+    value: &Value,
+    turn: u32,
+    quote: bool,
+) -> Result<ModelResponse, ProviderError> {
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
         if let Some(error) = value.get("error") {
-            return Err(invalid(format!(
-                "server reported an error: {}",
-                excerpt(error.to_string().as_bytes())
-            )));
+            return Err(invalid(if quote {
+                format!(
+                    "server reported an error: {}",
+                    excerpt(error.to_string().as_bytes())
+                )
+            } else {
+                "server reported an error (body withheld: authenticated request)".to_string()
+            }));
         }
         return Err(invalid("response has no choices"));
     };
@@ -828,12 +913,37 @@ pub fn parse_response(value: &Value, turn: u32) -> Result<ModelResponse, Provide
         Some("content_filter") => StopReason::Refusal,
         _ => StopReason::Other,
     };
-    Ok(ModelResponse {
+    let response = ModelResponse {
         text,
         tool_calls,
         stop_reason,
         usage: parse_usage(value.get("usage"))?,
-    })
+    };
+    check_completion_tokens(&response)?;
+    Ok(response)
+}
+
+/// Refuse a completion count that cannot be right for the output kept: zero
+/// for non-empty output, or fewer than one token per
+/// [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of it. Real tokenizers average a few
+/// bytes per token and rarely exceed 16, so the floor only catches gross
+/// under-reporting. Token counts are trusted for cost; the engine bounds
+/// output size separately in bytes.
+fn check_completion_tokens(response: &ModelResponse) -> Result<(), ProviderError> {
+    let output_bytes = response.output_bytes();
+    let completion = response.usage.output_tokens;
+    if output_bytes > 0 && completion == 0 {
+        return Err(invalid(
+            "usage reports zero completion tokens for non-empty output",
+        ));
+    }
+    if completion.saturating_mul(MAX_OUTPUT_BYTES_PER_TOKEN) < output_bytes {
+        return Err(invalid(format!(
+            "usage reports {completion} completion tokens for {output_bytes} bytes of output, \
+             more than {MAX_OUTPUT_BYTES_PER_TOKEN} bytes per token"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_tool_call(call: &Value, turn: u32, position: usize) -> Result<ToolCall, ProviderError> {
@@ -875,6 +985,10 @@ fn parse_usage(usage: Option<&Value>) -> Result<Usage, ProviderError> {
             .ok_or_else(|| invalid(format!("usage has no {field}")))
     };
     let prompt = count("prompt_tokens")?;
+    // Every request carries at least the user's task.
+    if prompt == 0 {
+        return Err(invalid("usage reports zero prompt tokens"));
+    }
     let completion = count("completion_tokens")?;
     let cached = usage
         .get("prompt_tokens_details")
@@ -1043,7 +1157,15 @@ mod tests {
             (302, b"", ProviderErrorKind::Rejected, false),
         ];
         for (code, body, kind, retryable) in cases {
-            let failure = classify_status(StatusCode::from_u16(*code).expect("status"), body);
+            let status = StatusCode::from_u16(*code).expect("status");
+            let failure = classify_status(status, body, true);
+            let withheld = classify_status(status, body, false);
+            assert_eq!(withheld.error.kind, *kind, "{code}");
+            assert_eq!(withheld.error.retryable, *retryable, "{code}");
+            assert_eq!(
+                withheld.error.message,
+                format!("HTTP {code} (body withheld: authenticated request)")
+            );
             assert_eq!(failure.error.kind, *kind, "{code}");
             assert_eq!(failure.error.retryable, *retryable, "{code}");
             assert!(failure.error.message.starts_with(&format!("HTTP {code}")));

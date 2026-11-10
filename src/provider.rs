@@ -131,6 +131,31 @@ impl ModelResponse {
         }
     }
 
+    /// Bytes of model output the harness keeps from this response: its text
+    /// plus the compact JSON encoding of each tool call's arguments. The
+    /// engine's `max_total_model_output_bytes` budget, the journal grammar,
+    /// and adapters' usage plausibility checks all count with this, so they
+    /// agree on every response.
+    #[must_use]
+    pub fn output_bytes(&self) -> u64 {
+        struct Count(u64);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len() as u64);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(self.text.as_ref().map_or(0, |text| text.len() as u64));
+        for call in &self.tool_calls {
+            // Encoding a Value into a counter cannot fail.
+            let _ = serde_json::to_writer(&mut count, &call.arguments);
+        }
+        count.0
+    }
+
     /// A turn that requests the given tool calls.
     #[must_use]
     pub fn tool_use(tool_calls: impl IntoIterator<Item = ToolCall>) -> Self {

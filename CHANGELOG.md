@@ -33,6 +33,21 @@ change the CLI or audit format.
   and four calls, tripped on a `/workspace/`-prefixed path and on `exec`
   starting in `/`, and its journal verified and replayed as `reproduced` with
   the model server stopped.
+- Review fixes for the provider: with an API key, error bodies are never
+  quoted and a response containing the exact key (raw, JSON-escaped, or in
+  parsed arguments and object keys) is refused, so the harness never writes
+  the key or its JSON-escaped form anywhere; a transformed or split echo
+  cannot be detected, and the docs now say so instead of promising
+  redaction. Zero prompt tokens, zero completion tokens for non-empty
+  output, and more than 64 output bytes per completion token are invalid
+  usage. A new provider-neutral budget, `max_total_model_output_bytes`
+  (`--max-total-output-bytes`, 8 MiB by default, 256 MiB ceiling), bounds
+  model output locally, is recorded in `SessionLimits` (journals without it
+  load with the default), and is applied by the journal grammar too. The
+  response cap is documented as counting decoded payload bytes, with
+  framing bounded by the deadline. `--prompt-file` and `--system-file` are
+  opened non-blocking without following a final symlink and must be regular
+  files. Final answers are printed with control characters escaped.
 - `HarnessConfig::validate` exposes the engine's limit checks so a command
   can refuse a bad configuration before opening outputs or contacting kilnd.
 - A command that refuses its outputs, or cannot reach kilnd, now discards the

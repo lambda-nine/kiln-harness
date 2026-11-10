@@ -845,6 +845,7 @@ fn distinct_config() -> HarnessConfig {
         max_output_tokens_per_request: 77,
         max_total_input_tokens: 5555,
         max_total_output_tokens: 666,
+        max_total_model_output_bytes: 7777,
         tool_limits: ToolLimits {
             timeout: Duration::from_millis(1234),
             max_argv_bytes: 101,
@@ -872,6 +873,7 @@ fn limits_round_trip_every_model_visible_setting() {
     assert_eq!(restored.limits(), limits);
     assert_eq!(restored.max_model_arguments_bytes, 1);
     assert_eq!(restored.max_final_answer_bytes, 1000);
+    assert_eq!(restored.max_total_model_output_bytes, 7777);
     assert_eq!(restored.session_timeout, recorded.session_timeout);
     assert_eq!(restored.tool_limits.timeout, recorded.tool_limits.timeout);
     assert_eq!(
@@ -953,7 +955,7 @@ async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
     let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
     let journal = read_journal(&path).expect("journal verifies");
-    let over: [fn(&mut kiln_harness::journal::SessionLimits); 8] = [
+    let over: [fn(&mut kiln_harness::journal::SessionLimits); 10] = [
         |limits| limits.max_steps = MAX_STEPS + 1,
         |limits| limits.max_tool_calls = MAX_TOOL_CALLS + 1,
         |limits| limits.max_tool_calls_per_turn = MAX_TOOL_CALLS_PER_TURN + 1,
@@ -962,6 +964,11 @@ async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
         |limits| limits.tool_limits.max_stdin_bytes = MAX_BYTE_LIMIT + 1,
         |limits| limits.max_output_tokens_per_request = MAX_OUTPUT_TOKENS_PER_REQUEST + 1,
         |limits| limits.max_total_input_tokens = MAX_TOTAL_TOKENS + 1,
+        |limits| {
+            limits.max_total_model_output_bytes =
+                kiln_harness::engine::MAX_TOTAL_MODEL_OUTPUT_BYTES + 1;
+        },
+        |limits| limits.max_total_model_output_bytes = 0,
     ];
     for raise in over {
         // A crafted journal with these limits fails verification and does not
@@ -1029,6 +1036,7 @@ async fn limits_exactly_at_the_ceilings_are_accepted() {
         max_output_tokens_per_request: MAX_OUTPUT_TOKENS_PER_REQUEST,
         max_total_input_tokens: MAX_TOTAL_TOKENS,
         max_total_output_tokens: MAX_TOTAL_TOKENS,
+        max_total_model_output_bytes: kiln_harness::engine::MAX_TOTAL_MODEL_OUTPUT_BYTES,
         tool_limits: ToolLimits {
             timeout: MAX_TOOL_TIMEOUT,
             max_argv_bytes: MAX_BYTE_LIMIT,

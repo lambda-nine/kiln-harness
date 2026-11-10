@@ -137,15 +137,23 @@ server.
 
 A server that needs a key gets it from an environment variable named by
 `--api-key-env VAR`, never from a flag. The key is sent only in the
-`Authorization` header and never reaches the journal, the audit, or error
-messages. Plain `http` is accepted for a model server on the LAN without a
+`Authorization` header. With a key, error bodies are never quoted, and a
+response that contains the exact key, raw or JSON-escaped, is refused
+whole, so the harness never writes the key or its JSON-escaped form to the
+journal, the audit, or an error. A server holding the key could still send
+it back transformed or split, which cannot be detected. Plain `http` is accepted for a model server on the LAN without a
 key; with a key, the base URL must be `https` unless its host is a loopback
 IP address.
 
-Responses must report token `usage`, or the session fails: budgets cannot be
-enforced without it. Response bodies are capped at 4 MiB and requests at 8
-MiB; rate limits, overload, and transport failures are retried up to three
-attempts with jittered backoff, honoring `Retry-After`.
+Responses must report plausible token `usage`, or the session fails: budgets
+cannot be enforced without it. Usage accuracy is the server's job and is
+trusted for cost only; the harness also counts model output itself and stops
+a session past `--max-total-output-bytes` (8 MiB by default) whatever usage
+says. Response payloads are capped at 4 MiB and requests at 8 MiB; rate
+limits, overload, and transport failures are retried up to three attempts
+with jittered backoff, honoring `Retry-After`. `--prompt-file` and
+`--system-file` must be regular files; a symlink as the last path component
+is refused. The final answer is printed with control characters escaped.
 
 ## Journal and replay
 

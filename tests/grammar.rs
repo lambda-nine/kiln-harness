@@ -600,6 +600,13 @@ fn recorded_limits_bound_what_may_follow() {
         "completed after a response the engine refuses",
     );
     assert_rejected_because(
+        "completion after the model-output byte budget was exceeded",
+        with_limits(valid(), |limits| {
+            limits.max_total_model_output_bytes = valid_output_bytes() - 1;
+        }),
+        "completed after a response the engine refuses",
+    );
+    assert_rejected_because(
         "completion with a final answer over its byte bound",
         with_limits(valid(), |limits| limits.max_final_answer_bytes = 3),
         "completed after a response the engine refuses",
@@ -631,8 +638,20 @@ fn recorded_limits_bound_what_may_follow() {
             limits.max_total_input_tokens = 30;
             limits.max_total_output_tokens = 2;
             limits.max_final_answer_bytes = 4;
+            limits.max_total_model_output_bytes = valid_output_bytes();
         }),
     );
+}
+
+/// The model output the `valid()` journal's responses add up to.
+fn valid_output_bytes() -> u64 {
+    valid()
+        .iter()
+        .filter_map(|event| match event {
+            JournalEvent::ModelResponded { response, .. } => Some(response.output_bytes()),
+            _ => None,
+        })
+        .sum()
 }
 
 /// The engine's own journal for a refused response, from a real run.

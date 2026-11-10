@@ -70,7 +70,12 @@ disjoint: `input_tokens` is uncached input, and cache reads and cache writes
 are separate; adapters normalize to this. The input budget compares
 `total_input_tokens()`, the saturating sum of all three. One response over the
 per-request output cap, or a cumulative total over the input or output budget,
-ends the session with `TokenBudget`.
+ends the session with `TokenBudget`. Token counts come from the endpoint and
+are trusted for cost, not for size: the engine also counts each response's
+model output itself (`ModelResponse::output_bytes`, its text plus the
+compact JSON of every tool call's arguments) and ends the session with
+`OutputBytesBudget` once the session total passes
+`max_total_model_output_bytes` (8 MiB by default, 256 MiB at most).
 
 A response without tool calls is the final answer. `max_tokens` ends with
 `ModelTruncated`, `refusal` with `ModelRefused`, and empty text with
@@ -125,14 +130,31 @@ Usage follows the disjoint contract: `input_tokens` is `prompt_tokens` minus
 `cache_read_input_tokens`, and `output_tokens` is `completion_tokens`. A
 response without `usage`, or without either count, is `InvalidResponse`: a
 budget that cannot be measured is not enforced, so the session fails closed.
+Usage that cannot be right is refused the same way: zero prompt tokens (the
+request always carries a task), zero completion tokens for non-empty
+output, or fewer completion tokens than one per 64 bytes of output, counted
+as the engine counts it. Real tokenizers average a few bytes per token and
+rarely exceed 16, so 64 catches only gross under-reporting.
+
+With an API key, the adapter quotes nothing the endpoint sends. Error
+messages are the status and `body withheld: authenticated request`. A
+success is refused as `Rejected` ("response contained the request
+credential") if the exact key appears in the raw body, in any decoded JSON
+string or object key, or in the parsed text, call IDs, tool names, or
+arguments; nothing from it reaches `ModelResponse`, so `model_failed`
+records only that message.
 
 The body is read chunk by chunk and abandoned at `max_response_bytes` (4 MiB
 by default, at most 64 MiB); a declared `Content-Length` over the cap is
-refused before reading. Error bodies are read to at most 64 KiB, and messages
-quote the status and at most 512 bytes of the body, UTF-8-lossy and without
-control characters. The client follows no redirects, uses no proxy, and
-enables no decompression, so the cap applies to wire bytes from the
-configured endpoint only.
+refused before reading. The cap counts decoded HTTP payload bytes; with no
+decompression enabled that is the body exactly as the server sent it.
+Transfer framing (chunk headers and extensions, HTTP/2 frames) is not
+counted: it is bounded only by the session deadline and cancellation, and by
+hyper's own limits, such as 16 KiB of chunk extensions per message. Error
+bodies are read to at most 64 KiB, and without a key messages quote the
+status and at most 512 bytes of the body, UTF-8-lossy and without control
+characters. The client follows no redirects and uses no proxy, so it reads
+only from the configured endpoint.
 
 Connect errors, timeouts, other transport failures, HTTP 408, 409, 429, 500,
 502, 503 and 504, and other 5xx responses whose body is not JSON are retried,
@@ -192,8 +214,8 @@ deadline construction cannot overflow after a sandbox exists.
 Every configuration, including limits loaded from a journal, must also stay
 under hard ceilings: 1,000 steps, 10,000 tool calls and 64 per turn, a 6-hour
 session, a 10-minute tool timeout, 16 MiB for each byte limit, 1,000,000
-output tokens per request, and 1,000,000,000 tokens for each cumulative
-budget.
+output tokens per request, 1,000,000,000 tokens for each cumulative
+budget, and 256 MiB of model output per session.
 
 ## Audit
 
@@ -290,7 +312,8 @@ did not complete.
 The grammar also applies the engine's acceptance rules with the recorded
 limits. Requests stop at `max_steps`, and tool records at `max_tool_calls` in
 total and `max_tool_calls_per_turn` in a turn. A response the engine refuses (a
-token budget or the per-request output cap exceeded, a `max_tokens` or
+token budget, the per-request output cap, or the model-output byte budget
+exceeded, a `max_tokens` or
 `refusal` stop, invalid or repeated call IDs, too many calls, or text over its
 byte bound) may be recorded, because the engine records it before refusing it,
 but nothing but `session_ended` may follow it and it cannot complete the
