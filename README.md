@@ -176,13 +176,17 @@ The model defaults to `claude-opus-5-5` (`--model` picks another) at
 not streamed. Automatic prompt caching is on, and since each request
 extends the previous one unchanged, later turns read most of their prompt
 from the cache; cache reads and writes are reported in usage and count
-against the input budget. Server-side fallbacks are on: if a safety check
-declines a request, the API reruns it on a suitable fallback model in the
-same call, and the audit records which model served each turn as
-`served_model`. Every attempt counts against the token budgets, including
-one that was declined, so `--max-output-tokens` limits one model call with
-all its attempts; `--no-fallbacks` turns fallbacks off and makes it a
-per-attempt cap. `--strict-tools` marks the tool schemas `strict` and
+against the input budget. Server-side fallbacks are off by default.
+Anthropic's guidance recommends them for production apps, where an answer
+from another model beats a refusal; this harness records, replays, and
+compares specific models, so it opts out for reproducibility: a refusal is
+reported as a refusal by the model you asked for, not silently answered by
+a different one. `--fallbacks` turns them on: if a safety check declines a
+request, the API reruns it on a suitable fallback model in the same call,
+and the audit records which model served each turn as `served_model`.
+Every attempt then counts against the token budgets, including one that
+was declined, so `--max-output-tokens` limits one model call with all its
+attempts. `--strict-tools` marks the tool schemas `strict` and
 sends them without the bounds strict mode refuses (`maxItems`, `minimum`,
 and `minItems` above 1); the harness still enforces those bounds itself. A
 schema construct strict mode does not support and the harness would not
@@ -190,7 +194,7 @@ enforce, such as `pattern` or `multipleOf`, is refused before the session
 starts rather than dropped. It is off by default. An API key must be at
 least 20 bytes. `--temperature` and `--seed` are
 refused for this provider, and `--effort`, `--strict-tools`, and
-`--no-fallbacks` for openai-compat. `--base-url` defaults to
+`--fallbacks` for openai-compat. `--base-url` defaults to
 `https://api.anthropic.com` and must be `https` unless its host is a
 loopback address. The budget flags and defaults are the same as above.
 

@@ -142,7 +142,9 @@ it is not a hostile multi-tenant boundary.
   responses, including one without token usage or with plainly wrong usage,
   fail the session instead of being guessed at.
 - Reported token usage is an endpoint property the harness relies on for
-  cost accounting, not for safety. For anthropic, every server-side attempt
+  cost accounting, not for safety. Anthropic fallbacks are opt-in, so by
+  default every turn is served by the requested model and a refusal is
+  recorded as one. With `--fallbacks`, every server-side attempt
   in `usage.iterations` is counted, so a declined fallback attempt cannot
   spend tokens outside the budgets; the per-request cap applies to the
   whole call. The top-level serving counters are validated too and must

@@ -122,9 +122,11 @@ struct RunArgs {
     /// Effort: low, medium, high, xhigh, or max (anthropic; default high).
     #[arg(long, value_name = "LEVEL", value_parser = parse_effort)]
     effort: Option<Effort>,
-    /// Do not send `fallbacks: "default"` (anthropic).
+    /// Send `fallbacks: "default"`, letting the API rerun a declined
+    /// request on another model (anthropic; off by default, so every turn is
+    /// served by the model asked for).
     #[arg(long)]
-    no_fallbacks: bool,
+    fallbacks: bool,
     /// Mark every tool schema `strict` (anthropic).
     #[arg(long)]
     strict_tools: bool,
@@ -382,7 +384,7 @@ fn build_provider(args: &RunArgs) -> Result<RunProvider> {
                 );
             }
             provider_config.effort = args.effort.unwrap_or_default();
-            provider_config.fallbacks = !args.no_fallbacks;
+            provider_config.fallbacks = args.fallbacks;
             provider_config.strict_tools = args.strict_tools;
             RunProvider::Anthropic(AnthropicProvider::new(provider_config)?)
         }
@@ -398,7 +400,7 @@ fn check_provider_flags(args: &RunArgs) -> Result<()> {
             &[
                 ("--effort", args.effort.is_some()),
                 ("--strict-tools", args.strict_tools),
-                ("--no-fallbacks", args.no_fallbacks),
+                ("--fallbacks", args.fallbacks),
             ],
         ),
         ProviderKind::Anthropic => (

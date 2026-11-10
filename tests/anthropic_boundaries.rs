@@ -30,6 +30,14 @@ fn config_with(base_url: &str, key: &str) -> AnthropicConfig {
     config
 }
 
+/// [`config_with`] with server-side fallbacks requested, for the tests
+/// that exercise them; the default is off.
+fn fallback_config(base_url: &str, key: &str) -> AnthropicConfig {
+    let mut config = config_with(base_url, key);
+    config.fallbacks = true;
+    config
+}
+
 fn base(server: &FakeHttp) -> String {
     format!("http://{}", server.addr)
 }
@@ -124,7 +132,7 @@ async fn fallback_attempts_count_against_the_session_budgets() {
         &usage(412, 2),
     );
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
-    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
     let mut config = short_lifecycle_config();
     config.max_output_tokens_per_request = 10;
     config.max_total_input_tokens = 600;
@@ -152,7 +160,7 @@ async fn the_per_request_cap_covers_every_attempt_of_one_call() {
     // Each attempt is under the 10-token cap; together they are not.
     let body = fallback_body(&json!([50, 6, 0, 0]), &json!([50, 6, 0, 0]), &usage(50, 6));
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
-    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
     let mut config = short_lifecycle_config();
     config.max_output_tokens_per_request = 10;
     let mut harness = harness_for(provider, config);
@@ -182,7 +190,7 @@ async fn a_mid_output_decline_is_summed_into_journal_audit_and_outcome() {
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
     let temp = common::private_tempdir().expect("tempdir");
     let path = temp.path().join("fallback.jsonl");
-    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
     let mut harness = Harness::new(
         FakeApi::default(),
         provider,
@@ -287,7 +295,12 @@ fn iterations_must_end_with_the_serving_attempt() {
     // Fallback usage follows the documentation; no live fallback has been
     // captured.
     let mismatch = "usage iterations do not end with the serving attempt the top level reports";
-    let text = json!([{"type": "text", "text": "ok"}]);
+    let chain = "fallback blocks do not match the usage iterations";
+    // One handoff, claude-opus-5-5 to claude-opus-4-8, then the answer.
+    let text = json!([
+        {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
+        {"type": "text", "text": "ok"}
+    ]);
     let body = |top: Value, iterations: Value| {
         let mut usage = top;
         usage["iterations"] = iterations;
@@ -317,7 +330,7 @@ fn iterations_must_end_with_the_serving_attempt() {
         json!([declined, {"type": "fallback_message", "model": "claude-opus-5",
                           "input_tokens": 5, "output_tokens": 1}]),
     );
-    assert_eq!(invalid(&wrong_model), mismatch);
+    assert_eq!(invalid(&wrong_model), chain);
     // A serving entry that is there but not last does not count.
     let not_last = body(
         json!({"input_tokens": 5, "output_tokens": 1}),
@@ -333,7 +346,7 @@ fn iterations_must_end_with_the_serving_attempt() {
         json!({"input_tokens": 5, "output_tokens": 1}),
         json!([declined]),
     );
-    assert_eq!(invalid(&missing), mismatch);
+    assert_eq!(invalid(&missing), chain);
     // Cache counters must match exactly too.
     let cache = body(
         json!({"input_tokens": 5, "output_tokens": 1, "cache_read_input_tokens": 7}),
@@ -348,7 +361,7 @@ async fn contradictory_serving_usage_cannot_complete_a_session() {
     // Daybreak r2-repro-01 end to end: refused before any budget is checked.
     let body = fallback_body(&json!([1, 3, 0, 0]), &json!([1, 1, 0, 0]), &usage(900, 500));
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
-    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
     let mut config = short_lifecycle_config();
     config.max_total_input_tokens = 10;
     config.max_total_output_tokens = 10;
@@ -368,16 +381,21 @@ fn the_token_floor_uses_the_serving_output() {
     // Fallback usage follows the documentation; no live fallback has been
     // captured.
     // 300 bytes of returned text: the serving attempt must account for them.
-    let long = json!([{"type": "text", "text": "x".repeat(300)}]);
+    let long = json!([
+        {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
+        {"type": "text", "text": "x".repeat(300)}
+    ]);
     let body = |serving: u64| {
-        message(
+        let mut body = message(
             &long,
             "end_turn",
             &json!({"input_tokens": 1, "output_tokens": serving, "iterations": [
                 {"type": "message", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 50},
-                {"type": "fallback_message", "model": "claude-opus-5-5",
+                {"type": "fallback_message", "model": "claude-opus-4-8",
                  "input_tokens": 1, "output_tokens": serving}]}),
-        )
+        );
+        body["model"] = json!("claude-opus-4-8");
+        body
     };
     // 2 serving tokens cannot cover 300 bytes, whatever the declined attempt spent.
     assert!(invalid(&body(2)).contains("2 completion tokens for 300 bytes"));
@@ -1126,14 +1144,25 @@ fn fallback_message_comes_once_and_last() {
         true,
     )
     .expect("a lone fallback_message is valid");
-    // Two declined attempts, then the fallback.
-    let chain = served_by_fallback(&json!([
+    // Two declined attempts, each with its handoff block, then the fallback.
+    let mut chain = served_by_fallback(&json!([
         declined_entry(4, 2),
-        declined_entry(4, 3),
+        {"type": "message", "model": "claude-opus-5", "input_tokens": 4, "output_tokens": 3},
         fallback_entry(5, 1)
     ]));
+    chain["content"] = json!([
+        fallback_block("claude-opus-5-5", "claude-opus-5"),
+        fallback_block("claude-opus-5", "claude-opus-4-8"),
+        {"type": "text", "text": "ok"}
+    ]);
     let parsed = parse_response(&chain, "claude-opus-5-5", true).expect("a chain is valid");
     assert_eq!(parsed.usage.output_tokens, 6);
+    // Declined attempts without their handoff blocks are not a chain.
+    let unmarked = served_by_fallback(&json!([declined_entry(4, 2), fallback_entry(5, 1)]));
+    assert_eq!(
+        invalid(&unmarked),
+        "fallback blocks do not match the usage iterations"
+    );
 }
 
 #[tokio::test]
@@ -1163,7 +1192,7 @@ async fn a_metadata_only_final_fallback_refusal_is_a_refusal() {
         "the boundary still counts as bytes"
     );
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
-    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
     let mut harness = harness_for(provider, short_lifecycle_config());
     let error = harness
         .run(&task(), CancellationToken::new())
@@ -1259,7 +1288,7 @@ async fn fallbacks_on_require_iterations() {
     );
 
     let server = FakeHttp::start([Reply::json(200, &missing)]).await;
-    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
     let mut config = short_lifecycle_config();
     config.max_total_input_tokens = 10;
     config.max_total_output_tokens = 10;
@@ -1406,4 +1435,235 @@ fn fallback_blocks_must_match_the_usage() {
         &fallback_usage(json!([fallback_entry(5, 1)])),
     );
     parse_response(&sticky, "claude-opus-5-5", true).expect("sticky");
+}
+
+// H1 and H2, review round five. Fallbacks are opt-in now, so these tests
+// request them; block and iteration shapes follow the documentation.
+
+#[test]
+fn every_handoff_needs_its_declined_attempt() {
+    let chain = "fallback blocks do not match the usage iterations";
+    let answer = json!({"type": "text", "text": "ok"});
+    let hop = || json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), answer]);
+    let iterations =
+        |entries: Value| json!({"input_tokens": 5, "output_tokens": 1, "iterations": entries});
+    // Daybreak r5-repro-01: a handoff block with only the terminal entry.
+    let terminal_only = served(
+        "claude-opus-4-8",
+        &hop(),
+        &iterations(json!([fallback_entry(5, 1)])),
+    );
+    assert_eq!(invalid(&terminal_only), chain);
+    // A valid single hop: the declined message, then the fallback.
+    let single = served(
+        "claude-opus-4-8",
+        &hop(),
+        &iterations(json!([declined_entry(900, 20), fallback_entry(5, 1)])),
+    );
+    let parsed = parse_response(&single, "claude-opus-5-5", true).expect("one hop");
+    assert_eq!(
+        parsed.usage.input_tokens, 905,
+        "the declined attempt is billed"
+    );
+    // The first attempt may leave its model null: it ran on the request's.
+    let null_first = served(
+        "claude-opus-4-8",
+        &hop(),
+        &iterations(json!([
+            {"type": "message", "model": null, "input_tokens": 9, "output_tokens": 2},
+            fallback_entry(5, 1)
+        ])),
+    );
+    parse_response(&null_first, "claude-opus-5-5", true).expect("null is the requested model");
+    // A valid two-hop chain.
+    let two = served(
+        "claude-opus-4-8",
+        &json!([
+            fallback_block("claude-opus-5-5", "claude-opus-5"),
+            fallback_block("claude-opus-5", "claude-opus-4-8"),
+            answer
+        ]),
+        &iterations(json!([
+            declined_entry(4, 2),
+            {"type": "message", "model": "claude-opus-5", "input_tokens": 4, "output_tokens": 2},
+            fallback_entry(5, 1)
+        ])),
+    );
+    parse_response(&two, "claude-opus-5-5", true).expect("two hops");
+    // More or fewer entries than handoffs.
+    let extra = served(
+        "claude-opus-4-8",
+        &hop(),
+        &iterations(json!([
+            declined_entry(4, 2),
+            declined_entry(4, 2),
+            fallback_entry(5, 1)
+        ])),
+    );
+    assert_eq!(invalid(&extra), chain);
+    let short = served(
+        "claude-opus-4-8",
+        &json!([
+            fallback_block("claude-opus-5-5", "claude-opus-5"),
+            fallback_block("claude-opus-5", "claude-opus-4-8"),
+            answer
+        ]),
+        &iterations(json!([declined_entry(4, 2), fallback_entry(5, 1)])),
+    );
+    assert_eq!(invalid(&short), chain);
+    // A block's `from` must be its own entry's model.
+    let wrong_entry = served(
+        "claude-opus-4-8",
+        &json!([
+            fallback_block("claude-opus-5-5", "claude-opus-5"),
+            fallback_block("claude-opus-5", "claude-opus-4-8"),
+            answer
+        ]),
+        &iterations(json!([
+            declined_entry(4, 2),
+            {"type": "message", "model": "claude-sonnet-5-5", "input_tokens": 4, "output_tokens": 2},
+            fallback_entry(5, 1)
+        ])),
+    );
+    assert_eq!(invalid(&wrong_entry), chain);
+    // Only the first entry may leave its model null.
+    let null_later = served(
+        "claude-opus-4-8",
+        &json!([
+            fallback_block("claude-opus-5-5", "claude-opus-5"),
+            fallback_block("claude-opus-5", "claude-opus-4-8"),
+            answer
+        ]),
+        &iterations(json!([
+            declined_entry(4, 2),
+            {"type": "message", "model": null, "input_tokens": 4, "output_tokens": 2},
+            fallback_entry(5, 1)
+        ])),
+    );
+    assert_eq!(invalid(&null_later), chain);
+    // The sticky form stays valid.
+    let sticky = served(
+        "claude-opus-4-8",
+        &json!([answer]),
+        &iterations(json!([fallback_entry(5, 1)])),
+    );
+    parse_response(&sticky, "claude-opus-5-5", true).expect("sticky");
+}
+
+#[tokio::test]
+async fn a_terminal_only_fallback_cannot_complete_a_session() {
+    // Daybreak r5-repro-01 end to end, under budgets the declined attempt
+    // could have exceeded.
+    let body = served(
+        "claude-opus-4-8",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), {"type": "text", "text": "ok"}]),
+        &json!({"input_tokens": 5, "output_tokens": 1, "iterations": [fallback_entry(5, 1)]}),
+    );
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
+    let mut config = short_lifecycle_config();
+    config.max_total_input_tokens = 10;
+    config.max_total_output_tokens = 10;
+    let mut harness = harness_for(provider, config);
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+    let HarnessError::Provider(error) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(
+        error.message,
+        "fallback blocks do not match the usage iterations"
+    );
+}
+
+#[tokio::test]
+async fn content_before_the_fallback_boundary_is_refused() {
+    // Daybreak r5-repro-02: the declined model's tool call ahead of the
+    // boundary would otherwise run under the fallback's identity.
+    let call = json!({"type": "tool_use", "id": "toolu_pre", "name": "write_file",
+                      "input": {"path": "a.txt", "content": "primary"}});
+    let usage = json!({"input_tokens": 5, "output_tokens": 10,
+                       "iterations": [declined_entry(4, 2), fallback_entry(5, 10)]});
+    let mut body = served(
+        "claude-opus-4-8",
+        &json!([call, fallback_block("claude-opus-5-5", "claude-opus-4-8"),
+                {"type": "text", "text": "ok"}]),
+        &usage,
+    );
+    body["stop_reason"] = json!("tool_use");
+    assert_eq!(invalid(&body), "content before the fallback boundary");
+    for before in [
+        json!({"type": "text", "text": "partial"}),
+        json!({"type": "thinking", "thinking": "", "signature": "c2ln"}),
+        json!({"type": "future_block"}),
+    ] {
+        let mut early = served(
+            "claude-opus-4-8",
+            &json!([before, fallback_block("claude-opus-5-5", "claude-opus-4-8"),
+                    {"type": "text", "text": "ok"}]),
+            &usage,
+        );
+        early["stop_reason"] = json!("end_turn");
+        assert_eq!(invalid(&early), "content before the fallback boundary");
+    }
+
+    let api = FakeApi::default();
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+    assert!(!api.state().files.contains_key("a.txt"), "nothing ran");
+    assert!(
+        harness
+            .journal()
+            .records
+            .iter()
+            .all(|record| !matches!(record.event, JournalEvent::ToolExecuted { .. }))
+    );
+
+    // After the boundary, text and a tool call are the fallback's own.
+    let mut after = served(
+        "claude-opus-4-8",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"),
+                {"type": "text", "text": "Writing."}, call]),
+        &usage,
+    );
+    after["stop_reason"] = json!("tool_use");
+    let parsed = parse_response(&after, "claude-opus-5-5", true).expect("valid");
+    assert_eq!(parsed.tool_calls.len(), 1);
+}
+
+#[test]
+fn fallbacks_off_still_validates_iterations() {
+    // Fallbacks off: no fallback_message anywhere, and the terminal entry
+    // must match the top level.
+    let text = json!([{"type": "text", "text": "ok"}]);
+    let off = |usage: &Value| {
+        parse_response(&message(&text, "end_turn", usage), "claude-opus-5-5", false)
+    };
+    off(&usage(5, 1)).expect("the live shape");
+    off(&json!({"input_tokens": 5, "output_tokens": 1})).expect("no iterations");
+    let mismatch = json!({"input_tokens": 5, "output_tokens": 1, "iterations": [
+        {"type": "message", "model": null, "input_tokens": 5, "output_tokens": 2}]});
+    assert_eq!(
+        off(&mismatch).expect_err("mismatch").message,
+        "usage iterations do not end with the serving attempt the top level reports"
+    );
+    let sticky =
+        json!({"input_tokens": 5, "output_tokens": 1, "iterations": [fallback_entry(5, 1)]});
+    assert_eq!(
+        off(&sticky).expect_err("a fallback entry").message,
+        "a fallback_message iteration, but the request did not ask for fallbacks"
+    );
 }

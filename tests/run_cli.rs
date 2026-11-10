@@ -373,7 +373,7 @@ fn provider_specific_flags_are_refused_for_the_other_provider() {
     for (flag, value) in [
         ("--effort", Some("high")),
         ("--strict-tools", None),
-        ("--no-fallbacks", None),
+        ("--fallbacks", None),
     ] {
         let run = Run::new(dir).arg("--prompt", "hi");
         let run = match value {

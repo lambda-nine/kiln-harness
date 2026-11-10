@@ -103,7 +103,7 @@
 //! verbatim). Other usage fields are ignored. The usage is
 //! then the saturating sum of every entry, without the top level counted
 //! again, so the per-request output cap covers one model call with all its
-//! attempts; `--no-fallbacks` gives a strict per-attempt cap. Zero total
+//! attempts; without fallbacks, the default, it is a per-attempt cap. Zero total
 //! input (overall and for the serving attempt), and zero output tokens for
 //! non-empty content or more than
 //! [`MAX_OUTPUT_BYTES_PER_TOKEN`](super::http::MAX_OUTPUT_BYTES_PER_TOKEN)
@@ -114,13 +114,19 @@
 //!
 //! # Decisions
 //!
-//! - **Fallbacks on by default.** With `fallbacks` set the request carries
-//!   `fallbacks: "default"` and the `server-side-fallback-2026-07-01` beta.
-//!   On a safety decline the API reruns the request on a suitable model in
-//!   the same call and returns `fallback` blocks and the serving `model`;
-//!   both are stored and echoed verbatim, and the serving model is recorded
-//!   as `served_model` in the audit. A non-streaming response omits a
-//!   declined partial, so no block before a `fallback` block needs dropping.
+//! - **Fallbacks off by default.** The harness exists to record, replay, and
+//!   evaluate specific models; a refusal the server silently reroutes to a
+//!   different model breaks model attribution and per-model comparisons.
+//!   So by default a refusal is an honest `Refusal`, and the request carries
+//!   no `fallbacks` field and no beta header. With `fallbacks` set it
+//!   carries `fallbacks: "default"` and the `server-side-fallback-2026-07-01`
+//!   beta; on a safety decline the API reruns the request on a suitable
+//!   model in the same call and returns `fallback` blocks and the serving
+//!   `model`, both stored and echoed verbatim, and the serving model is
+//!   recorded as `served_model` in the audit. A non-streaming response
+//!   omits a declined partial, so content before the last `fallback` block
+//!   is refused, and each block must have its declined attempt in
+//!   `usage.iterations`.
 //! - **Strict tools off by default.** Strict mode refuses `maxItems` and
 //!   similar bounds, which the harness's schemas use. With `strict_tools`,
 //!   each schema is sent through [`strict_input_schema`]: supported keywords
@@ -309,7 +315,7 @@ impl AnthropicConfig {
             model: model.into(),
             api_key,
             effort: Effort::default(),
-            fallbacks: true,
+            fallbacks: false,
             strict_tools: false,
             connect_timeout: Duration::from_secs(10),
             max_response_bytes: 4 << 20,
@@ -910,7 +916,7 @@ fn parse_response_quoting(
         check_exact_numbers(details)?;
     }
     let hops = fallback_hops(blocks)?;
-    if hops.is_some() && !fallbacks {
+    if !hops.is_empty() && !fallbacks {
         return Err(invalid(
             "a fallback block, but the request did not ask for fallbacks",
         ));
@@ -1001,16 +1007,22 @@ fn model_id_is_valid(model: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:@/-".contains(&byte))
 }
 
-/// The first `from.model` and the last `to.model` of the response's
-/// `fallback` blocks, when it has any. Every block must name both, as valid
-/// identifiers. The blocks themselves are echoed verbatim; only these two
-/// fields are read, to reconcile the content with the usage.
-fn fallback_hops(blocks: &[Value]) -> Result<Option<(&str, &str)>, ProviderError> {
-    let mut hops: Option<(&str, &str)> = None;
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) != Some("fallback") {
-            continue;
+/// The `from.model` and `to.model` of each of the response's `fallback`
+/// blocks, in order. Every block must name both, as valid identifiers, and
+/// nothing but `fallback` blocks may come before the last of them: a
+/// non-streaming response omits a declined partial, so content there could
+/// only be the declined model's, such as a tool call that would otherwise
+/// run under the fallback's identity. The blocks themselves are echoed
+/// verbatim; only these fields are read, to reconcile content with usage.
+fn fallback_hops(blocks: &[Value]) -> Result<Vec<(&str, &str)>, ProviderError> {
+    let is_fallback = |block: &Value| block.get("type").and_then(Value::as_str) == Some("fallback");
+    if let Some(boundary) = blocks.iter().rposition(is_fallback) {
+        if !blocks[..boundary].iter().all(is_fallback) {
+            return Err(invalid("content before the fallback boundary"));
         }
+    }
+    let mut hops = Vec::new();
+    for block in blocks.iter().filter(|block| is_fallback(block)) {
         let side = |name: &str| {
             block
                 .get(name)
@@ -1019,8 +1031,7 @@ fn fallback_hops(blocks: &[Value]) -> Result<Option<(&str, &str)>, ProviderError
                 .filter(|model| model_id_is_valid(model))
                 .ok_or_else(|| invalid(format!("fallback block has no valid {name}.model")))
         };
-        let (from, to) = (side("from")?, side("to")?);
-        hops = Some((hops.map_or(from, |(first, _)| first), to));
+        hops.push((side("from")?, side("to")?));
     }
     Ok(hops)
 }
@@ -1031,8 +1042,41 @@ struct Expected<'a> {
     model: &'a str,
     requested_model: &'a str,
     fallbacks: bool,
-    /// From [`fallback_hops`].
-    hops: Option<(&'a str, &'a str)>,
+    /// From [`fallback_hops`]: each handoff's from and to models.
+    hops: Vec<(&'a str, &'a str)>,
+}
+
+/// Whether the iteration `models` (None for a `message` without a model)
+/// are exactly one declined `message` per handoff in `expected.hops`, in
+/// order and each with its block's `from.model`, then the terminal
+/// `fallback_message` with the last block's `to.model`, which is also the
+/// response's model. With no hops, only a lone terminal entry matches: a
+/// sticky-routed turn.
+fn chain_matches(models: &[Option<&str>], ends_in_fallback: bool, expected: &Expected<'_>) -> bool {
+    let Some((terminal, declined)) = models.split_last() else {
+        return false;
+    };
+    ends_in_fallback
+        && declined.len() == expected.hops.len()
+        && declined.iter().zip(&expected.hops).enumerate().all(
+            |(index, (attempt_model, (from, _)))| {
+                // Only the first attempt may leave its model null.
+                let effective = match attempt_model {
+                    Some(named) => Some(*named),
+                    None if index == 0 => Some(expected.requested_model),
+                    None => None,
+                };
+                effective == Some(*from)
+            },
+        )
+        && expected
+            .hops
+            .first()
+            .is_none_or(|(from, _)| *from == expected.requested_model)
+        && expected
+            .hops
+            .last()
+            .is_none_or(|(_, to)| *to == expected.model && *terminal == Some(*to))
 }
 
 /// The response's usage, and the output count of the serving attempt.
@@ -1077,6 +1121,7 @@ fn parse_usage(
             let mut sum = Usage::default();
             let mut last = None;
             let mut fallbacks = 0_usize;
+            let mut models = Vec::with_capacity(attempts.len());
             for (index, attempt) in attempts.iter().enumerate() {
                 let what = format!("usage iterations[{index}]");
                 if !attempt.is_object() {
@@ -1101,6 +1146,7 @@ fn parse_usage(
                 }
                 sum = sum + counted;
                 last = Some((attempt_model, counted));
+                models.push(attempt_model);
                 if tag == "fallback_message" {
                     fallbacks += 1;
                 }
@@ -1123,16 +1169,16 @@ fn parse_usage(
                     "usage iterations must be message attempts then one fallback_message",
                 ));
             }
-            // Fallback blocks in the content must describe this chain.
-            if let Some((from, to)) = expected.hops {
-                let terminal = last.and_then(|(attempt_model, _)| attempt_model);
-                if !ends_in_fallback
-                    || terminal != Some(to)
-                    || to != model
-                    || from != requested_model
-                {
-                    return Err(invalid("fallback blocks do not match the usage iterations"));
-                }
+            // Every handoff block proves an attempt that declined, which
+            // must be billed as its own message entry, in order, before the
+            // one fallback_message that served. With client tools only, one
+            // non-streaming call has no other iterations, so the array is
+            // exactly one entry per block plus the terminal one; a lone
+            // fallback_message without blocks is a sticky-routed turn.
+            if (ends_in_fallback || !expected.hops.is_empty())
+                && !chain_matches(&models, ends_in_fallback, expected)
+            {
+                return Err(invalid("fallback blocks do not match the usage iterations"));
             }
             match last {
                 Some((last_model, counted))
@@ -1283,7 +1329,7 @@ mod tests {
         let config = config(DEFAULT_BASE_URL);
         config.validate().expect("defaults are valid");
         assert_eq!(config.effort, Effort::High);
-        assert!(config.fallbacks);
+        assert!(!config.fallbacks, "fallbacks are opt-in");
         assert!(!config.strict_tools);
         assert_eq!(config.model, "claude-opus-5-5");
     }

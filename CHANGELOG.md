@@ -6,9 +6,22 @@ change the CLI or audit format.
 
 ## Unreleased
 
-- Fourth review round for the anthropic provider: with fallbacks on (the
-  default), `usage.iterations` is required, as the live API always sends
-  it; with `--no-fallbacks` it may be missing, and a `fallback_message`
+- Anthropic server-side fallbacks are now opt-in: `--fallbacks` replaces
+  `--no-fallbacks`, and by default the request carries no `fallbacks` field
+  and no beta header. The harness records, replays, and compares specific
+  models, and a refusal silently rerouted to another model breaks that
+  attribution; without fallbacks a refusal is an honest `ModelRefused`.
+  With fallbacks off, any `fallback` block or `fallback_message` iteration
+  is refused, and `usage.iterations`, when present, is validated like any
+  other. Fifth review round, on the opt-in path: every `fallback` block
+  needs its declined attempt as an ordinary `message` iteration, in order
+  and with that block's `from.model`, before the one terminal
+  `fallback_message`, so the array is exactly one entry per block plus one;
+  and any block before the last `fallback` block, such as a declined
+  model's tool call, is refused as content before the fallback boundary.
+- Fourth review round for the anthropic provider: with fallbacks on,
+  `usage.iterations` is required, as the live API always sends it; with
+  fallbacks off it may be missing, and a `fallback_message`
   entry or a `fallback` block is refused. `fallback` blocks in the content
   must match the usage: the last iteration is a `fallback_message` whose
   model, and the response's, is the last block's `to.model`, and the first
@@ -50,7 +63,7 @@ change the CLI or audit format.
   fallback is the sum of every attempt in `usage.iterations`, each
   validated, so declined attempts count against all token budgets, and the
   per-request output cap now covers one call with its attempts
-  (`--no-fallbacks` for a per-attempt cap). Authenticated error messages
+  (fallbacks off for a per-attempt cap). Authenticated error messages
   drop the error type and request ID when either contains the key. Opaque
   content holding a float or an integer outside 64 bits anywhere,
   `tool_use` inputs included, is refused, since it could not be echoed
@@ -73,14 +86,15 @@ change the CLI or audit format.
 - Add an `anthropic` provider for Anthropic's Messages API over raw HTTP
   (`anthropic-version: 2026-10-21`; no SDK, no new dependency), and
   `run --provider anthropic [--base-url] [--model] [--effort]
-  [--no-fallbacks] [--strict-tools] [--api-key-env VAR]`. It defaults to
+  [--fallbacks] [--strict-tools] [--api-key-env VAR]`. It defaults to
   `claude-opus-5-5` at high effort, non-streaming, with top-level automatic
-  prompt caching and server-side fallbacks (`fallbacks: "default"`); it
+  prompt caching and no server-side fallbacks (`--fallbacks` sends
+  `fallbacks: "default"`); it
   never sends sampling parameters, `thinking`, or `stream`. Each turn's tool
   results go in one user message. Errors quote only the status, an
   allowlisted error type, and a validated request ID. `--temperature` and
   `--seed` are refused with it, and `--effort`, `--strict-tools`, and
-  `--no-fallbacks` with openai-compat; `--base-url` and `--model` become
+  `--fallbacks` with openai-compat; `--base-url` and `--model` become
   optional flags that openai-compat still requires.
 - Add opaque provider content to the turn model: `ModelResponse` and
   `Message::Assistant` carry an optional `ProviderContent` (provider,

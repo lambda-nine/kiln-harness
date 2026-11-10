@@ -215,7 +215,7 @@ model name. Replay answers from the journal and never contacts the server.
 
 `anthropic` posts to `<base_url>/v1/messages` (default
 `https://api.anthropic.com`) with `x-api-key` (marked sensitive),
-`anthropic-version: 2026-10-21`, and, with fallbacks on,
+`anthropic-version: 2026-10-21`, and, only with `--fallbacks`,
 `anthropic-beta: server-side-fallback-2026-07-01`. The body is
 `{"model", "max_tokens", "system"?, "messages", "tools"?, "tool_choice":
 {"type": "auto"}?, "output_config": {"effort"}, "cache_control": {"type":
@@ -306,9 +306,17 @@ because the request asked for neither. When the content holds `fallback`
 blocks, they must describe the same chain as the usage: the last entry is
 a `fallback_message`, the last block's `to.model` is its model and the
 response's `model`, and the first block's `from.model` is the requested
-model. Only those fields are read, as identifiers; the blocks are echoed
-verbatim. A `fallback_message` with no block is a sticky-routed turn and
-stays valid. Other usage fields (`cache_creation`,
+model. Every block also proves an attempt that declined, so each must
+have its own ordinary `message` entry, in order, whose model (null for the
+first means the requested model) is that block's `from.model`, before the
+one terminal `fallback_message`: with client tools only, one non-streaming
+call has no other iterations, so the array holds exactly one entry per
+block plus one. And since a non-streaming response omits a declined
+partial, any block before the last `fallback` block is refused as content
+before the fallback boundary; a declined model's tool call can never run
+under the fallback's identity. Only `from.model` and `to.model` are read,
+as identifiers; the blocks are echoed verbatim. A lone `fallback_message`
+with no block is a sticky-routed turn and stays valid. Other usage fields (`cache_creation`,
 `output_tokens_details`, `service_tier`, and the like) are ignored. The
 zero-output check exempts `fallback` blocks, which are boundary metadata
 rather than generated output, so a final fallback that declined before
@@ -317,8 +325,8 @@ included, still needs a token, and `fallback` blocks still count as bytes. A res
 attempt disagree is `InvalidResponse`; neither side is picked. The usage is
 then the saturating sum of every entry, without adding the top level
 again; without the array it is the top level. The per-request output cap therefore covers one model
-call including its server-side attempts; an operator who needs a strict
-per-attempt cap runs with `--no-fallbacks`. A missing `usage` object, zero
+call including its server-side attempts; without `--fallbacks`, the
+default, it is a strict per-attempt cap. A missing `usage` object, zero
 total input (not zero uncached input: a fully cached prompt has none), zero
 output tokens for non-empty content, or more than 64 bytes of neutral
 output per output token is `InvalidResponse`. The output checks use the
@@ -358,8 +366,17 @@ refused (`run` says to pass `--api-key-env` or a proxy `--base-url`). With
 a key, nothing changes: `https` unless the host is a loopback IP literal,
 the key in `x-api-key`, and the scan.
 
-Fallbacks. With `fallbacks: "default"`, a safety decline is rerun server-side
-on a suitable model in the same call. The response then holds `fallback`
+Fallbacks are opt-in (`--fallbacks`). The harness exists to record, replay,
+and evaluate specific models; a refusal the server silently reroutes to a
+different model breaks model attribution and per-model comparisons, so by
+default the request carries no `fallbacks` field and no beta header, and a
+refusal ends the session as `ModelRefused`. Without fallbacks, a `fallback`
+block or `fallback_message` iteration is `InvalidResponse`, and
+`usage.iterations`, when present, must be `message` entries whose last one
+matches the top level; when absent, the top level is used. No fallbacks-off
+response has been captured live, so both shapes are accepted. With
+`fallbacks: "default"`, a safety decline is rerun server-side on a suitable
+model in the same call. The response then holds `fallback`
 blocks and names the serving model in `model`; both are stored and echoed
 verbatim, and `served_model` records the model in the audit. A non-streaming
 response omits a declined partial, so no thinking block precedes a

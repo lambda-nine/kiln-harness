@@ -201,8 +201,7 @@ fn request_body_matches_the_golden_json() {
         }],
         "tool_choice": {"type": "auto"},
         "output_config": {"effort": "xhigh"},
-        "cache_control": {"type": "ephemeral"},
-        "fallbacks": "default"
+        "cache_control": {"type": "ephemeral"}
     });
     assert_eq!(body, golden);
     // The echoed turn is byte-identical to the recorded blocks.
@@ -210,9 +209,23 @@ fn request_body_matches_the_golden_json() {
         serde_json::to_string(&body["messages"][1]["content"]).expect("encode"),
         serde_json::to_string(&blocks).expect("encode")
     );
-    for absent in ["temperature", "top_p", "top_k", "thinking", "stream"] {
+    // Fallbacks are off by default, so the request carries none.
+    for absent in [
+        "temperature",
+        "top_p",
+        "top_k",
+        "thinking",
+        "stream",
+        "fallbacks",
+    ] {
         assert!(body.get(absent).is_none(), "{absent} must not be sent");
     }
+    let mut opted_in = config.clone();
+    opted_in.fallbacks = true;
+    assert_eq!(
+        request_body(&opted_in, &request).expect("body")["fallbacks"],
+        "default"
+    );
 }
 
 #[test]
@@ -317,7 +330,9 @@ async fn the_request_carries_the_api_headers_and_the_key_only_in_x_api_key() {
     assert_eq!(request.path, "/v1/messages");
     assert_eq!(request.header("x-api-key"), Some(SENTINEL_KEY));
     assert_eq!(request.header("anthropic-version"), Some(API_VERSION));
-    assert_eq!(request.header("anthropic-beta"), Some(FALLBACK_BETA));
+    // Fallbacks are opt-in: no beta header and no field by default.
+    assert_eq!(request.header("anthropic-beta"), None);
+    assert!(request.json().get("fallbacks").is_none());
     assert_eq!(request.header("content-type"), Some("application/json"));
     assert_eq!(request.header("authorization"), None);
     assert!(!String::from_utf8_lossy(&request.body).contains(SENTINEL_KEY));
@@ -326,12 +341,12 @@ async fn the_request_carries_the_api_headers_and_the_key_only_in_x_api_key() {
     }
 
     let server = FakeHttp::start([ok(&json!([text("hi")]), "end_turn")]).await;
-    let mut no_fallbacks = config(&base(&server));
-    no_fallbacks.fallbacks = false;
-    complete_with(no_fallbacks).await.expect("response");
+    let mut fallbacks = config(&base(&server));
+    fallbacks.fallbacks = true;
+    complete_with(fallbacks).await.expect("response");
     let request = &server.requests()[0];
-    assert_eq!(request.header("anthropic-beta"), None);
-    assert!(request.json().get("fallbacks").is_none());
+    assert_eq!(request.header("anthropic-beta"), Some(FALLBACK_BETA));
+    assert_eq!(request.json()["fallbacks"], "default");
 }
 
 #[tokio::test]
@@ -441,8 +456,10 @@ fn a_refusal_keeps_its_stop_details_out_of_the_text() {
 #[test]
 fn unknown_and_fallback_blocks_are_kept_only_as_opaque_content() {
     let blocks = json!([
-        {"type": "redacted_thinking", "data": "opaque=="},
+        // Nothing may come before the boundary: the declined partial is
+        // omitted from a non-streaming response.
         {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-4-8"}},
+        {"type": "redacted_thinking", "data": "opaque=="},
         {"type": "brand_new_block", "payload": {"nested": [1, -2, "three"]}},
         text("answer"),
     ]);
@@ -1227,7 +1244,11 @@ async fn a_keyless_request_sends_no_credential_header() {
     assert_eq!(request.header("x-api-key"), None);
     assert_eq!(request.header("authorization"), None);
     assert_eq!(request.header("anthropic-version"), Some(API_VERSION));
-    assert_eq!(request.header("anthropic-beta"), Some(FALLBACK_BETA));
+    assert_eq!(
+        request.header("anthropic-beta"),
+        None,
+        "fallbacks are opt-in"
+    );
 }
 
 #[test]
