@@ -1,18 +1,27 @@
 #!/bin/sh
 set -eu
 
+# The node may hold sandboxes this run does not own, such as a failed one
+# kilnd keeps charged because its absence is unproven. Require no activity,
+# then require the reservations and non-deleted sandbox IDs recorded before
+# the run.
 assert_clean() {
     health=$(sudo /usr/local/bin/kilndctl health)
     printf '%s\n' "$health"
     active=$(printf '%s\n' "$health" | awk '/^active sandboxes:/ { print $3 }')
     running=$(printf '%s\n' "$health" | awk '/^running executions:/ { print $3 }')
-    reservations=$(printf '%s\n' "$health" | awk '/^node reservations:/ { print }')
     test "$active" = "0"
     test "$running" = "0"
-    printf '%s\n' "$reservations" | grep -q 'sandboxes 0/'
-    printf '%s\n' "$reservations" | grep -q 'memory 0/'
-    printf '%s\n' "$reservations" | grep -q 'pids 0/'
-    printf '%s\n' "$reservations" | grep -q 'disk 0/'
+    reservations=$(printf '%s\n' "$health" | awk '/^node reservations:/ { print }')
+    test -n "$reservations"
+    listing=$(sudo /usr/local/bin/kilndctl ls)
+    sandboxes=$(printf '%s\n' "$listing" | awk 'NR > 1 { print $1 }' | sort)
+    snapshot=$(printf '%s\n%s' "$reservations" "$sandboxes")
+    if test -n "${baseline+set}"; then
+        test "$snapshot" = "$baseline"
+    else
+        baseline=$snapshot
+    fi
 
     registry_lines=$(sudo /usr/local/bin/kiln ls | wc -l | tr -d ' ')
     test "$registry_lines" = "1"
@@ -58,15 +67,24 @@ for line in sys.stdin:
 print(matches[-1] if matches else "")
 ')
 test -n "$bin"
-work=$(mktemp -d)
+# Journals must live in a directory owned by the user running the harness.
+work=$(sudo mktemp -d)
 trap 'sudo rm -rf "$work"' EXIT
 sudo "$bin" demo --audit "$work/demo-audit.jsonl" --journal "$work/demo.jsonl"
-sudo "$bin" journal verify "$work/demo.jsonl" | tee "$work/verify.out"
-grep -qx 'status: complete (completed)' "$work/verify.out"
-sudo "$bin" replay --from "$work/demo.jsonl" \
-    --audit "$work/replay-audit.jsonl" --journal "$work/replay.jsonl" | \
-    tee "$work/replay.out"
-grep -qx reproduced "$work/replay.out"
+verify=$(sudo "$bin" journal verify "$work/demo.jsonl") || {
+    printf '%s\n' "$verify"
+    exit 1
+}
+printf '%s\n' "$verify"
+printf '%s\n' "$verify" | grep -qx 'status: complete (completed)'
+printf '%s\n' "$verify" | grep -qx 'sandbox deleted: yes'
+replay=$(sudo "$bin" replay --from "$work/demo.jsonl" \
+    --audit "$work/replay-audit.jsonl" --journal "$work/replay.jsonl") || {
+    printf '%s\n' "$replay"
+    exit 1
+}
+printf '%s\n' "$replay"
+printf '%s\n' "$replay" | grep -qx reproduced
 sudo "$bin" journal verify "$work/replay.jsonl"
 
 assert_clean

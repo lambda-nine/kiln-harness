@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use kiln_harness::api::{SandboxApi, TonicKilnd};
@@ -26,13 +27,10 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         "integration baseline is not empty"
     );
     assert_eq!(before.running_executions, 0);
-    assert_eq!(before.reservations.sandboxes, 0);
-    assert!(
-        api.non_deleted_sandboxes()
-            .await
-            .expect("list baseline")
-            .is_empty()
-    );
+    // A node may keep sandboxes this test does not own, such as a failed one
+    // kilnd still charges because its absence is unproven. Compare against
+    // what existed before rather than against zero.
+    let sandboxes_before = non_deleted_ids(&api).await;
 
     let temp = tempfile::tempdir().expect("temporary audit directory");
     let audit_path = temp.path().join("integration.jsonl");
@@ -92,14 +90,15 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     assert!(after.serving, "kilnd unhealthy: {}", after.detail);
     assert_eq!(after.active_sandboxes, 0);
     assert_eq!(after.running_executions, 0);
-    assert_eq!(after.reservations.sandboxes, 0);
-    assert_eq!(after.reservations.memory_bytes, 0);
-    assert_eq!(after.reservations.pids, 0);
-    assert_eq!(after.reservations.disk_bytes, 0);
-    assert!(
-        api.non_deleted_sandboxes()
-            .await
-            .expect("list after")
-            .is_empty()
-    );
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
+}
+
+async fn non_deleted_ids(api: &TonicKilnd) -> BTreeSet<String> {
+    api.non_deleted_sandboxes()
+        .await
+        .expect("list non-deleted sandboxes")
+        .into_iter()
+        .map(|sandbox| sandbox.id)
+        .collect()
 }
