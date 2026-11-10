@@ -1074,7 +1074,7 @@ fn a_null_iteration_model_means_the_requested_model() {
     // requested one: refused.
     assert_eq!(
         invalid(&live_body("claude-opus-4-8")),
-        "usage iterations do not end with the serving attempt the top level reports"
+        "response model differs from the requested model without a fallback"
     );
     // The same body is consistent for a request that named that model.
     parse_response(&live_body("claude-opus-4-8"), "claude-opus-4-8", true)
@@ -1666,4 +1666,134 @@ fn fallbacks_off_still_validates_iterations() {
         off(&sticky).expect_err("a fallback entry").message,
         "a fallback_message iteration, but the request did not ask for fallbacks"
     );
+}
+
+// I1, review round six: no model switch without fallback evidence.
+
+fn live_off_body(model: &str) -> Value {
+    let usage: Value =
+        serde_json::from_str(common::anthropic::LIVE_USAGE_FALLBACKS_OFF).expect("fixture");
+    let mut body = message(&json!([{"type": "text", "text": "ok"}]), "end_turn", &usage);
+    body["model"] = json!(model);
+    body
+}
+
+#[test]
+fn the_captured_fallbacks_off_usage_parses() {
+    let usage: Value =
+        serde_json::from_str(common::anthropic::LIVE_USAGE_FALLBACKS_OFF).expect("fixture");
+    assert!(
+        usage.get("iterations").is_none(),
+        "live fallbacks-off shape"
+    );
+    let response = parse_response(&live_off_body("claude-opus-5-5"), "claude-opus-5-5", false)
+        .expect("the real fallbacks-off usage is valid");
+    assert_eq!(
+        (response.usage.input_tokens, response.usage.output_tokens),
+        (18, 4)
+    );
+}
+
+#[tokio::test]
+async fn an_unmarked_model_switch_is_refused_with_nothing_run() {
+    let switched = "response model differs from the requested model without a fallback";
+    let call = json!([{"type": "tool_use", "id": "toolu_alt", "name": "write_file",
+                       "input": {"path": "a.txt", "content": "alternate"}}]);
+    // Daybreak r6-repro-01, fallbacks off: top-level usage only.
+    let mut off = message(
+        &call,
+        "tool_use",
+        &json!({"input_tokens": 5, "output_tokens": 10}),
+    );
+    off["model"] = json!("claude-opus-4-8");
+    assert_eq!(
+        parse_response(&off, "claude-opus-5-5", false)
+            .expect_err("switched")
+            .message,
+        switched
+    );
+    // Fallbacks on: one ordinary named message iteration.
+    let mut on = message(
+        &call,
+        "tool_use",
+        &json!({"input_tokens": 5, "output_tokens": 10, "iterations": [
+            {"type": "message", "model": "claude-opus-4-8", "input_tokens": 5, "output_tokens": 10}]}),
+    );
+    on["model"] = json!("claude-opus-4-8");
+    assert_eq!(invalid(&on), switched);
+
+    for (body, fallbacks) in [(off, false), (on, true)] {
+        let api = FakeApi::default();
+        let server = FakeHttp::start([Reply::json(200, &body)]).await;
+        let mut config = config_with(&base(&server), KEY);
+        config.fallbacks = fallbacks;
+        let provider = AnthropicProvider::new(config).expect("provider");
+        let mut harness = Harness::new(
+            api.clone(),
+            provider,
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+        let error = harness
+            .run(&task(), CancellationToken::new())
+            .await
+            .expect_err("refused");
+        let HarnessError::Provider(error) = error else {
+            panic!("{error}");
+        };
+        assert_eq!(error.message, switched);
+        assert!(!api.state().files.contains_key("a.txt"), "nothing ran");
+        assert!(
+            harness
+                .journal()
+                .records
+                .iter()
+                .all(|record| !matches!(record.event, JournalEvent::ToolExecuted { .. }))
+        );
+        assert_eq!(api.state().deleted, ["sb-0000000000000001"]);
+    }
+}
+
+#[test]
+fn the_requested_model_is_accepted_on_both_paths() {
+    let switched = "response model differs from the requested model without a fallback";
+    let text = json!([{"type": "text", "text": "ok"}]);
+    // Fallbacks off, top level only, and fallbacks on with the live shape.
+    parse_response(&live_off_body("claude-opus-5-5"), "claude-opus-5-5", false).expect("off");
+    parse_response(
+        &message(&text, "end_turn", &usage(5, 1)),
+        "claude-opus-5-5",
+        true,
+    )
+    .expect("on");
+    // A named message iteration equal to the requested model.
+    let named = |model: &str| {
+        message(
+            &text,
+            "end_turn",
+            &json!({"input_tokens": 5, "output_tokens": 1, "iterations": [
+                {"type": "message", "model": model, "input_tokens": 5, "output_tokens": 1}]}),
+        )
+    };
+    for fallbacks in [false, true] {
+        parse_response(&named("claude-opus-5-5"), "claude-opus-5-5", fallbacks)
+            .expect("named requested model");
+        // A named iteration that differs, even with the top level right.
+        assert_eq!(
+            parse_response(&named("claude-opus-4-8"), "claude-opus-5-5", fallbacks)
+                .expect_err("differs")
+                .message,
+            switched
+        );
+    }
+    // An earlier iteration that differs is refused too.
+    let earlier = message(
+        &text,
+        "end_turn",
+        &json!({"input_tokens": 5, "output_tokens": 1, "iterations": [
+            {"type": "message", "model": "claude-opus-4-8", "input_tokens": 5, "output_tokens": 1},
+            {"type": "message", "model": null, "input_tokens": 5, "output_tokens": 1}]}),
+    );
+    assert_eq!(invalid(&earlier), switched);
 }

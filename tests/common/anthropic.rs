@@ -7,6 +7,11 @@ use serde_json::{Value, json};
 /// fallback ran.
 pub const LIVE_USAGE: &str = include_str!("../fixtures/anthropic-live-usage.json");
 
+/// `usage` exactly as `claude-opus-5-5` returned it live without
+/// fallbacks: top-level counters only, no `iterations`.
+pub const LIVE_USAGE_FALLBACKS_OFF: &str =
+    include_str!("../fixtures/anthropic-live-usage-fallbacks-off.json");
+
 /// [`LIVE_USAGE`]'s shape with other counters: the real non-fallback form,
 /// one `message` iteration with a null model mirroring the top level, and
 /// the extra fields the API adds. Prefer it to invented usage objects.

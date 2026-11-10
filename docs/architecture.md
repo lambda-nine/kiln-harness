@@ -366,6 +366,15 @@ refused (`run` says to pass `--api-key-env` or a proxy `--base-url`). With
 a key, nothing changes: `https` unless the host is a loopback IP literal,
 the key in `x-api-key`, and the scan.
 
+Model attribution. A turn is credited to the model that served it, and
+only fallback evidence explains a model other than the requested one.
+Without a `fallback` block or a `fallback_message` iteration, on either
+path, the response's `model` and every named `message` iteration must equal
+the requested model exactly, or the response is `InvalidResponse`
+("response model differs from the requested model without a fallback"),
+before any tool runs. Captured live responses report the requested model
+exactly.
+
 Fallbacks are opt-in (`--fallbacks`). The harness exists to record, replay,
 and evaluate specific models; a refusal the server silently reroutes to a
 different model breaks model attribution and per-model comparisons, so by

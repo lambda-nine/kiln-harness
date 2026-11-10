@@ -126,7 +126,10 @@
 //!   recorded as `served_model` in the audit. A non-streaming response
 //!   omits a declined partial, so content before the last `fallback` block
 //!   is refused, and each block must have its declined attempt in
-//!   `usage.iterations`.
+//!   `usage.iterations`. Without fallback evidence (no `fallback` block and
+//!   no `fallback_message` entry), on either path, the response's `model`
+//!   and every named `message` iteration must be exactly the requested
+//!   model: an unmarked switch is `InvalidResponse`.
 //! - **Strict tools off by default.** Strict mode refuses `maxItems` and
 //!   similar bounds, which the harness's schemas use. With `strict_tools`,
 //!   each schema is sent through [`strict_input_schema`]: supported keywords
@@ -1116,6 +1119,11 @@ fn parse_usage(
         None | Some(Value::Null) if expected.fallbacks => {
             return Err(invalid("fallbacks are on but usage.iterations is missing"));
         }
+        // No iterations and (fallbacks being off) no fallback evidence: the
+        // requested model must be the one that answered.
+        None | Some(Value::Null) if model != requested_model => {
+            return Err(unmarked_switch());
+        }
         None | Some(Value::Null) => serving,
         Some(Value::Array(attempts)) if !attempts.is_empty() => {
             let mut sum = Usage::default();
@@ -1180,6 +1188,17 @@ fn parse_usage(
             {
                 return Err(invalid("fallback blocks do not match the usage iterations"));
             }
+            // Without fallback evidence every attempt, and the response,
+            // must be the requested model: an unmarked switch would credit
+            // one model with another's answer.
+            if !ends_in_fallback
+                && (model != requested_model
+                    || models
+                        .iter()
+                        .any(|named| named.is_some_and(|named| named != requested_model)))
+            {
+                return Err(unmarked_switch());
+            }
             match last {
                 Some((last_model, counted))
                     if last_model.unwrap_or(requested_model) == model && counted == serving =>
@@ -1201,6 +1220,12 @@ fn parse_usage(
         return Err(invalid("usage reports zero input tokens"));
     }
     Ok((total, serving.output_tokens))
+}
+
+/// The refusal for a response from a model other than the requested one
+/// with no fallback block or `fallback_message` to account for it.
+fn unmarked_switch() -> ProviderError {
+    invalid("response model differs from the requested model without a fallback")
 }
 
 /// The four disjoint counters of one usage object; a missing or null

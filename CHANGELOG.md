@@ -6,6 +6,12 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Sixth review round for the anthropic provider: without fallback
+  evidence (no `fallback` block and no `fallback_message` iteration), the
+  response's `model` and every named `message` iteration must equal the
+  requested model exactly, with fallbacks off or on, so an unmarked model
+  switch is refused before any tool runs. The captured fallbacks-off live
+  usage (top level only, no `iterations`) is a second test fixture.
 - Anthropic server-side fallbacks are now opt-in: `--fallbacks` replaces
   `--no-fallbacks`, and by default the request carries no `fallbacks` field
   and no beta header. The harness records, replays, and compares specific
