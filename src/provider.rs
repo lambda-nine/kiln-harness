@@ -67,12 +67,29 @@ pub enum StopReason {
     Other,
 }
 
+/// Token usage for one response.
+///
+/// The three input counters are disjoint: `input_tokens` counts uncached
+/// input only, and cache reads and cache writes are counted separately.
+/// Adapters must normalize to this. For example, an API that reports total
+/// prompt tokens with a cached subset must subtract the cached count from its
+/// prompt tokens before filling `input_tokens`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+}
+
+impl Usage {
+    /// All input tokens: uncached, cache-read, and cache-creation, saturating.
+    #[must_use]
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+    }
 }
 
 /// Adds two usage reports, saturating each counter at `u64::MAX`.

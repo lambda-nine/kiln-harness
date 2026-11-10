@@ -563,7 +563,7 @@ where
         )?;
         progress.usage = progress.usage + response.usage;
         if response.usage.output_tokens > u64::from(config.max_output_tokens_per_request)
-            || progress.usage.input_tokens > config.max_total_input_tokens
+            || progress.usage.total_input_tokens() > config.max_total_input_tokens
             || progress.usage.output_tokens > config.max_total_output_tokens
         {
             return Err(HarnessError::TokenBudget);

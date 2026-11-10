@@ -1680,3 +1680,52 @@ async fn zero_turn_and_token_budgets_are_rejected_before_create() {
         assert!(observer.state().creates.is_empty());
     }
 }
+
+#[tokio::test]
+async fn cached_input_tokens_count_against_the_input_budget() {
+    let usage = |input_tokens, cache_read_input_tokens, cache_creation_input_tokens| Usage {
+        input_tokens,
+        output_tokens: 1,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+    };
+    // (usage, budget, accepted)
+    for (usage, budget, accepted) in [
+        (usage(1, 50, 50), 1, false),
+        (usage(1, 50, 50), 100, false),
+        (usage(1, 50, 50), 101, true),
+        // No double counting when the cache counters are zero.
+        (usage(10, 0, 0), 10, true),
+        (usage(10, 0, 0), 9, false),
+    ] {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let config = HarnessConfig {
+            max_total_input_tokens: budget,
+            ..short_lifecycle_config()
+        };
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::new([ModelResponse {
+                usage,
+                ..ModelResponse::final_text("done")
+            }]),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config,
+        );
+
+        let result = harness.run(&task(), CancellationToken::new()).await;
+
+        if accepted {
+            assert_eq!(result.expect("within budget").usage, usage);
+        } else {
+            assert!(
+                matches!(result, Err(HarnessError::TokenBudget)),
+                "{usage:?} with budget {budget}"
+            );
+        }
+        assert_eq!(observer.state().deleted.len(), 1);
+    }
+    assert_eq!(usage(u64::MAX, 1, 1).total_input_tokens(), u64::MAX);
+}
