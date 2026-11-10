@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -12,100 +13,248 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
+/// One tool invocation requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ModelAction {
-    ToolCall {
-        call_id: String,
-        tool: String,
-        arguments: Value,
-    },
-    FinalAnswer {
+pub struct ToolCall {
+    /// Provider-assigned ID, used only to route the result back to the model.
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+impl ToolCall {
+    #[must_use]
+    pub fn new(call_id: impl Into<String>, tool: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: tool.into(),
+            arguments,
+        }
+    }
+}
+
+/// The model-visible result of one tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub tool: String,
+    pub result: Value,
+}
+
+/// One entry in the provider-neutral conversation sent to the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum Message {
+    User {
         text: String,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TranscriptItem {
-    Model(ModelAction),
-    ToolResult {
-        call_id: String,
-        tool: String,
-        result: Value,
+    Assistant {
+        text: Option<String>,
+        tool_calls: Vec<ToolCall>,
+    },
+    ToolResults {
+        results: Vec<ToolResult>,
     },
 }
 
-pub struct ProviderContext<'a> {
-    pub session_id: &'a str,
-    pub turn: u32,
-    pub tools: &'a [ToolDefinition],
-    pub transcript: &'a [TranscriptItem],
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Refusal,
+    Other,
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[error("provider failed: {message}")]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+}
+
+/// Adds two usage reports, saturating each counter at `u64::MAX`.
+impl std::ops::Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+        }
+    }
+}
+
+/// One complete model turn: optional text plus zero or more tool calls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelResponse {
+    pub text: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub stop_reason: StopReason,
+    pub usage: Usage,
+}
+
+impl ModelResponse {
+    /// A final answer that ends the turn.
+    #[must_use]
+    pub fn final_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        }
+    }
+
+    /// A turn that requests the given tool calls.
+    #[must_use]
+    pub fn tool_use(tool_calls: impl IntoIterator<Item = ToolCall>) -> Self {
+        Self {
+            text: None,
+            tool_calls: tool_calls.into_iter().collect(),
+            stop_reason: StopReason::ToolUse,
+            usage: Usage::default(),
+        }
+    }
+}
+
+/// Everything a provider needs for one completion. It carries no credentials.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelRequest<'a> {
+    pub session_id: &'a str,
+    pub turn: u32,
+    pub system: &'a str,
+    pub tools: &'a [ToolDefinition],
+    pub messages: &'a [Message],
+    pub max_output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderInfo {
+    pub name: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    Transport,
+    Timeout,
+    RateLimited,
+    Overloaded,
+    Rejected,
+    InvalidResponse,
+    ContextOverflow,
+    Script,
+    ReplayDiverged,
+}
+
+impl ProviderErrorKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate_limited",
+            Self::Overloaded => "overloaded",
+            Self::Rejected => "rejected",
+            Self::InvalidResponse => "invalid_response",
+            Self::ContextOverflow => "context_overflow",
+            Self::Script => "script",
+            Self::ReplayDiverged => "replay_diverged",
+        }
+    }
+}
+
+impl fmt::Display for ProviderErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A provider failure. The loop treats every provider error as fatal; any
+/// retry policy belongs inside a network adapter.
+#[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[error("provider failed ({kind}): {message}")]
 pub struct ProviderError {
+    pub kind: ProviderErrorKind,
     pub message: String,
+    pub retryable: bool,
+}
+
+impl ProviderError {
+    #[must_use]
+    pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            retryable: false,
+        }
+    }
 }
 
 #[async_trait]
 pub trait Provider: Send {
-    async fn next(&mut self, context: ProviderContext<'_>) -> Result<ModelAction, ProviderError>;
+    fn info(&self) -> ProviderInfo;
+    async fn complete(&mut self, request: ModelRequest<'_>)
+    -> Result<ModelResponse, ProviderError>;
 }
+
+/// The bytes the demo writes, reads back, and counts.
+pub const DEMO_CONTENT: &str = "hello from kiln-harness\n";
 
 /// A deterministic provider used by tests and the no-API demo.
 pub struct ScriptedProvider {
-    actions: VecDeque<ModelAction>,
+    responses: VecDeque<ModelResponse>,
     validate_demo_results: bool,
 }
 
 impl ScriptedProvider {
     #[must_use]
-    pub fn new(actions: impl IntoIterator<Item = ModelAction>) -> Self {
+    pub fn new(responses: impl IntoIterator<Item = ModelResponse>) -> Self {
         Self {
-            actions: actions.into_iter().collect(),
+            responses: responses.into_iter().collect(),
             validate_demo_results: false,
         }
     }
 
+    /// Five turns, including one with two calls, then a verified final answer.
     #[must_use]
     pub fn demo() -> Self {
         let mut provider = Self::new([
-            ModelAction::ToolCall {
-                call_id: "call-1".to_string(),
-                tool: "write_file".to_string(),
-                arguments: json!({
-                    "path": "demo.txt",
-                    "content": "hello from kiln-harness\n"
-                }),
-            },
-            ModelAction::ToolCall {
-                call_id: "call-2".to_string(),
-                tool: "read_file".to_string(),
-                arguments: json!({"path": "demo.txt", "max_bytes": 4096}),
-            },
-            ModelAction::ToolCall {
-                call_id: "call-3".to_string(),
-                tool: "list_dir".to_string(),
-                arguments: json!({"path": "."}),
-            },
-            ModelAction::ToolCall {
-                call_id: "call-4".to_string(),
-                tool: "workspace_diff".to_string(),
-                arguments: json!({}),
-            },
-            ModelAction::ToolCall {
-                call_id: "call-5".to_string(),
-                tool: "exec".to_string(),
-                arguments: json!({
+            ModelResponse::tool_use([ToolCall::new(
+                "call-1",
+                "write_file",
+                json!({"path": "demo.txt", "content": DEMO_CONTENT}),
+            )]),
+            ModelResponse::tool_use([
+                ToolCall::new(
+                    "call-2",
+                    "read_file",
+                    json!({"path": "demo.txt", "max_bytes": 4096}),
+                ),
+                ToolCall::new("call-3", "list_dir", json!({"path": "."})),
+            ]),
+            ModelResponse::tool_use([ToolCall::new("call-4", "workspace_diff", json!({}))]),
+            ModelResponse::tool_use([ToolCall::new(
+                "call-5",
+                "exec",
+                json!({
                     "argv": ["/usr/bin/wc", "-c", "/workspace/demo.txt"],
                     "stdin": ""
                 }),
-            },
-            ModelAction::FinalAnswer {
-                text: "The deterministic harness wrote, read, listed, diffed, and counted demo.txt through kilnd.".to_string(),
-            },
+            )]),
+            ModelResponse::final_text(
+                "The deterministic harness wrote, read, listed, diffed, and counted demo.txt through kilnd.",
+            ),
         ]);
         provider.validate_demo_results = true;
         provider
@@ -114,72 +263,90 @@ impl ScriptedProvider {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
-    async fn next(&mut self, context: ProviderContext<'_>) -> Result<ModelAction, ProviderError> {
-        if context.tools.is_empty() {
-            return Err(ProviderError {
-                message: "tool registry is empty".to_string(),
-            });
+    fn info(&self) -> ProviderInfo {
+        ProviderInfo {
+            name: "scripted".to_string(),
+            model: "demo".to_string(),
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        if request.tools.is_empty() {
+            return Err(script_error("tool registry is empty"));
         }
         if self.validate_demo_results {
-            validate_demo_result(&context)?;
+            validate_demo_results(&request)?;
         }
-        self.actions.pop_front().ok_or_else(|| ProviderError {
-            message: "script ended before a final answer".to_string(),
-        })
+        self.responses
+            .pop_front()
+            .ok_or_else(|| script_error("script ended before a final answer"))
     }
 }
 
-fn validate_demo_result(context: &ProviderContext<'_>) -> Result<(), ProviderError> {
-    if context.turn == 1 {
-        return Ok(());
-    }
-    let Some(TranscriptItem::ToolResult { tool, result, .. }) = context.transcript.last() else {
-        return Err(ProviderError {
-            message: "demo expected a tool result before the next turn".to_string(),
-        });
+fn script_error(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::Script, message)
+}
+
+fn validate_demo_results(request: &ModelRequest<'_>) -> Result<(), ProviderError> {
+    let expected: &[(&str, &str)] = match request.turn {
+        1 => return Ok(()),
+        2 => &[("call-1", "write_file")],
+        3 => &[("call-2", "read_file"), ("call-3", "list_dir")],
+        4 => &[("call-4", "workspace_diff")],
+        5 => &[("call-5", "exec")],
+        _ => return Err(script_error("demo received an unexpected turn")),
     };
-    if result.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(ProviderError {
-            message: format!("demo tool {tool} did not succeed"),
-        });
-    }
-    let valid = match context.turn {
-        2 => {
-            tool == "write_file" && result.get("bytes_written").and_then(Value::as_u64) == Some(24)
-        }
-        3 => {
-            tool == "read_file"
-                && result.get("content").and_then(Value::as_str)
-                    == Some("hello from kiln-harness\n")
-        }
-        4 => {
-            tool == "list_dir"
-                && result
-                    .get("listing")
-                    .and_then(Value::as_str)
-                    .is_some_and(|listing| listing.contains("demo.txt"))
-        }
-        5 => {
-            tool == "workspace_diff"
-                && result
-                    .get("added")
-                    .and_then(Value::as_array)
-                    .is_some_and(|added| added.iter().any(|path| path == "demo.txt"))
-        }
-        6 => {
-            tool == "exec"
-                && result
-                    .get("stdout")
-                    .and_then(Value::as_str)
-                    .is_some_and(|stdout| stdout.trim() == "24 /workspace/demo.txt")
-        }
-        _ => true,
+    let Some(Message::ToolResults { results }) = request.messages.last() else {
+        return Err(script_error(
+            "demo expected tool results before the next turn",
+        ));
     };
-    if valid {
-        Ok(())
-    } else {
-        Err(ProviderError {
-            message: format!("demo tool {tool} returned an unexpected result"),
-        })
+    if results.len() != expected.len() {
+        return Err(script_error(format!(
+            "demo expected {} tool results, got {}",
+            expected.len(),
+            results.len()
+        )));
+    }
+    for (result, (call_id, tool)) in results.iter().zip(expected) {
+        if result.call_id != *call_id || result.tool != *tool {
+            return Err(script_error(format!(
+                "demo expected the {tool} result for {call_id}"
+            )));
+        }
+        if result.result.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(script_error(format!("demo tool {tool} did not succeed")));
+        }
+        if !demo_result_valid(tool, &result.result) {
+            return Err(script_error(format!(
+                "demo tool {tool} returned an unexpected result"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn demo_result_valid(tool: &str, result: &Value) -> bool {
+    match tool {
+        "write_file" => {
+            result.get("bytes_written").and_then(Value::as_u64) == Some(DEMO_CONTENT.len() as u64)
+        }
+        "read_file" => result.get("content").and_then(Value::as_str) == Some(DEMO_CONTENT),
+        "list_dir" => result
+            .get("listing")
+            .and_then(Value::as_str)
+            .is_some_and(|listing| listing.lines().any(|line| line.ends_with("demo.txt"))),
+        "workspace_diff" => result
+            .get("added")
+            .and_then(Value::as_array)
+            .is_some_and(|added| added.iter().any(|path| path == "demo.txt")),
+        "exec" => result
+            .get("stdout")
+            .and_then(Value::as_str)
+            .is_some_and(|stdout| stdout.trim() == "24 /workspace/demo.txt"),
+        _ => false,
     }
 }

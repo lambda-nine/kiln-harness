@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::time::{Instant, sleep, timeout_at};
@@ -9,23 +10,58 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{ApiError, SandboxApi, SandboxRequest};
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
-use crate::provider::{ModelAction, Provider, ProviderContext, ProviderError, TranscriptItem};
+use crate::journal::{
+    BudgetSnapshot, JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, request_sha256,
+};
+use crate::provider::{
+    Message, ModelRequest, ModelResponse, Provider, ProviderError, StopReason, ToolCall,
+    ToolDefinition, ToolResult, Usage,
+};
 use crate::tools::{
-    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolStop, recover_execution_evidence,
+    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop, recover_execution_evidence,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest accepted system prompt or task prompt.
+pub const MAX_TASK_TEXT_BYTES: usize = 64 << 10;
+const UNKNOWN_TOOL: &str = "unknown";
+
+/// What one session is asked to do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTask {
+    pub system: String,
+    pub prompt: String,
+}
+
+impl SessionTask {
+    /// The task the deterministic demo script carries out.
+    #[must_use]
+    pub fn demo() -> Self {
+        Self {
+            system: "You operate one no-network kiln sandbox through typed tools. \
+                     Work only under /workspace."
+                .to_string(),
+            prompt: "Write demo.txt, read it back, list the workspace, check the workspace \
+                     diff, count the file's bytes with wc, then report what you did."
+                .to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
     pub max_steps: u32,
     pub max_tool_calls: u32,
+    pub max_tool_calls_per_turn: u32,
     pub session_timeout: Duration,
     pub lifecycle_timeout: Duration,
     pub lifecycle_retry_delay: Duration,
     pub max_model_arguments_bytes: usize,
     pub max_final_answer_bytes: usize,
+    pub max_output_tokens_per_request: u32,
+    pub max_total_input_tokens: u64,
+    pub max_total_output_tokens: u64,
     pub tool_limits: ToolLimits,
 }
 
@@ -34,13 +70,44 @@ impl Default for HarnessConfig {
         Self {
             max_steps: 8,
             max_tool_calls: 6,
+            max_tool_calls_per_turn: 8,
             session_timeout: Duration::from_secs(30),
             lifecycle_timeout: Duration::from_secs(10),
             lifecycle_retry_delay: Duration::from_millis(100),
             max_model_arguments_bytes: 64 << 10,
             max_final_answer_bytes: 64 << 10,
+            max_output_tokens_per_request: 4096,
+            max_total_input_tokens: 2_000_000,
+            max_total_output_tokens: 200_000,
             tool_limits: ToolLimits::default(),
         }
+    }
+}
+
+impl HarnessConfig {
+    /// The budgets recorded in a session journal.
+    #[must_use]
+    pub fn budgets(&self) -> BudgetSnapshot {
+        BudgetSnapshot {
+            max_steps: self.max_steps,
+            max_tool_calls: self.max_tool_calls,
+            max_tool_calls_per_turn: self.max_tool_calls_per_turn,
+            session_timeout_ms: duration_ms(self.session_timeout),
+            max_output_tokens_per_request: self.max_output_tokens_per_request,
+            max_total_input_tokens: self.max_total_input_tokens,
+            max_total_output_tokens: self.max_total_output_tokens,
+        }
+    }
+
+    /// Replace this configuration's budgets with recorded ones.
+    pub fn apply_budgets(&mut self, budgets: &BudgetSnapshot) {
+        self.max_steps = budgets.max_steps;
+        self.max_tool_calls = budgets.max_tool_calls;
+        self.max_tool_calls_per_turn = budgets.max_tool_calls_per_turn;
+        self.session_timeout = Duration::from_millis(budgets.session_timeout_ms);
+        self.max_output_tokens_per_request = budgets.max_output_tokens_per_request;
+        self.max_total_input_tokens = budgets.max_total_input_tokens;
+        self.max_total_output_tokens = budgets.max_total_output_tokens;
     }
 }
 
@@ -51,6 +118,7 @@ pub struct SessionOutcome {
     pub final_answer: String,
     pub steps: u32,
     pub tool_calls: u32,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Error)]
@@ -60,9 +128,13 @@ pub enum HarnessError {
     #[error(transparent)]
     Audit(#[from] AuditError),
     #[error(transparent)]
+    Journal(#[from] JournalError),
+    #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error("tool setup failed: {0}")]
     ToolSetup(#[from] ToolError),
+    #[error("invalid session task: {0}")]
+    InvalidTask(String),
     #[error("session deadline expired")]
     Deadline,
     #[error("session canceled")]
@@ -71,6 +143,14 @@ pub enum HarnessError {
     StepBudget(u32),
     #[error("model exceeded the {0}-tool-call budget")]
     ToolBudget(u32),
+    #[error("model requested more than {0} tool calls in one turn")]
+    TurnToolBudget(u32),
+    #[error("model exceeded a token budget")]
+    TokenBudget,
+    #[error("model output was truncated at its token limit")]
+    ModelTruncated,
+    #[error("model refused the request")]
+    ModelRefused,
     #[error("invalid model tool call: {0}")]
     InvalidModelCall(String),
     #[error("final answer exceeds the configured byte limit")]
@@ -81,27 +161,38 @@ pub enum HarnessError {
     CreateUncertain(ApiError),
 }
 
-pub struct Harness<A, P, S> {
+pub struct Harness<A, P, S, J> {
     api: A,
     provider: P,
     audit: S,
+    journal: J,
     config: HarnessConfig,
     registry: ToolRegistry,
 }
 
-impl<A, P, S> Harness<A, P, S>
+/// Counters that every exit path reports in `session_ended`.
+#[derive(Debug, Default)]
+struct Progress {
+    steps: u32,
+    tool_calls: u32,
+    usage: Usage,
+}
+
+impl<A, P, S, J> Harness<A, P, S, J>
 where
     A: SandboxApi,
     P: Provider,
     S: AuditSink,
+    J: JournalSink,
 {
     #[must_use]
-    pub fn new(api: A, provider: P, audit: S, config: HarnessConfig) -> Self {
+    pub fn new(api: A, provider: P, audit: S, journal: J, config: HarnessConfig) -> Self {
         let registry = ToolRegistry::new(config.tool_limits.clone());
         Self {
             api,
             provider,
             audit,
+            journal,
             config,
             registry,
         }
@@ -112,15 +203,30 @@ where
         &self.audit
     }
 
+    #[must_use]
+    pub fn journal(&self) -> &J {
+        &self.journal
+    }
+
+    #[must_use]
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
     /// Run one session and wait until its sandbox has been deleted.
     ///
     /// # Errors
     ///
-    /// Returns an error for provider, budget, audit, kilnd, deadline,
-    /// cancellation, or cleanup failures.
+    /// Returns an error for invalid tasks or budgets, provider, budget, audit,
+    /// journal, kilnd, deadline, cancellation, or cleanup failures.
     #[allow(clippy::too_many_lines)]
-    pub async fn run(&mut self, cancel: CancellationToken) -> Result<SessionOutcome, HarnessError> {
+    pub async fn run(
+        &mut self,
+        task: &SessionTask,
+        cancel: CancellationToken,
+    ) -> Result<SessionOutcome, HarnessError> {
         validate_config(&self.config)?;
+        validate_task(task)?;
         let session_id = session_id()?;
         let deadline = Instant::now()
             .checked_add(self.config.session_timeout)
@@ -133,6 +239,32 @@ where
                 network: "none".to_string(),
             },
         )?;
+        let started = self.journal.append(
+            &session_id,
+            JournalEvent::SessionStarted {
+                schema: JOURNAL_SCHEMA,
+                harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                provider: self.provider.info(),
+                system: task.system.clone(),
+                task: task.prompt.clone(),
+                tools: self.registry.definitions().to_vec(),
+                budgets: self.config.budgets(),
+            },
+        );
+        if let Err(error) = started {
+            // No sandbox exists yet. Close the audit session best-effort and
+            // report the journal failure, which is the primary error.
+            let _ = self.audit.append(
+                &session_id,
+                None,
+                AuditEvent::SessionFinished {
+                    outcome: "failed".to_string(),
+                    sandbox_deleted: true,
+                },
+            );
+            return Err(error.into());
+        }
+        let mut progress = Progress::default();
 
         let create = timeout_at(deadline, self.api.create(sandbox_request(&session_id))).await;
         let sandbox = match create {
@@ -171,11 +303,16 @@ where
                         sandbox_deleted: absence_confirmed,
                     },
                 );
+                let finish_journal = self.journal.append(
+                    &session_id,
+                    session_ended("create_failed", None, &progress, absence_confirmed),
+                );
                 if let Err(cleanup_error) = recovery {
                     return Err(HarnessError::Cleanup(cleanup_error));
                 }
                 recovery_audit?;
                 finish_audit?;
+                finish_journal?;
                 if !recovered && (deadline_expired || !unambiguous_create_error(&error)) {
                     return Err(HarnessError::CreateUncertain(error));
                 }
@@ -244,16 +381,29 @@ where
                     file_count: baseline.file_count,
                 },
             )?;
+            self.journal.append(
+                &session_id,
+                JournalEvent::SandboxReady {
+                    sandbox_id: sandbox_id.clone(),
+                    baseline_file_count: baseline.file_count,
+                },
+            )?;
+            let context = LoopContext {
+                config: &self.config,
+                task,
+                definitions: self.registry.definitions(),
+                tools: &tools,
+                session_id: &session_id,
+                sandbox_id: &sandbox_id,
+                deadline,
+                cancel: &cancel,
+            };
             run_loop(
                 &mut self.provider,
                 &mut self.audit,
-                &self.config,
-                self.registry.definitions(),
-                &tools,
-                &session_id,
-                &sandbox_id,
-                deadline,
-                &cancel,
+                &mut self.journal,
+                &context,
+                &mut progress,
                 baseline_execution_ids,
             )
             .await
@@ -285,37 +435,65 @@ where
                 sandbox_deleted: deleted,
             },
         );
+        let final_answer = body
+            .as_ref()
+            .ok()
+            .map(|outcome| outcome.final_answer.clone());
+        let finish_journal = self.journal.append(
+            &session_id,
+            session_ended(outcome_name, final_answer, &progress, deleted),
+        );
 
         if let Err(error) = cleanup {
             return Err(HarnessError::Cleanup(error));
         }
-        if let Err(error) = finish_audit {
-            return Err(HarnessError::Audit(error));
-        }
+        finish_audit?;
+        finish_journal?;
         body
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn run_loop<A, P, S>(
+struct LoopContext<'a, 'r, A: SandboxApi> {
+    config: &'a HarnessConfig,
+    task: &'a SessionTask,
+    definitions: &'a [ToolDefinition],
+    tools: &'a ToolSession<'r, A>,
+    session_id: &'a str,
+    sandbox_id: &'a str,
+    deadline: Instant,
+    cancel: &'a CancellationToken,
+}
+
+/// A tool call after host-side sanitization, as the model will see it.
+struct PreparedCall {
+    visible: ToolCall,
+    registered: bool,
+    arguments: Option<ContentSummary>,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_loop<A, P, S, J>(
     provider: &mut P,
     audit: &mut S,
-    config: &HarnessConfig,
-    definitions: &[crate::provider::ToolDefinition],
-    tools: &crate::tools::ToolSession<'_, A>,
-    session_id: &str,
-    sandbox_id: &str,
-    deadline: Instant,
-    cancel: &CancellationToken,
+    journal: &mut J,
+    context: &LoopContext<'_, '_, A>,
+    progress: &mut Progress,
     initial_execution_ids: Vec<String>,
 ) -> Result<SessionOutcome, HarnessError>
 where
     A: SandboxApi,
     P: Provider,
     S: AuditSink,
+    J: JournalSink,
 {
-    let mut transcript = Vec::new();
-    let mut tool_calls = 0u32;
+    let config = context.config;
+    let session_id = context.session_id;
+    let sandbox_id = context.sandbox_id;
+    let deadline = context.deadline;
+    let cancel = context.cancel;
+    let mut messages = vec![Message::User {
+        text: context.task.prompt.clone(),
+    }];
     let mut known_execution_ids = initial_execution_ids.into_iter().collect::<BTreeSet<_>>();
 
     for turn in 1..=config.max_steps {
@@ -325,181 +503,370 @@ where
         if Instant::now() >= deadline {
             return Err(HarnessError::Deadline);
         }
-        let context = ProviderContext {
+        progress.steps = turn;
+        journal.append(
+            session_id,
+            JournalEvent::ModelRequested {
+                turn,
+                request_sha256: request_sha256(
+                    &context.task.system,
+                    context.definitions,
+                    &messages,
+                ),
+                message_count: messages.len(),
+            },
+        )?;
+        let request = ModelRequest {
             session_id,
             turn,
-            tools: definitions,
-            transcript: &transcript,
+            system: &context.task.system,
+            tools: context.definitions,
+            messages: &messages,
+            max_output_tokens: config.max_output_tokens_per_request,
         };
-        let action = tokio::select! {
+        let requested_at = Instant::now();
+        let response = tokio::select! {
             () = cancel.cancelled() => return Err(HarnessError::Canceled),
-            result = timeout_at(deadline, provider.next(context)) => {
-                result.map_err(|_| HarnessError::Deadline)??
+            result = timeout_at(deadline, provider.complete(request)) => {
+                result.map_err(|_| HarnessError::Deadline)?
             }
         };
-
-        match action {
-            ModelAction::FinalAnswer { text } => {
-                let rejected = text.len() > config.max_final_answer_bytes;
-                audit.append(
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                journal.append(
                     session_id,
-                    Some(sandbox_id),
-                    AuditEvent::ModelTurn {
+                    JournalEvent::ModelFailed {
                         turn,
-                        action: if rejected {
-                            "final_answer_rejected".to_string()
-                        } else {
-                            "final_answer".to_string()
-                        },
-                        audit_call_id: None,
-                        tool: None,
-                        arguments: None,
+                        kind: error.kind,
+                        message: error.message.clone(),
                     },
                 )?;
-                if rejected {
-                    return Err(HarnessError::FinalAnswerTooLarge);
-                }
-                audit.append(
-                    session_id,
-                    Some(sandbox_id),
-                    AuditEvent::FinalAnswer {
-                        turn,
-                        answer: ContentSummary::bytes(text.as_bytes()),
-                    },
-                )?;
-                return Ok(SessionOutcome {
-                    session_id: session_id.to_string(),
-                    sandbox_id: sandbox_id.to_string(),
-                    final_answer: text,
-                    steps: turn,
-                    tool_calls,
-                });
+                return Err(HarnessError::Provider(error));
             }
-            ModelAction::ToolCall {
-                call_id,
-                tool,
-                arguments,
-            } => {
-                // Provider IDs are untrusted content and stay in the transient transcript.
-                let audit_call_id = format!("call-{turn}");
-                let call_id_valid = validate_call_id(&call_id).is_ok();
-                let tool_name_valid = tool.len() <= 64
-                    && !tool.is_empty()
-                    && tool.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
-                    });
-                let next_tool_calls = tool_calls.saturating_add(1);
-                let audited_tool = definitions
-                    .iter()
-                    .find(|definition| definition.name == tool)
-                    .map_or_else(
-                        || "unknown".to_string(),
-                        |definition| definition.name.clone(),
-                    );
-                let argument_summary =
-                    ContentSummary::json_bounded(&arguments, config.max_model_arguments_bytes)?;
-                let rejected = !call_id_valid
-                    || !tool_name_valid
-                    || next_tool_calls > config.max_tool_calls
-                    || argument_summary.is_none();
-                audit.append(
-                    session_id,
-                    Some(sandbox_id),
-                    AuditEvent::ModelTurn {
-                        turn,
-                        action: if rejected {
-                            "tool_call_rejected".to_string()
-                        } else {
-                            "tool_call".to_string()
-                        },
-                        audit_call_id: Some(audit_call_id.clone()),
-                        tool: Some(audited_tool.clone()),
-                        arguments: argument_summary.clone(),
-                    },
-                )?;
-                if !call_id_valid {
-                    return Err(HarnessError::InvalidModelCall(
-                        "call_id must be 1..=64 ASCII letters, digits, '.', '_' or '-'".to_string(),
-                    ));
-                }
-                if !tool_name_valid {
-                    return Err(HarnessError::InvalidModelCall(
-                        "tool name must be 1..=64 lowercase ASCII letters, digits or '_'"
-                            .to_string(),
-                    ));
-                }
-                if next_tool_calls > config.max_tool_calls {
-                    return Err(HarnessError::ToolBudget(config.max_tool_calls));
-                }
-                tool_calls = next_tool_calls;
-                let model_action = ModelAction::ToolCall {
-                    call_id: call_id.clone(),
-                    tool: audited_tool.clone(),
-                    arguments: argument_summary.as_ref().map_or_else(
-                        || json!({"omitted": "arguments exceeded byte limit"}),
-                        |_| arguments.clone(),
-                    ),
-                };
-                transcript.push(TranscriptItem::Model(model_action));
+        };
+        let latency_ms = duration_ms(requested_at.elapsed());
+        journal.append(
+            session_id,
+            JournalEvent::ModelResponded {
+                turn,
+                response: response.clone(),
+                latency_ms,
+            },
+        )?;
+        audit.append(
+            session_id,
+            Some(sandbox_id),
+            AuditEvent::ModelResponded {
+                turn,
+                stop_reason: response.stop_reason,
+                tool_calls: response.tool_calls.len(),
+                usage: response.usage,
+                latency_ms,
+            },
+        )?;
+        progress.usage = progress.usage + response.usage;
+        if response.usage.output_tokens > u64::from(config.max_output_tokens_per_request)
+            || progress.usage.input_tokens > config.max_total_input_tokens
+            || progress.usage.output_tokens > config.max_total_output_tokens
+        {
+            return Err(HarnessError::TokenBudget);
+        }
+        let ModelResponse {
+            text,
+            tool_calls,
+            stop_reason,
+            ..
+        } = response;
 
-                let mut run = if argument_summary.is_none() {
-                    rejected_tool_run(
-                        "model_arguments_too_large",
-                        config.max_model_arguments_bytes,
-                    )
-                } else {
-                    tokio::select! {
-                        () = cancel.cancelled() => ToolRun::interrupted(ToolStop::Canceled),
-                        run = tools.execute(&audited_tool, arguments, deadline) => run,
-                    }
-                };
-                if run.execution_ids.is_empty()
-                    && (!run.stdout.total_bytes_known || !run.stderr.total_bytes_known)
-                {
-                    let recovery_window = config.lifecycle_timeout.min(Duration::from_secs(1));
-                    if let Some(recovery_deadline) = Instant::now().checked_add(recovery_window) {
-                        let recovered = tools
-                            .recover_new_execution_evidence(&known_execution_ids, recovery_deadline)
-                            .await;
-                        run.attach_recovered(recovered);
-                    }
-                }
-                known_execution_ids.extend(run.execution_ids.iter().cloned());
-                let result_summary = ContentSummary::json(&run.result)?;
-                let stop = run.stop;
-                audit.append(
-                    session_id,
-                    Some(sandbox_id),
-                    AuditEvent::ToolCompleted {
-                        turn,
-                        audit_call_id,
-                        tool: audited_tool.clone(),
-                        ok: run.ok,
-                        execution_ids: run.execution_ids,
-                        result: result_summary,
-                        stdout: run.stdout,
-                        stderr: run.stderr,
-                    },
-                )?;
-                transcript.push(TranscriptItem::ToolResult {
-                    call_id,
-                    tool: audited_tool,
-                    result: run.result,
-                });
-                match stop {
-                    Some(ToolStop::Deadline) => return Err(HarnessError::Deadline),
-                    Some(ToolStop::Canceled) => return Err(HarnessError::Canceled),
-                    None => {}
-                }
+        if tool_calls.is_empty() {
+            return final_answer(audit, context, progress, turn, stop_reason, text);
+        }
+
+        // Tool arguments may be cut off, and a refusal must not run tools.
+        match stop_reason {
+            StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
+            StopReason::Refusal => return Err(HarnessError::ModelRefused),
+            StopReason::EndTurn | StopReason::ToolUse | StopReason::Other => {}
+        }
+        let reject_turn = |audit: &mut S| {
+            audit.append(
+                session_id,
+                Some(sandbox_id),
+                AuditEvent::ModelTurn {
+                    turn,
+                    action: "tool_call_rejected".to_string(),
+                    audit_call_id: None,
+                    tool: None,
+                    arguments: None,
+                },
+            )
+        };
+        if tool_calls.len() > config.max_tool_calls_per_turn as usize {
+            reject_turn(audit)?;
+            return Err(HarnessError::TurnToolBudget(config.max_tool_calls_per_turn));
+        }
+        // Call IDs route results back to the model. A malformed or repeated
+        // ID is a provider protocol fault, so the whole turn is refused
+        // before any call runs.
+        let mut seen_call_ids = BTreeSet::new();
+        for call in &tool_calls {
+            if let Err(error) = validate_call_id(&call.call_id) {
+                reject_turn(audit)?;
+                return Err(error);
+            }
+            if !seen_call_ids.insert(call.call_id.as_str()) {
+                reject_turn(audit)?;
+                return Err(HarnessError::InvalidModelCall(
+                    "call_id is repeated within one turn".to_string(),
+                ));
             }
         }
+        if text
+            .as_ref()
+            .is_some_and(|text| text.len() > config.max_final_answer_bytes)
+        {
+            reject_turn(audit)?;
+            return Err(HarnessError::InvalidModelCall(
+                "assistant text exceeds the configured byte limit".to_string(),
+            ));
+        }
+
+        let prepared = tool_calls
+            .into_iter()
+            .map(|call| prepare_call(config, context.definitions, call))
+            .collect::<Result<Vec<_>, _>>()?;
+        messages.push(Message::Assistant {
+            text,
+            tool_calls: prepared.iter().map(|call| call.visible.clone()).collect(),
+        });
+
+        let mut results = Vec::with_capacity(prepared.len());
+        for (position, call) in prepared.into_iter().enumerate() {
+            let index = u32::try_from(position + 1).unwrap_or(u32::MAX);
+            // Provider IDs are untrusted content and stay out of the audit.
+            let audit_call_id = format!("call-{turn}-{index}");
+            let next_tool_calls = progress.tool_calls.saturating_add(1);
+            let over_budget = next_tool_calls > config.max_tool_calls;
+            let rejected = over_budget || !call.registered || call.arguments.is_none();
+            audit.append(
+                session_id,
+                Some(sandbox_id),
+                AuditEvent::ModelTurn {
+                    turn,
+                    action: if rejected {
+                        "tool_call_rejected".to_string()
+                    } else {
+                        "tool_call".to_string()
+                    },
+                    audit_call_id: Some(audit_call_id.clone()),
+                    tool: Some(call.visible.tool.clone()),
+                    arguments: call.arguments.clone(),
+                },
+            )?;
+            if over_budget {
+                return Err(HarnessError::ToolBudget(config.max_tool_calls));
+            }
+            progress.tool_calls = next_tool_calls;
+
+            let mut run = if call.arguments.is_none() {
+                rejected_tool_run("model_arguments_too_large")
+            } else if !call.registered {
+                // Misnamed tools are model mistakes: report and continue.
+                rejected_tool_run("unknown_tool")
+            } else {
+                tokio::select! {
+                    () = cancel.cancelled() => ToolRun::interrupted(ToolStop::Canceled),
+                    run = context.tools.execute(
+                        &call.visible.tool,
+                        call.visible.arguments.clone(),
+                        deadline,
+                    ) => run,
+                }
+            };
+            if run.execution_ids.is_empty()
+                && (!run.stdout.total_bytes_known || !run.stderr.total_bytes_known)
+            {
+                let recovery_window = config.lifecycle_timeout.min(Duration::from_secs(1));
+                if let Some(recovery_deadline) = Instant::now().checked_add(recovery_window) {
+                    let recovered = context
+                        .tools
+                        .recover_new_execution_evidence(&known_execution_ids, recovery_deadline)
+                        .await;
+                    run.attach_recovered(recovered);
+                }
+            }
+            known_execution_ids.extend(run.execution_ids.iter().cloned());
+            let result_summary = ContentSummary::json(&run.result)?;
+            let stop = run.stop;
+            audit.append(
+                session_id,
+                Some(sandbox_id),
+                AuditEvent::ToolCompleted {
+                    turn,
+                    audit_call_id: audit_call_id.clone(),
+                    tool: call.visible.tool.clone(),
+                    ok: run.ok,
+                    execution_ids: run.execution_ids.clone(),
+                    result: result_summary,
+                    stdout: run.stdout,
+                    stderr: run.stderr,
+                },
+            )?;
+            journal.append(
+                session_id,
+                JournalEvent::ToolExecuted {
+                    turn,
+                    index,
+                    audit_call_id,
+                    call: call.visible.clone(),
+                    ok: run.ok,
+                    result: run.result.clone(),
+                    execution_ids: run.execution_ids,
+                },
+            )?;
+            results.push(ToolResult {
+                call_id: call.visible.call_id,
+                tool: call.visible.tool,
+                result: run.result,
+            });
+            match stop {
+                Some(ToolStop::Deadline) => return Err(HarnessError::Deadline),
+                Some(ToolStop::Canceled) => return Err(HarnessError::Canceled),
+                None => {}
+            }
+        }
+        messages.push(Message::ToolResults { results });
     }
     Err(HarnessError::StepBudget(config.max_steps))
+}
+
+/// Bound a call's arguments and map its name to a registered tool or
+/// `unknown`, so neither oversized arguments nor arbitrary names reach the
+/// transcript, the audit, or kilnd.
+fn prepare_call(
+    config: &HarnessConfig,
+    definitions: &[ToolDefinition],
+    call: ToolCall,
+) -> Result<PreparedCall, HarnessError> {
+    let registered = definitions
+        .iter()
+        .find(|definition| definition.name == call.tool);
+    let arguments =
+        ContentSummary::json_bounded(&call.arguments, config.max_model_arguments_bytes)?;
+    Ok(PreparedCall {
+        visible: ToolCall {
+            call_id: call.call_id,
+            tool: registered.map_or_else(
+                || UNKNOWN_TOOL.to_string(),
+                |definition| definition.name.clone(),
+            ),
+            arguments: if arguments.is_some() {
+                call.arguments
+            } else {
+                json!({"omitted": "arguments exceeded byte limit"})
+            },
+        },
+        registered: registered.is_some(),
+        arguments,
+    })
+}
+
+fn final_answer<A, S>(
+    audit: &mut S,
+    context: &LoopContext<'_, '_, A>,
+    progress: &Progress,
+    turn: u32,
+    stop_reason: StopReason,
+    text: Option<String>,
+) -> Result<SessionOutcome, HarnessError>
+where
+    A: SandboxApi,
+    S: AuditSink,
+{
+    match stop_reason {
+        StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
+        StopReason::Refusal => return Err(HarnessError::ModelRefused),
+        StopReason::EndTurn | StopReason::ToolUse | StopReason::Other => {}
+    }
+    let text = text.unwrap_or_default();
+    let rejected = text.is_empty() || text.len() > context.config.max_final_answer_bytes;
+    audit.append(
+        context.session_id,
+        Some(context.sandbox_id),
+        AuditEvent::ModelTurn {
+            turn,
+            action: if rejected {
+                "final_answer_rejected".to_string()
+            } else {
+                "final_answer".to_string()
+            },
+            audit_call_id: None,
+            tool: None,
+            arguments: None,
+        },
+    )?;
+    if text.is_empty() {
+        return Err(HarnessError::InvalidModelCall(
+            "empty final answer".to_string(),
+        ));
+    }
+    if rejected {
+        return Err(HarnessError::FinalAnswerTooLarge);
+    }
+    audit.append(
+        context.session_id,
+        Some(context.sandbox_id),
+        AuditEvent::FinalAnswer {
+            turn,
+            answer: ContentSummary::bytes(text.as_bytes()),
+        },
+    )?;
+    Ok(SessionOutcome {
+        session_id: context.session_id.to_string(),
+        sandbox_id: context.sandbox_id.to_string(),
+        final_answer: text,
+        steps: turn,
+        tool_calls: progress.tool_calls,
+        usage: progress.usage,
+    })
+}
+
+fn session_ended(
+    outcome: &str,
+    final_answer: Option<String>,
+    progress: &Progress,
+    sandbox_deleted: bool,
+) -> JournalEvent {
+    JournalEvent::SessionEnded {
+        outcome: outcome.to_string(),
+        final_answer,
+        steps: progress.steps,
+        tool_calls: progress.tool_calls,
+        usage: progress.usage,
+        sandbox_deleted,
+    }
+}
+
+fn validate_task(task: &SessionTask) -> Result<(), HarnessError> {
+    if task.prompt.is_empty() {
+        return Err(HarnessError::InvalidTask("prompt is empty".to_string()));
+    }
+    if task.prompt.len() > MAX_TASK_TEXT_BYTES || task.system.len() > MAX_TASK_TEXT_BYTES {
+        return Err(HarnessError::InvalidTask(format!(
+            "system and prompt are each limited to {MAX_TASK_TEXT_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
     if config.max_steps == 0
         || config.max_tool_calls == 0
+        || config.max_tool_calls_per_turn == 0
+        || config.max_output_tokens_per_request == 0
+        || config.max_total_input_tokens == 0
+        || config.max_total_output_tokens == 0
         || config.session_timeout.is_zero()
         || config.lifecycle_timeout.is_zero()
         || config.lifecycle_timeout > MAX_LIFECYCLE_TIMEOUT
@@ -568,7 +935,7 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn rejected_tool_run(kind: &str, _limit: usize) -> ToolRun {
+fn rejected_tool_run(kind: &str) -> ToolRun {
     ToolRun {
         ok: false,
         result: json!({"ok": false, "error": kind}),

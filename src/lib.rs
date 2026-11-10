@@ -3,7 +3,9 @@
 pub mod api;
 pub mod audit;
 pub mod engine;
+pub mod journal;
 pub mod provider;
+pub mod replay;
 pub mod tools;
 
 /// Rust types and clients generated from the pinned `kilnd.v1` schema.

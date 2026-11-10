@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 use kiln_harness::api::{SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
-use kiln_harness::engine::{Harness, HarnessConfig};
+use kiln_harness::engine::{Harness, HarnessConfig, SessionTask};
+use kiln_harness::journal::{JsonlJournal, read_journal};
 use kiln_harness::provider::ScriptedProvider;
+use kiln_harness::replay::ReplayProvider;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -35,14 +37,17 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     let temp = tempfile::tempdir().expect("temporary audit directory");
     let audit_path = temp.path().join("integration.jsonl");
     let audit = JsonlAudit::open(&audit_path).expect("open audit");
+    let journal_path = temp.path().join("integration-journal.jsonl");
+    let journal = JsonlJournal::open(&journal_path).expect("open journal");
     let mut harness = Harness::new(
         api.clone(),
         ScriptedProvider::demo(),
         audit,
+        journal,
         HarnessConfig::default(),
     );
     let outcome = harness
-        .run(CancellationToken::new())
+        .run(&SessionTask::demo(), CancellationToken::new())
         .await
         .expect("real kilnd scenario succeeds");
     assert_eq!(outcome.tool_calls, 5);
@@ -60,6 +65,27 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
                 .and_then(Value::as_array)
                 .is_some_and(|ids| !ids.is_empty())
     }));
+
+    // The recording replays against a fresh sandbox with identical requests.
+    let recorded = read_journal(&journal_path).expect("journal verifies");
+    assert!(recorded.complete);
+    let provider = ReplayProvider::from_journal(&recorded).expect("replayable journal");
+    let task = provider.task();
+    let mut config = HarnessConfig::default();
+    config.apply_budgets(&provider.budgets());
+    let mut replay = Harness::new(
+        api.clone(),
+        provider,
+        JsonlAudit::open(&temp.path().join("replay.jsonl")).expect("open replay audit"),
+        JsonlJournal::open(&temp.path().join("replay-journal.jsonl")).expect("open replay journal"),
+        config,
+    );
+    let replayed = replay
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("replay reproduces against installed kilnd");
+    assert_eq!(replay.provider().diverged_at(), None);
+    assert_eq!(replayed.final_answer, outcome.final_answer);
 
     let after = api.health().await.expect("health after");
     assert!(after.serving, "kilnd unhealthy: {}", after.detail);

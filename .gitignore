@@ -3,3 +3,4 @@
 *.jsonl
 /dist/
 __pycache__/
+/journal/

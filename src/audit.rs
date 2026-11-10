@@ -11,6 +11,8 @@ use thiserror::Error;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::provider::{StopReason, Usage};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContentSummary {
     pub sha256: String,
@@ -81,6 +83,14 @@ pub enum AuditEvent {
         ok: bool,
         execution_ids: Vec<String>,
         file_count: usize,
+    },
+    /// Metadata for one provider response; its content goes only to the journal.
+    ModelResponded {
+        turn: u32,
+        stop_reason: StopReason,
+        tool_calls: usize,
+        usage: Usage,
+        latency_ms: u64,
     },
     ModelTurn {
         turn: u32,

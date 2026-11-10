@@ -1,277 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet};
+mod common;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kiln_harness::api::{
-    ApiError, CapturedOutput, Execution, ExecutionState, Health, NodeReservations, Sandbox,
-    SandboxApi, SandboxExec, SandboxRequest,
-};
+use common::{DeleteBehavior, FakeApi, short_lifecycle_config};
+use kiln_harness::api::ApiError;
 use kiln_harness::audit::{AuditError, AuditEvent, AuditSink, MemoryAudit};
-use kiln_harness::engine::{Harness, HarnessConfig, HarnessError};
+use kiln_harness::engine::{
+    Harness, HarnessConfig, HarnessError, MAX_TASK_TEXT_BYTES, SessionTask,
+};
+use kiln_harness::journal::{JournalError, JournalEvent, JournalSink, MemoryJournal};
 use kiln_harness::provider::{
-    ModelAction, Provider, ProviderContext, ProviderError, ScriptedProvider, TranscriptItem,
+    Message, ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider,
+    StopReason, ToolCall, Usage,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status};
 
-#[derive(Clone, Default)]
-struct FakeApi {
-    state: Arc<Mutex<FakeState>>,
-}
-
-#[derive(Default)]
-enum DeleteBehavior {
-    #[default]
-    Remove,
-    AcknowledgeOnly,
-    FailAfterRemoving,
-}
-
-#[derive(Default)]
-struct FakeState {
-    creates: Vec<SandboxRequest>,
-    execs: Vec<SandboxExec>,
-    executions: Vec<Execution>,
-    deleted: Vec<String>,
-    files: BTreeMap<String, Vec<u8>>,
-    next_execution: u64,
-    create_delay: Duration,
-    create_ready_at: Option<std::time::Instant>,
-    suppress_create_record: bool,
-    create_error_after_record: bool,
-    create_rejection: Option<ApiError>,
-    tool_exec_delay: Duration,
-    baseline_exec_delay: Duration,
-    fail_baseline: bool,
-    delete_failures: u32,
-    delete_attempts: u32,
-    delete_behavior: DeleteBehavior,
-    delete_acknowledgements_before_removal: u32,
-    list_failures: u32,
-    list_delay: Duration,
-    list_attempts: u32,
-}
-
-impl FakeApi {
-    fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
-        self.state.lock().expect("fake state lock")
-    }
-}
-
-#[async_trait]
-impl SandboxApi for FakeApi {
-    async fn health(&self) -> Result<Health, ApiError> {
-        let state = self.state();
-        Ok(Health {
-            serving: true,
-            detail: String::new(),
-            active_sandboxes: u32::from(state.creates.len() > state.deleted.len()),
-            running_executions: 0,
-            reservations: NodeReservations::default(),
-        })
-    }
-
-    async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
-        let labels = request.labels.clone();
-        let (delay, fail) = {
-            let mut state = self.state();
-            if let Some(error) = &state.create_rejection {
-                return Err(error.clone());
-            }
-            let delay = state.create_delay;
-            let fail = state.create_error_after_record;
-            if !state.suppress_create_record {
-                state.creates.push(request);
-                state.create_ready_at = std::time::Instant::now().checked_add(delay);
-            }
-            (delay, fail)
-        };
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        if fail {
-            return Err(api_error(Code::Unavailable, "create response lost"));
-        }
-        Ok(Sandbox {
-            id: "sb-0000000000000001".to_string(),
-            backend_id: "test-backend-1".to_string(),
-            labels,
-        })
-    }
-
-    async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
-        let (execution, delay) = {
-            let mut state = self.state();
-            state.next_execution += 1;
-            let id = format!("ex-{:016x}", state.next_execution);
-            state.execs.push(request.clone());
-            let argv = &request.argv;
-            let (exit_code, stdout, stderr) = match argv.first().map(String::as_str) {
-                Some("/usr/bin/find") => {
-                    if state.fail_baseline && state.execs.len() == 1 {
-                        (1, Vec::new(), b"find failed".to_vec())
-                    } else {
-                        let mut output = Vec::new();
-                        for path in state.files.keys() {
-                            output.extend_from_slice(path.as_bytes());
-                            output.push(0);
-                        }
-                        (0, output, Vec::new())
-                    }
-                }
-                Some("/bin/dd") => {
-                    let path = argv
-                        .iter()
-                        .find_map(|arg| arg.strip_prefix("of="))
-                        .expect("dd output path")
-                        .to_string();
-                    state.files.insert(path, request.stdin.clone());
-                    (0, Vec::new(), Vec::new())
-                }
-                Some("/bin/stat") => {
-                    let path = argv.last().expect("stat path");
-                    match state.files.get(path) {
-                        Some(bytes) => (0, format!("{}\n", bytes.len()).into_bytes(), Vec::new()),
-                        None => (1, Vec::new(), b"not found".to_vec()),
-                    }
-                }
-                Some("/usr/bin/head") => {
-                    let limit = argv[2].parse::<usize>().expect("head limit");
-                    let path = argv.last().expect("head path");
-                    match state.files.get(path) {
-                        Some(bytes) => (0, bytes[..bytes.len().min(limit)].to_vec(), Vec::new()),
-                        None => (1, Vec::new(), b"not found".to_vec()),
-                    }
-                }
-                Some("/bin/ls") => {
-                    let names: BTreeSet<_> = state
-                        .files
-                        .keys()
-                        .filter_map(|path| path.strip_prefix("/workspace/"))
-                        .collect();
-                    let listing = names.into_iter().collect::<Vec<_>>().join("\n") + "\n";
-                    (0, listing.into_bytes(), Vec::new())
-                }
-                Some("/usr/bin/wc") => {
-                    let path = argv.last().expect("wc path");
-                    let size = state.files.get(path).map_or(0, Vec::len);
-                    (0, format!("{size} {path}\n").into_bytes(), Vec::new())
-                }
-                Some("/bin/big-output") => (0, vec![b'x'; 100 << 10], Vec::new()),
-                _ => (127, Vec::new(), b"unsupported fake command".to_vec()),
-            };
-            let execution = Execution {
-                id,
-                state: ExecutionState::Exited,
-                exit_code: Some(exit_code),
-                failure_reason: String::new(),
-                stdout: captured(stdout),
-                stderr: captured(stderr),
-            };
-            state.executions.push(execution.clone());
-            let delay = if argv.first().map(String::as_str) == Some("/usr/bin/find") {
-                state.baseline_exec_delay
-            } else {
-                state.tool_exec_delay
-            };
-            (execution, delay)
-        };
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        Ok(execution)
-    }
-
-    async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError> {
-        let mut state = self.state();
-        state.delete_attempts += 1;
-        if state
-            .create_ready_at
-            .is_some_and(|ready_at| std::time::Instant::now() < ready_at)
-        {
-            return Err(api_error(
-                Code::FailedPrecondition,
-                "create operation is still in progress",
-            ));
-        }
-        if state.delete_failures > 0 {
-            state.delete_failures -= 1;
-            return Err(api_error(Code::Unavailable, "transient delete failure"));
-        }
-        if matches!(state.delete_behavior, DeleteBehavior::AcknowledgeOnly) {
-            return Ok(());
-        }
-        if state.delete_acknowledgements_before_removal > 0 {
-            state.delete_acknowledgements_before_removal -= 1;
-            return Ok(());
-        }
-        if !state.deleted.iter().any(|id| id == sandbox_id) {
-            state.deleted.push(sandbox_id.to_string());
-        }
-        if matches!(state.delete_behavior, DeleteBehavior::FailAfterRemoving) {
-            return Err(api_error(Code::Unavailable, "delete response lost"));
-        }
-        Ok(())
-    }
-
-    async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
-        let state = self.state();
-        Ok(state.executions.iter().rev().cloned().collect())
-    }
-
-    async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
-        let delay = {
-            let mut state = self.state();
-            state.list_attempts += 1;
-            if state.list_failures > 0 {
-                state.list_failures -= 1;
-                return Err(api_error(Code::Unavailable, "listing failed"));
-            }
-            state.list_delay
-        };
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-        let state = self.state();
-        Ok(if state.creates.len() > state.deleted.len() {
-            vec![Sandbox {
-                id: "sb-0000000000000001".to_string(),
-                backend_id: "test-backend-1".to_string(),
-                labels: state
-                    .creates
-                    .last()
-                    .map_or_else(BTreeMap::new, |request| request.labels.clone()),
-            }]
-        } else {
-            Vec::new()
-        })
-    }
-}
-
-fn api_error(code: Code, message: &str) -> ApiError {
-    ApiError {
-        code,
-        message: message.to_string(),
-    }
-}
-
-fn captured(data: Vec<u8>) -> CapturedOutput {
-    CapturedOutput {
-        observed_bytes: data.len() as u64,
-        data,
-        total_bytes_known: true,
-        truncated: false,
-    }
-}
-
-fn short_lifecycle_config() -> HarnessConfig {
-    HarnessConfig {
-        lifecycle_timeout: Duration::from_millis(100),
-        lifecycle_retry_delay: Duration::from_millis(5),
-        ..HarnessConfig::default()
-    }
+fn task() -> SessionTask {
+    SessionTask::demo()
 }
 
 struct SlowProvider {
@@ -280,11 +29,23 @@ struct SlowProvider {
 
 #[async_trait]
 impl Provider for SlowProvider {
-    async fn next(&mut self, _context: ProviderContext<'_>) -> Result<ModelAction, ProviderError> {
+    fn info(&self) -> ProviderInfo {
+        test_info()
+    }
+
+    async fn complete(
+        &mut self,
+        _request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
         tokio::time::sleep(self.delay).await;
-        Ok(ModelAction::FinalAnswer {
-            text: "late".to_string(),
-        })
+        Ok(ModelResponse::final_text("late"))
+    }
+}
+
+fn test_info() -> ProviderInfo {
+    ProviderInfo {
+        name: "test".to_string(),
+        model: "test".to_string(),
     }
 }
 
@@ -319,15 +80,16 @@ async fn deterministic_vertical_uses_one_no_network_sandbox_and_cleans_it() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         HarnessConfig::default(),
     );
 
     let outcome = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("demo succeeds");
 
-    assert_eq!(outcome.steps, 6);
+    assert_eq!(outcome.steps, 5);
     assert_eq!(outcome.tool_calls, 5);
     let state = observer.state();
     assert_eq!(state.creates.len(), 1);
@@ -369,24 +131,23 @@ async fn invalid_workspace_path_is_rejected_before_kilnd_exec() {
     let api = FakeApi::default();
     let observer = api.clone();
     let provider = ScriptedProvider::new([
-        ModelAction::ToolCall {
-            call_id: "bad-path".to_string(),
-            tool: "write_file".to_string(),
-            arguments: json!({"path": "../host", "content": "no"}),
-        },
-        ModelAction::FinalAnswer {
-            text: "handled".to_string(),
-        },
+        ModelResponse::tool_use([ToolCall::new(
+            "bad-path",
+            "write_file",
+            json!({"path": "../host", "content": "no"}),
+        )]),
+        ModelResponse::final_text("handled"),
     ]);
     let mut harness = Harness::new(
         api,
         provider,
         MemoryAudit::default(),
+        MemoryJournal::default(),
         HarnessConfig::default(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("provider can recover from tool rejection");
 
@@ -412,11 +173,12 @@ async fn provider_failure_still_deletes_the_sandbox() {
         api,
         ScriptedProvider::new([]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         HarnessConfig::default(),
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("empty script fails");
 
@@ -428,24 +190,23 @@ async fn provider_failure_still_deletes_the_sandbox() {
 async fn audit_excludes_model_arguments_and_file_contents() {
     let secret = "TOPSECRET-should-not-enter-audit";
     let provider = ScriptedProvider::new([
-        ModelAction::ToolCall {
-            call_id: secret.to_string(),
-            tool: "write_file".to_string(),
-            arguments: json!({"path": "secret.txt", "content": secret}),
-        },
-        ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        },
+        ModelResponse::tool_use([ToolCall::new(
+            secret,
+            "write_file",
+            json!({"path": "secret.txt", "content": secret}),
+        )]),
+        ModelResponse::final_text("done"),
     ]);
     let mut harness = Harness::new(
         FakeApi::default(),
         provider,
         MemoryAudit::default(),
+        MemoryJournal::default(),
         HarnessConfig::default(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("session succeeds");
 
@@ -462,31 +223,30 @@ async fn audit_correlation_is_host_generated_and_preserves_provider_result_routi
 
     #[async_trait]
     impl Provider for ReusedIdProvider {
-        async fn next(
+        fn info(&self) -> ProviderInfo {
+            test_info()
+        }
+
+        async fn complete(
             &mut self,
-            context: ProviderContext<'_>,
-        ) -> Result<ModelAction, ProviderError> {
-            if context.turn > 1 {
+            request: ModelRequest<'_>,
+        ) -> Result<ModelResponse, ProviderError> {
+            if request.turn > 1 {
                 assert!(matches!(
-                    context.transcript.last(),
-                    Some(TranscriptItem::ToolResult { call_id, .. }) if call_id == PROVIDER_ID
+                    request.messages.last(),
+                    Some(Message::ToolResults { results })
+                        if results.len() == 1 && results[0].call_id == PROVIDER_ID
                 ));
                 assert!(matches!(
-                    &context.transcript[context.transcript.len() - 2],
-                    TranscriptItem::Model(ModelAction::ToolCall { call_id, .. })
-                        if call_id == PROVIDER_ID
+                    &request.messages[request.messages.len() - 2],
+                    Message::Assistant { tool_calls, .. }
+                        if tool_calls.len() == 1 && tool_calls[0].call_id == PROVIDER_ID
                 ));
             }
-            Ok(if context.turn <= 2 {
-                ModelAction::ToolCall {
-                    call_id: PROVIDER_ID.to_string(),
-                    tool: "workspace_diff".to_string(),
-                    arguments: json!({}),
-                }
+            Ok(if request.turn <= 2 {
+                ModelResponse::tool_use([ToolCall::new(PROVIDER_ID, "workspace_diff", json!({}))])
             } else {
-                ModelAction::FinalAnswer {
-                    text: "done".to_string(),
-                }
+                ModelResponse::final_text("done")
             })
         }
     }
@@ -495,10 +255,11 @@ async fn audit_correlation_is_host_generated_and_preserves_provider_result_routi
         FakeApi::default(),
         ReusedIdProvider,
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("session succeeds");
 
@@ -516,7 +277,7 @@ async fn audit_correlation_is_host_generated_and_preserves_provider_result_routi
             _ => {}
         }
     }
-    assert_eq!(model_ids, ["call-1", "call-2"]);
+    assert_eq!(model_ids, ["call-1-1", "call-2-1"]);
     assert_eq!(completed_ids, model_ids);
     let encoded = serde_json::to_string(&harness.audit().records).expect("serialize audit");
     assert!(!encoded.contains(PROVIDER_ID));
@@ -527,25 +288,23 @@ async fn tool_call_budget_fails_closed_and_cleans_up() {
     let api = FakeApi::default();
     let observer = api.clone();
     let provider = ScriptedProvider::new([
-        ModelAction::ToolCall {
-            call_id: "one".to_string(),
-            tool: "workspace_diff".to_string(),
-            arguments: json!({}),
-        },
-        ModelAction::ToolCall {
-            call_id: "two".to_string(),
-            tool: "workspace_diff".to_string(),
-            arguments: json!({}),
-        },
+        ModelResponse::tool_use([ToolCall::new("one", "workspace_diff", json!({}))]),
+        ModelResponse::tool_use([ToolCall::new("two", "workspace_diff", json!({}))]),
     ]);
     let config = HarnessConfig {
         max_tool_calls: 1,
         ..HarnessConfig::default()
     };
-    let mut harness = Harness::new(api, provider, MemoryAudit::default(), config);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("second tool call exceeds budget");
 
@@ -562,11 +321,12 @@ async fn lost_create_response_is_recovered_by_session_label() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("lost create response remains an API error");
 
@@ -612,11 +372,12 @@ async fn every_tonic_status_is_classified_through_adapter_conversion() {
             api,
             ScriptedProvider::demo(),
             MemoryAudit::default(),
+            MemoryJournal::default(),
             config,
         );
 
         let error = harness
-            .run(CancellationToken::new())
+            .run(&task(), CancellationToken::new())
             .await
             .expect_err("create was rejected");
 
@@ -635,6 +396,16 @@ async fn every_tonic_status_is_classified_through_adapter_conversion() {
             harness.audit().records.last().map(|record| &record.event),
             Some(AuditEvent::SessionFinished { sandbox_deleted, .. }) if *sandbox_deleted == unambiguous
         ));
+        let journal = &harness.journal().records;
+        assert!(matches!(
+            journal.first().map(|record| &record.event),
+            Some(JournalEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            journal.last().map(|record| &record.event),
+            Some(JournalEvent::SessionEnded { outcome, sandbox_deleted, steps: 0, .. })
+                if outcome == "create_failed" && *sandbox_deleted == unambiguous
+        ));
     }
 }
 
@@ -650,11 +421,12 @@ async fn create_wall_deadline_recovers_already_recorded_sandbox() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("create response exceeds session wall deadline");
 
@@ -682,11 +454,12 @@ async fn create_deadline_without_observable_row_is_reported_uncertain() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("a timed-out create without a discoverable row is ambiguous");
 
@@ -702,15 +475,14 @@ async fn transient_delete_failures_are_retried() {
     observer.state().delete_failures = 2;
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("delete eventually succeeds");
 
@@ -727,16 +499,15 @@ async fn permanent_delete_failure_is_bounded_and_reported() {
     config.lifecycle_timeout = Duration::from_millis(25);
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
     let started = tokio::time::Instant::now();
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("cleanup cannot be confirmed");
 
@@ -759,16 +530,15 @@ async fn successful_delete_response_must_still_verify_absence() {
     observer.state().delete_behavior = DeleteBehavior::AcknowledgeOnly;
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     let started = tokio::time::Instant::now();
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("cleanup is not confirmed while the sandbox remains listed");
 
@@ -796,15 +566,14 @@ async fn acknowledged_delete_is_retried_until_independent_absence() {
     observer.state().delete_acknowledgements_before_removal = 2;
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("absence is eventually verified");
 
@@ -836,16 +605,15 @@ async fn delete_acknowledgement_requires_successful_bounded_verification() {
         }
         let mut harness = Harness::new(
             api,
-            ScriptedProvider::new([ModelAction::FinalAnswer {
-                text: "done".to_string(),
-            }]),
+            ScriptedProvider::new([ModelResponse::final_text("done")]),
             MemoryAudit::default(),
+            MemoryJournal::default(),
             short_lifecycle_config(),
         );
         let started = tokio::time::Instant::now();
 
         let error = harness
-            .run(CancellationToken::new())
+            .run(&task(), CancellationToken::new())
             .await
             .expect_err("verification is required");
 
@@ -874,15 +642,14 @@ async fn transient_verification_errors_are_retried() {
     observer.state().list_failures = 2;
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("listing eventually confirms absence");
 
@@ -897,15 +664,14 @@ async fn lost_delete_response_is_confirmed_by_independent_absence() {
     observer.state().delete_behavior = DeleteBehavior::FailAfterRemoving;
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("absence confirms ambiguous deletion");
 
@@ -918,19 +684,25 @@ async fn stalled_exec_hits_wall_deadline_and_then_cleans_up() {
     let api = FakeApi::default();
     let observer = api.clone();
     observer.state().tool_exec_delay = Duration::from_secs(1);
-    let provider = ScriptedProvider::new([ModelAction::ToolCall {
-        call_id: "slow".to_string(),
-        tool: "exec".to_string(),
-        arguments: json!({"argv": ["/bin/slow"]}),
-    }]);
+    let provider = ScriptedProvider::new([ModelResponse::tool_use([ToolCall::new(
+        "slow",
+        "exec",
+        json!({"argv": ["/bin/slow"]}),
+    )])]);
     let mut config = short_lifecycle_config();
     config.session_timeout = Duration::from_millis(500);
     config.tool_limits.timeout = Duration::from_millis(50);
-    let mut harness = Harness::new(api, provider, MemoryAudit::default(), config);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
     let started = tokio::time::Instant::now();
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("stalled exec reaches its wall deadline");
 
@@ -954,15 +726,16 @@ async fn cancellation_during_exec_is_prompt_and_cleans_up() {
     let api = FakeApi::default();
     let observer = api.clone();
     observer.state().tool_exec_delay = Duration::from_secs(1);
-    let provider = ScriptedProvider::new([ModelAction::ToolCall {
-        call_id: "cancel-me".to_string(),
-        tool: "exec".to_string(),
-        arguments: json!({"argv": ["/bin/slow"]}),
-    }]);
+    let provider = ScriptedProvider::new([ModelResponse::tool_use([ToolCall::new(
+        "cancel-me",
+        "exec",
+        json!({"argv": ["/bin/slow"]}),
+    )])]);
     let mut harness = Harness::new(
         api,
         provider,
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
     let cancel = CancellationToken::new();
@@ -974,7 +747,7 @@ async fn cancellation_during_exec_is_prompt_and_cleans_up() {
     let started = tokio::time::Instant::now();
 
     let error = harness
-        .run(cancel)
+        .run(&task(), cancel)
         .await
         .expect_err("cancellation wins the tool wait");
 
@@ -1005,11 +778,12 @@ async fn provider_deadline_cleans_up() {
             delay: Duration::from_secs(1),
         },
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("provider exceeds session deadline");
 
@@ -1026,11 +800,12 @@ async fn baseline_failure_is_audited_with_execution_id_and_cleans_up() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("baseline find fails");
 
@@ -1058,11 +833,12 @@ async fn baseline_response_deadline_recovers_accepted_execution_and_cleans_up() 
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("baseline response exceeds its client wall deadline");
 
@@ -1089,11 +865,12 @@ async fn audit_failure_after_create_still_cleans_up() {
             calls: 0,
             fail_at: 2,
         },
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("sandbox-created audit write fails");
 
@@ -1104,24 +881,23 @@ async fn audit_failure_after_create_still_cleans_up() {
 #[tokio::test]
 async fn model_visible_output_truncation_is_explicit_in_result_and_audit() {
     let provider = ScriptedProvider::new([
-        ModelAction::ToolCall {
-            call_id: "big".to_string(),
-            tool: "exec".to_string(),
-            arguments: json!({"argv": ["/bin/big-output"]}),
-        },
-        ModelAction::FinalAnswer {
-            text: "done".to_string(),
-        },
+        ModelResponse::tool_use([ToolCall::new(
+            "big",
+            "exec",
+            json!({"argv": ["/bin/big-output"]}),
+        )]),
+        ModelResponse::final_text("done"),
     ]);
     let mut harness = Harness::new(
         FakeApi::default(),
         provider,
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("provider accepts bounded result");
 
@@ -1140,24 +916,23 @@ async fn oversized_arguments_are_rejected_before_transcript_or_exec_retention() 
     let api = FakeApi::default();
     let observer = api.clone();
     let provider = ScriptedProvider::new([
-        ModelAction::ToolCall {
-            call_id: "large".to_string(),
-            tool: "write_file".to_string(),
-            arguments: json!({"path": "large.txt", "content": "x".repeat(70 << 10)}),
-        },
-        ModelAction::FinalAnswer {
-            text: "handled".to_string(),
-        },
+        ModelResponse::tool_use([ToolCall::new(
+            "large",
+            "write_file",
+            json!({"path": "large.txt", "content": "x".repeat(70 << 10)}),
+        )]),
+        ModelResponse::final_text("handled"),
     ]);
     let mut harness = Harness::new(
         api,
         provider,
         MemoryAudit::default(),
+        MemoryJournal::default(),
         short_lifecycle_config(),
     );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("provider can continue after bounded rejection");
 
@@ -1175,21 +950,25 @@ async fn oversized_arguments_are_rejected_before_transcript_or_exec_retention() 
 #[tokio::test]
 async fn minimum_result_budget_contains_oversized_argument_rejection() {
     let provider = ScriptedProvider::new([
-        ModelAction::ToolCall {
-            call_id: "large".to_string(),
-            tool: "write_file".to_string(),
-            arguments: json!({"path": "large.txt", "content": "x".repeat(70 << 10)}),
-        },
-        ModelAction::FinalAnswer {
-            text: "handled".to_string(),
-        },
+        ModelResponse::tool_use([ToolCall::new(
+            "large",
+            "write_file",
+            json!({"path": "large.txt", "content": "x".repeat(70 << 10)}),
+        )]),
+        ModelResponse::final_text("handled"),
     ]);
     let mut config = short_lifecycle_config();
     config.tool_limits.max_result_bytes = 64;
-    let mut harness = Harness::new(FakeApi::default(), provider, MemoryAudit::default(), config);
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
 
     harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect("the fixed rejection fits the accepted minimum");
 
@@ -1207,15 +986,14 @@ async fn oversized_final_answer_is_rejected_without_hashing_or_acceptance_event(
     config.max_final_answer_bytes = 8;
     let mut harness = Harness::new(
         api,
-        ScriptedProvider::new([ModelAction::FinalAnswer {
-            text: "x".repeat(1 << 20),
-        }]),
+        ScriptedProvider::new([ModelResponse::final_text("x".repeat(1 << 20))]),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("oversized final answer is rejected");
 
@@ -1244,11 +1022,12 @@ async fn tiny_result_limit_is_rejected_before_create() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("tiny result budget is invalid");
 
@@ -1268,14 +1047,629 @@ async fn excessive_lifecycle_timeout_is_rejected_before_create() {
         api,
         ScriptedProvider::demo(),
         MemoryAudit::default(),
+        MemoryJournal::default(),
         config,
     );
 
     let error = harness
-        .run(CancellationToken::new())
+        .run(&task(), CancellationToken::new())
         .await
         .expect_err("overflowing lifecycle timeout is invalid");
 
     assert!(matches!(error, HarnessError::InvalidModelCall(_)));
     assert!(observer.state().creates.is_empty());
+}
+
+/// Records the messages each request carried, then defers to a script.
+struct RecordingProvider {
+    inner: ScriptedProvider,
+    seen: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+impl RecordingProvider {
+    fn new(
+        responses: impl IntoIterator<Item = ModelResponse>,
+    ) -> (Self, Arc<Mutex<Vec<Vec<Message>>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                inner: ScriptedProvider::new(responses),
+                seen: seen.clone(),
+            },
+            seen,
+        )
+    }
+}
+
+#[async_trait]
+impl Provider for RecordingProvider {
+    fn info(&self) -> ProviderInfo {
+        self.inner.info()
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.seen
+            .lock()
+            .expect("seen lock")
+            .push(request.messages.to_vec());
+        self.inner.complete(request).await
+    }
+}
+
+struct FailingJournal {
+    calls: usize,
+    fail_at: usize,
+}
+
+impl JournalSink for FailingJournal {
+    fn append(&mut self, _session_id: &str, _event: JournalEvent) -> Result<(), JournalError> {
+        self.calls += 1;
+        if self.calls == self.fail_at {
+            Err(JournalError::Io(std::io::Error::other(
+                "injected journal failure",
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn audit_call_ids(audit: &MemoryAudit) -> (Vec<String>, Vec<String>) {
+    let mut model = Vec::new();
+    let mut completed = Vec::new();
+    for record in &audit.records {
+        match &record.event {
+            AuditEvent::ModelTurn {
+                audit_call_id: Some(id),
+                ..
+            } => model.push(id.clone()),
+            AuditEvent::ToolCompleted { audit_call_id, .. } => {
+                completed.push(audit_call_id.clone());
+            }
+            _ => {}
+        }
+    }
+    (model, completed)
+}
+
+#[tokio::test]
+async fn multi_call_turn_runs_in_order_and_routes_results_by_provider_id() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    let (provider, seen) = RecordingProvider::new([
+        ModelResponse::tool_use([
+            ToolCall::new(
+                "write-a",
+                "write_file",
+                json!({"path": "a.txt", "content": "abc"}),
+            ),
+            ToolCall::new("read-a", "read_file", json!({"path": "a.txt"})),
+        ]),
+        ModelResponse::final_text("done"),
+    ]);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("multi-call turn succeeds");
+
+    assert_eq!(outcome.steps, 2);
+    assert_eq!(outcome.tool_calls, 2);
+    let programs = observer
+        .state()
+        .execs
+        .iter()
+        .map(|exec| exec.argv[0].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        programs,
+        ["/usr/bin/find", "/bin/dd", "/bin/stat", "/usr/bin/head"],
+        "the write ran before the read"
+    );
+    assert_eq!(observer.state().deleted.len(), 1);
+
+    let seen = seen.lock().expect("seen lock");
+    assert_eq!(seen.len(), 2);
+    let second = &seen[1];
+    assert_eq!(second.len(), 3, "user, assistant, one tool-results message");
+    assert!(matches!(&second[0], Message::User { text } if *text == task().prompt));
+    assert!(matches!(
+        &second[1],
+        Message::Assistant { tool_calls, .. }
+            if tool_calls.iter().map(|call| call.call_id.as_str()).eq(["write-a", "read-a"])
+    ));
+    let Message::ToolResults { results } = &second[2] else {
+        panic!("expected one tool-results message, got {:?}", second[2]);
+    };
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].call_id, "write-a");
+    assert_eq!(results[0].tool, "write_file");
+    assert_eq!(results[0].result["bytes_written"], 3);
+    assert_eq!(results[1].call_id, "read-a");
+    assert_eq!(results[1].tool, "read_file");
+    assert_eq!(results[1].result["content"], "abc");
+    drop(seen);
+
+    let (model_ids, completed_ids) = audit_call_ids(harness.audit());
+    assert_eq!(model_ids, ["call-1-1", "call-1-2"]);
+    assert_eq!(completed_ids, model_ids);
+}
+
+#[tokio::test]
+async fn per_turn_call_budget_fails_closed_before_any_exec() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    let provider = ScriptedProvider::new([ModelResponse::tool_use([
+        ToolCall::new("one", "workspace_diff", json!({})),
+        ToolCall::new("two", "workspace_diff", json!({})),
+        ToolCall::new("three", "workspace_diff", json!({})),
+    ])]);
+    let config = HarnessConfig {
+        max_tool_calls_per_turn: 2,
+        ..short_lifecycle_config()
+    };
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("three calls exceed the per-turn budget");
+
+    assert!(matches!(error, HarnessError::TurnToolBudget(2)));
+    assert_eq!(observer.state().execs.len(), 1, "only the baseline ran");
+    assert_eq!(observer.state().deleted.len(), 1);
+    assert!(harness.audit().records.iter().any(|record| matches!(
+        &record.event,
+        AuditEvent::ModelTurn {
+            turn: 1,
+            action,
+            audit_call_id: None,
+            ..
+        } if action == "tool_call_rejected"
+    )));
+    assert!(
+        !harness
+            .audit()
+            .records
+            .iter()
+            .any(|record| matches!(&record.event, AuditEvent::ToolCompleted { .. }))
+    );
+}
+
+#[tokio::test]
+async fn invalid_or_repeated_call_ids_reject_the_whole_turn() {
+    for calls in [
+        vec![
+            ToolCall::new("same", "workspace_diff", json!({})),
+            ToolCall::new("same", "workspace_diff", json!({})),
+        ],
+        vec![
+            ToolCall::new("fine", "workspace_diff", json!({})),
+            ToolCall::new("not valid!", "workspace_diff", json!({})),
+        ],
+    ] {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::new([ModelResponse::tool_use(calls)]),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+
+        let error = harness
+            .run(&task(), CancellationToken::new())
+            .await
+            .expect_err("call IDs are a provider protocol contract");
+
+        assert!(matches!(error, HarnessError::InvalidModelCall(_)));
+        assert_eq!(observer.state().execs.len(), 1, "no call in the turn ran");
+        assert_eq!(observer.state().deleted.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn misnamed_tool_is_a_model_visible_result_and_the_loop_continues() {
+    const BAD_NAME: &str = "Bad Name! rm -rf";
+    let api = FakeApi::default();
+    let observer = api.clone();
+    let (provider, seen) = RecordingProvider::new([
+        ModelResponse::tool_use([ToolCall::new("oops", BAD_NAME, json!({"x": 1}))]),
+        ModelResponse::final_text("recovered"),
+    ]);
+    let config = HarnessConfig {
+        max_tool_calls: 1,
+        ..short_lifecycle_config()
+    };
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("the model can recover from a misnamed tool");
+
+    assert_eq!(outcome.final_answer, "recovered");
+    assert_eq!(outcome.tool_calls, 1, "the call counts against the budget");
+    assert_eq!(observer.state().execs.len(), 1, "only the baseline ran");
+    assert_eq!(observer.state().deleted.len(), 1);
+    let seen = seen.lock().expect("seen lock");
+    assert!(matches!(
+        &seen[1][1],
+        Message::Assistant { tool_calls, .. } if tool_calls[0].tool == "unknown"
+    ));
+    assert!(matches!(
+        &seen[1][2],
+        Message::ToolResults { results }
+            if results.len() == 1
+                && results[0].call_id == "oops"
+                && results[0].tool == "unknown"
+                && results[0].result == json!({"ok": false, "error": "unknown_tool"})
+    ));
+    drop(seen);
+    assert!(harness.audit().records.iter().any(|record| matches!(
+        &record.event,
+        AuditEvent::ToolCompleted { tool, ok: false, execution_ids, .. }
+            if tool == "unknown" && execution_ids.is_empty()
+    )));
+    let encoded = serde_json::to_string(&harness.audit().records).expect("serialize audit");
+    assert!(!encoded.contains(BAD_NAME));
+}
+
+#[tokio::test]
+async fn truncated_refused_and_empty_responses_fail_closed_and_clean_up() {
+    type Expected = fn(&HarnessError) -> bool;
+    let write_call = || ToolCall::new("w", "write_file", json!({"path": "a.txt", "content": "a"}));
+    let cases: Vec<(&str, ModelResponse, Expected)> = vec![
+        (
+            "max tokens with tool calls",
+            ModelResponse {
+                stop_reason: StopReason::MaxTokens,
+                ..ModelResponse::tool_use([write_call()])
+            },
+            |error| matches!(error, HarnessError::ModelTruncated),
+        ),
+        (
+            "max tokens without tool calls",
+            ModelResponse {
+                stop_reason: StopReason::MaxTokens,
+                ..ModelResponse::final_text("half an ans")
+            },
+            |error| matches!(error, HarnessError::ModelTruncated),
+        ),
+        (
+            "refusal",
+            ModelResponse {
+                stop_reason: StopReason::Refusal,
+                ..ModelResponse::final_text("no")
+            },
+            |error| matches!(error, HarnessError::ModelRefused),
+        ),
+        (
+            "refusal with tool calls",
+            ModelResponse {
+                stop_reason: StopReason::Refusal,
+                ..ModelResponse::tool_use([write_call()])
+            },
+            |error| matches!(error, HarnessError::ModelRefused),
+        ),
+        ("empty final text", ModelResponse::final_text(""), |error| {
+            matches!(error, HarnessError::InvalidModelCall(_))
+        }),
+        (
+            "missing final text",
+            ModelResponse {
+                text: None,
+                ..ModelResponse::final_text("")
+            },
+            |error| matches!(error, HarnessError::InvalidModelCall(_)),
+        ),
+    ];
+    for (name, response, expected) in cases {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::new([response]),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+
+        let error = harness
+            .run(&task(), CancellationToken::new())
+            .await
+            .expect_err(name);
+
+        assert!(expected(&error), "{name}: unexpected {error}");
+        assert_eq!(observer.state().execs.len(), 1, "{name}: no tool ran");
+        assert_eq!(observer.state().deleted.len(), 1, "{name}: cleanup");
+        assert!(matches!(
+            harness.journal().records.last().map(|record| &record.event),
+            Some(JournalEvent::SessionEnded {
+                outcome,
+                sandbox_deleted: true,
+                final_answer: None,
+                ..
+            }) if outcome == "failed"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn cumulative_and_per_request_token_budgets_fail_closed() {
+    let usage = |input_tokens, output_tokens| Usage {
+        input_tokens,
+        output_tokens,
+        ..Usage::default()
+    };
+    let with_usage = |response: ModelResponse, usage: Usage| ModelResponse { usage, ..response };
+    let diff = || ModelResponse::tool_use([ToolCall::new("d", "workspace_diff", json!({}))]);
+    let cases = [
+        // Cumulative input: 10 + 10 > 15.
+        (
+            vec![
+                with_usage(diff(), usage(10, 1)),
+                with_usage(ModelResponse::final_text("done"), usage(10, 1)),
+            ],
+            2,
+        ),
+        // Cumulative output: 6 + 6 > 10.
+        (
+            vec![
+                with_usage(diff(), usage(1, 6)),
+                with_usage(ModelResponse::final_text("done"), usage(1, 6)),
+            ],
+            2,
+        ),
+        // One response above the per-request output cap of 8.
+        (vec![with_usage(diff(), usage(1, 9))], 1),
+    ];
+    for (responses, steps) in cases {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let config = HarnessConfig {
+            max_total_input_tokens: 15,
+            max_total_output_tokens: 10,
+            max_output_tokens_per_request: 8,
+            ..short_lifecycle_config()
+        };
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::new(responses),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config,
+        );
+
+        let error = harness
+            .run(&task(), CancellationToken::new())
+            .await
+            .expect_err("usage exceeds a token budget");
+
+        assert!(matches!(error, HarnessError::TokenBudget), "{error}");
+        assert_eq!(observer.state().deleted.len(), 1);
+        assert!(matches!(
+            harness.journal().records.last().map(|record| &record.event),
+            Some(JournalEvent::SessionEnded { steps: recorded, sandbox_deleted: true, .. })
+                if *recorded == steps
+        ));
+        assert!(harness.audit().records.iter().any(|record| matches!(
+            &record.event,
+            AuditEvent::ModelResponded { turn: 1, usage, .. } if usage.input_tokens > 0
+        )));
+    }
+}
+
+#[tokio::test]
+async fn usage_is_summed_into_the_outcome() {
+    let response = |text: &str, input_tokens| ModelResponse {
+        usage: Usage {
+            input_tokens,
+            output_tokens: 2,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 4,
+        },
+        ..ModelResponse::final_text(text)
+    };
+    let first = ModelResponse {
+        tool_calls: vec![ToolCall::new("d", "workspace_diff", json!({}))],
+        stop_reason: StopReason::ToolUse,
+        ..response("thinking", 100)
+    };
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::new([first, response("done", 200)]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("session succeeds");
+
+    assert_eq!(
+        outcome.usage,
+        Usage {
+            input_tokens: 300,
+            output_tokens: 4,
+            cache_read_input_tokens: 6,
+            cache_creation_input_tokens: 8,
+        }
+    );
+    assert_eq!(
+        Usage {
+            input_tokens: u64::MAX,
+            ..Usage::default()
+        } + Usage {
+            input_tokens: 1,
+            ..Usage::default()
+        },
+        Usage {
+            input_tokens: u64::MAX,
+            ..Usage::default()
+        },
+        "usage addition saturates"
+    );
+}
+
+#[tokio::test]
+async fn journal_failure_after_create_still_cleans_up() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        FailingJournal {
+            calls: 0,
+            // 1: session_started, 2: sandbox_ready.
+            fail_at: 2,
+        },
+        short_lifecycle_config(),
+    );
+
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("sandbox-ready journal write fails");
+
+    assert!(matches!(error, HarnessError::Journal(_)));
+    assert_eq!(observer.state().creates.len(), 1);
+    assert_eq!(observer.state().deleted.len(), 1);
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished {
+            sandbox_deleted: true,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn journal_failure_before_create_never_creates_a_sandbox() {
+    let api = FakeApi::default();
+    let observer = api.clone();
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        FailingJournal {
+            calls: 0,
+            fail_at: 1,
+        },
+        short_lifecycle_config(),
+    );
+
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("session-started journal write fails");
+
+    assert!(matches!(error, HarnessError::Journal(_)));
+    assert!(observer.state().creates.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_tasks_are_rejected_before_create() {
+    let oversized = "x".repeat(MAX_TASK_TEXT_BYTES + 1);
+    for task in [
+        SessionTask {
+            system: String::new(),
+            prompt: String::new(),
+        },
+        SessionTask {
+            system: oversized.clone(),
+            prompt: "ok".to_string(),
+        },
+        SessionTask {
+            system: String::new(),
+            prompt: oversized.clone(),
+        },
+    ] {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::demo(),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+
+        let error = harness
+            .run(&task, CancellationToken::new())
+            .await
+            .expect_err("task is invalid");
+
+        assert!(matches!(error, HarnessError::InvalidTask(_)));
+        assert!(observer.state().creates.is_empty());
+        assert!(harness.audit().records.is_empty());
+        assert!(harness.journal().records.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn zero_turn_and_token_budgets_are_rejected_before_create() {
+    let configs = [
+        HarnessConfig {
+            max_tool_calls_per_turn: 0,
+            ..HarnessConfig::default()
+        },
+        HarnessConfig {
+            max_output_tokens_per_request: 0,
+            ..HarnessConfig::default()
+        },
+        HarnessConfig {
+            max_total_input_tokens: 0,
+            ..HarnessConfig::default()
+        },
+        HarnessConfig {
+            max_total_output_tokens: 0,
+            ..HarnessConfig::default()
+        },
+    ];
+    for config in configs {
+        let api = FakeApi::default();
+        let observer = api.clone();
+        let mut harness = Harness::new(
+            api,
+            ScriptedProvider::demo(),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config,
+        );
+
+        let error = harness
+            .run(&task(), CancellationToken::new())
+            .await
+            .expect_err("zero budget is invalid");
+
+        assert!(matches!(error, HarnessError::InvalidModelCall(_)));
+        assert!(observer.state().creates.is_empty());
+    }
 }
