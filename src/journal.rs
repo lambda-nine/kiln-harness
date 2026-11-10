@@ -5,9 +5,9 @@
 //! so a session can be replayed. It is a trusted host-side file and must never
 //! be placed in or mounted into a sandbox.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 // The harness reaches kilnd over a Unix socket and is Unix-only.
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+
+use rustix::fs::{Mode, OFlags};
 
 use crate::provider::{
     ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall, ToolDefinition, Usage,
@@ -182,8 +185,6 @@ pub enum JournalError {
     InvalidPath(PathBuf),
     #[error("journal directory {path:?} is unsafe: {reason}")]
     UnsafeDirectory { path: PathBuf, reason: &'static str },
-    #[error("journal file {0:?} changed while it was being created")]
-    Replaced(PathBuf),
     #[error("journal sink is closed after a failed write or a finished session")]
     Closed,
 }
@@ -288,17 +289,21 @@ pub struct JsonlJournal {
 impl JsonlJournal {
     /// Create a new journal file with mode 0600, creating missing parents.
     ///
-    /// The parent is canonicalized and the file is created inside the
-    /// resolved directory. As with OpenSSH `StrictModes`, the resolved directory
-    /// must be owned by the current user and writable by no one else, and
-    /// every ancestor must be owned by root or the current user and, if
-    /// group- or world-writable, sticky. The new file is still empty when
-    /// these checks run and is removed if they fail.
+    /// The directory is reached through pinned descriptors: starting at `/`,
+    /// each component of the resolved parent is opened relative to the
+    /// previous directory with `O_DIRECTORY | O_NOFOLLOW` (and created with
+    /// mode 0700 when missing), then checked with `fstat`. As with OpenSSH
+    /// `StrictModes`, every directory must be owned by root or the effective
+    /// user and be sticky if group- or world-writable, and the final one must
+    /// be owned by the effective user and writable by no one else. The file is
+    /// created relative to that verified descriptor with
+    /// `O_CREAT | O_EXCL | O_NOFOLLOW`, so a parent swapped by path after a
+    /// check cannot redirect it.
     ///
     /// # Errors
     ///
-    /// Returns an error if the path already exists, its directory is unsafe,
-    /// or the file cannot be created.
+    /// Returns an error if the path already exists, a directory is unsafe or
+    /// a symlink, or the file cannot be created.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
         let name = path
             .file_name()
@@ -307,40 +312,147 @@ impl JsonlJournal {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)?;
-        let directory = std::fs::canonicalize(parent)?;
-        let target = directory.join(name);
-        let mut options = OpenOptions::new();
-        // create_new refuses existing files and final-component symlinks.
-        options.write(true).create_new(true).mode(0o600);
-        let file = options.open(&target)?;
-        let created = file.metadata()?;
-        // A file this process just created is owned by its effective user.
-        let euid = created.uid();
-        let verified = check_directory_chain(&directory, euid).and_then(|()| {
-            let on_disk = std::fs::symlink_metadata(&target)?;
-            if on_disk.file_type().is_file()
-                && (on_disk.dev(), on_disk.ino()) == (created.dev(), created.ino())
-            {
-                Ok(())
-            } else {
-                Err(JournalError::Replaced(target.clone()))
-            }
-        });
-        if let Err(error) = verified {
-            // Remove only the empty file this call created.
-            if std::fs::symlink_metadata(&target)
-                .is_ok_and(|meta| (meta.dev(), meta.ino()) == (created.dev(), created.ino()))
-            {
-                let _ = std::fs::remove_file(&target);
-            }
-            return Err(error);
-        }
+        let directory = open_verified_directory(&resolved_directory(parent)?)?;
+        let fd = rustix::fs::openat(
+            &directory,
+            name,
+            OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(std::io::Error::from)?;
         Ok(Self {
-            file,
+            file: File::from(fd),
             chain: Chain::default(),
         })
     }
+
+    /// The device and inode of the open journal file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor cannot be queried.
+    pub fn file_identity(&self) -> Result<(u64, u64), JournalError> {
+        let metadata = self.file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+}
+
+/// An absolute starting path for the descriptor walk: the deepest existing
+/// ancestor, canonicalized once, followed by the components that do not exist
+/// yet. Those name nothing on disk, so `.` and `..` among them resolve
+/// lexically. The walk itself re-resolves every component without following
+/// links, so this path is only a starting point.
+fn resolved_directory(parent: &Path) -> Result<PathBuf, JournalError> {
+    let absolute = std::path::absolute(parent)?;
+    let mut existing = absolute.clone();
+    let mut rest = Vec::new();
+    let mut resolved = loop {
+        if let Ok(canonical) = std::fs::canonicalize(&existing) {
+            break canonical;
+        }
+        let Some(last) = existing.components().next_back() else {
+            return Err(JournalError::InvalidPath(parent.to_path_buf()));
+        };
+        rest.push(last.as_os_str().to_os_string());
+        if !existing.pop() {
+            return Err(JournalError::InvalidPath(parent.to_path_buf()));
+        }
+    };
+    for component in rest.iter().rev() {
+        match Path::new(component).components().next() {
+            Some(Component::CurDir) => {}
+            Some(Component::ParentDir) => {
+                resolved.pop();
+            }
+            _ => resolved.push(component),
+        }
+    }
+    Ok(resolved)
+}
+
+/// Walk `directory` from `/` through pinned descriptors, creating missing
+/// components, and return the verified final directory.
+fn open_verified_directory(directory: &Path) -> Result<OwnedFd, JournalError> {
+    let euid = rustix::process::geteuid().as_raw();
+    let walk = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut current = rustix::fs::open("/", walk, Mode::empty()).map_err(std::io::Error::from)?;
+    let mut shown = PathBuf::from("/");
+    let components = directory
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    check_directory(&current, &shown, euid, components.is_empty())?;
+    for (position, name) in components.iter().enumerate() {
+        shown.push(name);
+        let next = match rustix::fs::openat(&current, *name, walk, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                match rustix::fs::mkdirat(&current, *name, Mode::from_raw_mode(0o700)) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(std::io::Error::from(error).into()),
+                }
+                rustix::fs::openat(&current, *name, walk, Mode::empty())
+                    .map_err(|error| directory_error(&shown, error))?
+            }
+            Err(error) => return Err(directory_error(&shown, error)),
+        };
+        check_directory(&next, &shown, euid, position + 1 == components.len())?;
+        current = next;
+    }
+    Ok(current)
+}
+
+fn directory_error(path: &Path, error: rustix::io::Errno) -> JournalError {
+    if matches!(error, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) {
+        JournalError::UnsafeDirectory {
+            path: path.to_path_buf(),
+            reason: "not a directory or a symlink",
+        }
+    } else {
+        std::io::Error::from(error).into()
+    }
+}
+
+const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
+const STICKY: u32 = 0o1000;
+
+/// Apply the ownership and mode rules to one open directory.
+fn check_directory(
+    directory: &OwnedFd,
+    path: &Path,
+    euid: u32,
+    is_final: bool,
+) -> Result<(), JournalError> {
+    let unsafe_directory = |reason| JournalError::UnsafeDirectory {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let stat = rustix::fs::fstat(directory).map_err(std::io::Error::from)?;
+    let mode = u32::from(stat.st_mode);
+    let owner = stat.st_uid;
+    if is_final {
+        if owner != euid {
+            return Err(unsafe_directory("not owned by the current user"));
+        }
+        if mode & GROUP_OR_WORLD_WRITABLE != 0 {
+            return Err(unsafe_directory("group- or world-writable"));
+        }
+    } else {
+        if owner != 0 && owner != euid {
+            return Err(unsafe_directory(
+                "ancestor not owned by root or the current user",
+            ));
+        }
+        if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
+            return Err(unsafe_directory(
+                "ancestor is group- or world-writable without the sticky bit",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl JournalSink for JsonlJournal {
@@ -362,46 +474,6 @@ impl JournalSink for JsonlJournal {
         self.chain.commit(encoded);
         Ok(())
     }
-}
-
-const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
-const STICKY: u32 = 0o1000;
-
-/// Check a canonical directory and each ancestor without following links.
-fn check_directory_chain(directory: &Path, euid: u32) -> Result<(), JournalError> {
-    let unsafe_directory = |path: &Path, reason| JournalError::UnsafeDirectory {
-        path: path.to_path_buf(),
-        reason,
-    };
-    for (depth, current) in directory.ancestors().enumerate() {
-        let metadata = std::fs::symlink_metadata(current)?;
-        if !metadata.file_type().is_dir() {
-            return Err(unsafe_directory(current, "not a directory"));
-        }
-        let mode = metadata.mode();
-        if depth == 0 {
-            if metadata.uid() != euid {
-                return Err(unsafe_directory(current, "not owned by the current user"));
-            }
-            if mode & GROUP_OR_WORLD_WRITABLE != 0 {
-                return Err(unsafe_directory(current, "group- or world-writable"));
-            }
-        } else {
-            if metadata.uid() != 0 && metadata.uid() != euid {
-                return Err(unsafe_directory(
-                    current,
-                    "ancestor not owned by root or the current user",
-                ));
-            }
-            if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
-                return Err(unsafe_directory(
-                    current,
-                    "ancestor is group- or world-writable without the sticky bit",
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// An in-memory journal for tests. `lines` holds the exact encoded records.
@@ -484,16 +556,25 @@ pub fn read_journal_with_limits(
 /// Returns an error if the path is missing, not a regular file, or cannot
 /// be opened.
 pub fn open_journal_source(path: &Path) -> Result<File, JournalError> {
-    // Refuse FIFOs and devices before open can block on them. The path is a
-    // trusted operator path; see the threat model for the remaining race.
-    if !std::fs::metadata(path)?.is_file() {
+    // O_NONBLOCK keeps a FIFO or device from blocking the open itself;
+    // fstat on the descriptor then decides, so no path can be swapped in
+    // between. Reads are blocking again once the file is known to be regular.
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP => JournalError::NotRegularFile,
+        error => std::io::Error::from(error).into(),
+    })?;
+    let stat = rustix::fs::fstat(&fd).map_err(std::io::Error::from)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
         return Err(JournalError::NotRegularFile);
     }
-    let file = File::open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(JournalError::NotRegularFile);
-    }
-    Ok(file)
+    let flags = rustix::fs::fcntl_getfl(&fd).map_err(std::io::Error::from)?;
+    rustix::fs::fcntl_setfl(&fd, flags - OFlags::NONBLOCK).map_err(std::io::Error::from)?;
+    Ok(File::from(fd))
 }
 
 /// Read and verify a journal from an already open handle, from its start.

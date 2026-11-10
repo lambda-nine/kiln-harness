@@ -1,5 +1,9 @@
 //! A small provider-neutral agent harness that executes tools only through kilnd.
 
+// kilnd is reached over a Unix socket, and journals rely on Unix descriptors.
+#[cfg(not(unix))]
+compile_error!("kiln-harness supports only Unix hosts");
+
 pub mod api;
 pub mod audit;
 pub mod engine;

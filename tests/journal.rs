@@ -1095,3 +1095,95 @@ fn journal_path_must_name_a_file() {
         .expect("no file name");
     assert!(matches!(error, JournalError::InvalidPath(_)), "{error}");
 }
+
+#[test]
+fn swapped_parents_never_place_a_journal_in_an_unsafe_tree() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pivot = temp.path().join("pivot");
+    let alternate = temp.path().join("alternate");
+    let relative = (0..32).fold(PathBuf::new(), |path, level| path.join(format!("l{level}")));
+    for (root, marker, mode) in [(&pivot, "safe", 0o700), (&alternate, "unsafe", 0o777)] {
+        std::fs::create_dir_all(root.join(&relative)).expect("tree");
+        std::fs::write(root.join("marker"), marker).expect("marker");
+        set_mode(&root.join(&relative), mode);
+    }
+
+    // Atomically exchange the two trees as fast as possible.
+    let stop = Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let (stop, left, right) = (stop.clone(), pivot.clone(), alternate.clone());
+        std::thread::spawn(move || {
+            let mut swaps = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                rustix::fs::renameat_with(
+                    rustix::fs::CWD,
+                    &left,
+                    rustix::fs::CWD,
+                    &right,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                )
+                .expect("exchange trees");
+                swaps += 1;
+            }
+            swaps
+        })
+    };
+    let mut accepted = Vec::new();
+    for index in 0..3000 {
+        let name = format!("journal-{index}.jsonl");
+        if JsonlJournal::open(&pivot.join(&relative).join(&name)).is_ok() {
+            accepted.push(name);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let swaps = swapper.join().expect("swapper");
+
+    let unsafe_root = [&pivot, &alternate]
+        .into_iter()
+        .find(|root| std::fs::read_to_string(root.join("marker")).expect("marker") == "unsafe")
+        .expect("unsafe tree");
+    let safe_root = if unsafe_root == &pivot {
+        &alternate
+    } else {
+        &pivot
+    };
+    assert!(swaps > 0, "the trees were never swapped");
+    assert!(!accepted.is_empty(), "no journal was ever accepted");
+    assert!(
+        accepted.len() < 3000,
+        "no open ever saw the unsafe tree, so the race was not exercised"
+    );
+    for name in &accepted {
+        assert!(
+            !unsafe_root.join(&relative).join(name).exists(),
+            "{name} was accepted inside the world-writable tree"
+        );
+        assert!(safe_root.join(&relative).join(name).is_file(), "{name}");
+    }
+}
+
+#[test]
+fn journal_sources_must_be_regular_files_reached_without_links() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fifo = temp.path().join("fifo.jsonl");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success());
+    // Without O_NONBLOCK this open would block forever with no writer.
+    let started = std::time::Instant::now();
+    let error = read_journal(&fifo).expect_err("a FIFO is not a journal");
+    assert!(matches!(error, JournalError::NotRegularFile), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    let real = temp.path().join("real.jsonl");
+    std::fs::write(&real, b"{}\n").expect("write");
+    let link = temp.path().join("link.jsonl");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let error = read_journal(&link).expect_err("a symlinked source is refused");
+    assert!(matches!(error, JournalError::NotRegularFile), "{error}");
+}

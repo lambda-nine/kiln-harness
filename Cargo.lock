@@ -491,6 +491,7 @@ dependencies = [
  "clap",
  "hyper-util",
  "prost",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
