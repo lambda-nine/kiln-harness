@@ -43,3 +43,30 @@ sudo env KILND_INTEGRATION=1 "$test_bin" \
     --nocapture
 
 assert_clean
+
+# The CLI records, verifies, and reproduces one session.
+bin=$(cargo build --locked --bin kiln-harness --message-format=json | \
+    python3 -c '
+import json, sys
+matches = []
+for line in sys.stdin:
+    event = json.loads(line)
+    if (event.get("reason") == "compiler-artifact"
+            and event.get("target", {}).get("name") == "kiln-harness"
+            and event.get("executable")):
+        matches.append(event["executable"])
+print(matches[-1] if matches else "")
+')
+test -n "$bin"
+work=$(mktemp -d)
+trap 'sudo rm -rf "$work"' EXIT
+sudo "$bin" demo --audit "$work/demo-audit.jsonl" --journal "$work/demo.jsonl"
+sudo "$bin" journal verify "$work/demo.jsonl" | tee "$work/verify.out"
+grep -qx 'status: complete (completed)' "$work/verify.out"
+sudo "$bin" replay --from "$work/demo.jsonl" \
+    --audit "$work/replay-audit.jsonl" --journal "$work/replay.jsonl" | \
+    tee "$work/replay.out"
+grep -qx reproduced "$work/replay.out"
+sudo "$bin" journal verify "$work/replay.jsonl"
+
+assert_clean

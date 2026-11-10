@@ -30,8 +30,20 @@ it is not a hostile multi-tenant boundary.
   definite rejections only after successful recovery listings. Other codes and
   local transport/protocol failures remain ambiguous without a recovered row.
 - Audit records omit content. They store hashes, byte/truncation evidence,
-  host-generated call correlation IDs, sandbox IDs, and kilnd execution IDs. Raw
-  provider call IDs stay only in the transient provider transcript.
+  token usage, host-generated call correlation IDs, sandbox IDs, and kilnd
+  execution IDs. Raw provider call IDs stay out of the audit.
+- The session journal deliberately contains content: prompts, model text, tool
+  arguments, tool results, and final answers, because replay needs them. It is
+  a trusted host-side file created new with mode 0600 and is never placed in or
+  mounted into a sandbox. Readers and writers bound file and line sizes.
+- Provider credentials must never be journaled. No provider handles one yet;
+  adapters must keep keys out of `ModelRequest`, `ModelResponse`, and provider
+  error messages.
+- Every response is bounded before it reaches kilnd: per-turn and per-session
+  call budgets, per-request and cumulative token budgets, argument and
+  assistant-text byte limits, and fail-closed handling of truncated or refused
+  turns. Malformed or repeated provider call IDs fail the session; unregistered
+  tool names only produce a model-visible `unknown_tool` result.
 
 ## Deliberate limits
 
@@ -49,9 +61,16 @@ it is not a hostile multi-tenant boundary.
 - SIGKILL, host loss, or a harness crash can prevent client-side delete. kilnd
   reconciliation handles known state; a future sandbox TTL is still needed for
   unattended client crashes.
-- The JSONL file is append-only by open mode, not tamper-proof. A trusted host
-  user can modify it. Durable signing or a remote append service is out of
+- The audit JSONL file is append-only by open mode, not tamper-proof. A trusted
+  host user can modify it. Durable signing or a remote append service is out of
   scope.
+- The journal's hash chain detects accidental corruption, reordering, and
+  dropped middle records. It is not tamper-proof: anyone who can write the file
+  can rewrite the chain. A missing tail shows only as `complete: false`, and a
+  torn final line is rejected.
+- Replay trusts the journal it reads, but replayed responses pass through the
+  same loop checks and budgets as live ones. It reproduces model responses,
+  not sandbox state, and detects divergence by SHA-256 over request content.
 - kilnd persists bounded command output in its root-only SQLite database. The
   harness audit excludes it, but callers must still avoid printing host secrets
   into a sandbox command.

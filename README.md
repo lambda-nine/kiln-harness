@@ -3,8 +3,10 @@
 A provider-neutral agent loop for running tool calls in
 [kiln](https://github.com/lambda-nine/kiln) sandboxes. It talks only to
 [kilnd](https://github.com/lambda-nine/kilnd)'s `kilnd.v1` gRPC API over a Unix
-socket: one no-network sandbox per session, five typed tools, hard budgets, a
-metadata-only audit log, and verified sandbox deletion after every session.
+socket: one no-network sandbox per session, five typed tools, multi-call model
+turns, hard budgets, a metadata-only audit log, a content-bearing session
+journal that replays deterministically, and verified sandbox deletion after
+every session.
 
 **Status: experimental.** This milestone has only a deterministic scripted
 provider, so it needs no model account, API key or network access; no live
@@ -45,9 +47,11 @@ cargo run --locked -- demo --audit audit/demo.jsonl
 ## Overview
 
 The smallest useful provider-neutral agent loop over `kilnd.v1`. It creates one no-network sandbox per session, exposes five typed tools
-(`exec`, `read_file`, `write_file`, `list_dir`, and `workspace_diff`), applies
-hard step/call/input/output/deadline budgets, writes a metadata-only append-only
-JSONL audit with host-generated call correlation IDs, and retries sandbox
+(`exec`, `read_file`, `write_file`, `list_dir`, and `workspace_diff`), runs
+model turns that may request several tool calls at once, applies hard
+step/call/per-turn/token/input/output/deadline budgets, writes a metadata-only
+append-only JSONL audit with host-generated call correlation IDs, records a
+hash-chained session journal with the content replay needs, and retries sandbox
 deletion after every returned work outcome. Every delete acknowledgement needs
 a separate listing confirming absence within the cleanup window.
 An unconfirmed cleanup is a bounded, explicit error rather than a hidden
@@ -73,11 +77,34 @@ Run this inside the Linux VM where `/run/kilnd/kilnd.sock` exists:
 cargo run --locked -- demo --audit audit/demo.jsonl
 ```
 
-The script writes and reads `/workspace/demo.txt`, lists the workspace, checks
-the session file-set diff, and runs `wc` with literal argv. The scripted
-provider verifies every result before emitting its final answer. Ctrl-C and
-wall deadlines stop waiting on an active RPC; kilnd is asked to cancel it, then
-deletion is retried and verified within a separate bounded cleanup window.
+The script takes five model turns. It writes `/workspace/demo.txt`; reads it
+back and lists the workspace in one two-call turn; checks the session file-set
+diff; runs `wc` with literal argv; then answers. The scripted provider verifies
+every result before its next turn. The command prints the journal path, by
+default `journal/demo-<unix_ms>.jsonl`; pass `--journal PATH` to choose one.
+Journals are never overwritten. Ctrl-C and wall deadlines stop waiting on an
+active RPC; kilnd is asked to cancel it, then deletion is retried and verified
+within a separate bounded cleanup window.
+
+## Journal and replay
+
+The audit stays metadata-only. The journal is its content-bearing counterpart:
+the task, each request's SHA-256, every model response, and every tool call and
+result, one hash-chained JSONL record each. It is a trusted 0600 host file.
+
+```sh
+cargo run --locked -- journal verify journal/demo-<unix_ms>.jsonl
+cargo run --locked -- replay --from journal/demo-<unix_ms>.jsonl --audit audit/replay.jsonl
+```
+
+`journal verify` runs offline. It checks limits, record order, and the hash
+chain, then prints the session, record count, completeness, turns, tool calls,
+and token usage. `replay` reruns the recorded task with the recorded budgets in
+a fresh sandbox and answers each model request from the journal, after checking
+that the request hashes the same as the recorded one. It prints `reproduced`
+when the final answer matches. Otherwise it prints `diverged at turn N`, the
+first turn whose request differed because the sandbox returned different tool
+results, and exits non-zero.
 
 ## Checks
 
@@ -97,17 +124,20 @@ scripts/integration-vm.sh
 ```
 
 It requires an empty baseline, verifies all five tool results and execution
-links, and checks API reservations, kiln's registry, run directories, cgroups,
-and shim/init processes before and after the test. It does not run benchmark
-campaigns.
+links, replays the recorded journal against a second sandbox, runs the `demo`,
+`journal verify`, and `replay` commands, and checks API reservations, kiln's
+registry, run directories, cgroups, and shim/init processes before and after.
+It does not run benchmark campaigns.
 
 ## Next step: live provider
 
-Add one provider adapter in a separate change. It should translate the existing
-provider trait to a chosen model API, keep credentials in the host vault or
-environment, enforce request/token/cost budgets, cancel HTTP work at the
-session deadline, and retain the same tool and audit contracts. No paid
-provider is selected or called in this milestone.
+Add one provider adapter in a separate change. It should translate
+`ModelRequest` and `ModelResponse` to a chosen model API, own its retry policy
+(the loop treats every provider error as fatal), keep credentials in the host
+vault or environment and out of requests, responses, and the journal, report
+token usage, cancel HTTP work at the session deadline, and retain the same
+tool, audit, and journal contracts. No paid provider is selected or called in
+this milestone.
 
 See `docs/architecture.md` and `docs/threat-model.md` for lifecycle and trust
 details.
