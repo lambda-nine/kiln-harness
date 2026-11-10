@@ -90,8 +90,8 @@ async fn demo(socket: PathBuf, audit_path: &Path, journal_path: &Path) -> Result
         ("--audit", FileIdentity::of_path(audit_path)?),
         ("--journal", FileIdentity::of_path(journal_path)?),
     ])?;
+    let (audit, journal) = open_sinks(None, audit_path, journal_path)?;
     let api = connect(socket).await?;
-    let (audit, journal) = open_sinks(audit_path, journal_path)?;
     let mut harness = Harness::new(
         api.clone(),
         ScriptedProvider::demo(),
@@ -140,8 +140,8 @@ async fn replay(
     let mut config = HarnessConfig::default();
     config.apply_limits(&provider.limits());
 
+    let (audit, journal) = open_sinks(Some(&source), audit_path, journal_path)?;
     let api = connect(socket).await?;
-    let (audit, journal) = open_sinks(audit_path, journal_path)?;
     let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
     let result = harness.run(&task, interrupt()).await;
     check_health(&api).await?;
@@ -352,12 +352,62 @@ async fn check_health(api: &TonicKilnd) -> Result<()> {
     Ok(())
 }
 
-fn open_sinks(audit_path: &Path, journal_path: &Path) -> Result<(JsonlAudit, JsonlJournal)> {
+/// Open both outputs without writing, then refuse if any two of the source
+/// and outputs are the same file by `fstat` on their open descriptors. Path
+/// checks earlier are only diagnostics: a path can be relinked after them,
+/// but an open descriptor cannot change which file it names.
+fn open_sinks(
+    source: Option<&File>,
+    audit_path: &Path,
+    journal_path: &Path,
+) -> Result<(JsonlAudit, JsonlJournal)> {
     let audit = JsonlAudit::open(audit_path)
         .with_context(|| format!("open audit log {}", audit_path.display()))?;
-    let journal = JsonlJournal::open(journal_path)
-        .with_context(|| format!("create journal {}", journal_path.display()))?;
+    let journal = match JsonlJournal::open(journal_path) {
+        Ok(journal) => journal,
+        Err(error) => {
+            if audit.created() {
+                discard_if_new_and_empty(audit_path, audit.file_identity().ok());
+            }
+            return Err(anyhow::Error::new(error)
+                .context(format!("create journal {}", journal_path.display())));
+        }
+    };
+    let audit_identity = audit.file_identity()?;
+    let journal_identity = journal.file_identity()?;
+    let source_identity = source
+        .map(|file| file.metadata().map(|meta| (meta.dev(), meta.ino())))
+        .transpose()?;
+    let clash = if source_identity == Some(audit_identity) {
+        Some("--from and --audit")
+    } else if source_identity == Some(journal_identity) {
+        Some("--from and --journal")
+    } else if audit_identity == journal_identity {
+        Some("--audit and --journal")
+    } else {
+        None
+    };
+    if let Some(flags) = clash {
+        if audit.created() {
+            discard_if_new_and_empty(audit_path, Some(audit_identity));
+        }
+        discard_if_new_and_empty(journal_path, Some(journal_identity));
+        bail!("{flags} refer to the same file");
+    }
     Ok((audit, journal))
+}
+
+/// Remove a file this invocation created, but only while the path still
+/// names that same, still empty, file.
+fn discard_if_new_and_empty(path: &Path, identity: Option<(u64, u64)>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    if std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| (meta.dev(), meta.ino()) == identity && meta.len() == 0)
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn interrupt() -> CancellationToken {
@@ -390,4 +440,64 @@ fn print_outcome(outcome: &SessionOutcome) {
         "usage: input {}, output {}",
         outcome.usage.input_tokens, outcome.usage.output_tokens
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_check_refuses_an_audit_that_is_the_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("source.jsonl");
+        std::fs::write(&source_path, b"recorded\n").expect("source");
+        let source = File::open(&source_path).expect("open source");
+        // A hard link made after any path check names the same inode.
+        let audit_path = temp.path().join("audit.jsonl");
+        std::fs::hard_link(&source_path, &audit_path).expect("hard link");
+        let journal_path = temp.path().join("replay.jsonl");
+
+        let error = open_sinks(Some(&source), &audit_path, &journal_path)
+            .err()
+            .expect("aliased outputs are refused");
+
+        assert!(error.to_string().contains("--from and --audit"), "{error}");
+        assert_eq!(std::fs::read(&source_path).expect("read"), b"recorded\n");
+        assert!(audit_path.exists(), "a pre-existing file is never removed");
+        assert!(!journal_path.exists(), "the new empty journal is removed");
+    }
+
+    #[test]
+    fn one_new_path_for_both_outputs_is_refused_and_cleaned_up() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("both.jsonl");
+
+        let error = open_sinks(None, &path, &path)
+            .err()
+            .expect("one file cannot be both outputs");
+
+        assert!(error.to_string().contains("create journal"), "{error}");
+        assert!(!path.exists(), "the audit this call created is removed");
+    }
+
+    #[test]
+    fn distinct_outputs_open_without_writing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("source.jsonl");
+        std::fs::write(&source_path, b"recorded\n").expect("source");
+        let source = File::open(&source_path).expect("open source");
+        let audit_path = temp.path().join("audit.jsonl");
+        let journal_path = temp.path().join("replay.jsonl");
+
+        let (audit, journal) =
+            open_sinks(Some(&source), &audit_path, &journal_path).expect("distinct outputs");
+
+        assert!(audit.created());
+        assert_ne!(
+            audit.file_identity().expect("audit identity"),
+            journal.file_identity().expect("journal identity")
+        );
+        assert_eq!(std::fs::metadata(&audit_path).expect("audit").len(), 0);
+        assert_eq!(std::fs::metadata(&journal_path).expect("journal").len(), 0);
+    }
 }

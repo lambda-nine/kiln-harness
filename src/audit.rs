@@ -162,6 +162,7 @@ pub trait AuditSink: Send {
 pub struct JsonlAudit {
     writer: BufWriter<File>,
     sequence: u64,
+    created: bool,
 }
 
 impl JsonlAudit {
@@ -178,14 +179,40 @@ impl JsonlAudit {
             std::fs::create_dir_all(parent)?;
         }
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.append(true);
         #[cfg(unix)]
         options.mode(0o600);
-        let file = options.open(path)?;
+        // Try to create first so callers know whether this call made the file.
+        let (file, created) = match options.clone().create_new(true).open(path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                (options.open(path)?, false)
+            }
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
             writer: BufWriter::new(file),
             sequence: 0,
+            created,
         })
+    }
+
+    /// Whether `open` created the file rather than appending to an existing one.
+    #[must_use]
+    pub fn created(&self) -> bool {
+        self.created
+    }
+
+    /// The device and inode of the open audit file, from `fstat` on its
+    /// descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor cannot be queried.
+    pub fn file_identity(&self) -> Result<(u64, u64), AuditError> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.writer.get_ref().metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 }
 
