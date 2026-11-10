@@ -122,21 +122,21 @@ budget.
 ## Audit
 
 Each JSONL record has a session-local sequence, timestamp, session ID, sandbox
-ID once known, and one event. Accepted model arguments and final answers, tool results, and
-sandbox output are represented by SHA-256 plus byte counts or by output
-evidence; their contents are excluded. Tool events use `audit_call_id`, a
-host-generated ID unique within the session, to link model turns and tool
+ID once known, and one event. Accepted model arguments and final answers, tool
+results, and sandbox output are represented by SHA-256 plus byte counts or by
+output evidence; their contents are excluded. Tool events use `audit_call_id`,
+a host-generated ID unique within the session, to link model turns and tool
 completion. Raw provider call IDs stay out of the audit; they appear only in
 the model history, for result routing, and in the journal. `model_responded`
 records each response's stop reason, call count, token usage, and latency.
 Events retain registered tool names, kilnd execution IDs, and the sandbox ID.
 Unknown model tool names are recorded as `unknown`, not copied into the log.
 Oversized or invalid model actions are recorded as rejected before they are
-refused or the session terminates. On a client
-deadline/cancel, the harness queries recent sandbox executions to recover any
-ID kilnd already assigned and copies that row's byte/truncation evidence; an
-empty ID list with unknown totals means no row was observable through v1 within
-the bounded recovery query. Baseline execution failures use the same recovery.
+refused or the session terminates. On a client deadline/cancel, the harness
+queries recent sandbox executions to recover any ID kilnd already assigned and
+copies that row's byte/truncation evidence; an empty ID list with unknown
+totals means no row was observable through v1 within the bounded recovery
+query. Baseline execution failures use the same recovery.
 
 ## Journal
 
@@ -191,12 +191,13 @@ after every record, and nothing after `session_ended`. Writers enforce the same
 limits. `complete` is true when the last record is `session_ended`.
 
 Writers and readers also run one `Grammar` over the events. The recorded task
-must pass the engine's task checks and the recorded limits its hard ceilings. `sandbox_ready` appears at most once,
-before any request, and a request needs it. Requests run turn 1, 2, … and each
-is answered by exactly one `model_responded` or `model_failed` before the next;
-nothing but `session_ended` follows a failure or a response without tool calls.
-After a response with n calls, up to n `tool_executed` records follow with
-indexes 1, 2, …, and each call must equal the response's call after the shared
+must pass the engine's task checks and the recorded limits its hard ceilings.
+`sandbox_ready` appears at most once, before any request, and a request needs
+it. Requests run turn 1, 2, … and each is answered by exactly one
+`model_responded` or `model_failed` before the next; nothing but
+`session_ended` follows a failure or a response without tool calls. After a
+response with n calls, up to n `tool_executed` records follow with indexes 1,
+2, …, and each call must equal the response's call after the shared
 `sanitize_call` (unregistered names become `unknown`, oversized arguments the
 `omitted` marker); fewer only when the session then ends. The grammar rebuilds
 the message history from the task, each response, and each tool result exactly
@@ -230,26 +231,26 @@ Equal requests therefore hash equally before and after a journal round trip.
 ## Replay
 
 `ReplayProvider` loads each turn's recorded request hash with its response or
-failure. For each request it checks the turn number and recomputes the hash;
-on a mismatch it records `diverged_at` and returns a non-retryable
+failure. For each request it checks the turn number and recomputes the hash; on
+a mismatch it records `diverged_at` and returns a non-retryable
 `ReplayDiverged` error, otherwise it returns the recorded response or rebuilt
 error. A recording that ends with an unanswered request keeps it as a turn to
 reach: replaying it returns a `Script` error and accounts for it. A request
 past the end of the recording is also a `Script` error, and it sets
-`diverged_at` like any other request or call the recording does not match. After each tool call
-is journaled, an interrupted one included, the engine calls
-`Provider::tool_completed`; replay compares the sanitized call, `ok`, and
+`diverged_at` like any other request or call the recording does not match.
+After each tool call is journaled, an interrupted one included, the engine
+calls `Provider::tool_completed`; replay compares the sanitized call, `ok`, and
 result with the next recorded `tool_executed` and diverges at that turn on a
 mismatch, before the result reaches another request. A call or request the
 recording does not match counts as unexpected. It rechecks the grammar when
 loading, and `exhausted()` is true only when every turn and tool call was
-matched and nothing unexpected happened. The CLI prints `reproduced` only for a completed recording
-replayed to the same final answer with no divergence and everything consumed.
-Before contacting kilnd it opens the source read-only and both outputs, and
-compares device and inode by `fstat` on the open descriptors; path checks
-before that are diagnostics only. On a clash it discards both outputs, which
-removes only what their opens created, through the pinned parent descriptors. The recorded
-task and limits, which must pass the same ceilings, drive the replayed
-session, which uses a new sandbox, session ID,
-audit, and journal. Since the model side is fixed, a divergence means kilnd
-returned different tool results than during the recording.
+matched and nothing unexpected happened. The CLI prints `reproduced` only for a
+completed recording replayed to the same final answer with no divergence and
+everything consumed. Before contacting kilnd it opens the source read-only and
+both outputs, and compares device and inode by `fstat` on the open descriptors;
+path checks before that are diagnostics only. On a clash it discards both
+outputs, which removes only what their opens created, through the pinned parent
+descriptors. The recorded task and limits, which must pass the same ceilings,
+drive the replayed session, which uses a new sandbox, session ID, audit, and
+journal. Since the model side is fixed, a divergence means kilnd returned
+different tool results than during the recording.
