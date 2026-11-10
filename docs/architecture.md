@@ -173,7 +173,10 @@ extended ACLs are not inspected. A refusal names the directory, its mode, and
 the fix. The opener records each directory it creates with its pinned parent
 descriptor, name, and identity; if anything later fails, it removes the new
 file and then the new directories, newest first, through those descriptors and
-only if `fstatat` still shows the same empty entry. `discard` does the same for
+only if `fstatat` still shows the same empty entry. What rollback keeps is
+taken before each `mkdirat`, and an entry created but not yet recorded is
+removed by name at once, so even running out of descriptors part-way through a
+deep path leaves nothing behind. `discard` does the same for
 an output nobody has written to yet. The journal syncs data after every record,
 serializes each record through a writer that stops at the line limit, and
 refuses further writes after `session_ended` or a failed write. A journal write
@@ -187,8 +190,8 @@ only once, one session ID, contiguous sequences, an intact chain, a newline
 after every record, and nothing after `session_ended`. Writers enforce the same
 limits. `complete` is true when the last record is `session_ended`.
 
-Writers and readers also run one `Grammar` over the events. Recorded limits
-must pass the engine's hard ceilings. `sandbox_ready` appears at most once,
+Writers and readers also run one `Grammar` over the events. The recorded task
+must pass the engine's task checks and the recorded limits its hard ceilings. `sandbox_ready` appears at most once,
 before any request, and a request needs it. Requests run turn 1, 2, … and each
 is answered by exactly one `model_responded` or `model_failed` before the next;
 nothing but `session_ended` follows a failure or a response without tool calls.
@@ -230,7 +233,10 @@ Equal requests therefore hash equally before and after a journal round trip.
 failure. For each request it checks the turn number and recomputes the hash;
 on a mismatch it records `diverged_at` and returns a non-retryable
 `ReplayDiverged` error, otherwise it returns the recorded response or rebuilt
-error. Running out of recorded turns is a `Script` error. After each tool call
+error. A recording that ends with an unanswered request keeps it as a turn to
+reach: replaying it returns a `Script` error and accounts for it. A request
+past the end of the recording is also a `Script` error, and it sets
+`diverged_at` like any other request or call the recording does not match. After each tool call
 is journaled, an interrupted one included, the engine calls
 `Provider::tool_completed`; replay compares the sanitized call, `ok`, and
 result with the next recorded `tool_executed` and diverges at that turn on a

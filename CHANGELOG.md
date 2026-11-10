@@ -42,6 +42,10 @@ change the CLI or audit format.
   refused by name; failed or refused opens roll back what they created through
   pinned descriptors; and clippy is clean for Linux targets. On macOS,
   extended ACLs are not inspected, which is documented.
+- Fourth review round: rollback stays complete when descriptors run out
+  part-way through a deep path; the grammar applies the engine's task checks;
+  replay keeps an unanswered recorded request as a turn to reach and locates a
+  request past the end of the recording.
 - Journals written before these review fixes do not load. `JOURNAL_SCHEMA`
   stays 1 because the journal format has not been released.
 - Prepare the repository for public visibility: add the Apache-2.0 `LICENSE`
