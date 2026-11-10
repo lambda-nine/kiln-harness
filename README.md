@@ -82,9 +82,11 @@ back and lists the workspace in one two-call turn; checks the session file-set
 diff; runs `wc` with literal argv; then answers. The scripted provider verifies
 every result before its next turn. The command prints the journal path, by
 default `journal/demo-<unix_ms>.jsonl`; pass `--journal PATH` to choose one.
-Journals are never overwritten. Ctrl-C and wall deadlines stop waiting on an
-active RPC; kilnd is asked to cancel it, then deletion is retried and verified
-within a separate bounded cleanup window.
+Journals are never overwritten, and their directory must be owned by the user
+running the harness and writable by no one else. Ctrl-C and wall deadlines stop
+waiting on an active RPC, including sandbox create and the workspace baseline;
+kilnd is asked to cancel it, then deletion is retried and verified within a
+separate bounded cleanup window.
 
 ## Journal and replay
 
@@ -97,12 +99,17 @@ cargo run --locked -- journal verify journal/demo-<unix_ms>.jsonl
 cargo run --locked -- replay --from journal/demo-<unix_ms>.jsonl --audit audit/replay.jsonl
 ```
 
-`journal verify` runs offline. It checks limits, record order, and the hash
-chain, then prints the session, record count, completeness, turns, tool calls,
-and token usage. `replay` reruns the recorded task with the recorded budgets in
-a fresh sandbox and answers each model request from the journal, after checking
-that the request hashes the same as the recorded one. It prints `reproduced`
-when the final answer matches. Otherwise it prints `diverged at turn N`, the
+`journal verify` runs offline. It checks limits, the hash chain, and the event
+grammar (pairing, order, and a terminal record consistent with the session),
+then prints the session, record count, outcome, whether the sandbox was
+deleted, turns, tool calls, and token usage. A session whose sandbox deletion
+was not confirmed ends `cleanup_failed`. `replay` reruns the recorded task
+under every recorded model-visible limit in a fresh sandbox and answers each
+model request from the journal, after checking that the request, including its
+output-token cap, hashes the same as the recorded one. It refuses output paths
+that are the same file as the source. It prints `reproduced` only when a
+completed recording replays to the same final answer with every turn
+consumed. Otherwise it prints `diverged at turn N`, the
 first turn whose request differed because the sandbox returned different tool
 results, and exits non-zero.
 
@@ -123,11 +130,13 @@ The installed-service test is opt-in and must run inside the kiln VM:
 scripts/integration-vm.sh
 ```
 
-It requires an empty baseline, verifies all five tool results and execution
-links, replays the recorded journal against a second sandbox, runs the `demo`,
-`journal verify`, and `replay` commands, and checks API reservations, kiln's
-registry, run directories, cgroups, and shim/init processes before and after.
-It does not run benchmark campaigns.
+It requires no active sandboxes or running executions, verifies all five tool
+results and execution links, replays the recorded journal against a second
+sandbox, and runs the `demo`, `journal verify`, and `replay` commands.
+Afterwards, node reservations and the set of non-deleted sandboxes must match
+a snapshot taken before the run, since a node may keep sandboxes the test does
+not own. kiln's registry, run directories, cgroups, and shim/init processes are
+checked before and after. It does not run benchmark campaigns.
 
 ## Next step: live provider
 

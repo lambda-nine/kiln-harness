@@ -18,6 +18,15 @@ change the CLI or audit format.
   sessions and replays.
 - Enable serde_json's `float_roundtrip` so journaled floats hash identically
   after a round trip.
+- Harden the journal after review: one event grammar shared by writers,
+  readers, and replay; every model-visible limit recorded, with hard ceilings
+  on all limits; cached input counted against the input budget; request hashes
+  that cover the output-token cap; `cleanup_failed` and `work_outcome` in
+  terminal records; cancellation during create and the baseline; journals
+  created only in operator-owned directories; and replay refusing outputs that
+  alias its source.
+- The VM integration check compares residue against a pre-run snapshot of
+  node reservations and non-deleted sandboxes instead of zero.
 
 - Prepare the repository for public visibility: add the Apache-2.0 `LICENSE`
   (matching kiln and kilnd), `SECURITY.md` with private vulnerability
