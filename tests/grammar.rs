@@ -890,3 +890,40 @@ async fn engine_refusals_verify_and_forged_continuations_do_not() {
     });
     assert_rejected_because("past the call budget", over_calls, "beyond max_tool_calls");
 }
+
+#[test]
+fn recorded_tasks_must_be_ones_the_engine_accepts() {
+    use kiln_harness::engine::MAX_TASK_TEXT_BYTES;
+
+    let over = "x".repeat(MAX_TASK_TEXT_BYTES + 1);
+    for (name, system, task) in [
+        ("empty prompt", "system".to_string(), String::new()),
+        ("prompt one byte over", "system".to_string(), over.clone()),
+        ("system one byte over", over.clone(), "task".to_string()),
+    ] {
+        let mut events = valid();
+        let JournalEvent::SessionStarted {
+            system: recorded_system,
+            task: recorded_task,
+            ..
+        } = &mut events[0]
+        else {
+            panic!("session start");
+        };
+        *recorded_system = system;
+        *recorded_task = task;
+        // Only the start record is needed: it is refused on its own.
+        events.truncate(1);
+        assert_rejected_because(name, events, "recorded task is invalid");
+    }
+
+    // Exactly at the limit is fine for both strings.
+    let at = "x".repeat(MAX_TASK_TEXT_BYTES);
+    let mut events = vec![started()];
+    let JournalEvent::SessionStarted { system, task, .. } = &mut events[0] else {
+        panic!("session start");
+    };
+    *system = at.clone();
+    *task = at;
+    write_all(&events).expect("a task at the limit is valid");
+}

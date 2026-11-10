@@ -941,15 +941,22 @@ impl Terminal {
 }
 
 fn validate_task(task: &SessionTask) -> Result<(), HarnessError> {
-    if task.prompt.is_empty() {
-        return Err(HarnessError::InvalidTask("prompt is empty".to_string()));
+    task_problem(&task.system, &task.prompt)
+        .map_or(Ok(()), |problem| Err(HarnessError::InvalidTask(problem)))
+}
+
+/// Why the engine would refuse a task, if it would. Shared with the journal
+/// grammar, so a verified journal never records a task the engine rejects.
+pub(crate) fn task_problem(system: &str, prompt: &str) -> Option<String> {
+    if prompt.is_empty() {
+        return Some("prompt is empty".to_string());
     }
-    if task.prompt.len() > MAX_TASK_TEXT_BYTES || task.system.len() > MAX_TASK_TEXT_BYTES {
-        return Err(HarnessError::InvalidTask(format!(
+    if prompt.len() > MAX_TASK_TEXT_BYTES || system.len() > MAX_TASK_TEXT_BYTES {
+        return Some(format!(
             "system and prompt are each limited to {MAX_TASK_TEXT_BYTES} bytes"
-        )));
+        ));
     }
-    Ok(())
+    None
 }
 
 /// Whether recorded limits could have come from a valid configuration: every

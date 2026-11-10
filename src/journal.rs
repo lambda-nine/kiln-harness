@@ -709,7 +709,13 @@ impl Grammar {
                     expected: JOURNAL_SCHEMA,
                 });
             }
-            // Reject limits the engine itself would refuse to run under.
+            // Reject a task or limits the engine itself would refuse.
+            if let Some(problem) = crate::engine::task_problem(system, task) {
+                return Err(JournalError::Grammar {
+                    sequence,
+                    reason: format!("recorded task is invalid: {problem}"),
+                });
+            }
             if !crate::engine::limits_are_valid(limits) {
                 return Err(JournalError::Grammar {
                     sequence,
