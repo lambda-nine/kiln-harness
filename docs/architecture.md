@@ -72,8 +72,9 @@ are separate; adapters normalize to this. The input budget compares
 per-request output cap, or a cumulative total over the input or output budget,
 ends the session with `TokenBudget`. Token counts come from the endpoint and
 are trusted for cost, not for size: the engine also counts each response's
-model output itself (`ModelResponse::output_bytes`, its text plus the
-compact JSON of every tool call's arguments) and ends the session with
+model output itself (`ModelResponse::output_bytes`: its text plus, for
+every tool call, its call ID, its tool name, and the compact JSON of its
+arguments) and ends the session with
 `OutputBytesBudget` once the session total passes
 `max_total_model_output_bytes` (8 MiB by default, 256 MiB at most).
 
@@ -139,10 +140,17 @@ rarely exceed 16, so 64 catches only gross under-reporting.
 With an API key, the adapter quotes nothing the endpoint sends. Error
 messages are the status and `body withheld: authenticated request`. A
 success is refused as `Rejected` ("response contained the request
-credential") if the exact key appears in the raw body, in any decoded JSON
-string or object key, or in the parsed text, call IDs, tool names, or
-arguments; nothing from it reaches `ModelResponse`, so `model_failed`
-records only that message.
+credential") if the key, exactly or in its JSON-escaped spelling, appears
+in the raw body, in any decoded JSON string or object key, in the parsed
+text, call IDs, or tool names, or in the arguments: decoded when an object,
+and otherwise both as the raw string kept and, when it is JSON of any other
+type, as its decoded value. Nothing from it reaches `ModelResponse`, so
+`model_failed` records only that message.
+
+A tool name over 256 bytes is `InvalidResponse`, checked before the name is
+copied; a shorter unregistered name still becomes `unknown_tool`. Server
+call IDs are copied only when they pass the engine's rule (at most 64
+bytes) and are otherwise replaced by `call-<turn>-<index>`.
 
 The body is read chunk by chunk and abandoned at `max_response_bytes` (4 MiB
 by default, at most 64 MiB); a declared `Content-Length` over the cap is

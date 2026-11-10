@@ -257,15 +257,17 @@ async fn workspace_prefixed_paths_name_the_same_files() {
 
 #[tokio::test]
 async fn model_output_bytes_are_bounded_whatever_usage_reports() {
-    // {"path":"."} is 12 bytes of arguments, then a 4-byte answer: 16 in
-    // all. Usage reports nothing, so only the byte budget can stop it.
+    // Call ID "l" (1), tool name "list_dir" (8) and {"path":"."} (12),
+    // then a 4-byte answer: 25 in all. Usage reports nothing, so only the
+    // byte budget can stop it, and it counts the name and ID too: 16, the
+    // text and arguments alone, is not enough.
     let script = || {
         ScriptedProvider::new([
             ModelResponse::tool_use([ToolCall::new("l", "list_dir", json!({"path": "."}))]),
             ModelResponse::final_text("done"),
         ])
     };
-    for (budget, completes) in [(16, true), (15, false), (11, false)] {
+    for (budget, completes) in [(25, true), (24, false), (16, false)] {
         let api = FakeApi::default();
         let mut config = short_lifecycle_config();
         config.max_total_model_output_bytes = budget;

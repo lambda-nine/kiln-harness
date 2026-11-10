@@ -643,6 +643,34 @@ fn recorded_limits_bound_what_may_follow() {
     );
 }
 
+#[test]
+fn tool_names_and_ids_count_toward_the_recorded_byte_budget() {
+    // A budget that covers the text and arguments alone, but not the call
+    // IDs and tool names as well, refuses the continuation.
+    let without_names: u64 = valid()
+        .iter()
+        .filter_map(|event| match event {
+            JournalEvent::ModelResponded { response, .. } => {
+                let mut stripped = response.clone();
+                for call in &mut stripped.tool_calls {
+                    call.call_id.clear();
+                    call.tool.clear();
+                }
+                Some(stripped.output_bytes())
+            }
+            _ => None,
+        })
+        .sum();
+    assert!(without_names < valid_output_bytes());
+    assert_rejected_because(
+        "names and IDs push the session over its byte budget",
+        with_limits(valid(), |limits| {
+            limits.max_total_model_output_bytes = without_names;
+        }),
+        "after a response the engine refuses",
+    );
+}
+
 /// The model output the `valid()` journal's responses add up to.
 fn valid_output_bytes() -> u64 {
     valid()

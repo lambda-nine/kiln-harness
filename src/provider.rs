@@ -132,7 +132,8 @@ impl ModelResponse {
     }
 
     /// Bytes of model output the harness keeps from this response: its text
-    /// plus the compact JSON encoding of each tool call's arguments. The
+    /// plus, for each tool call, its call ID, its tool name, and the compact
+    /// JSON encoding of its arguments. The
     /// engine's `max_total_model_output_bytes` budget, the journal grammar,
     /// and adapters' usage plausibility checks all count with this, so they
     /// agree on every response.
@@ -150,6 +151,10 @@ impl ModelResponse {
         }
         let mut count = Count(self.text.as_ref().map_or(0, |text| text.len() as u64));
         for call in &self.tool_calls {
+            count.0 = count
+                .0
+                .saturating_add(call.call_id.len() as u64)
+                .saturating_add(call.tool.len() as u64);
             // Encoding a Value into a counter cannot fail.
             let _ = serde_json::to_writer(&mut count, &call.arguments);
         }

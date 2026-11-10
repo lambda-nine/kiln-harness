@@ -39,9 +39,12 @@
 //! With an API key, nothing the endpoint sends is quoted: an error is its
 //! status and `body withheld: authenticated request`. A success is refused
 //! as `Rejected` ("response contained the request credential") when the
-//! exact key appears in the raw body, in any decoded JSON string or object
-//! key, or in anything kept from the parsed response, arguments included,
-//! so neither the key nor its JSON-escaped form reaches a journal. An
+//! key, exactly or in its JSON-escaped spelling, appears in the raw body, in
+//! any decoded JSON string or object key, or in anything kept from the
+//! parsed response, including the JSON nested in `function.arguments`
+//! decoded whatever its type, so neither the key nor its JSON-escaped form
+//! reaches a journal. Tool names over [`MAX_TOOL_NAME_BYTES`] are refused
+//! before they are kept. An
 //! endpoint that holds the key can still return it transformed or split;
 //! that cannot be detected.
 //!
@@ -99,6 +102,8 @@ pub const MAX_ATTEMPTS: u32 = 8;
 pub const MAX_CONFIG_DELAY: Duration = Duration::from_secs(300);
 /// Most bytes of an error body quoted in an error message.
 pub const ERROR_EXCERPT_BYTES: usize = 512;
+/// Longest tool name accepted from a response.
+pub const MAX_TOOL_NAME_BYTES: usize = 256;
 /// The most output bytes one reported completion token may account for.
 pub const MAX_OUTPUT_BYTES_PER_TOKEN: u64 = 64;
 /// Most bytes of an error response read to classify it.
@@ -359,7 +364,8 @@ impl OpenAiCompatProvider {
             .and_then(|value| parse_retry_after(value, SystemTime::now()));
         // With a key, the endpoint holds a credential: nothing it sends is
         // quoted, and a response that contains the key is refused whole.
-        let key = self.config.api_key.as_ref().map(SecretString::expose);
+        let key = self.config.api_key.as_ref().map(Credential::new);
+        let key = key.as_ref();
         if status.is_success() {
             let limit = self.config.max_response_bytes;
             let (bytes, complete) = read_bounded(&mut response, limit).await?;
@@ -369,7 +375,7 @@ impl OpenAiCompatProvider {
                     format!("response exceeds {limit} bytes"),
                 ));
             }
-            if key.is_some_and(|key| contains_bytes(&bytes, key.as_bytes())) {
+            if key.is_some_and(|key| key.in_bytes(&bytes)) {
                 return Err(credential_echo());
             }
             let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -378,8 +384,8 @@ impl OpenAiCompatProvider {
                     format!("response is not JSON: {error}"),
                 )
             })?;
-            // Decoded strings catch JSON-escaped forms of the key.
-            if key.is_some_and(|key| value_contains(&value, key)) {
+            // Decoded strings catch the key behind the outer JSON layer.
+            if key.is_some_and(|key| key.in_value(&value)) {
                 return Err(credential_echo());
             }
             let parsed =
@@ -387,8 +393,8 @@ impl OpenAiCompatProvider {
                     error,
                     retry_after: None,
                 })?;
-            // Arguments decoded from their string form are a second layer.
-            if key.is_some_and(|key| response_contains(&parsed, key)) {
+            // Tool arguments are JSON inside a JSON string: a second layer.
+            if key.is_some_and(|key| key.in_response(&parsed)) {
                 return Err(credential_echo());
             }
             return Ok(parsed);
@@ -410,36 +416,73 @@ fn credential_echo() -> Failure {
     )
 }
 
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+/// The request's API key as the response scans look for it: its exact
+/// bytes and its JSON-escaped spelling (which differs when the key holds
+/// `"` or `\\`). Both must be absent from every layer the protocol decodes.
+struct Credential<'a> {
+    needles: Vec<std::borrow::Cow<'a, str>>,
 }
 
-/// Whether any string or object key in `value` contains `key`.
-fn value_contains(value: &Value, key: &str) -> bool {
-    match value {
-        Value::String(text) => text.contains(key),
-        Value::Array(items) => items.iter().any(|item| value_contains(item, key)),
-        Value::Object(map) => map
-            .iter()
-            .any(|(name, item)| name.contains(key) || value_contains(item, key)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+impl<'a> Credential<'a> {
+    fn new(key: &'a SecretString) -> Self {
+        let exact = key.expose();
+        let mut needles = vec![std::borrow::Cow::Borrowed(exact)];
+        // Encoding a str cannot fail; strip the surrounding quotes.
+        let encoded = serde_json::to_string(exact).unwrap_or_default();
+        let escaped = encoded
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(exact);
+        if escaped != exact {
+            needles.push(std::borrow::Cow::Owned(escaped.to_string()));
+        }
+        needles.retain(|needle| !needle.is_empty());
+        Self { needles }
     }
-}
 
-/// Whether anything the harness would keep from `response` contains `key`.
-fn response_contains(response: &ModelResponse, key: &str) -> bool {
-    response
-        .text
-        .as_ref()
-        .is_some_and(|text| text.contains(key))
-        || response.tool_calls.iter().any(|call| {
-            call.call_id.contains(key)
-                || call.tool.contains(key)
-                || value_contains(&call.arguments, key)
+    fn in_text(&self, text: &str) -> bool {
+        self.needles
+            .iter()
+            .any(|needle| text.contains(needle.as_ref()))
+    }
+
+    fn in_bytes(&self, bytes: &[u8]) -> bool {
+        self.needles.iter().any(|needle| {
+            let needle = needle.as_bytes();
+            bytes.windows(needle.len()).any(|window| window == needle)
         })
+    }
+
+    /// Any string or object key in `value`.
+    fn in_value(&self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => self.in_text(text),
+            Value::Array(items) => items.iter().any(|item| self.in_value(item)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(name, item)| self.in_text(name) || self.in_value(item)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    /// Anything kept from `response`. Arguments kept as a raw string are
+    /// also decoded when they are JSON of any kind (a string, array, number
+    /// or null as well as an object), so the protocol's nested JSON layer
+    /// cannot carry the key in its encoded spelling.
+    fn in_response(&self, response: &ModelResponse) -> bool {
+        response
+            .text
+            .as_ref()
+            .is_some_and(|text| self.in_text(text))
+            || response.tool_calls.iter().any(|call| {
+                self.in_text(&call.call_id)
+                    || self.in_text(&call.tool)
+                    || self.in_value(&call.arguments)
+                    || matches!(&call.arguments, Value::String(raw)
+                        if serde_json::from_str::<Value>(raw)
+                            .is_ok_and(|decoded| self.in_value(&decoded)))
+            })
+    }
 }
 
 #[async_trait]
@@ -955,6 +998,15 @@ fn parse_tool_call(call: &Value, turn: u32, position: usize) -> Result<ToolCall,
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("tool call has no function name"))?;
+    // Checked before the name is copied anywhere. A name within the bound
+    // that is not registered still becomes a model-visible unknown_tool.
+    if tool.len() > MAX_TOOL_NAME_BYTES {
+        return Err(invalid(format!(
+            "tool name exceeds {MAX_TOOL_NAME_BYTES} bytes"
+        )));
+    }
+    // A server ID is copied only once it passes the engine's rule (at most
+    // 64 bytes); otherwise a short positional ID replaces it.
     let call_id = match call.get("id").and_then(Value::as_str) {
         Some(id) if call_id_is_valid(id) => id.to_string(),
         _ => format!("call-{turn}-{}", position + 1),

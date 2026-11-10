@@ -205,6 +205,135 @@ async fn a_key_inside_tool_arguments_is_refused() {
     assert_eq!(response.tool_calls[0].arguments["path"], ESCAPED_KEY);
 }
 
+// R2-01: the key behind the nested JSON layer of tool arguments.
+
+/// Contains `"`, so its JSON spelling differs from it.
+const ROUND2_KEY: &str = "sk-ROUND2-\"quote-7a1";
+
+#[tokio::test]
+async fn a_key_in_non_object_json_arguments_is_refused() {
+    let encoded = serde_json::to_string(ROUND2_KEY).expect("encode");
+    let cases = [
+        // The repro: arguments that are the key's JSON string encoding.
+        encoded.clone(),
+        // An array containing it, and the same one level deeper.
+        json!([ROUND2_KEY, 1]).to_string(),
+        json!([[{"k": [ROUND2_KEY]}]]).to_string(),
+        // Malformed, so it stays raw, but holds the escaped spelling.
+        format!("[{encoded}"),
+    ];
+    for arguments in cases {
+        assert!(!arguments.contains(ROUND2_KEY), "{arguments}");
+        let server = FakeHttp::start([Reply::json(200, &tool_call(&json!(arguments)))]).await;
+        assert_credential_echo(complete(&server, Some(ROUND2_KEY)).await);
+    }
+
+    // Valid non-object JSON without the key still reaches the typed tool
+    // as a raw string, so the model sees invalid_arguments.
+    for harmless in ["null", "[1,2]", "\"just text\"", "7"] {
+        let server = FakeHttp::start([Reply::json(200, &tool_call(&json!(harmless)))]).await;
+        let response = complete(&server, Some(ROUND2_KEY))
+            .await
+            .expect("no credential");
+        assert_eq!(response.tool_calls[0].arguments, json!(harmless));
+    }
+}
+
+#[tokio::test]
+async fn a_nested_key_never_reaches_the_journal() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let journal_path = temp.path().join("run.jsonl");
+    let encoded = serde_json::to_string(ROUND2_KEY).expect("encode");
+    let server = FakeHttp::start([
+        Reply::json(200, &tool_call(&json!(encoded))),
+        Reply::json(200, &text("done")),
+    ])
+    .await;
+    let provider =
+        OpenAiCompatProvider::new(config(&server.base_url(), Some(ROUND2_KEY))).expect("provider");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider,
+        kiln_harness::audit::MemoryAudit::default(),
+        JsonlJournal::open(&journal_path).expect("journal"),
+        short_lifecycle_config(),
+    );
+
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+
+    assert!(
+        matches!(&error, HarnessError::Provider(error) if error.message == CREDENTIAL_ECHO),
+        "{error}"
+    );
+    let journal = std::fs::read_to_string(&journal_path).expect("read");
+    let escaped_once = &encoded[1..encoded.len() - 1];
+    assert!(!journal.contains(ROUND2_KEY));
+    assert!(!journal.contains(escaped_once));
+    assert!(!journal.contains("ROUND2"), "no part of the key is kept");
+}
+
+// R2-02: tool names are bounded and counted.
+
+#[tokio::test]
+async fn a_long_tool_name_is_refused_before_it_is_kept() {
+    let mut body = tool_call(&json!("{}"));
+    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = json!("n".repeat(100_000));
+    body["usage"] = json!({"prompt_tokens": 1, "completion_tokens": 1});
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let error = complete(&server, None).await.expect_err("too long");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert_eq!(error.message, "tool name exceeds 256 bytes");
+    assert!(!error.retryable);
+
+    // 256 bytes is accepted, and an unregistered name still becomes the
+    // model-visible unknown_tool rather than a failure.
+    let mut body = tool_call(&json!("{}"));
+    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = json!("m".repeat(256));
+    body["usage"] = json!({"prompt_tokens": 1, "completion_tokens": 5});
+    let server = FakeHttp::start([Reply::json(200, &body), Reply::json(200, &text("ok"))]).await;
+    let provider = OpenAiCompatProvider::new(config(&server.base_url(), None)).expect("provider");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider,
+        kiln_harness::audit::MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("unknown tool, then an answer");
+    assert_eq!(outcome.final_answer, "ok");
+    let second = &server.requests()[1].json();
+    let tool = second["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .expect("tool result");
+    assert!(
+        tool["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("unknown_tool")),
+        "{tool}"
+    );
+}
+
+#[tokio::test]
+async fn tool_names_count_toward_the_usage_floor() {
+    // 256-byte name + 6-byte ID + 2-byte arguments = 264 > 4 * 64.
+    let mut body = tool_call(&json!("{}"));
+    body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = json!("m".repeat(256));
+    body["usage"] = json!({"prompt_tokens": 1, "completion_tokens": 4});
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let error = complete(&server, None).await.expect_err("under-reported");
+    assert!(
+        error.message.contains("4 completion tokens for 264 bytes"),
+        "{error}"
+    );
+}
+
 // F2: implausible usage is refused, and output size is bounded locally.
 
 #[tokio::test]
@@ -284,7 +413,8 @@ async fn counts_at_the_floor_are_accepted() {
     let response = complete(&server, None).await.expect("at the floor");
     assert_eq!(response.output_bytes(), 64);
 
-    // Tool-call arguments count as compact JSON: {"path":"."} is 12 bytes.
+    // A tool call counts its ID ("c", 1), name ("list_dir", 8), and
+    // arguments as compact JSON ({"path":"."}, 12): 21 bytes.
     let body = completion(
         &json!({"role": "assistant", "content": null, "tool_calls": [
             {"id": "c", "function": {"name": "list_dir", "arguments": "{ \"path\" : \".\" }"}}
@@ -293,7 +423,7 @@ async fn counts_at_the_floor_are_accepted() {
     );
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
     let response = complete(&server, None).await.expect("small call");
-    assert_eq!(response.output_bytes(), 12);
+    assert_eq!(response.output_bytes(), 21);
 }
 
 // F3: the response cap counts decoded payload bytes; framing is bounded by

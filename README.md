@@ -138,12 +138,14 @@ server.
 A server that needs a key gets it from an environment variable named by
 `--api-key-env VAR`, never from a flag. The key is sent only in the
 `Authorization` header. With a key, error bodies are never quoted, and a
-response that contains the exact key, raw or JSON-escaped, is refused
-whole, so the harness never writes the key or its JSON-escaped form to the
+response that contains the key, exactly or in its JSON-escaped spelling, at
+any JSON layer the protocol defines (the body, and the JSON nested inside
+each tool call's `function.arguments` string, whatever its type) is refused
+whole. So the harness never writes the key or its JSON-escaped form to the
 journal, the audit, or an error. A server holding the key could still send
-it back transformed or split, which cannot be detected. Plain `http` is accepted for a model server on the LAN without a
-key; with a key, the base URL must be `https` unless its host is a loopback
-IP address.
+it back transformed or split, which cannot be detected. Plain `http` is
+accepted for a model server on the LAN without a key; with a key, the base
+URL must be `https` unless its host is a loopback IP address.
 
 Responses must report plausible token `usage`, or the session fails: budgets
 cannot be enforced without it. Usage accuracy is the server's job and is

@@ -74,9 +74,13 @@ it is not a hostile multi-tenant boundary.
   `ModelRequest` or `ModelResponse`. The endpoint receives the key, so its
   responses may echo it: with a key, error bodies are never quoted (the
   message is the status and `body withheld: authenticated request`), and a
-  success whose raw body, decoded JSON strings or object keys, or parsed
-  text, call IDs, tool names, or arguments contain the exact key is refused
-  whole as `response contained the request credential`. The claim is
+  success is refused whole as `response contained the request credential`
+  when the key, exactly or in its JSON-escaped spelling, appears at any JSON
+  layer the protocol defines: the raw body; every decoded string and object
+  key; the parsed text, call IDs, and tool names; and the JSON nested inside
+  `function.arguments`, decoded whatever its type (an object, string, array,
+  number, or null), as well as the raw string kept when it is not an
+  object. The claim is
   therefore exact: the harness never writes the key, or a JSON-escaped form
   of it, to the journal, the audit, or an error. An endpoint that holds the
   key can still return a transformed or split form of it (base64, reversed,
@@ -105,8 +109,10 @@ it is not a hostile multi-tenant boundary.
   of output per completion token) is refused, but a plausible lie is not
   detectable without the model's tokenizer. Size is bounded locally
   regardless: `max_total_model_output_bytes` (8 MiB by default, 256 MiB at
-  most) caps the text and tool-call arguments a session accepts, counted by
-  the harness, and the journal grammar applies the same budget.
+  most) caps the text, call IDs, tool names, and tool-call arguments a
+  session accepts, counted by the harness, and the journal grammar applies
+  the same budget. Tool names over 256 bytes are refused before they are
+  kept, and call IDs are kept only when at most 64 bytes.
 - Model text printed by `run`, `demo`, and `replay` has C0 and C1 control
   characters and DEL (other than newline and tab) shown as `\u{..}`, so a
   final answer cannot drive the operator's terminal. The journal keeps the

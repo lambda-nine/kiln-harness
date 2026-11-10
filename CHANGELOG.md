@@ -48,6 +48,14 @@ change the CLI or audit format.
   framing bounded by the deadline. `--prompt-file` and `--system-file` are
   opened non-blocking without following a final symlink and must be regular
   files. Final answers are printed with control characters escaped.
+- Second review round: the credential scan also decodes the JSON nested in
+  `function.arguments` when it is not an object, and looks for the key's
+  JSON-escaped spelling as well as the key at every layer.
+  `ModelResponse::output_bytes` now counts call IDs and tool names as well
+  as text and arguments, and tool names over 256 bytes are refused. The
+  grammar counts the same way, so a journal recorded under the earlier
+  definition can now fail verification if its names and IDs push it past
+  its byte budget; this is accepted because the format is unreleased.
 - `HarnessConfig::validate` exposes the engine's limit checks so a command
   can refuse a bad configuration before opening outputs or contacting kilnd.
 - A command that refuses its outputs, or cannot reach kilnd, now discards the
