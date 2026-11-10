@@ -32,6 +32,9 @@ enum RecordedOutcome {
         kind: ProviderErrorKind,
         message: String,
     },
+    /// The recording ends while this request was outstanding, for example
+    /// at a deadline during the provider call.
+    Unanswered,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +71,8 @@ impl ReplayProvider {
     /// Collect each recorded turn's request hash and response or failure.
     ///
     /// A trailing request without a response (an interrupted recording) is
-    /// dropped; replay reaching it returns a `Script` error.
+    /// kept as a turn without an answer: `exhausted()` stays false until
+    /// replay reaches it, and reaching it returns a `Script` error.
     ///
     /// # Errors
     ///
@@ -152,6 +156,9 @@ impl ReplayProvider {
                 JournalEvent::SessionStarted { .. } | JournalEvent::SandboxReady { .. } => {}
             }
         }
+        // A trailing request with no answer stays a turn to account for, so
+        // `exhausted()` is false until replay has reached it.
+        replay.push_turn(&mut pending, RecordedOutcome::Unanswered);
         Ok(replay)
     }
 
@@ -250,7 +257,7 @@ impl Provider for ReplayProvider {
         request: ModelRequest<'_>,
     ) -> Result<ModelResponse, ProviderError> {
         let Some(recorded) = self.turns.pop_front() else {
-            self.unexpected = self.unexpected.saturating_add(1);
+            self.mark_unexpected(request.turn);
             return Err(ProviderError::new(
                 ProviderErrorKind::Script,
                 format!("recording has no response for turn {}", request.turn),
@@ -266,6 +273,11 @@ impl Provider for ReplayProvider {
         match recorded.outcome {
             RecordedOutcome::Responded(response) => Ok(response),
             RecordedOutcome::Failed { kind, message } => Err(ProviderError::new(kind, message)),
+            // The request matched; the recording simply has no answer for it.
+            RecordedOutcome::Unanswered => Err(ProviderError::new(
+                ProviderErrorKind::Script,
+                format!("recording ends before turn {} was answered", request.turn),
+            )),
         }
     }
 }
