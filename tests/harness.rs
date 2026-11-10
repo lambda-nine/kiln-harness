@@ -105,6 +105,13 @@ async fn deterministic_vertical_uses_one_no_network_sandbox_and_cleans_it() {
             .iter()
             .all(|request| request.sandbox_id == "sb-0000000000000001")
     );
+    // A names-only listing keeps replays of the same session identical.
+    assert!(
+        state
+            .execs
+            .iter()
+            .any(|request| request.argv == ["/bin/ls", "-1Ap", "--", "/workspace"])
+    );
     drop(state);
 
     let records = &harness.audit().records;

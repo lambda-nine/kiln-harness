@@ -418,9 +418,12 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         };
         match self
             .run(
+                // Names only, one per line, directories marked with '/'.
+                // Long listings carry timestamps and link counts that would
+                // make otherwise identical sessions diverge on replay.
                 vec![
                     "/bin/ls".to_string(),
-                    "-la".to_string(),
+                    "-1Ap".to_string(),
                     "--".to_string(),
                     path,
                 ],
@@ -858,7 +861,9 @@ fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_dir".to_string(),
-            description: "List one strictly relative directory under /workspace.".to_string(),
+            description: "List entry names in one strictly relative directory under \
+                          /workspace; directory names end in '/'."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
