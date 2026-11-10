@@ -350,6 +350,7 @@ fn parsed(content: &Value, stop_reason: &str) -> ModelResponse {
     parse_response(
         &message(content, stop_reason, &usage(100, 400)),
         "claude-opus-5-5",
+        true,
     )
     .expect("valid response")
 }
@@ -418,7 +419,8 @@ fn a_refusal_keeps_its_stop_details_out_of_the_text() {
     let mut body = message(&json!([]), "refusal", &usage(100, 0));
     body["stop_details"] = json!({"type": "refusal", "category": "cyber",
                                   "explanation": "declined", "recommended_model": null});
-    let response = parse_response(&body, "claude-opus-5-5").expect("a pre-output refusal is valid");
+    let response =
+        parse_response(&body, "claude-opus-5-5", true).expect("a pre-output refusal is valid");
     assert_eq!(response.stop_reason, StopReason::Refusal);
     assert_eq!(response.text, None);
     let content = response.provider_content.expect("content");
@@ -432,7 +434,7 @@ fn a_refusal_keeps_its_stop_details_out_of_the_text() {
     );
 
     body["stop_details"] = json!("cyber");
-    let error = parse_response(&body, "claude-opus-5-5").expect_err("not an object");
+    let error = parse_response(&body, "claude-opus-5-5", true).expect_err("not an object");
     assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
 }
 
@@ -454,7 +456,7 @@ fn unknown_and_fallback_blocks_are_kept_only_as_opaque_content() {
     ]);
     let mut body = message(&blocks, "end_turn", &fallback_usage);
     body["model"] = json!("claude-opus-4-8");
-    let response = parse_response(&body, "claude-opus-5-5").expect("valid");
+    let response = parse_response(&body, "claude-opus-5-5", true).expect("valid");
     assert_eq!(response.text.as_deref(), Some("answer"));
     assert!(response.tool_calls.is_empty());
     let content = response.provider_content.expect("content");
@@ -502,6 +504,7 @@ fn malformed_blocks_and_tool_uses_are_invalid() {
         let error = parse_response(
             &message(&content, "tool_use", &usage(100, 400)),
             "claude-opus-5-5",
+            true,
         )
         .expect_err("invalid");
         assert_eq!(error.kind, ProviderErrorKind::InvalidResponse, "{content}");
@@ -516,11 +519,11 @@ fn malformed_blocks_and_tool_uses_are_invalid() {
         .as_object_mut()
         .expect("object")
         .remove("content");
-    assert!(parse_response(&no_content, "claude-opus-5-5").is_err());
+    assert!(parse_response(&no_content, "claude-opus-5-5", true).is_err());
     let mut bad_model = message(&json!([text("x")]), "end_turn", &usage(1, 1));
     bad_model["model"] = json!("claude\u{1b}[2J");
     assert!(
-        parse_response(&bad_model, "claude-opus-5-5")
+        parse_response(&bad_model, "claude-opus-5-5", true)
             .expect_err("model")
             .message
             .contains("model identifier")
@@ -725,6 +728,7 @@ fn usage_is_disjoint_and_a_fully_cached_prompt_is_accepted() {
     let response = parse_response(
         &message(&json!([text("ok")]), "end_turn", &cached),
         "claude-opus-5-5",
+        true,
     )
     .expect("fully cached");
     assert_eq!(
@@ -744,6 +748,7 @@ fn usage_is_disjoint_and_a_fully_cached_prompt_is_accepted() {
             &json!({"input_tokens": 9, "output_tokens": 1, "cache_read_input_tokens": null}),
         ),
         "claude-opus-5-5",
+        false,
     )
     .expect("missing and null counters are zero");
     assert_eq!(sparse.usage.cache_read_input_tokens, 0);
@@ -751,7 +756,8 @@ fn usage_is_disjoint_and_a_fully_cached_prompt_is_accepted() {
 
 #[test]
 fn implausible_usage_is_invalid() {
-    // Synthetic top-level-only usage, invented to isolate each check.
+    // Synthetic top-level-only usage, invented to isolate each check; it
+    // is valid only without fallbacks, which make iterations required.
     let content = json!([text(&"x".repeat(650))]);
     let cases = [
         (
@@ -776,8 +782,12 @@ fn implausible_usage_is_invalid() {
         ),
     ];
     for (usage, needle) in cases {
-        let error = parse_response(&message(&content, "end_turn", &usage), "claude-opus-5-5")
-            .expect_err("invalid");
+        let error = parse_response(
+            &message(&content, "end_turn", &usage),
+            "claude-opus-5-5",
+            false,
+        )
+        .expect_err("invalid");
         assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
         assert!(
             error.message.contains(needle),
@@ -788,7 +798,7 @@ fn implausible_usage_is_invalid() {
     let mut no_usage = message(&content, "end_turn", &json!({}));
     no_usage.as_object_mut().expect("object").remove("usage");
     assert!(
-        parse_response(&no_usage, "claude-opus-5-5")
+        parse_response(&no_usage, "claude-opus-5-5", false)
             .expect_err("no usage")
             .message
             .contains("no usage")
@@ -801,6 +811,7 @@ fn implausible_usage_is_invalid() {
             &json!({"input_tokens": 10, "output_tokens": 0}),
         ),
         "claude-opus-5-5",
+        false,
     )
     .expect_err("zero tokens for a thinking block");
     assert!(error.message.contains("zero completion tokens"), "{error}");
@@ -817,6 +828,7 @@ async fn large_signatures_skip_the_token_floor_but_count_toward_the_byte_budget(
     let response = parse_response(
         &message(&blocks, "end_turn", &usage(10, 1)),
         "claude-opus-5-5",
+        true,
     )
     .expect("the floor counts only the neutral view");
     assert_eq!(response.token_floor_bytes(), 4);

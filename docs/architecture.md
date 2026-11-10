@@ -298,7 +298,17 @@ attempt: the response's `model` (an entry without one matches only when
 the response's `model` is the requested one) and exactly the top-level
 counters. When any entry is a `fallback_message`, there is exactly one and
 it is last, after `message` attempts only; a lone `fallback_message` is a
-sticky-routed turn. Other usage fields (`cache_creation`,
+sticky-routed turn. With fallbacks requested, the array is required: a
+response without it, or with `null`, is `InvalidResponse`, since it would
+hide every attempt but the serving one. Without fallbacks the array may be
+missing, and a `fallback_message` entry or a `fallback` block is refused,
+because the request asked for neither. When the content holds `fallback`
+blocks, they must describe the same chain as the usage: the last entry is
+a `fallback_message`, the last block's `to.model` is its model and the
+response's `model`, and the first block's `from.model` is the requested
+model. Only those fields are read, as identifiers; the blocks are echoed
+verbatim. A `fallback_message` with no block is a sticky-routed turn and
+stays valid. Other usage fields (`cache_creation`,
 `output_tokens_details`, `service_tier`, and the like) are ignored. The
 zero-output check exempts `fallback` blocks, which are boundary metadata
 rather than generated output, so a final fallback that declined before

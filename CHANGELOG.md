@@ -6,6 +6,14 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Fourth review round for the anthropic provider: with fallbacks on (the
+  default), `usage.iterations` is required, as the live API always sends
+  it; with `--no-fallbacks` it may be missing, and a `fallback_message`
+  entry or a `fallback` block is refused. `fallback` blocks in the content
+  must match the usage: the last iteration is a `fallback_message` whose
+  model, and the response's, is the last block's `to.model`, and the first
+  block's `from.model` is the requested model. `anthropic::parse_response`
+  takes the fallback mode.
 - Third review round for the anthropic provider: a `fallback_message`
   iteration must be the only one and the last, after `message` attempts;
   content made only of `fallback` boundary blocks may carry zero output

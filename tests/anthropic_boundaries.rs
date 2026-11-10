@@ -82,7 +82,7 @@ fn harness_for(
 }
 
 fn invalid(body: &Value) -> String {
-    let error = parse_response(body, "claude-opus-5-5").expect_err("invalid");
+    let error = parse_response(body, "claude-opus-5-5", true).expect_err("invalid");
     assert_eq!(error.kind, ProviderErrorKind::InvalidResponse, "{body}");
     error.message
 }
@@ -136,7 +136,7 @@ async fn fallback_attempts_count_against_the_session_budgets() {
         .expect_err("947 input and 6 output tokens exceed the budgets");
     assert!(matches!(error, HarnessError::TokenBudget), "{error}");
 
-    let parsed = parse_response(&body, "claude-opus-5-5").expect("valid");
+    let parsed = parse_response(&body, "claude-opus-5-5", true).expect("valid");
     assert_eq!(
         parsed.usage,
         Usage {
@@ -237,7 +237,7 @@ fn malformed_iterations_are_invalid() {
             &json!({"input_tokens": 10, "output_tokens": 2, "iterations": iterations}),
         )
     };
-    parse_response(&with(json!([serving()])), "claude-opus-5-5")
+    parse_response(&with(json!([serving()])), "claude-opus-5-5", true)
         .expect("a lone serving entry is valid");
     for (iterations, needle) in [
         (
@@ -381,7 +381,8 @@ fn the_token_floor_uses_the_serving_output() {
     };
     // 2 serving tokens cannot cover 300 bytes, whatever the declined attempt spent.
     assert!(invalid(&body(2)).contains("2 completion tokens for 300 bytes"));
-    let accepted = parse_response(&body(5), "claude-opus-5-5").expect("5 tokens cover 300 bytes");
+    let accepted =
+        parse_response(&body(5), "claude-opus-5-5", true).expect("5 tokens cover 300 bytes");
     assert_eq!(accepted.usage.output_tokens, 55, "budgets see the sum");
 }
 
@@ -558,7 +559,7 @@ fn short_keys_are_refused_but_keyless_mode_is_not() {
 
 fn opaque_number_body(number: &str) -> String {
     format!(
-        r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{{"type":"future_block","nonce":{number}}},{{"type":"tool_use","id":"toolu_1","name":"list_dir","input":{{"path":"."}}}}],"stop_reason":"tool_use","stop_details":null,"usage":{{"input_tokens":100,"output_tokens":10}}}}"#
+        r#"{{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{{"type":"future_block","nonce":{number}}},{{"type":"tool_use","id":"toolu_1","name":"list_dir","input":{{"path":"."}}}}],"stop_reason":"tool_use","stop_details":null,"usage":{{"input_tokens":100,"output_tokens":10,"iterations":[{{"type":"message","model":null,"input_tokens":100,"output_tokens":10}}]}}}}"#
     )
 }
 
@@ -651,7 +652,7 @@ fn inexact_numbers_are_refused_anywhere_in_opaque_content() {
 
 #[tokio::test]
 async fn a_u64_max_tool_argument_echoes_exactly() {
-    let call = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.txt","max_bytes":18446744073709551615}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"output_tokens":10}}"#;
+    let call = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.txt","max_bytes":18446744073709551615}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"output_tokens":10,"iterations":[{"type":"message","model":null,"input_tokens":100,"output_tokens":10}]}}"#;
     let server = FakeHttp::start([raw(call.to_string()), final_text()]).await;
     let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
     let mut harness = harness_for(provider, short_lifecycle_config());
@@ -702,7 +703,7 @@ fn the_envelope_and_stop_reason_are_required() {
         "end_turn",
         &usage(10, 1),
     );
-    parse_response(&good, "claude-opus-5-5").expect("the baseline is valid");
+    parse_response(&good, "claude-opus-5-5", true).expect("the baseline is valid");
     let mut error_without_content = json!({"type": "error",
         "error": {"type": "overloaded_error", "message": "m"}});
     assert!(invalid(&error_without_content).contains("server reported overloaded_error"));
@@ -979,8 +980,12 @@ fn tool_blocks_without_a_tool_use_stop_are_refused() {
         ("max_tokens", kiln_harness::provider::StopReason::MaxTokens),
         ("refusal", kiln_harness::provider::StopReason::Refusal),
     ] {
-        let parsed =
-            parse_response(&message(&call, stop, &usage(10, 10)), "claude-opus-5-5").expect(stop);
+        let parsed = parse_response(
+            &message(&call, stop, &usage(10, 10)),
+            "claude-opus-5-5",
+            true,
+        )
+        .expect(stop);
         assert_eq!(parsed.stop_reason, expected);
     }
 }
@@ -1002,7 +1007,7 @@ fn the_captured_live_usage_parses() {
         fixture,
         "the test helper is the captured shape"
     );
-    let response = parse_response(&live_body("claude-opus-5-5"), "claude-opus-5-5")
+    let response = parse_response(&live_body("claude-opus-5-5"), "claude-opus-5-5", true)
         .expect("the real API's usage is valid");
     assert_eq!(
         response.usage,
@@ -1017,7 +1022,7 @@ fn the_captured_live_usage_parses() {
     let mut future = live_body("claude-opus-5-5");
     future["usage"]["server_tool_use"] = json!({"web_search_requests": 0});
     future["usage"]["iterations"][0]["future_field"] = json!({"x": [1, 2]});
-    parse_response(&future, "claude-opus-5-5").expect("extra fields are ignored");
+    parse_response(&future, "claude-opus-5-5", true).expect("extra fields are ignored");
 }
 
 #[tokio::test]
@@ -1054,7 +1059,7 @@ fn a_null_iteration_model_means_the_requested_model() {
         "usage iterations do not end with the serving attempt the top level reports"
     );
     // The same body is consistent for a request that named that model.
-    parse_response(&live_body("claude-opus-4-8"), "claude-opus-4-8")
+    parse_response(&live_body("claude-opus-4-8"), "claude-opus-4-8", true)
         .expect("null model is the requested model");
     // A fallback attempt must name its model.
     let mut body = live_body("claude-opus-5-5");
@@ -1071,7 +1076,7 @@ fn a_null_iteration_model_means_the_requested_model() {
         .as_object_mut()
         .expect("entry")
         .remove("model");
-    parse_response(&body, "claude-opus-5-5").expect("absent is null");
+    parse_response(&body, "claude-opus-5-5", true).expect("absent is null");
     body["usage"]["iterations"][0]["model"] = json!(7);
     assert!(invalid(&body).contains("iterations[0] has no valid model"));
 }
@@ -1118,6 +1123,7 @@ fn fallback_message_comes_once_and_last() {
     parse_response(
         &served_by_fallback(&json!([fallback_entry(5, 1)])),
         "claude-opus-5-5",
+        true,
     )
     .expect("a lone fallback_message is valid");
     // Two declined attempts, then the fallback.
@@ -1126,7 +1132,7 @@ fn fallback_message_comes_once_and_last() {
         declined_entry(4, 3),
         fallback_entry(5, 1)
     ]));
-    let parsed = parse_response(&chain, "claude-opus-5-5").expect("a chain is valid");
+    let parsed = parse_response(&chain, "claude-opus-5-5", true).expect("a chain is valid");
     assert_eq!(parsed.usage.output_tokens, 6);
 }
 
@@ -1151,7 +1157,7 @@ async fn a_metadata_only_final_fallback_refusal_is_a_refusal() {
         "usage": {"input_tokens": 12, "output_tokens": 0,
                   "iterations": [declined_entry(11, 1), fallback_entry(12, 0)]}
     });
-    let parsed = parse_response(&body, "claude-opus-5-5").expect("a valid refusal");
+    let parsed = parse_response(&body, "claude-opus-5-5", true).expect("a valid refusal");
     assert!(
         parsed.output_bytes() > 0,
         "the boundary still counts as bytes"
@@ -1213,4 +1219,191 @@ fn strict_enums_and_consts_must_be_scalars() {
     ] {
         assert!(strict_input_schema(&object(keyword)).is_err());
     }
+}
+
+// G1 and G2, review round four. Fallback blocks follow the documented shape
+// (`from.model`, `to.model`); no live fallback has been captured.
+
+fn fallback_block(from: &str, to: &str) -> Value {
+    json!({"type": "fallback", "from": {"model": from}, "to": {"model": to},
+           "trigger": {"type": "refusal", "category": "cyber"}})
+}
+
+/// Served by `model`, with `content` and the given usage.
+fn served(model: &str, content: &Value, usage: &Value) -> Value {
+    let mut body = message(content, "end_turn", usage);
+    body["model"] = json!(model);
+    body
+}
+
+#[tokio::test]
+async fn fallbacks_on_require_iterations() {
+    // Daybreak r4-repro-01: a fallback boundary and another serving model,
+    // but no per-attempt record.
+    let content = json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"),
+                         {"type": "text", "text": "ok"}]);
+    let missing = served(
+        "claude-opus-4-8",
+        &content,
+        &json!({"input_tokens": 5, "output_tokens": 1}),
+    );
+    assert_eq!(
+        invalid(&missing),
+        "fallbacks are on but usage.iterations is missing"
+    );
+    let mut null = missing.clone();
+    null["usage"]["iterations"] = Value::Null;
+    assert_eq!(
+        invalid(&null),
+        "fallbacks are on but usage.iterations is missing"
+    );
+
+    let server = FakeHttp::start([Reply::json(200, &missing)]).await;
+    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let mut config = short_lifecycle_config();
+    config.max_total_input_tokens = 10;
+    config.max_total_output_tokens = 10;
+    let mut harness = harness_for(provider, config);
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+    let HarnessError::Provider(error) = error else {
+        panic!("{error}");
+    };
+    assert_eq!(
+        error.message,
+        "fallbacks are on but usage.iterations is missing"
+    );
+    assert_eq!(server.requests()[0].json()["fallbacks"], "default");
+}
+
+#[tokio::test]
+async fn fallbacks_off_allows_top_level_usage_and_refuses_fallback_signs() {
+    let text = json!([{"type": "text", "text": "ok"}]);
+    let plain = served(
+        "claude-opus-5-5",
+        &text,
+        &json!({"input_tokens": 5, "output_tokens": 1}),
+    );
+    parse_response(&plain, "claude-opus-5-5", false).expect("no iterations needed");
+    // The live shape is fine without fallbacks too.
+    parse_response(
+        &served("claude-opus-5-5", &text, &usage(5, 1)),
+        "claude-opus-5-5",
+        false,
+    )
+    .expect("a lone message iteration");
+
+    let with_block = served(
+        "claude-opus-5-5",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), {"type": "text", "text": "ok"}]),
+        &json!({"input_tokens": 5, "output_tokens": 1}),
+    );
+    assert_eq!(
+        parse_response(&with_block, "claude-opus-5-5", false)
+            .expect_err("a fallback block")
+            .message,
+        "a fallback block, but the request did not ask for fallbacks"
+    );
+    let with_entry = served(
+        "claude-opus-4-8",
+        &text,
+        &json!({"input_tokens": 5, "output_tokens": 1,
+                "iterations": [fallback_entry(5, 1)]}),
+    );
+    assert_eq!(
+        parse_response(&with_entry, "claude-opus-5-5", false)
+            .expect_err("a fallback entry")
+            .message,
+        "a fallback_message iteration, but the request did not ask for fallbacks"
+    );
+
+    // End to end with fallbacks off: the request has none, the response
+    // needs no iterations.
+    let server = FakeHttp::start([Reply::json(200, &plain)]).await;
+    let mut config = config_with(&base(&server), KEY);
+    config.fallbacks = false;
+    let provider = AnthropicProvider::new(config).expect("provider");
+    let mut harness = harness_for(provider, short_lifecycle_config());
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("completes");
+    assert_eq!(outcome.final_answer, "ok");
+    assert!(server.requests()[0].json().get("fallbacks").is_none());
+}
+
+#[test]
+fn fallback_blocks_must_match_the_usage() {
+    let mismatch = "fallback blocks do not match the usage iterations";
+    let answer = json!({"type": "text", "text": "ok"});
+    // Daybreak r4-repro-02: a fallback boundary, but the usage and the
+    // top-level model say the requested model served.
+    let unserved = served(
+        "claude-opus-5-5",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), answer]),
+        &usage(18, 1),
+    );
+    assert_eq!(invalid(&unserved), mismatch);
+
+    let fallback_usage = |iterations: Value| json!({"input_tokens": 5, "output_tokens": 1, "iterations": iterations});
+    let chain = || fallback_usage(json!([declined_entry(4, 2), fallback_entry(5, 1)]));
+    // `to` names a model other than the one that served.
+    let wrong_to = served(
+        "claude-opus-4-8",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-5"), answer]),
+        &chain(),
+    );
+    assert_eq!(invalid(&wrong_to), mismatch);
+    // `from` is not the requested model.
+    let wrong_from = served(
+        "claude-opus-4-8",
+        &json!([
+            fallback_block("claude-sonnet-5-5", "claude-opus-4-8"),
+            answer
+        ]),
+        &chain(),
+    );
+    assert_eq!(invalid(&wrong_from), mismatch);
+    // Block models must be identifiers.
+    let mut bad = served(
+        "claude-opus-4-8",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), answer]),
+        &chain(),
+    );
+    bad["content"][0]["to"]["model"] = json!("claude opus");
+    assert_eq!(invalid(&bad), "fallback block has no valid to.model");
+    bad["content"][0]["to"] = json!({});
+    assert_eq!(invalid(&bad), "fallback block has no valid to.model");
+
+    // A valid single hop.
+    let single = served(
+        "claude-opus-4-8",
+        &json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), answer]),
+        &chain(),
+    );
+    parse_response(&single, "claude-opus-5-5", true).expect("one hop");
+    // Two hops: only the first `from` and the last `to` are checked.
+    let two = served(
+        "claude-opus-4-8",
+        &json!([
+            fallback_block("claude-opus-5-5", "claude-opus-5"),
+            fallback_block("claude-opus-5", "claude-opus-4-8"),
+            answer
+        ]),
+        &fallback_usage(json!([
+            declined_entry(4, 2),
+            {"type": "message", "model": "claude-opus-5", "input_tokens": 4, "output_tokens": 2},
+            fallback_entry(5, 1)
+        ])),
+    );
+    parse_response(&two, "claude-opus-5-5", true).expect("two hops");
+    // Sticky routing: a lone fallback_message and no block.
+    let sticky = served(
+        "claude-opus-4-8",
+        &json!([answer]),
+        &fallback_usage(json!([fallback_entry(5, 1)])),
+    );
+    parse_response(&sticky, "claude-opus-5-5", true).expect("sticky");
 }

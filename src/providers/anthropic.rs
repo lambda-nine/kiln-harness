@@ -93,8 +93,14 @@
 //! the requested one) and exactly the top-level counters, or the response
 //! is `InvalidResponse`. When any entry is a `fallback_message`, it must be
 //! the only one and the last, after `message` attempts only; a lone
-//! `fallback_message` is a sticky-routed turn. Other usage fields are
-//! ignored. The usage is
+//! `fallback_message` is a sticky-routed turn. With fallbacks requested
+//! the array is required; without them it may be missing, and a
+//! `fallback_message` entry or a `fallback` block is refused. When the
+//! content holds `fallback` blocks, the last entry must be a
+//! `fallback_message`, the last block's `to.model` must be its model and
+//! the response's `model`, and the first block's `from.model` the
+//! requested model (only those two fields are read; the blocks are echoed
+//! verbatim). Other usage fields are ignored. The usage is
 //! then the saturating sum of every entry, without the top level counted
 //! again, so the per-request output cap covers one model call with all its
 //! attempts; `--no-fallbacks` gives a strict per-attempt cap. Zero total
@@ -476,7 +482,12 @@ impl AnthropicProvider {
         let key = key.as_ref();
         if exchange.status.is_success() {
             let value = http::decode_success(&exchange, limit, key)?;
-            let parsed = parse_response_quoting(&value, &self.config.model, key.is_none())?;
+            let parsed = parse_response_quoting(
+                &value,
+                &self.config.model,
+                self.config.fallbacks,
+                key.is_none(),
+            )?;
             if key.is_some_and(|key| key.in_response(&parsed)) {
                 return Err(http::credential_echo());
             }
@@ -788,23 +799,21 @@ fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
 /// implausible usage. An error object in the body is reported by its
 /// allowlisted type only, as for an authenticated request.
 /// `requested_model` is the model the request named; an iteration without a
-/// model ran on it.
+/// model ran on it. `fallbacks` is whether the request asked for
+/// server-side fallbacks: with them, `usage.iterations` is required; without
+/// them, any sign of a fallback is refused.
 pub fn parse_response(
     value: &Value,
     requested_model: &str,
+    fallbacks: bool,
 ) -> Result<ModelResponse, ProviderError> {
-    parse_response_quoting(value, requested_model, false)
+    parse_response_quoting(value, requested_model, fallbacks, false)
 }
 
-/// [`parse_response`], quoting an error object in the body only when
-/// `quote` (a request without a key).
-fn parse_response_quoting(
-    value: &Value,
-    requested_model: &str,
-    quote: bool,
-) -> Result<ModelResponse, ProviderError> {
-    // The success envelope comes first: an error object is never read as a
-    // message, whatever else it carries.
+/// The non-streaming success envelope, checked before anything else so an
+/// error object is never read as a message, whatever else it carries.
+/// Returns the serving model.
+fn check_envelope(value: &Value, quote: bool) -> Result<String, ProviderError> {
     match value.get("type").and_then(Value::as_str) {
         Some("message") => {}
         Some("error") => {
@@ -821,11 +830,22 @@ fn parse_response_quoting(
     if value.get("role").and_then(Value::as_str) != Some("assistant") {
         return Err(invalid("response role is not \"assistant\""));
     }
-    let model = match value.get("model") {
-        Some(Value::String(model)) if model_id_is_valid(model) => model.clone(),
-        None | Some(Value::Null) => return Err(invalid("response has no model")),
-        Some(_) => return Err(invalid("response model is not a model identifier")),
-    };
+    match value.get("model") {
+        Some(Value::String(model)) if model_id_is_valid(model) => Ok(model.clone()),
+        None | Some(Value::Null) => Err(invalid("response has no model")),
+        Some(_) => Err(invalid("response model is not a model identifier")),
+    }
+}
+
+/// [`parse_response`], quoting an error object in the body only when
+/// `quote` (a request without a key).
+fn parse_response_quoting(
+    value: &Value,
+    requested_model: &str,
+    fallbacks: bool,
+    quote: bool,
+) -> Result<ModelResponse, ProviderError> {
+    let model = check_envelope(value, quote)?;
     let Some(blocks) = value.get("content").and_then(Value::as_array) else {
         return Err(invalid("response has no content array"));
     };
@@ -889,7 +909,21 @@ fn parse_response_quoting(
     if let Some(details) = &stop_details {
         check_exact_numbers(details)?;
     }
-    let (usage, serving_output) = parse_usage(value.get("usage"), &model, requested_model)?;
+    let hops = fallback_hops(blocks)?;
+    if hops.is_some() && !fallbacks {
+        return Err(invalid(
+            "a fallback block, but the request did not ask for fallbacks",
+        ));
+    }
+    let (usage, serving_output) = parse_usage(
+        value.get("usage"),
+        &Expected {
+            model: &model,
+            requested_model,
+            fallbacks,
+            hops,
+        },
+    )?;
     let response = ModelResponse {
         text,
         tool_calls,
@@ -967,6 +1001,40 @@ fn model_id_is_valid(model: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._:@/-".contains(&byte))
 }
 
+/// The first `from.model` and the last `to.model` of the response's
+/// `fallback` blocks, when it has any. Every block must name both, as valid
+/// identifiers. The blocks themselves are echoed verbatim; only these two
+/// fields are read, to reconcile the content with the usage.
+fn fallback_hops(blocks: &[Value]) -> Result<Option<(&str, &str)>, ProviderError> {
+    let mut hops: Option<(&str, &str)> = None;
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) != Some("fallback") {
+            continue;
+        }
+        let side = |name: &str| {
+            block
+                .get(name)
+                .and_then(|side| side.get("model"))
+                .and_then(Value::as_str)
+                .filter(|model| model_id_is_valid(model))
+                .ok_or_else(|| invalid(format!("fallback block has no valid {name}.model")))
+        };
+        let (from, to) = (side("from")?, side("to")?);
+        hops = Some((hops.map_or(from, |(first, _)| first), to));
+    }
+    Ok(hops)
+}
+
+/// What the response's usage must agree with.
+struct Expected<'a> {
+    /// The response's top-level `model`.
+    model: &'a str,
+    requested_model: &'a str,
+    fallbacks: bool,
+    /// From [`fallback_hops`].
+    hops: Option<(&'a str, &'a str)>,
+}
+
 /// The response's usage, and the output count of the serving attempt.
 ///
 /// The top-level counters are always checked; they describe the attempt
@@ -983,16 +1051,27 @@ fn model_id_is_valid(model: &str) -> bool {
 /// level added again. Fields other than the four counters, `iterations`,
 /// and each entry's `type` and `model` (`cache_creation`,
 /// `output_tokens_details`, `service_tier`, and so on) are ignored.
+///
+/// With fallbacks requested, `iterations` is required. Without them, a
+/// missing array is allowed and a `fallback_message` entry is refused. When
+/// the content holds `fallback` blocks, the last entry must be a
+/// `fallback_message`, the last block's `to.model` must be its model and the
+/// response's, and the first block's `from.model` must be the requested
+/// model. A `fallback_message` without blocks is a sticky-routed turn.
 fn parse_usage(
     usage: Option<&Value>,
-    model: &str,
-    requested_model: &str,
+    expected: &Expected<'_>,
 ) -> Result<(Usage, u64), ProviderError> {
+    let model = expected.model;
+    let requested_model = expected.requested_model;
     let usage = usage
         .filter(|usage| usage.is_object())
         .ok_or_else(|| invalid("response has no usage; token budgets cannot be enforced"))?;
     let serving = counters(usage, "usage")?;
     let total = match usage.get("iterations") {
+        None | Some(Value::Null) if expected.fallbacks => {
+            return Err(invalid("fallbacks are on but usage.iterations is missing"));
+        }
         None | Some(Value::Null) => serving,
         Some(Value::Array(attempts)) if !attempts.is_empty() => {
             let mut sum = Usage::default();
@@ -1034,10 +1113,26 @@ fn parse_usage(
                 .and_then(|attempt| attempt.get("type"))
                 .and_then(Value::as_str)
                 == Some("fallback_message");
+            if fallbacks > 0 && !expected.fallbacks {
+                return Err(invalid(
+                    "a fallback_message iteration, but the request did not ask for fallbacks",
+                ));
+            }
             if fallbacks > 0 && !(fallbacks == 1 && ends_in_fallback) {
                 return Err(invalid(
                     "usage iterations must be message attempts then one fallback_message",
                 ));
+            }
+            // Fallback blocks in the content must describe this chain.
+            if let Some((from, to)) = expected.hops {
+                let terminal = last.and_then(|(attempt_model, _)| attempt_model);
+                if !ends_in_fallback
+                    || terminal != Some(to)
+                    || to != model
+                    || from != requested_model
+                {
+                    return Err(invalid("fallback blocks do not match the usage iterations"));
+                }
             }
             match last {
                 Some((last_model, counted))
@@ -1239,8 +1334,8 @@ mod tests {
         let other = SecretString::new("sk-ant-unrelated-key-1234");
         assert_eq!(scrub(echo.clone(), Some(&other)), echo);
 
-        let parse =
-            parse_response(&json!({"type": "completion"}), DEFAULT_MODEL).expect_err("invalid");
+        let parse = parse_response(&json!({"type": "completion"}), DEFAULT_MODEL, true)
+            .expect_err("invalid");
         let scrubbed = scrub(parse, Some(&SecretString::new("is not")));
         assert_eq!(
             (scrubbed.kind, scrubbed.message.as_str()),
