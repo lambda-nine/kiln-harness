@@ -324,7 +324,10 @@ fn iterations_must_end_with_the_serving_attempt() {
         json!([{"type": "fallback_message", "model": "claude-opus-4-8",
                 "input_tokens": 5, "output_tokens": 1}, declined]),
     );
-    assert_eq!(invalid(&not_last), mismatch);
+    assert_eq!(
+        invalid(&not_last),
+        "usage iterations must be message attempts then one fallback_message"
+    );
     // Only the declined attempt, no serving entry.
     let missing = body(
         json!({"input_tokens": 5, "output_tokens": 1}),
@@ -1071,4 +1074,143 @@ fn a_null_iteration_model_means_the_requested_model() {
     parse_response(&body, "claude-opus-5-5").expect("absent is null");
     body["usage"]["iterations"][0]["model"] = json!(7);
     assert!(invalid(&body).contains("iterations[0] has no valid model"));
+}
+
+// F1-F3, review round three.
+
+fn fallback_entry(input: u64, output: u64) -> Value {
+    json!({"type": "fallback_message", "model": "claude-opus-4-8",
+           "input_tokens": input, "output_tokens": output})
+}
+
+fn declined_entry(input: u64, output: u64) -> Value {
+    json!({"type": "message", "model": "claude-opus-5-5",
+           "input_tokens": input, "output_tokens": output})
+}
+
+/// A response served by claude-opus-4-8 with the given iterations; the top
+/// level mirrors a 5/1 serving attempt. Documented shape, not captured.
+fn served_by_fallback(iterations: &Value) -> Value {
+    let mut body = message(
+        &json!([{"type": "text", "text": "ok"}]),
+        "end_turn",
+        &json!({"input_tokens": 5, "output_tokens": 1, "iterations": iterations}),
+    );
+    body["model"] = json!("claude-opus-4-8");
+    body
+}
+
+#[test]
+fn fallback_message_comes_once_and_last() {
+    let order = "usage iterations must be message attempts then one fallback_message";
+    // Daybreak r3-repro-01: the fallback first, a message after it.
+    let reversed = served_by_fallback(&json!([fallback_entry(5, 1), declined_entry(5, 1)]));
+    assert_eq!(invalid(&reversed), order);
+    let twice = served_by_fallback(&json!([fallback_entry(5, 1), fallback_entry(5, 1)]));
+    assert_eq!(invalid(&twice), order);
+    let middle = served_by_fallback(&json!([
+        declined_entry(5, 1),
+        fallback_entry(5, 1),
+        fallback_entry(5, 1)
+    ]));
+    assert_eq!(invalid(&middle), order);
+    // A sticky-routed turn: one fallback_message alone.
+    parse_response(
+        &served_by_fallback(&json!([fallback_entry(5, 1)])),
+        "claude-opus-5-5",
+    )
+    .expect("a lone fallback_message is valid");
+    // Two declined attempts, then the fallback.
+    let chain = served_by_fallback(&json!([
+        declined_entry(4, 2),
+        declined_entry(4, 3),
+        fallback_entry(5, 1)
+    ]));
+    let parsed = parse_response(&chain, "claude-opus-5-5").expect("a chain is valid");
+    assert_eq!(parsed.usage.output_tokens, 6);
+}
+
+#[tokio::test]
+async fn a_metadata_only_final_fallback_refusal_is_a_refusal() {
+    // Daybreak r3-repro-02: the declined primary spent a token, the final
+    // fallback declined before output, and content is only the boundary.
+    let mut body = json!({
+        "id": "msg_r3_02",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [{
+            "type": "fallback",
+            "from": {"model": "claude-opus-5-5"},
+            "to": {"model": "claude-opus-4-8"},
+            "trigger": {"type": "refusal", "category": "cyber"}
+        }],
+        "stop_reason": "refusal",
+        "stop_details": {"type": "refusal", "category": "cyber",
+                         "explanation": "The final fallback declined before output."},
+        "usage": {"input_tokens": 12, "output_tokens": 0,
+                  "iterations": [declined_entry(11, 1), fallback_entry(12, 0)]}
+    });
+    let parsed = parse_response(&body, "claude-opus-5-5").expect("a valid refusal");
+    assert!(
+        parsed.output_bytes() > 0,
+        "the boundary still counts as bytes"
+    );
+    let server = FakeHttp::start([Reply::json(200, &body)]).await;
+    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let mut harness = harness_for(provider, short_lifecycle_config());
+    let error = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, HarnessError::ModelRefused), "{error}");
+
+    // Any other block still needs a token from the serving attempt.
+    body["content"]
+        .as_array_mut()
+        .expect("content")
+        .push(json!({"type": "thinking", "thinking": "", "signature": "c2ln"}));
+    assert_eq!(
+        invalid(&body),
+        "usage reports zero completion tokens for non-empty output"
+    );
+}
+
+#[test]
+fn strict_enums_and_consts_must_be_scalars() {
+    let object = |property: Value| {
+        json!({"type": "object", "additionalProperties": false,
+               "properties": {"choice": property}})
+    };
+    // Daybreak r3-repro-03's complex enum.
+    assert_eq!(
+        strict_input_schema(&object(json!({"enum": [{"branch": "one"}]}))).expect_err("object"),
+        "input_schema.properties.choice.enum[0] is not a scalar"
+    );
+    assert_eq!(
+        strict_input_schema(&object(json!({"enum": ["a", [1]]}))).expect_err("array"),
+        "input_schema.properties.choice.enum[1] is not a scalar"
+    );
+    assert_eq!(
+        strict_input_schema(&object(json!({"enum": "a"}))).expect_err("not a list"),
+        "input_schema.properties.choice.enum is not an array"
+    );
+    assert_eq!(
+        strict_input_schema(&object(json!({"const": {"x": 1}}))).expect_err("const"),
+        "input_schema.properties.choice.const is not a scalar"
+    );
+    let scalar = object(json!({"enum": ["a", 1, true, null]}));
+    assert_eq!(
+        strict_input_schema(&scalar).expect("scalars")["properties"],
+        scalar["properties"]
+    );
+    strict_input_schema(&object(json!({"const": "fixed"}))).expect("scalar const");
+    // The repro's pattern and format stay refused: a deliberately narrow
+    // subset, even where the API might accept them.
+    for keyword in [
+        json!({"type": "string", "pattern": "^a$"}),
+        json!({"type": "string", "format": "email"}),
+    ] {
+        assert!(strict_input_schema(&object(keyword)).is_err());
+    }
 }

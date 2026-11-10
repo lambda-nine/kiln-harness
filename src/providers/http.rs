@@ -626,7 +626,8 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
 
 /// Refuse `completion`, the output-token count of the attempt that produced
 /// `response`'s content, when it cannot be right for the output kept: zero
-/// for non-empty output (opaque content blocks included), or fewer than one
+/// for non-empty output (the neutral view, or opaque content the adapter
+/// says needs tokens, `opaque_output`), or fewer than one
 /// token per [`MAX_OUTPUT_BYTES_PER_TOKEN`] bytes of
 /// [`ModelResponse::token_floor_bytes`]. Real tokenizers average a few bytes
 /// per token and rarely exceed 16, so the floor only catches gross
@@ -636,15 +637,10 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
 pub(crate) fn check_completion_tokens(
     response: &ModelResponse,
     completion: u64,
+    opaque_output: bool,
 ) -> Result<(), ProviderError> {
     let output_bytes = response.token_floor_bytes();
-    let opaque = response.provider_content.as_ref().is_some_and(|content| {
-        content
-            .blocks
-            .as_array()
-            .is_none_or(|blocks| !blocks.is_empty())
-    });
-    if (output_bytes > 0 || opaque) && completion == 0 {
+    if (output_bytes > 0 || opaque_output) && completion == 0 {
         return Err(invalid(
             "usage reports zero completion tokens for non-empty output",
         ));

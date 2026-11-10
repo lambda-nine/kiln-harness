@@ -234,9 +234,13 @@ built-in tools that is `exec.argv.maxItems`, `exec.timeout_ms.minimum`, and
 `read_file.max_bytes.minimum`, while `exec.argv.minItems: 1` stays. An
 object schema without `required` gets `"required": []`. Any other keyword
 (`pattern`, `multipleOf`, `$ref`, `$defs`, `format`, `oneOf`, ...), tuple
-`items`, or an object schema without `"additionalProperties": false` is
-refused with its path rather than dropped, since nothing would enforce it,
-and the built-in tools are checked this way when the provider is built. The canonical schemas in
+`items`, an `enum` or `const` member that is not a string, integer,
+boolean, or null, or an object schema without
+`"additionalProperties": false` is refused with its path rather than
+dropped, since nothing would enforce it, and the built-in tools are checked
+this way when the provider is built. The subset is deliberately narrow and
+fails closed: it refuses some constructs the API's strict mode may accept,
+because the harness's tools need none of them. The canonical schemas in
 `ToolDefinition`, the journal, and the request hash are unchanged, and the
 typed tools still enforce every removed bound.
 
@@ -292,8 +296,14 @@ fallback ran. When the array is present, every entry needs a known `type`
 or absent, meaning the requested model. The last entry must be the serving
 attempt: the response's `model` (an entry without one matches only when
 the response's `model` is the requested one) and exactly the top-level
-counters. Other usage fields (`cache_creation`, `output_tokens_details`,
-`service_tier`, and the like) are ignored. A response whose two views of the serving
+counters. When any entry is a `fallback_message`, there is exactly one and
+it is last, after `message` attempts only; a lone `fallback_message` is a
+sticky-routed turn. Other usage fields (`cache_creation`,
+`output_tokens_details`, `service_tier`, and the like) are ignored. The
+zero-output check exempts `fallback` blocks, which are boundary metadata
+rather than generated output, so a final fallback that declined before
+output is a refusal, not invalid usage; every other block, unknown ones
+included, still needs a token, and `fallback` blocks still count as bytes. A response whose two views of the serving
 attempt disagree is `InvalidResponse`; neither side is picked. The usage is
 then the saturating sum of every entry, without adding the top level
 again; without the array it is the top level. The per-request output cap therefore covers one model

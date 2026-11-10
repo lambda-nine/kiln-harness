@@ -6,6 +6,14 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Third review round for the anthropic provider: a `fallback_message`
+  iteration must be the only one and the last, after `message` attempts;
+  content made only of `fallback` boundary blocks may carry zero output
+  tokens, so a final fallback that declined before output reaches the
+  engine as a refusal (the blocks still count as bytes, and every other
+  block still needs a token); and strict-mode `enum` and `const` members
+  must be strings, integers, booleans, or null. The strict subset is
+  documented as deliberately narrow.
 - The live API sends `usage.iterations` on every response when fallbacks
   are on, with `"model": null` for an attempt on the requested model, which
   the second-round validation refused. A `message` iteration may now leave

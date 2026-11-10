@@ -91,7 +91,10 @@
 //! requested model. The last must be the serving attempt, with the
 //! response's `model` (or, when it names none, a response `model` equal to
 //! the requested one) and exactly the top-level counters, or the response
-//! is `InvalidResponse`. Other usage fields are ignored. The usage is
+//! is `InvalidResponse`. When any entry is a `fallback_message`, it must be
+//! the only one and the last, after `message` attempts only; a lone
+//! `fallback_message` is a sticky-routed turn. Other usage fields are
+//! ignored. The usage is
 //! then the saturating sum of every entry, without the top level counted
 //! again, so the per-request output cap covers one model call with all its
 //! attempts; `--no-fallbacks` gives a strict per-attempt cap. Zero total
@@ -690,10 +693,23 @@ pub const STRICT_STRIPPED_KEYWORDS: [&str; 8] = [
 /// Any other keyword (`pattern`, `multipleOf`, `$ref`, `$defs`, `format`,
 /// `oneOf`, ...) is refused with its path rather than dropped, since
 /// dropping a constraint nothing enforces locally would weaken validation;
-/// so are tuple `items` and an object schema without
-/// `"additionalProperties": false`, which strict mode requires.
+/// so are tuple `items`, an `enum` or `const` with a member that is not a
+/// string, integer, boolean, or null, and an object schema without
+/// `"additionalProperties": false`, which strict mode requires. The subset
+/// is deliberately narrow: it refuses some constructs the API's strict mode
+/// may accept, because the harness's tools do not need them.
 pub fn strict_input_schema(schema: &Value) -> Result<Value, String> {
     strict_schema_at(schema, "input_schema")
+}
+
+/// A string, integer, boolean, or null: what strict `enum` and `const`
+/// members may be. Floats are excluded too, matching the exact-number rule.
+fn is_scalar(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+        Value::Number(number) => number.is_i64() || number.is_u64(),
+        Value::Array(_) | Value::Object(_) => false,
+    }
 }
 
 fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
@@ -734,6 +750,16 @@ fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
                 ),
                 _ => return Err(format!("{here} is not an array")),
             },
+            "enum" => match value {
+                Value::Array(members) => {
+                    if let Some(index) = members.iter().position(|member| !is_scalar(member)) {
+                        return Err(format!("{here}[{index}] is not a scalar"));
+                    }
+                    value.clone()
+                }
+                _ => return Err(format!("{here} is not an array")),
+            },
+            "const" if !is_scalar(value) => return Err(format!("{here} is not a scalar")),
             keyword if STRICT_KEPT_KEYWORDS.contains(&keyword) => value.clone(),
             _ => return Err(format!("{here} is not supported in strict mode")),
         };
@@ -877,8 +903,14 @@ fn parse_response_quoting(
         }),
     };
     // The serving attempt produced the returned content, so its own output
-    // count must account for it; declined attempts' output cannot.
-    check_completion_tokens(&response, serving_output)?;
+    // count must account for it; declined attempts' output cannot. A
+    // `fallback` block is boundary metadata the API adds, not generated
+    // output, so content that is only fallback blocks may cost no tokens;
+    // every other block, unknown ones included, counts conservatively.
+    let opaque_output = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) != Some("fallback"));
+    check_completion_tokens(&response, serving_output, opaque_output)?;
     Ok(response)
 }
 
@@ -965,6 +997,7 @@ fn parse_usage(
         Some(Value::Array(attempts)) if !attempts.is_empty() => {
             let mut sum = Usage::default();
             let mut last = None;
+            let mut fallbacks = 0_usize;
             for (index, attempt) in attempts.iter().enumerate() {
                 let what = format!("usage iterations[{index}]");
                 if !attempt.is_object() {
@@ -989,6 +1022,22 @@ fn parse_usage(
                 }
                 sum = sum + counted;
                 last = Some((attempt_model, counted));
+                if tag == "fallback_message" {
+                    fallbacks += 1;
+                }
+            }
+            // A fallback chain is requested-model attempts, then the one
+            // fallback attempt that served; a lone fallback_message is a
+            // sticky-routed turn.
+            let ends_in_fallback = attempts
+                .last()
+                .and_then(|attempt| attempt.get("type"))
+                .and_then(Value::as_str)
+                == Some("fallback_message");
+            if fallbacks > 0 && !(fallbacks == 1 && ends_in_fallback) {
+                return Err(invalid(
+                    "usage iterations must be message attempts then one fallback_message",
+                ));
             }
             match last {
                 Some((last_model, counted))
