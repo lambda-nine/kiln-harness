@@ -1509,3 +1509,155 @@ async fn an_interrupted_unrecorded_tool_diverges_and_leaves_replay_unexhausted()
     assert_eq!(replay.provider().diverged_at(), Some(1));
     assert!(!replay.provider().exhausted());
 }
+
+#[test]
+fn a_failed_open_removes_only_what_it_created() {
+    use kiln_harness::audit::JsonlAudit;
+
+    let temp = common::private_tempdir().expect("temp dir");
+    let kept = temp.path().join("kept");
+    common::dir_all_with_mode(&kept, 0o700);
+    std::fs::write(kept.join("other"), b"keep").expect("other file");
+    // A final name over NAME_MAX fails the last openat, after the walk has
+    // created two directories.
+    let long = "x".repeat(300);
+
+    let error = JsonlJournal::open(&kept.join("created/nested").join(&long))
+        .err()
+        .expect("the name is too long");
+    assert!(matches!(error, JournalError::Io(_)), "{error}");
+    assert!(
+        !kept.join("created").exists(),
+        "created directories are removed"
+    );
+    assert!(
+        kept.join("other").is_file(),
+        "existing entries are untouched"
+    );
+
+    let error = JsonlAudit::open(&kept.join("audit-created/nested").join(&long))
+        .err()
+        .expect("the name is too long");
+    assert!(
+        matches!(error, kiln_harness::audit::AuditError::Io(_)),
+        "{error}"
+    );
+    assert!(!kept.join("audit-created").exists());
+    assert!(kept.is_dir());
+}
+
+#[test]
+fn discarding_an_unwritten_output_removes_its_new_directories() {
+    use kiln_harness::audit::JsonlAudit;
+
+    let temp = common::private_tempdir().expect("temp dir");
+    let journal =
+        JsonlJournal::open(&temp.path().join("new/deeper/journal.jsonl")).expect("open journal");
+    journal.discard();
+    assert!(!temp.path().join("new").exists());
+
+    // An existing audit opened for appending is never removed.
+    let existing = temp.path().join("audit.jsonl");
+    std::fs::write(&existing, b"").expect("existing audit");
+    let audit = JsonlAudit::open(&existing).expect("open audit");
+    assert!(!audit.created());
+    audit.discard();
+    assert!(existing.is_file());
+
+    // A journal that has written a record is not discarded.
+    let path = temp.path().join("kept/journal.jsonl");
+    let mut written = JsonlJournal::open(&path).expect("open journal");
+    written
+        .append(
+            "hs-test",
+            JournalEvent::SessionStarted {
+                schema: 1,
+                harness_version: "0.1.0".to_string(),
+                provider: kiln_harness::provider::ProviderInfo {
+                    name: "test".to_string(),
+                    model: "test".to_string(),
+                },
+                system: String::new(),
+                task: "task".to_string(),
+                tools: Vec::new(),
+                limits: HarnessConfig::default().limits(),
+            },
+        )
+        .expect("first record");
+    written.discard();
+    assert!(path.is_file());
+}
+
+#[test]
+fn unreadable_ancestors_are_refused_by_name() {
+    if rustix::process::geteuid().is_root() {
+        println!("skipped: root can read any directory");
+        return;
+    }
+    let temp = common::private_tempdir().expect("temp dir");
+    let ancestor = temp.path().join("search-only");
+    let parent = ancestor.join("private");
+    common::dir_all_with_mode(&parent, 0o700);
+    set_mode(&ancestor, 0o111);
+
+    let result = JsonlJournal::open(&parent.join("journal.jsonl"));
+
+    set_mode(&ancestor, 0o700);
+    let error = result.err().expect("the walk must read each directory");
+    assert!(
+        matches!(
+            &error,
+            JournalError::UnsafeDirectory {
+                path,
+                problem: DirectoryProblem::NotReadable,
+                ..
+            } if path.ends_with("search-only")
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("search-only"), "{message}");
+    assert!(message.contains("chmod u+rx"), "{message}");
+}
+
+#[test]
+fn the_audit_follows_the_same_directory_rule() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use kiln_harness::audit::{AuditError, JsonlAudit};
+
+    let temp = common::private_tempdir().expect("temp dir");
+    let shared = temp.path().join("shared");
+    common::dir_all_with_mode(&shared, 0o770);
+
+    let error = JsonlAudit::open(&shared.join("audit.jsonl"))
+        .err()
+        .expect("a group-writable audit directory is refused");
+
+    assert!(
+        matches!(
+            &error,
+            AuditError::UnsafeDirectory {
+                problem: DirectoryProblem::WritableByOthers,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("--audit"), "{error}");
+    assert!(!shared.join("audit.jsonl").exists());
+
+    // Inside a private directory the audit opens, and a created file is 0600.
+    let audit_path = temp.path().join("private/nested/audit.jsonl");
+    let audit = JsonlAudit::open(&audit_path).expect("private audit");
+    assert!(audit.created());
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(mode(&audit_path), 0o600);
+    assert_eq!(mode(&temp.path().join("private")), 0o700);
+}

@@ -7,7 +7,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,11 +16,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 // The harness reaches kilnd over a Unix socket and is Unix-only.
-use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 
 use rustix::fs::{Mode, OFlags};
 
+pub use crate::outputs::DirectoryProblem;
+use crate::outputs::{Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{
     Message, ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall,
     ToolDefinition, ToolResult, Usage,
@@ -133,6 +134,24 @@ pub struct JournalRecord {
     pub event: JournalEvent,
 }
 
+impl From<OutputError> for JournalError {
+    fn from(error: OutputError) -> Self {
+        match error {
+            OutputError::InvalidPath(path) => Self::InvalidPath(path),
+            OutputError::UnsafeDirectory {
+                path,
+                mode,
+                problem,
+            } => Self::UnsafeDirectory {
+                path,
+                mode,
+                problem,
+            },
+            OutputError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum JournalError {
     #[error("journal I/O failed: {0}")]
@@ -185,12 +204,7 @@ pub enum JournalError {
     Grammar { sequence: u64, reason: String },
     #[error("journal path {0:?} does not name a file")]
     InvalidPath(PathBuf),
-    #[error(
-        "journal directory {shown} is unsafe: {problem} (mode {mode_text}); {remedy}",
-        shown = path.display(),
-        mode_text = mode.map_or_else(|| "unknown".to_string(), |mode| format!("{:04o}", mode & 0o7777)),
-        remedy = problem.remedy(path),
-    )]
+    #[error("{}", describe_unsafe("journal", "--journal", path, *mode, *problem))]
     UnsafeDirectory {
         path: PathBuf,
         /// The directory's mode from `fstat`, when it could be opened.
@@ -292,6 +306,8 @@ impl Chain {
 pub struct JsonlJournal {
     file: File,
     chain: Chain,
+    /// What `open` created, kept until the first record is written.
+    rollback: Option<Rollback>,
 }
 
 impl JsonlJournal {
@@ -313,28 +329,22 @@ impl JsonlJournal {
     /// Returns an error if the path already exists, a directory is unsafe or
     /// a symlink, or the file cannot be created.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
-        crate::outputs::validate_file_path(path).map_err(JournalError::InvalidPath)?;
-        let name = path
-            .file_name()
-            .ok_or_else(|| JournalError::InvalidPath(path.to_path_buf()))?;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let directory = open_verified_directory(&resolved_directory(parent)?)?;
-        let fd = rustix::fs::openat(
-            &directory,
-            name,
-            OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::WRONLY | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(std::io::Error::from)?;
-        // As for directories: never let a umask or default ACL decide.
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600)).map_err(std::io::Error::from)?;
+        let (file, rollback) = crate::outputs::open_output(path, Existing::Refuse)?;
         Ok(Self {
-            file: File::from(fd),
+            file,
             chain: Chain::default(),
+            rollback: Some(rollback),
         })
+    }
+
+    /// Remove the journal file and any directories `open` created, through
+    /// the pinned directory descriptors, if nothing has been written yet.
+    /// Used when a caller refuses the journal after opening it.
+    pub fn discard(self) {
+        if let Some(rollback) = self.rollback {
+            drop(self.file);
+            rollback.undo();
+        }
     }
 
     /// The device and inode of the open journal file.
@@ -345,182 +355,6 @@ impl JsonlJournal {
     pub fn file_identity(&self) -> Result<(u64, u64), JournalError> {
         let metadata = self.file.metadata()?;
         Ok((metadata.dev(), metadata.ino()))
-    }
-}
-
-/// An absolute starting path for the descriptor walk: the deepest existing
-/// ancestor, canonicalized once, followed by the components that do not exist
-/// yet. Those name nothing on disk, so `.` and `..` among them resolve
-/// lexically. The walk itself re-resolves every component without following
-/// links, so this path is only a starting point.
-fn resolved_directory(parent: &Path) -> Result<PathBuf, JournalError> {
-    let absolute = std::path::absolute(parent)?;
-    let mut existing = absolute.clone();
-    let mut rest = Vec::new();
-    let mut resolved = loop {
-        if let Ok(canonical) = std::fs::canonicalize(&existing) {
-            break canonical;
-        }
-        let Some(last) = existing.components().next_back() else {
-            return Err(JournalError::InvalidPath(parent.to_path_buf()));
-        };
-        rest.push(last.as_os_str().to_os_string());
-        if !existing.pop() {
-            return Err(JournalError::InvalidPath(parent.to_path_buf()));
-        }
-    };
-    for component in rest.iter().rev() {
-        match Path::new(component).components().next() {
-            Some(Component::CurDir) => {}
-            Some(Component::ParentDir) => {
-                resolved.pop();
-            }
-            _ => resolved.push(component),
-        }
-    }
-    Ok(resolved)
-}
-
-/// Walk `directory` from `/` through pinned descriptors, creating missing
-/// components, and return the verified final directory.
-fn open_verified_directory(directory: &Path) -> Result<OwnedFd, JournalError> {
-    let euid = rustix::process::geteuid().as_raw();
-    let walk = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut current = rustix::fs::open("/", walk, Mode::empty()).map_err(std::io::Error::from)?;
-    let mut shown = PathBuf::from("/");
-    let components = directory
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    check_directory(&current, &shown, euid, components.is_empty())?;
-    for (position, name) in components.iter().enumerate() {
-        shown.push(name);
-        let next = match rustix::fs::openat(&current, *name, walk, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(rustix::io::Errno::NOENT) => {
-                let created = match rustix::fs::mkdirat(&current, *name, Mode::from_raw_mode(0o700))
-                {
-                    Ok(()) => true,
-                    Err(rustix::io::Errno::EXIST) => false,
-                    Err(error) => return Err(std::io::Error::from(error).into()),
-                };
-                let fd = rustix::fs::openat(&current, *name, walk, Mode::empty())
-                    .map_err(|error| directory_error(&shown, error))?;
-                if created {
-                    // The umask can only narrow 0700, but a default ACL on
-                    // the parent can widen it; set the mode explicitly.
-                    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))
-                        .map_err(std::io::Error::from)?;
-                }
-                fd
-            }
-            Err(error) => return Err(directory_error(&shown, error)),
-        };
-        check_directory(&next, &shown, euid, position + 1 == components.len())?;
-        current = next;
-    }
-    Ok(current)
-}
-
-fn directory_error(path: &Path, error: rustix::io::Errno) -> JournalError {
-    if matches!(error, rustix::io::Errno::NOTDIR | rustix::io::Errno::LOOP) {
-        JournalError::UnsafeDirectory {
-            path: path.to_path_buf(),
-            mode: None,
-            problem: DirectoryProblem::NotADirectory,
-        }
-    } else {
-        std::io::Error::from(error).into()
-    }
-}
-
-const GROUP_OR_WORLD_WRITABLE: u32 = 0o022;
-const STICKY: u32 = 0o1000;
-
-/// Apply the ownership and mode rules to one open directory.
-fn check_directory(
-    directory: &OwnedFd,
-    path: &Path,
-    euid: u32,
-    is_final: bool,
-) -> Result<(), JournalError> {
-    let stat = rustix::fs::fstat(directory).map_err(std::io::Error::from)?;
-    let mode = u32::from(stat.st_mode);
-    let owner = stat.st_uid;
-    let problem = if is_final {
-        if owner != euid {
-            Some(DirectoryProblem::NotOwned)
-        } else if mode & GROUP_OR_WORLD_WRITABLE != 0 {
-            Some(DirectoryProblem::WritableByOthers)
-        } else {
-            None
-        }
-    } else if owner != 0 && owner != euid {
-        Some(DirectoryProblem::AncestorNotOwned)
-    } else if mode & GROUP_OR_WORLD_WRITABLE != 0 && mode & STICKY == 0 {
-        Some(DirectoryProblem::AncestorWritableWithoutSticky)
-    } else {
-        None
-    };
-    match problem {
-        Some(problem) => Err(JournalError::UnsafeDirectory {
-            path: path.to_path_buf(),
-            mode: Some(mode),
-            problem,
-        }),
-        None => Ok(()),
-    }
-}
-
-/// Why a directory on the way to a journal was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirectoryProblem {
-    /// A component is not a directory, or is a symlink.
-    NotADirectory,
-    /// The journal's own directory is not owned by the effective user.
-    NotOwned,
-    /// The journal's own directory is group- or world-writable.
-    WritableByOthers,
-    /// An ancestor is owned by someone other than root or the effective user.
-    AncestorNotOwned,
-    /// An ancestor is group- or world-writable without the sticky bit.
-    AncestorWritableWithoutSticky,
-}
-
-impl DirectoryProblem {
-    /// What to do about it, naming the directory.
-    #[must_use]
-    pub fn remedy(self, path: &Path) -> String {
-        let shown = path.display();
-        match self {
-            Self::WritableByOthers | Self::AncestorWritableWithoutSticky => format!(
-                "run `chmod g-w,o-w {shown}`, or pass --journal a path under a private directory"
-            ),
-            Self::NotOwned | Self::AncestorNotOwned => {
-                "pass --journal a path under a directory you own".to_string()
-            }
-            Self::NotADirectory => {
-                "pass --journal a path whose directories are real directories, not symlinks"
-                    .to_string()
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for DirectoryProblem {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::NotADirectory => "not a directory, or a symlink",
-            Self::NotOwned => "not owned by the current user",
-            Self::WritableByOthers => "group- or world-writable",
-            Self::AncestorNotOwned => "an ancestor not owned by root or the current user",
-            Self::AncestorWritableWithoutSticky => {
-                "an ancestor that is group- or world-writable without the sticky bit"
-            }
-        })
     }
 }
 
@@ -541,6 +375,7 @@ impl JournalSink for JsonlJournal {
             return Err(error.into());
         }
         self.chain.commit(encoded);
+        self.rollback = None;
         Ok(())
     }
 }

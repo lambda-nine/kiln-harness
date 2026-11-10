@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,9 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
+use crate::outputs::{DirectoryProblem, Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{StopReason, Usage};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +143,31 @@ pub enum AuditError {
     Clock,
     #[error("audit path {0:?} does not name a file")]
     InvalidPath(std::path::PathBuf),
+    #[error("{}", describe_unsafe("audit", "--audit", path, *mode, *problem))]
+    UnsafeDirectory {
+        path: std::path::PathBuf,
+        /// The directory's mode from `fstat`, when it could be read.
+        mode: Option<u32>,
+        problem: DirectoryProblem,
+    },
+}
+
+impl From<OutputError> for AuditError {
+    fn from(error: OutputError) -> Self {
+        match error {
+            OutputError::InvalidPath(path) => Self::InvalidPath(path),
+            OutputError::UnsafeDirectory {
+                path,
+                mode,
+                problem,
+            } => Self::UnsafeDirectory {
+                path,
+                mode,
+                problem,
+            },
+            OutputError::Io(error) => Self::Io(error),
+        }
+    }
 }
 
 pub trait AuditSink: Send {
@@ -165,6 +188,8 @@ pub struct JsonlAudit {
     writer: BufWriter<File>,
     sequence: u64,
     created: bool,
+    /// What `open` created, kept until the first record is written.
+    rollback: Option<Rollback>,
 }
 
 impl JsonlAudit {
@@ -174,38 +199,23 @@ impl JsonlAudit {
     ///
     /// Returns an error when the parent or file cannot be created or opened.
     pub fn open(path: &Path) -> Result<Self, AuditError> {
-        crate::outputs::validate_file_path(path).map_err(AuditError::InvalidPath)?;
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            create_private_dirs(parent)?;
-        }
-        let mut options = OpenOptions::new();
-        options.append(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        // Try to create first so callers know whether this call made the file.
-        let (file, created) = match options.clone().create_new(true).open(path) {
-            Ok(file) => {
-                // Set the mode explicitly, whatever the umask or a default ACL.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-                }
-                (file, true)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                (options.open(path)?, false)
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let (file, rollback) = crate::outputs::open_output(path, Existing::Append)?;
         Ok(Self {
             writer: BufWriter::new(file),
             sequence: 0,
-            created,
+            created: rollback.created_file(),
+            rollback: Some(rollback),
         })
+    }
+
+    /// Remove the audit file and any directories `open` created, through
+    /// the pinned directory descriptors, if nothing has been written yet. An
+    /// existing audit that was only opened for appending is left alone.
+    pub fn discard(self) {
+        if let Some(rollback) = self.rollback {
+            drop(self.writer);
+            rollback.undo();
+        }
     }
 
     /// Whether `open` created the file rather than appending to an existing one.
@@ -255,6 +265,7 @@ impl AuditSink for JsonlAudit {
         serde_json::to_writer(&mut self.writer, &record)?;
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
+        self.rollback = None;
         Ok(())
     }
 }
@@ -282,30 +293,6 @@ impl AuditSink for MemoryAudit {
         });
         Ok(())
     }
-}
-
-/// Create missing directories with mode 0700 set explicitly, so neither the
-/// umask nor a default ACL widens them. Existing directories are untouched.
-fn create_private_dirs(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut missing = Vec::new();
-    let mut current = Some(path);
-    while let Some(directory) = current.filter(|directory| {
-        !directory.as_os_str().is_empty() && std::fs::symlink_metadata(directory).is_err()
-    }) {
-        missing.push(directory);
-        current = directory.parent();
-    }
-    for directory in missing.into_iter().rev() {
-        match std::fs::create_dir(directory) {
-            Ok(()) => {
-                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> String {

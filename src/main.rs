@@ -355,7 +355,9 @@ async fn check_health(api: &TonicKilnd) -> Result<()> {
 /// Open both outputs without writing, then refuse if any two of the source
 /// and outputs are the same file by `fstat` on their open descriptors. Path
 /// checks earlier are only diagnostics: a path can be relinked after them,
-/// but an open descriptor cannot change which file it names.
+/// but an open descriptor cannot change which file it names. A refused
+/// output is discarded: what its `open` created is removed through the
+/// pinned parent descriptors, never by path.
 fn open_sinks(
     source: Option<&File>,
     audit_path: &Path,
@@ -366,9 +368,7 @@ fn open_sinks(
     let journal = match JsonlJournal::open(journal_path) {
         Ok(journal) => journal,
         Err(error) => {
-            if audit.created() {
-                discard_if_new_and_empty(audit_path, audit.file_identity().ok());
-            }
+            audit.discard();
             return Err(anyhow::Error::new(error)
                 .context(format!("create journal {}", journal_path.display())));
         }
@@ -388,26 +388,11 @@ fn open_sinks(
         None
     };
     if let Some(flags) = clash {
-        if audit.created() {
-            discard_if_new_and_empty(audit_path, Some(audit_identity));
-        }
-        discard_if_new_and_empty(journal_path, Some(journal_identity));
+        audit.discard();
+        journal.discard();
         bail!("{flags} refer to the same file");
     }
     Ok((audit, journal))
-}
-
-/// Remove a file this invocation created, but only while the path still
-/// names that same, still empty, file.
-fn discard_if_new_and_empty(path: &Path, identity: Option<(u64, u64)>) {
-    let Some(identity) = identity else {
-        return;
-    };
-    if std::fs::symlink_metadata(path)
-        .is_ok_and(|meta| (meta.dev(), meta.ino()) == identity && meta.len() == 0)
-    {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 fn interrupt() -> CancellationToken {
@@ -465,7 +450,7 @@ mod tests {
         // A hard link made after any path check names the same inode.
         let audit_path = temp.path().join("audit.jsonl");
         std::fs::hard_link(&source_path, &audit_path).expect("hard link");
-        let journal_path = temp.path().join("replay.jsonl");
+        let journal_path = temp.path().join("new/replay.jsonl");
 
         let error = open_sinks(Some(&source), &audit_path, &journal_path)
             .err()
@@ -475,6 +460,10 @@ mod tests {
         assert_eq!(std::fs::read(&source_path).expect("read"), b"recorded\n");
         assert!(audit_path.exists(), "a pre-existing file is never removed");
         assert!(!journal_path.exists(), "the new empty journal is removed");
+        assert!(
+            !temp.path().join("new").exists(),
+            "and so is the directory created for it"
+        );
     }
 
     #[test]
