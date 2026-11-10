@@ -221,8 +221,33 @@ impl ProviderError {
 #[async_trait]
 pub trait Provider: Send {
     fn info(&self) -> ProviderInfo;
+
+    /// Answer one request.
+    ///
+    /// TODO(network adapters): bound the provider's response body in bytes
+    /// before parsing it. The loop and the journal bound what they keep and
+    /// write, but a response is fully in memory by the time it returns here.
     async fn complete(&mut self, request: ModelRequest<'_>)
     -> Result<ModelResponse, ProviderError>;
+
+    /// Observe one completed tool call, after it is journaled and before its
+    /// result goes back to the model. `call` is the sanitized call. Live
+    /// providers ignore this; replay compares it with the recording, and an
+    /// error ends the session as a provider error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error to stop the session at this tool call.
+    fn tool_completed(
+        &mut self,
+        _turn: u32,
+        _index: u32,
+        _call: &ToolCall,
+        _ok: bool,
+        _result: &Value,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
 }
 
 /// The bytes the demo writes, reads back, and counts.

@@ -8,9 +8,11 @@ use std::time::Duration;
 use common::{DeleteBehavior, FakeApi, chained_lines, short_lifecycle_config, write_journal_lines};
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionTask};
-use kiln_harness::journal::{JOURNAL_SCHEMA, JournalEvent, JsonlJournal, read_journal};
+use kiln_harness::journal::{
+    JOURNAL_SCHEMA, JournalEvent, JsonlJournal, read_journal, request_sha256,
+};
+use kiln_harness::provider::{Message, ModelRequest, ProviderInfo, ToolCall, Usage};
 use kiln_harness::provider::{ModelResponse, ScriptedProvider};
-use kiln_harness::provider::{ProviderInfo, ToolCall, Usage};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -128,9 +130,20 @@ fn completed(steps: u32) -> JournalEvent {
 
 #[test]
 fn verify_rejects_a_complete_journal_with_a_request_after_the_final_answer() {
+    // Turn 1 is a valid request, so the refusal comes from turn 2.
+    let messages = vec![Message::User {
+        text: "task".to_string(),
+    }];
     let request = |turn| JournalEvent::ModelRequested {
         turn,
-        request_sha256: format!("{turn:064x}"),
+        request_sha256: request_sha256(&ModelRequest {
+            session_id: "hs-pending",
+            turn,
+            system: "system",
+            tools: &[],
+            messages: &messages,
+            max_output_tokens: HarnessConfig::default().max_output_tokens_per_request,
+        }),
         message_count: 1,
     };
     let lines = chained_lines(
@@ -289,4 +302,47 @@ fn demo_refuses_an_audit_that_is_its_journal() {
         "{stderr}"
     );
     assert!(!dir.join("out.jsonl").exists());
+}
+
+#[tokio::test]
+async fn verify_rejects_a_tool_record_that_differs_from_the_model_call() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("recorded.jsonl");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::new([
+            ModelResponse::tool_use([ToolCall::new("call", "workspace_diff", json!({}))]),
+            ModelResponse::final_text("done"),
+        ]),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("recording");
+    let recorded = read_journal(&path).expect("recording verifies");
+    let (ok, _) = verify(&path);
+    assert!(ok);
+
+    // Same call ID, a different call and result, rechained.
+    let events = recorded
+        .records
+        .iter()
+        .map(|record| {
+            let mut event = record.event.clone();
+            if let JournalEvent::ToolExecuted { call, result, .. } = &mut event {
+                *call = ToolCall::new("call", "exec", json!({"argv": ["id"]}));
+                *result = json!({"ok": true, "stdout": "fabricated"});
+            }
+            event
+        })
+        .collect();
+    let forged = temp.path().join("forged.jsonl");
+    write_journal_lines(&forged, &chained_lines(recorded.session_id(), events));
+
+    let (ok, stdout) = verify(&forged);
+
+    assert!(!ok, "{stdout}");
 }

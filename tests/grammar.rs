@@ -3,12 +3,17 @@ mod common;
 
 use common::{chained_lines, write_journal_lines};
 use kiln_harness::engine::HarnessConfig;
+use kiln_harness::journal::request_sha256;
 use kiln_harness::journal::{
     JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, LoadedJournal, MemoryJournal,
     read_journal,
 };
-use kiln_harness::provider::{ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall, Usage};
+use kiln_harness::provider::{
+    Message, ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall,
+    ToolDefinition, ToolResult, Usage,
+};
 use kiln_harness::replay::ReplayProvider;
+use kiln_harness::tools::{ToolLimits, ToolRegistry};
 use serde_json::json;
 
 const SESSION: &str = "hs-grammar";
@@ -31,9 +36,42 @@ fn started() -> JournalEvent {
         },
         system: "system".to_string(),
         task: "task".to_string(),
-        tools: Vec::new(),
+        tools: tools(),
         limits: HarnessConfig::default().limits(),
     }
+}
+
+fn tools() -> Vec<ToolDefinition> {
+    ToolRegistry::new(ToolLimits::default())
+        .definitions()
+        .to_vec()
+}
+
+fn diff_call(call_id: &str) -> ToolCall {
+    ToolCall::new(call_id, "workspace_diff", json!({}))
+}
+
+/// The history the engine sends in `turn` of the valid session below.
+fn history(turn: u32) -> Vec<Message> {
+    let mut messages = vec![Message::User {
+        text: "task".to_string(),
+    }];
+    if turn >= 2 {
+        messages.push(Message::Assistant {
+            text: None,
+            tool_calls: vec![diff_call("a"), diff_call("b")],
+        });
+        messages.push(Message::ToolResults {
+            results: ["a", "b"]
+                .map(|call_id| ToolResult {
+                    call_id: call_id.to_string(),
+                    tool: "workspace_diff".to_string(),
+                    result: json!({"ok": true}),
+                })
+                .to_vec(),
+        });
+    }
+    messages
 }
 
 fn ready() -> JournalEvent {
@@ -44,10 +82,19 @@ fn ready() -> JournalEvent {
 }
 
 fn requested(turn: u32) -> JournalEvent {
+    let messages = history(turn);
+    let tools = tools();
     JournalEvent::ModelRequested {
         turn,
-        request_sha256: format!("{turn:064x}"),
-        message_count: 1,
+        request_sha256: request_sha256(&ModelRequest {
+            session_id: SESSION,
+            turn,
+            system: "system",
+            tools: &tools,
+            messages: &messages,
+            max_output_tokens: HarnessConfig::default().max_output_tokens_per_request,
+        }),
+        message_count: messages.len(),
     }
 }
 
@@ -62,10 +109,7 @@ fn responded(turn: u32, response: ModelResponse) -> JournalEvent {
 fn two_calls() -> ModelResponse {
     ModelResponse {
         usage: usage(10),
-        ..ModelResponse::tool_use([
-            ToolCall::new("a", "workspace_diff", json!({})),
-            ToolCall::new("b", "workspace_diff", json!({})),
-        ])
+        ..ModelResponse::tool_use([diff_call("a"), diff_call("b")])
     }
 }
 
@@ -81,7 +125,7 @@ fn executed(turn: u32, index: u32, call_id: &str) -> JournalEvent {
         turn,
         index,
         audit_call_id: format!("call-{turn}-{index}"),
-        call: ToolCall::new(call_id, "workspace_diff", json!({})),
+        call: diff_call(call_id),
         ok: true,
         result: json!({"ok": true}),
         execution_ids: vec![format!("ex-{index}")],
@@ -274,10 +318,52 @@ fn engine_shaped_journals_are_accepted() {
 }
 
 #[test]
+fn tool_records_must_be_the_sanitized_response_calls() {
+    // The engine records unknown and oversized calls as sanitized.
+    let oversized = json!({"content": "x".repeat(70 << 10)});
+    let response = ModelResponse::tool_use([
+        ToolCall::new("u", "Not A Tool", json!({})),
+        ToolCall::new("o", "write_file", oversized.clone()),
+    ]);
+    let sanitized = [
+        ToolCall::new("u", "unknown", json!({})),
+        ToolCall::new(
+            "o",
+            "write_file",
+            json!({"omitted": "arguments exceeded byte limit"}),
+        ),
+    ];
+    let tool = |index: u32, call: &ToolCall| JournalEvent::ToolExecuted {
+        turn: 1,
+        index,
+        audit_call_id: format!("call-1-{index}"),
+        call: call.clone(),
+        ok: false,
+        result: json!({"ok": false, "error": "rejected"}),
+        execution_ids: Vec::new(),
+    };
+    let ended = Ended {
+        outcome: "failed",
+        work_outcome: "failed",
+        final_answer: None,
+        steps: 1,
+        tool_calls: 2,
+        usage: Usage::default(),
+        sandbox_deleted: true,
+    }
+    .event();
+    let mut events = vec![started(), ready(), requested(1), responded(1, response)];
+    events.extend([tool(1, &sanitized[0]), tool(2, &sanitized[1]), ended]);
+    assert_accepted("sanitized unknown and oversized calls", events.clone());
+    events[5] = tool(2, &ToolCall::new("o", "write_file", oversized));
+    assert_rejected("oversized arguments kept raw", events);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn out_of_order_and_inconsistent_journals_are_rejected() {
     type Mutation = fn(&mut Vec<JournalEvent>);
-    let cases: [(&str, Mutation); 25] = [
+    let cases: [(&str, Mutation); 30] = [
         ("tool before sandbox_ready", |events| {
             events.insert(1, executed(99, 7, "ghost"));
         }),
@@ -376,6 +462,40 @@ fn out_of_order_and_inconsistent_journals_are_rejected() {
                 ..Ended::completed()
             }
             .event();
+        }),
+        ("tool call differs from the model's call", |events| {
+            let JournalEvent::ToolExecuted { call, result, .. } = &mut events[4] else {
+                panic!("tool record");
+            };
+            *call = ToolCall::new("a", "exec", json!({"argv": ["id"]}));
+            *result = json!({"ok": true, "stdout": "fabricated"});
+        }),
+        ("tool arguments differ from the model's call", |events| {
+            let JournalEvent::ToolExecuted { call, .. } = &mut events[4] else {
+                panic!("tool record");
+            };
+            call.arguments = json!({"extra": true});
+        }),
+        (
+            "tool result differs from what the next request carried",
+            |events| {
+                let JournalEvent::ToolExecuted { result, .. } = &mut events[5] else {
+                    panic!("tool record");
+                };
+                *result = json!({"ok": true, "added": ["fabricated.txt"]});
+            },
+        ),
+        ("message_count differs from the history", |events| {
+            let JournalEvent::ModelRequested { message_count, .. } = &mut events[6] else {
+                panic!("request record");
+            };
+            *message_count = 999;
+        }),
+        ("request hash differs from the history", |events| {
+            let JournalEvent::ModelRequested { request_sha256, .. } = &mut events[2] else {
+                panic!("request record");
+            };
+            *request_sha256 = "0".repeat(64);
         }),
         ("outcome differs from the work outcome", |events| {
             *events.last_mut().expect("end") = Ended {

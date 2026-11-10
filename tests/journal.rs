@@ -692,8 +692,10 @@ async fn replay_against_a_different_sandbox_diverges_and_cleans_up() {
         ),
         "{error}"
     );
-    // read_file runs in turn 2; its result first reaches the model in turn 3.
-    assert_eq!(harness.provider().diverged_at(), Some(3));
+    // read_file runs in turn 2. Replay compares each tool result with the
+    // recording as it completes, so it diverges there, before turn 3.
+    assert_eq!(harness.provider().diverged_at(), Some(2));
+    assert!(error.to_string().contains("tool call 1"), "{error}");
     assert_eq!(observer.state().deleted.len(), 1);
     assert!(matches!(
         harness.journal().records.last().map(|record| &record.event),
@@ -957,20 +959,18 @@ async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
         |limits| limits.max_total_input_tokens = MAX_TOTAL_TOKENS + 1,
     ];
     for raise in over {
-        let mut crafted = journal.clone();
-        let JournalEvent::SessionStarted { limits, .. } = &mut crafted.records[0].event else {
-            panic!("first record starts the session");
-        };
-        raise(limits);
-        let provider = ReplayProvider::from_journal(&crafted).expect("loads");
-        let task = provider.task();
+        let _ = &journal;
+        // The engine refuses the limits themselves before any sandbox.
+        let mut limits = HarnessConfig::default().limits();
+        raise(&mut limits);
         let mut config = short_lifecycle_config();
-        config.apply_limits(&provider.limits());
+        config.apply_limits(&limits);
+        let task = SessionTask::demo();
         let api = FakeApi::default();
         let observer = api.clone();
         let mut replay = Harness::new(
             api,
-            provider,
+            ScriptedProvider::demo(),
             MemoryAudit::default(),
             MemoryJournal::default(),
             config,
@@ -1186,4 +1186,117 @@ fn journal_sources_must_be_regular_files_reached_without_links() {
     std::os::unix::fs::symlink(&real, &link).expect("symlink");
     let error = read_journal(&link).expect_err("a symlinked source is refused");
     assert!(matches!(error, JournalError::NotRegularFile), "{error}");
+}
+
+/// A recorded tool turn followed by a final answer.
+async fn record_tool_turn(config: HarnessConfig) -> Vec<JournalRecord> {
+    let responses = [
+        ModelResponse::tool_use([ToolCall::new("call", "workspace_diff", json!({}))]),
+        ModelResponse::final_text("done"),
+    ];
+    let mut recording = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::new(responses),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let _ = recording
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await;
+    recording.journal().records.clone()
+}
+
+fn forge_tool_records(records: &mut [JournalRecord], forge: impl Fn(&mut ToolCall, &mut Value)) {
+    for record in records {
+        if let JournalEvent::ToolExecuted { call, result, .. } = &mut record.event {
+            forge(call, result);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_tool_record_that_differs_from_the_model_call_is_refused_everywhere() {
+    let mut records = record_tool_turn(short_lifecycle_config()).await;
+    forge_tool_records(&mut records, |call, result| {
+        call.tool = "exec".to_string();
+        call.arguments = json!({"argv": ["id"]});
+        *result = json!({"ok": true, "stdout": "fabricated"});
+    });
+
+    // The writer refuses to record it.
+    let mut writer = MemoryJournal::default();
+    let refused = records
+        .iter()
+        .try_for_each(|record| writer.append(&record.session_id, record.event.clone()));
+    assert!(
+        matches!(refused, Err(JournalError::Grammar { .. })),
+        "{refused:?}"
+    );
+
+    // A rechained file fails verification.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let path = temp.path().join("forged.jsonl");
+    let session = records[0].session_id.clone();
+    let lines = common::chained_lines(
+        &session,
+        records.iter().map(|record| record.event.clone()).collect(),
+    );
+    common::write_journal_lines(&path, &lines);
+    assert!(
+        matches!(read_journal(&path), Err(JournalError::Grammar { .. })),
+        "the forged call verifies"
+    );
+
+    // Replay refuses records handed to it directly.
+    let loaded = LoadedJournal {
+        records,
+        complete: true,
+    };
+    assert!(ReplayProvider::from_journal(&loaded).is_err());
+}
+
+#[tokio::test]
+async fn a_forged_result_in_the_last_tool_turn_diverges_at_that_tool() {
+    // With one step, the tool turn is the last turn: no later request
+    // carries its result, so only replay can check it.
+    let config = HarnessConfig {
+        max_steps: 1,
+        ..short_lifecycle_config()
+    };
+    let mut records = record_tool_turn(config.clone()).await;
+    forge_tool_records(&mut records, |_, result| {
+        *result = json!({"ok": true, "added": ["fabricated.txt"], "removed": []});
+    });
+    let loaded = LoadedJournal {
+        records,
+        complete: true,
+    };
+    let provider = ReplayProvider::from_journal(&loaded).expect("the grammar cannot see it");
+    let task = provider.task();
+    let api = FakeApi::default();
+    let observer = api.clone();
+    let mut replay = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+
+    let error = replay
+        .run(&task, CancellationToken::new())
+        .await
+        .expect_err("the replayed tool result differs");
+
+    assert!(
+        matches!(
+            &error,
+            HarnessError::Provider(provider) if provider.kind == ProviderErrorKind::ReplayDiverged
+        ),
+        "{error}"
+    );
+    assert_eq!(replay.provider().diverged_at(), Some(1));
+    assert!(!replay.provider().exhausted());
+    assert_eq!(observer.state().deleted.len(), 1);
 }

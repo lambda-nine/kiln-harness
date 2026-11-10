@@ -19,7 +19,8 @@ use crate::provider::{
     ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::{
-    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop, recover_execution_evidence,
+    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop,
+    recover_execution_evidence, sanitize_call_bounded,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,8 +39,6 @@ pub const MAX_TOTAL_TOKENS: u64 = 1_000_000_000;
 pub const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// Largest accepted system prompt or task prompt.
 pub const MAX_TASK_TEXT_BYTES: usize = 64 << 10;
-const UNKNOWN_TOOL: &str = "unknown";
-
 /// What one session is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTask {
@@ -722,9 +721,20 @@ where
         }
 
         let prepared = tool_calls
-            .into_iter()
-            .map(|call| prepare_call(config, context.definitions, call))
-            .collect::<Result<Vec<_>, _>>()?;
+            .iter()
+            .map(|call| {
+                let sanitized = sanitize_call_bounded(
+                    call,
+                    context.definitions,
+                    config.max_model_arguments_bytes,
+                );
+                PreparedCall {
+                    visible: sanitized.call,
+                    registered: sanitized.registered,
+                    arguments: sanitized.arguments,
+                }
+            })
+            .collect::<Vec<_>>();
         messages.push(Message::Assistant {
             text,
             tool_calls: prepared.iter().map(|call| call.visible.clone()).collect(),
@@ -814,51 +824,21 @@ where
                 },
             )?;
             progress.tool_calls = next_tool_calls;
-            results.push(ToolResult {
-                call_id: call.visible.call_id,
-                tool: call.visible.tool,
-                result: run.result,
-            });
             match stop {
                 Some(ToolStop::Deadline) => return Err(HarnessError::Deadline),
                 Some(ToolStop::Canceled) => return Err(HarnessError::Canceled),
                 None => {}
             }
+            provider.tool_completed(turn, index, &call.visible, run.ok, &run.result)?;
+            results.push(ToolResult {
+                call_id: call.visible.call_id,
+                tool: call.visible.tool,
+                result: run.result,
+            });
         }
         messages.push(Message::ToolResults { results });
     }
     Err(HarnessError::StepBudget(config.max_steps))
-}
-
-/// Bound a call's arguments and map its name to a registered tool or
-/// `unknown`, so neither oversized arguments nor arbitrary names reach the
-/// transcript, the audit, or kilnd.
-fn prepare_call(
-    config: &HarnessConfig,
-    definitions: &[ToolDefinition],
-    call: ToolCall,
-) -> Result<PreparedCall, HarnessError> {
-    let registered = definitions
-        .iter()
-        .find(|definition| definition.name == call.tool);
-    let arguments =
-        ContentSummary::json_bounded(&call.arguments, config.max_model_arguments_bytes)?;
-    Ok(PreparedCall {
-        visible: ToolCall {
-            call_id: call.call_id,
-            tool: registered.map_or_else(
-                || UNKNOWN_TOOL.to_string(),
-                |definition| definition.name.clone(),
-            ),
-            arguments: if arguments.is_some() {
-                call.arguments
-            } else {
-                json!({"omitted": "arguments exceeded byte limit"})
-            },
-        },
-        registered: registered.is_some(),
-        arguments,
-    })
 }
 
 fn final_answer<A, S>(

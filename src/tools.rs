@@ -8,9 +8,61 @@ use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::api::{ApiError, CapturedOutput, Execution, ExecutionState, SandboxApi, SandboxExec};
 use crate::audit::{ContentSummary, OutputEvidence};
-use crate::provider::ToolDefinition;
+use crate::journal::SessionLimits;
+use crate::provider::{ToolCall, ToolDefinition};
 
 const WORKSPACE: &str = "/workspace";
+/// The name a call to an unregistered tool is recorded and shown under.
+pub const UNKNOWN_TOOL: &str = "unknown";
+
+/// The call the model sees and the journal records after host
+/// sanitization: an unregistered name becomes `unknown`, and arguments over
+/// the byte limit become an `omitted` marker. The engine and the journal
+/// grammar both use this, so a recorded call can be checked against the
+/// response it came from.
+#[must_use]
+pub fn sanitize_call(
+    call: &ToolCall,
+    tools: &[ToolDefinition],
+    limits: &SessionLimits,
+) -> ToolCall {
+    sanitize_call_bounded(call, tools, limits.max_model_arguments_bytes).call
+}
+
+pub(crate) struct SanitizedCall {
+    pub(crate) call: ToolCall,
+    pub(crate) registered: bool,
+    /// The original arguments' summary, or `None` when they exceeded the limit.
+    pub(crate) arguments: Option<ContentSummary>,
+}
+
+pub(crate) fn sanitize_call_bounded(
+    call: &ToolCall,
+    tools: &[ToolDefinition],
+    max_arguments_bytes: usize,
+) -> SanitizedCall {
+    let registered = tools.iter().find(|definition| definition.name == call.tool);
+    // Encoding a JSON value cannot fail; treat a failure like an oversize.
+    let arguments = ContentSummary::json_bounded(&call.arguments, max_arguments_bytes)
+        .ok()
+        .flatten();
+    SanitizedCall {
+        call: ToolCall {
+            call_id: call.call_id.clone(),
+            tool: registered.map_or_else(
+                || UNKNOWN_TOOL.to_string(),
+                |definition| definition.name.clone(),
+            ),
+            arguments: if arguments.is_some() {
+                call.arguments.clone()
+            } else {
+                json!({"omitted": "arguments exceeded byte limit"})
+            },
+        },
+        registered: registered.is_some(),
+        arguments,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolLimits {

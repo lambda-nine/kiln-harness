@@ -22,8 +22,10 @@ use std::os::unix::fs::MetadataExt;
 use rustix::fs::{Mode, OFlags};
 
 use crate::provider::{
-    ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall, ToolDefinition, Usage,
+    Message, ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall,
+    ToolDefinition, ToolResult, Usage,
 };
+use crate::tools::sanitize_call;
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 /// Largest journal file `read_journal` accepts and a sink will write.
@@ -215,17 +217,17 @@ struct Chain {
 struct Encoded {
     record: JournalRecord,
     line: String,
-    grammar: Grammar,
 }
 
 impl Chain {
-    fn encode(&self, session_id: &str, event: JournalEvent) -> Result<Encoded, JournalError> {
+    /// Encode one record. The grammar is fed last, after every other check,
+    /// and `Grammar::feed` changes nothing when it fails, so a refused record
+    /// leaves the chain exactly as it was.
+    fn encode(&mut self, session_id: &str, event: JournalEvent) -> Result<Encoded, JournalError> {
         if self.closed {
             return Err(JournalError::Closed);
         }
         let sequence = self.next_sequence;
-        let mut grammar = self.grammar.clone();
-        grammar.feed(sequence, &event)?;
         if let Some(expected) = &self.session_id
             && expected != session_id
         {
@@ -259,15 +261,11 @@ impl Chain {
                 limit: MAX_JOURNAL_BYTES,
             });
         }
-        Ok(Encoded {
-            record,
-            line,
-            grammar,
-        })
+        self.grammar.feed(sequence, &record.event)?;
+        Ok(Encoded { record, line })
     }
 
     fn commit(&mut self, encoded: Encoded) -> JournalRecord {
-        self.grammar = encoded.grammar;
         self.next_sequence = encoded.record.sequence + 1;
         self.prev_sha256 = Some(sha256_hex(encoded.line.as_bytes()));
         self.session_id = Some(encoded.record.session_id.clone());
@@ -707,6 +705,7 @@ const CLEANUP_FAILED: &str = "cleanup_failed";
 #[derive(Debug, Clone, Default)]
 pub struct Grammar {
     phase: Phase,
+    context: Option<SessionContext>,
     sandbox_ready: bool,
     last_turn: u32,
     pending: Option<u32>,
@@ -724,12 +723,24 @@ enum Phase {
     Ended,
 }
 
+/// What `session_started` fixes for the whole session, and the message
+/// history rebuilt from the records so far, exactly as the engine builds it.
+#[derive(Debug, Clone)]
+struct SessionContext {
+    system: String,
+    tools: Vec<ToolDefinition>,
+    limits: SessionLimits,
+    messages: Vec<Message>,
+}
+
+/// The last model response: its text, its calls after sanitization, and the
+/// results recorded for them so far.
 #[derive(Debug, Clone)]
 struct RespondedTurn {
     turn: u32,
     text: Option<String>,
-    call_ids: Vec<String>,
-    executed: u32,
+    calls: Vec<ToolCall>,
+    results: Vec<ToolResult>,
 }
 
 impl Grammar {
@@ -743,7 +754,15 @@ impl Grammar {
             return Err(JournalError::RecordAfterEnd { sequence });
         }
         if self.phase == Phase::Empty {
-            let JournalEvent::SessionStarted { schema, .. } = event else {
+            let JournalEvent::SessionStarted {
+                schema,
+                system,
+                task,
+                tools,
+                limits,
+                ..
+            } = event
+            else {
                 return Err(JournalError::MissingSessionStarted { sequence });
             };
             if *schema != JOURNAL_SCHEMA {
@@ -752,6 +771,12 @@ impl Grammar {
                     expected: JOURNAL_SCHEMA,
                 });
             }
+            self.context = Some(SessionContext {
+                system: system.clone(),
+                tools: tools.clone(),
+                limits: *limits,
+                messages: vec![Message::User { text: task.clone() }],
+            });
             self.phase = Phase::Open;
             return Ok(());
         }
@@ -777,7 +802,11 @@ impl Grammar {
                 }
                 self.sandbox_ready = true;
             }
-            JournalEvent::ModelRequested { turn, .. } => {
+            JournalEvent::ModelRequested {
+                turn,
+                request_sha256,
+                message_count,
+            } => {
                 if !self.sandbox_ready {
                     return Err("model_requested before sandbox_ready");
                 }
@@ -788,16 +817,17 @@ impl Grammar {
                     return Err("model_requested after model_failed");
                 }
                 if let Some(last) = &self.last_response {
-                    if last.call_ids.is_empty() {
+                    if last.calls.is_empty() {
                         return Err("model_requested after a final response");
                     }
-                    if last.executed as usize != last.call_ids.len() {
+                    if last.results.len() != last.calls.len() {
                         return Err("model_requested before every tool call of the turn ran");
                     }
                 }
                 if Some(*turn) != self.last_turn.checked_add(1) {
                     return Err("model_requested turns must run 1, 2, ...");
                 }
+                self.check_request(*turn, request_sha256, *message_count)?;
                 self.last_turn = *turn;
                 self.pending = Some(*turn);
             }
@@ -806,16 +836,20 @@ impl Grammar {
                     return Err("model_responded without a matching request");
                 }
                 self.pending = None;
+                let context = self.context.as_ref().ok_or("no session context")?;
+                // Keep only what the history needs: the text and each call
+                // as the model will see it.
+                let calls = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| sanitize_call(call, &context.tools, &context.limits))
+                    .collect();
                 self.usage = self.usage + response.usage;
                 self.last_response = Some(RespondedTurn {
                     turn: *turn,
                     text: response.text.clone(),
-                    call_ids: response
-                        .tool_calls
-                        .iter()
-                        .map(|call| call.call_id.clone())
-                        .collect(),
-                    executed: 0,
+                    calls,
+                    results: Vec::new(),
                 });
             }
             JournalEvent::ModelFailed { turn, .. } => {
@@ -826,30 +860,12 @@ impl Grammar {
                 self.turn_failed = true;
             }
             JournalEvent::ToolExecuted {
-                turn, index, call, ..
-            } => {
-                let Some(last) = self
-                    .last_response
-                    .as_mut()
-                    .filter(|_| self.pending.is_none())
-                else {
-                    return Err("tool_executed without a model response");
-                };
-                if self.turn_failed || last.turn != *turn {
-                    return Err("tool_executed for a turn other than the last response");
-                }
-                if last.executed.checked_add(1) != Some(*index) {
-                    return Err("tool_executed indexes must run 1, 2, ...");
-                }
-                let Some(expected) = last.call_ids.get(last.executed as usize) else {
-                    return Err("more tool_executed records than tool calls");
-                };
-                if *expected != call.call_id {
-                    return Err("tool_executed call_id differs from the response");
-                }
-                last.executed += 1;
-                self.tool_calls = self.tool_calls.saturating_add(1);
-            }
+                turn,
+                index,
+                call,
+                result,
+                ..
+            } => self.record_tool(*turn, *index, call, result)?,
             JournalEvent::SessionEnded { .. } => {
                 self.check_end(event)?;
                 self.phase = Phase::Ended;
@@ -862,6 +878,102 @@ impl Grammar {
     #[must_use]
     pub fn ended(&self) -> bool {
         self.phase == Phase::Ended
+    }
+
+    /// Check one `tool_executed` against the last response and keep its
+    /// result for the rebuilt history.
+    fn record_tool(
+        &mut self,
+        turn: u32,
+        index: u32,
+        call: &ToolCall,
+        result: &Value,
+    ) -> Result<(), &'static str> {
+        let Some(last) = self
+            .last_response
+            .as_mut()
+            .filter(|_| self.pending.is_none())
+        else {
+            return Err("tool_executed without a model response");
+        };
+        if self.turn_failed || last.turn != turn {
+            return Err("tool_executed for a turn other than the last response");
+        }
+        let executed = last.results.len();
+        if u32::try_from(executed + 1).ok() != Some(index) {
+            return Err("tool_executed indexes must run 1, 2, ...");
+        }
+        let Some(expected) = last.calls.get(executed) else {
+            return Err("more tool_executed records than tool calls");
+        };
+        if expected != call {
+            return Err("tool_executed call differs from the sanitized response call");
+        }
+        last.results.push(ToolResult {
+            call_id: call.call_id.clone(),
+            tool: call.tool.clone(),
+            result: result.clone(),
+        });
+        self.tool_calls = self.tool_calls.saturating_add(1);
+        Ok(())
+    }
+
+    /// Extend the rebuilt history with the last tool turn, as the engine does
+    /// before its next request, and require the recorded message count and
+    /// request hash to match it. On failure the history is left unchanged.
+    fn check_request(
+        &mut self,
+        turn: u32,
+        recorded_sha256: &str,
+        message_count: usize,
+    ) -> Result<(), &'static str> {
+        let context = self.context.as_mut().ok_or("no session context")?;
+        // Move the last tool turn into the history; it is rebuilt from the
+        // history only if the check fails.
+        let extended = self.last_response.take().map(|last| {
+            context.messages.push(Message::Assistant {
+                text: last.text,
+                tool_calls: last.calls,
+            });
+            context.messages.push(Message::ToolResults {
+                results: last.results,
+            });
+            last.turn
+        });
+        let reason = if context.messages.len() == message_count {
+            let expected = request_sha256(&ModelRequest {
+                session_id: "",
+                turn,
+                system: &context.system,
+                tools: &context.tools,
+                messages: &context.messages,
+                max_output_tokens: context.limits.max_output_tokens_per_request,
+            });
+            (expected != recorded_sha256)
+                .then_some("model_requested hash differs from the rebuilt request")
+        } else {
+            Some("model_requested message_count differs from the rebuilt history")
+        };
+        let Some(reason) = reason else {
+            return Ok(());
+        };
+        if let Some(last_turn) = extended {
+            let results = context.messages.pop();
+            let assistant = context.messages.pop();
+            if let (
+                Some(Message::Assistant { text, tool_calls }),
+                Some(Message::ToolResults { results }),
+            ) = (assistant, results)
+            {
+                self.last_response = Some(RespondedTurn {
+                    turn: last_turn,
+                    text,
+                    calls: tool_calls,
+                    results,
+                });
+            }
+        }
+        Err(reason)
     }
 
     /// Check `session_ended` against everything fed before it.
@@ -903,7 +1015,7 @@ impl Grammar {
             let final_response = self
                 .last_response
                 .as_ref()
-                .filter(|last| last.turn == self.last_turn && last.call_ids.is_empty());
+                .filter(|last| last.turn == self.last_turn && last.calls.is_empty());
             if self.pending.is_some() || self.turn_failed || final_response.is_none() {
                 return Err("completed work needs a final response in the last turn");
             }

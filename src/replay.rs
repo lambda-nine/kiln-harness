@@ -13,8 +13,9 @@ use thiserror::Error;
 use crate::engine::SessionTask;
 use crate::journal::{Grammar, JournalEvent, LoadedJournal, SessionLimits, request_sha256};
 use crate::provider::{
-    ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo,
+    ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo, ToolCall,
 };
+use serde_json::Value;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ReplayError {
@@ -22,20 +23,6 @@ pub enum ReplayError {
     MissingSessionStarted,
     #[error("journal is not a valid session: {0}")]
     Grammar(String),
-    #[error(
-        "journal record {sequence} answers turn {found} without a matching request ({expected:?})"
-    )]
-    UnpairedResponse {
-        sequence: u64,
-        found: u32,
-        expected: Option<u32>,
-    },
-    #[error("journal record {sequence} requests turn {found}, expected turn {expected}")]
-    TurnOrder {
-        sequence: u64,
-        found: u32,
-        expected: u32,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -60,9 +47,19 @@ pub struct ReplayProvider {
     task: SessionTask,
     limits: SessionLimits,
     turns: VecDeque<RecordedTurn>,
+    tools: VecDeque<RecordedTool>,
     final_answer: Option<String>,
     outcome: Option<String>,
     diverged_at: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct RecordedTool {
+    turn: u32,
+    index: u32,
+    call: ToolCall,
+    ok: bool,
+    result: Value,
 }
 
 impl ReplayProvider {
@@ -73,8 +70,8 @@ impl ReplayProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if the journal does not start a session or its model
-    /// turns are out of order or unpaired.
+    /// Returns an error if the journal does not start a session or breaks
+    /// the session grammar.
     pub fn from_journal(journal: &LoadedJournal) -> Result<Self, ReplayError> {
         // `LoadedJournal` fields are public, so check the grammar here too
         // rather than trusting that the records came from `read_journal`.
@@ -103,45 +100,44 @@ impl ReplayProvider {
             },
             limits: *limits,
             turns: VecDeque::new(),
+            tools: VecDeque::new(),
             final_answer: None,
             outcome: None,
             diverged_at: None,
         };
+        // The grammar has paired every request with one answer in turn order.
         let mut pending: Option<(u32, String)> = None;
-        let mut next_turn = 1u32;
         for record in records {
-            let sequence = record.sequence;
-            let outcome = match &record.event {
+            match &record.event {
                 JournalEvent::ModelRequested {
                     turn,
                     request_sha256,
                     ..
-                } => {
-                    if pending.is_some() || *turn != next_turn {
-                        return Err(ReplayError::TurnOrder {
-                            sequence,
-                            found: *turn,
-                            expected: next_turn,
-                        });
-                    }
-                    pending = Some((*turn, request_sha256.clone()));
-                    next_turn = next_turn.saturating_add(1);
-                    continue;
+                } => pending = Some((*turn, request_sha256.clone())),
+                JournalEvent::ModelResponded { response, .. } => {
+                    replay.push_turn(&mut pending, RecordedOutcome::Responded(response.clone()));
                 }
-                JournalEvent::ModelResponded { turn, response, .. } => {
-                    (*turn, RecordedOutcome::Responded(response.clone()))
-                }
-                JournalEvent::ModelFailed {
-                    turn,
-                    kind,
-                    message,
-                } => (
-                    *turn,
+                JournalEvent::ModelFailed { kind, message, .. } => replay.push_turn(
+                    &mut pending,
                     RecordedOutcome::Failed {
                         kind: *kind,
                         message: message.clone(),
                     },
                 ),
+                JournalEvent::ToolExecuted {
+                    turn,
+                    index,
+                    call,
+                    ok,
+                    result,
+                    ..
+                } => replay.tools.push_back(RecordedTool {
+                    turn: *turn,
+                    index: *index,
+                    call: call.clone(),
+                    ok: *ok,
+                    result: result.clone(),
+                }),
                 JournalEvent::SessionEnded {
                     outcome,
                     final_answer,
@@ -149,28 +145,8 @@ impl ReplayProvider {
                 } => {
                     replay.outcome = Some(outcome.clone());
                     replay.final_answer.clone_from(final_answer);
-                    continue;
                 }
-                JournalEvent::SessionStarted { .. }
-                | JournalEvent::SandboxReady { .. }
-                | JournalEvent::ToolExecuted { .. } => continue,
-            };
-            let (turn, outcome) = outcome;
-            match pending.take() {
-                Some((requested, request_sha256)) if requested == turn => {
-                    replay.turns.push_back(RecordedTurn {
-                        turn,
-                        request_sha256,
-                        outcome,
-                    });
-                }
-                other => {
-                    return Err(ReplayError::UnpairedResponse {
-                        sequence,
-                        found: turn,
-                        expected: other.map(|(requested, _)| requested),
-                    });
-                }
+                JournalEvent::SessionStarted { .. } | JournalEvent::SandboxReady { .. } => {}
             }
         }
         Ok(replay)
@@ -200,10 +176,20 @@ impl ReplayProvider {
         self.outcome.as_deref()
     }
 
-    /// True once every recorded model turn has been replayed.
+    fn push_turn(&mut self, pending: &mut Option<(u32, String)>, outcome: RecordedOutcome) {
+        if let Some((turn, request_sha256)) = pending.take() {
+            self.turns.push_back(RecordedTurn {
+                turn,
+                request_sha256,
+                outcome,
+            });
+        }
+    }
+
+    /// True once every recorded model turn and tool call has been replayed.
     #[must_use]
     pub fn exhausted(&self) -> bool {
-        self.turns.is_empty()
+        self.turns.is_empty() && self.tools.is_empty()
     }
 
     /// The first turn whose request differed from the recording.
@@ -215,6 +201,36 @@ impl ReplayProvider {
 
 #[async_trait]
 impl Provider for ReplayProvider {
+    fn tool_completed(
+        &mut self,
+        turn: u32,
+        index: u32,
+        call: &ToolCall,
+        ok: bool,
+        result: &Value,
+    ) -> Result<(), ProviderError> {
+        // A tool that answers differently diverges here, before its result
+        // reaches the next request.
+        // Only a matching call consumes its record, so a divergence leaves
+        // the replay unexhausted.
+        let matches = self.tools.front().is_some_and(|recorded| {
+            recorded.turn == turn
+                && recorded.index == index
+                && recorded.call == *call
+                && recorded.ok == ok
+                && recorded.result == *result
+        });
+        if matches {
+            self.tools.pop_front();
+            return Ok(());
+        }
+        self.diverged_at = Some(turn);
+        Err(ProviderError::new(
+            ProviderErrorKind::ReplayDiverged,
+            format!("turn {turn} tool call {index} differs from the recording"),
+        ))
+    }
+
     fn info(&self) -> ProviderInfo {
         self.info.clone()
     }
