@@ -1,6 +1,7 @@
 //! A fake kilnd shared by host-side tests.
 #![allow(dead_code)]
 
+pub mod anthropic;
 pub mod http;
 
 use std::collections::{BTreeMap, BTreeSet};

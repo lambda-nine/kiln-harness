@@ -83,11 +83,15 @@
 //! `cache_creation_input_tokens` are already disjoint, as the provider
 //! contract wants; a missing or null counter is 0. The top-level counters
 //! are always checked; they describe the attempt that produced the returned
-//! message. With a server-side fallback, `usage.iterations` records every
-//! attempt: each entry must have a known `type` ([`ITERATION_TYPES`]), a
-//! valid `model`, valid counters, and nonzero input, and the last must be
-//! the serving attempt, with the response's `model` and exactly the
-//! top-level counters, or the response is `InvalidResponse`. The usage is
+//! message. With fallbacks on, `usage.iterations` records every attempt
+//! (the live API sends one `message` entry with a null `model` when no
+//! fallback ran): each entry must have a known `type` ([`ITERATION_TYPES`]),
+//! valid counters, and nonzero input; a `fallback_message` must name a valid
+//! `model`, while a `message` may leave it null or absent, meaning the
+//! requested model. The last must be the serving attempt, with the
+//! response's `model` (or, when it names none, a response `model` equal to
+//! the requested one) and exactly the top-level counters, or the response
+//! is `InvalidResponse`. Other usage fields are ignored. The usage is
 //! then the saturating sum of every entry, without the top level counted
 //! again, so the per-request output cap covers one model call with all its
 //! attempts; `--no-fallbacks` gives a strict per-attempt cap. Zero total
@@ -469,7 +473,7 @@ impl AnthropicProvider {
         let key = key.as_ref();
         if exchange.status.is_success() {
             let value = http::decode_success(&exchange, limit, key)?;
-            let parsed = parse_response_quoting(&value, key.is_none())?;
+            let parsed = parse_response_quoting(&value, &self.config.model, key.is_none())?;
             if key.is_some_and(|key| key.in_response(&parsed)) {
                 return Err(http::credential_echo());
             }
@@ -757,13 +761,22 @@ fn strict_schema_at(schema: &Value, path: &str) -> Result<Value, String> {
 /// opaque content holding a number that cannot be echoed exactly; or
 /// implausible usage. An error object in the body is reported by its
 /// allowlisted type only, as for an authenticated request.
-pub fn parse_response(value: &Value) -> Result<ModelResponse, ProviderError> {
-    parse_response_quoting(value, false)
+/// `requested_model` is the model the request named; an iteration without a
+/// model ran on it.
+pub fn parse_response(
+    value: &Value,
+    requested_model: &str,
+) -> Result<ModelResponse, ProviderError> {
+    parse_response_quoting(value, requested_model, false)
 }
 
 /// [`parse_response`], quoting an error object in the body only when
 /// `quote` (a request without a key).
-fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, ProviderError> {
+fn parse_response_quoting(
+    value: &Value,
+    requested_model: &str,
+    quote: bool,
+) -> Result<ModelResponse, ProviderError> {
     // The success envelope comes first: an error object is never read as a
     // message, whatever else it carries.
     match value.get("type").and_then(Value::as_str) {
@@ -850,7 +863,7 @@ fn parse_response_quoting(value: &Value, quote: bool) -> Result<ModelResponse, P
     if let Some(details) = &stop_details {
         check_exact_numbers(details)?;
     }
-    let (usage, serving_output) = parse_usage(value.get("usage"), &model)?;
+    let (usage, serving_output) = parse_usage(value.get("usage"), &model, requested_model)?;
     let response = ModelResponse {
         text,
         tool_calls,
@@ -926,13 +939,23 @@ fn model_id_is_valid(model: &str) -> bool {
 ///
 /// The top-level counters are always checked; they describe the attempt
 /// that produced the returned message. With `usage.iterations`, the
-/// per-attempt billing record a server-side fallback produces, every entry
-/// must have a known `type`, a valid `model`, valid counters, and nonzero
-/// input, and the last entry must be the serving attempt: the response's
-/// `model` and exactly the top-level counters. Any disagreement is
-/// `InvalidResponse`, never resolved by picking a side. The usage is then
-/// the saturating sum of every entry, without the top level added again.
-fn parse_usage(usage: Option<&Value>, model: &str) -> Result<(Usage, u64), ProviderError> {
+/// per-attempt billing record (the live API sends it on every response
+/// when fallbacks are on, with one entry when no fallback ran), every entry
+/// must have a known `type`, valid counters, and nonzero input. A
+/// `fallback_message` must name a valid `model`; a `message` may leave it
+/// null or absent, meaning the requested model. The last entry must be the
+/// serving attempt: the response's `model` (for a null model, the response's
+/// `model` must be `requested_model`) and exactly the top-level counters.
+/// Any disagreement is `InvalidResponse`, never resolved by picking a side.
+/// The usage is then the saturating sum of every entry, without the top
+/// level added again. Fields other than the four counters, `iterations`,
+/// and each entry's `type` and `model` (`cache_creation`,
+/// `output_tokens_details`, `service_tier`, and so on) are ignored.
+fn parse_usage(
+    usage: Option<&Value>,
+    model: &str,
+    requested_model: &str,
+) -> Result<(Usage, u64), ProviderError> {
     let usage = usage
         .filter(|usage| usage.is_object())
         .ok_or_else(|| invalid("response has no usage; token budgets cannot be enforced"))?;
@@ -947,18 +970,19 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Result<(Usage, u64), Provi
                 if !attempt.is_object() {
                     return Err(invalid(format!("{what} is not an object")));
                 }
-                if !attempt
+                let tag = attempt
                     .get("type")
                     .and_then(Value::as_str)
-                    .is_some_and(|tag| ITERATION_TYPES.contains(&tag))
-                {
-                    return Err(invalid(format!("{what} has no known type")));
-                }
-                let attempt_model = attempt
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .filter(|model| model_id_is_valid(model))
-                    .ok_or_else(|| invalid(format!("{what} has no valid model")))?;
+                    .filter(|tag| ITERATION_TYPES.contains(tag))
+                    .ok_or_else(|| invalid(format!("{what} has no known type")))?;
+                // None: the attempt ran on the requested model.
+                let attempt_model = match (tag, attempt.get("model")) {
+                    (_, Some(Value::String(named))) if model_id_is_valid(named) => {
+                        Some(named.as_str())
+                    }
+                    ("message", None | Some(Value::Null)) => None,
+                    _ => return Err(invalid(format!("{what} has no valid model"))),
+                };
                 let counted = counters(attempt, &what)?;
                 if counted.total_input_tokens() == 0 {
                     return Err(invalid(format!("{what} reports zero input tokens")));
@@ -967,7 +991,11 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Result<(Usage, u64), Provi
                 last = Some((attempt_model, counted));
             }
             match last {
-                Some((last_model, counted)) if last_model == model && counted == serving => sum,
+                Some((last_model, counted))
+                    if last_model.unwrap_or(requested_model) == model && counted == serving =>
+                {
+                    sum
+                }
                 _ => {
                     return Err(invalid(
                         "usage iterations do not end with the serving attempt the top level reports",
@@ -1162,7 +1190,8 @@ mod tests {
         let other = SecretString::new("sk-ant-unrelated-key-1234");
         assert_eq!(scrub(echo.clone(), Some(&other)), echo);
 
-        let parse = parse_response(&json!({"type": "completion"})).expect_err("invalid");
+        let parse =
+            parse_response(&json!({"type": "completion"}), DEFAULT_MODEL).expect_err("invalid");
         let scrubbed = scrub(parse, Some(&SecretString::new("is not")));
         assert_eq!(
             (scrubbed.kind, scrubbed.message.as_str()),

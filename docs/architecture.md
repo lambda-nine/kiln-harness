@@ -283,12 +283,17 @@ back, and never shown.
 
 Anthropic's usage counters are already disjoint. A missing or null counter
 is 0. The top-level counters are always validated: they describe the
-attempt that produced the returned message. After a server-side fallback,
-`usage.iterations` lists every attempt, each billed. When the array is
-present, every entry needs a known `type` (`message` or
-`fallback_message`), a valid `model`, valid counters, and nonzero input,
-and the last entry must be the serving attempt: the response's `model` and
-exactly the top-level counters. A response whose two views of the serving
+attempt that produced the returned message. With fallbacks on,
+`usage.iterations` lists every attempt, each billed; the live API sends it
+on every response, with one `message` entry whose `model` is null when no
+fallback ran. When the array is present, every entry needs a known `type`
+(`message` or `fallback_message`), valid counters, and nonzero input. A
+`fallback_message` must name a valid `model`; a `message` may leave it null
+or absent, meaning the requested model. The last entry must be the serving
+attempt: the response's `model` (an entry without one matches only when
+the response's `model` is the requested one) and exactly the top-level
+counters. Other usage fields (`cache_creation`, `output_tokens_details`,
+`service_tier`, and the like) are ignored. A response whose two views of the serving
 attempt disagree is `InvalidResponse`; neither side is picked. The usage is
 then the saturating sum of every entry, without adding the top level
 again; without the array it is the top level. The per-request output cap therefore covers one model

@@ -45,9 +45,9 @@ fn provider(config: AnthropicConfig) -> AnthropicProvider {
     AnthropicProvider::new(config).expect("provider")
 }
 
+/// The live non-fallback usage shape; see `common::anthropic`.
 fn usage(input: u64, output: u64) -> Value {
-    json!({"input_tokens": input, "output_tokens": output,
-           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+    common::anthropic::live_usage(input, output, 0, 0)
 }
 
 fn message(content: &Value, stop_reason: &str, usage: &Value) -> Value {
@@ -347,7 +347,11 @@ async fn an_oversized_request_is_never_sent() {
 // 2. Response mapping.
 
 fn parsed(content: &Value, stop_reason: &str) -> ModelResponse {
-    parse_response(&message(content, stop_reason, &usage(100, 400))).expect("valid response")
+    parse_response(
+        &message(content, stop_reason, &usage(100, 400)),
+        "claude-opus-5-5",
+    )
+    .expect("valid response")
 }
 
 #[test]
@@ -414,7 +418,7 @@ fn a_refusal_keeps_its_stop_details_out_of_the_text() {
     let mut body = message(&json!([]), "refusal", &usage(100, 0));
     body["stop_details"] = json!({"type": "refusal", "category": "cyber",
                                   "explanation": "declined", "recommended_model": null});
-    let response = parse_response(&body).expect("a pre-output refusal is valid");
+    let response = parse_response(&body, "claude-opus-5-5").expect("a pre-output refusal is valid");
     assert_eq!(response.stop_reason, StopReason::Refusal);
     assert_eq!(response.text, None);
     let content = response.provider_content.expect("content");
@@ -428,7 +432,7 @@ fn a_refusal_keeps_its_stop_details_out_of_the_text() {
     );
 
     body["stop_details"] = json!("cyber");
-    let error = parse_response(&body).expect_err("not an object");
+    let error = parse_response(&body, "claude-opus-5-5").expect_err("not an object");
     assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
 }
 
@@ -440,9 +444,17 @@ fn unknown_and_fallback_blocks_are_kept_only_as_opaque_content() {
         {"type": "brand_new_block", "payload": {"nested": [1, -2, "three"]}},
         text("answer"),
     ]);
-    let mut body = message(&blocks, "end_turn", &usage(100, 400));
+    // A fallback ran, so usage takes the documented fallback form (no live
+    // fallback has been captured): the declined attempt, then the serving one.
+    let mut fallback_usage = usage(100, 400);
+    fallback_usage["iterations"] = json!([
+        {"type": "message", "model": null, "input_tokens": 100, "output_tokens": 0},
+        {"type": "fallback_message", "model": "claude-opus-4-8",
+         "input_tokens": 100, "output_tokens": 400},
+    ]);
+    let mut body = message(&blocks, "end_turn", &fallback_usage);
     body["model"] = json!("claude-opus-4-8");
-    let response = parse_response(&body).expect("valid");
+    let response = parse_response(&body, "claude-opus-5-5").expect("valid");
     assert_eq!(response.text.as_deref(), Some("answer"));
     assert!(response.tool_calls.is_empty());
     let content = response.provider_content.expect("content");
@@ -487,8 +499,11 @@ fn malformed_blocks_and_tool_uses_are_invalid() {
         (json!([{"no_type": true}]), "not an object with a type"),
     ];
     for (content, needle) in cases {
-        let error =
-            parse_response(&message(&content, "tool_use", &usage(100, 400))).expect_err("invalid");
+        let error = parse_response(
+            &message(&content, "tool_use", &usage(100, 400)),
+            "claude-opus-5-5",
+        )
+        .expect_err("invalid");
         assert_eq!(error.kind, ProviderErrorKind::InvalidResponse, "{content}");
         assert!(
             error.message.contains(needle),
@@ -501,11 +516,11 @@ fn malformed_blocks_and_tool_uses_are_invalid() {
         .as_object_mut()
         .expect("object")
         .remove("content");
-    assert!(parse_response(&no_content).is_err());
+    assert!(parse_response(&no_content, "claude-opus-5-5").is_err());
     let mut bad_model = message(&json!([text("x")]), "end_turn", &usage(1, 1));
     bad_model["model"] = json!("claude\u{1b}[2J");
     assert!(
-        parse_response(&bad_model)
+        parse_response(&bad_model, "claude-opus-5-5")
             .expect_err("model")
             .message
             .contains("model identifier")
@@ -545,8 +560,7 @@ fn session_script() -> Vec<Reply> {
                 ]),
                 "tool_use",
                 // The first turn's prefix is now cached.
-                &json!({"input_tokens": 30, "output_tokens": 40,
-                        "cache_read_input_tokens": 900, "cache_creation_input_tokens": 70}),
+                &common::anthropic::live_usage(30, 40, 900, 70),
             ),
         ),
         ok(
@@ -707,10 +721,12 @@ async fn consecutive_requests_share_a_byte_identical_prefix() {
 
 #[test]
 fn usage_is_disjoint_and_a_fully_cached_prompt_is_accepted() {
-    let cached = json!({"input_tokens": 0, "output_tokens": 5,
-                        "cache_read_input_tokens": 4000, "cache_creation_input_tokens": 12});
-    let response =
-        parse_response(&message(&json!([text("ok")]), "end_turn", &cached)).expect("fully cached");
+    let cached = common::anthropic::live_usage(0, 5, 4000, 12);
+    let response = parse_response(
+        &message(&json!([text("ok")]), "end_turn", &cached),
+        "claude-opus-5-5",
+    )
+    .expect("fully cached");
     assert_eq!(
         response.usage,
         Usage {
@@ -720,17 +736,22 @@ fn usage_is_disjoint_and_a_fully_cached_prompt_is_accepted() {
             cache_creation_input_tokens: 12,
         }
     );
-    let sparse = parse_response(&message(
-        &json!([text("ok")]),
-        "end_turn",
-        &json!({"input_tokens": 9, "output_tokens": 1, "cache_read_input_tokens": null}),
-    ))
+    // Invented: missing and null counters, without iterations.
+    let sparse = parse_response(
+        &message(
+            &json!([text("ok")]),
+            "end_turn",
+            &json!({"input_tokens": 9, "output_tokens": 1, "cache_read_input_tokens": null}),
+        ),
+        "claude-opus-5-5",
+    )
     .expect("missing and null counters are zero");
     assert_eq!(sparse.usage.cache_read_input_tokens, 0);
 }
 
 #[test]
 fn implausible_usage_is_invalid() {
+    // Synthetic top-level-only usage, invented to isolate each check.
     let content = json!([text(&"x".repeat(650))]);
     let cases = [
         (
@@ -755,7 +776,8 @@ fn implausible_usage_is_invalid() {
         ),
     ];
     for (usage, needle) in cases {
-        let error = parse_response(&message(&content, "end_turn", &usage)).expect_err("invalid");
+        let error = parse_response(&message(&content, "end_turn", &usage), "claude-opus-5-5")
+            .expect_err("invalid");
         assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
         assert!(
             error.message.contains(needle),
@@ -766,17 +788,20 @@ fn implausible_usage_is_invalid() {
     let mut no_usage = message(&content, "end_turn", &json!({}));
     no_usage.as_object_mut().expect("object").remove("usage");
     assert!(
-        parse_response(&no_usage)
+        parse_response(&no_usage, "claude-opus-5-5")
             .expect_err("no usage")
             .message
             .contains("no usage")
     );
     // Opaque blocks alone are output too.
-    let error = parse_response(&message(
-        &json!([thinking("")]),
-        "end_turn",
-        &json!({"input_tokens": 10, "output_tokens": 0}),
-    ))
+    let error = parse_response(
+        &message(
+            &json!([thinking("")]),
+            "end_turn",
+            &json!({"input_tokens": 10, "output_tokens": 0}),
+        ),
+        "claude-opus-5-5",
+    )
     .expect_err("zero tokens for a thinking block");
     assert!(error.message.contains("zero completion tokens"), "{error}");
 }
@@ -789,8 +814,11 @@ async fn large_signatures_skip_the_token_floor_but_count_toward_the_byte_budget(
         text("done"),
     ]);
     // One output token covers four bytes of text; the signature is free.
-    let response = parse_response(&message(&blocks, "end_turn", &usage(10, 1)))
-        .expect("the floor counts only the neutral view");
+    let response = parse_response(
+        &message(&blocks, "end_turn", &usage(10, 1)),
+        "claude-opus-5-5",
+    )
+    .expect("the floor counts only the neutral view");
     assert_eq!(response.token_floor_bytes(), 4);
     assert!(response.output_bytes() > 200_000);
 

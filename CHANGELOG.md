@@ -6,6 +6,16 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- The live API sends `usage.iterations` on every response when fallbacks
+  are on, with `"model": null` for an attempt on the requested model, which
+  the second-round validation refused. A `message` iteration may now leave
+  `model` null or absent, meaning the requested model; a `fallback_message`
+  must still name one; and a terminal entry without a model matches only
+  when the response's `model` is the requested one. Unknown usage fields
+  (`cache_creation`, `output_tokens_details`, `service_tier`, ...) are
+  ignored. `anthropic::parse_response` takes the requested model, and the
+  captured live usage is a test fixture that every non-fallback test now
+  uses.
 - Second review round for the anthropic provider. Top-level usage is
   always validated, and with `usage.iterations` every entry needs a known
   type, a valid model, valid counters, and nonzero input, and the last must

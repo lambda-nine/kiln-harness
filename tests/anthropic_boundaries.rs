@@ -47,8 +47,9 @@ fn message(content: &Value, stop_reason: &str, usage: &Value) -> Value {
     })
 }
 
+/// The live non-fallback usage shape; see `common::anthropic`.
 fn usage(input: u64, output: u64) -> Value {
-    json!({"input_tokens": input, "output_tokens": output})
+    common::anthropic::live_usage(input, output, 0, 0)
 }
 
 fn raw(body: String) -> Reply {
@@ -81,7 +82,7 @@ fn harness_for(
 }
 
 fn invalid(body: &Value) -> String {
-    let error = parse_response(body).expect_err("invalid");
+    let error = parse_response(body, "claude-opus-5-5").expect_err("invalid");
     assert_eq!(error.kind, ProviderErrorKind::InvalidResponse, "{body}");
     error.message
 }
@@ -89,7 +90,8 @@ fn invalid(body: &Value) -> String {
 // D1: every server-side attempt counts.
 
 /// The documented fallback shape: top-level usage is the serving attempt,
-/// `usage.iterations` every attempt.
+/// `usage.iterations` every attempt. No live fallback has been captured, so
+/// this follows the documentation, not a real response.
 fn fallback_body(primary: &Value, fallback: &Value, top: &Value) -> Value {
     let mut usage = top.clone();
     usage["iterations"] = json!([
@@ -134,7 +136,7 @@ async fn fallback_attempts_count_against_the_session_budgets() {
         .expect_err("947 input and 6 output tokens exceed the budgets");
     assert!(matches!(error, HarnessError::TokenBudget), "{error}");
 
-    let parsed = parse_response(&body).expect("valid");
+    let parsed = parse_response(&body, "claude-opus-5-5").expect("valid");
     assert_eq!(
         parsed.usage,
         Usage {
@@ -163,6 +165,8 @@ async fn the_per_request_cap_covers_every_attempt_of_one_call() {
 
 #[tokio::test]
 async fn a_mid_output_decline_is_summed_into_journal_audit_and_outcome() {
+    // Fallback usage follows the documentation; no live fallback has been
+    // captured.
     let body = fallback_body(
         &json!([30, 40, 900, 70]),
         &json!([25, 12, 880, 15]),
@@ -221,6 +225,7 @@ async fn a_mid_output_decline_is_summed_into_journal_audit_and_outcome() {
 
 #[test]
 fn malformed_iterations_are_invalid() {
+    // Hand-built entries: each varies one field of the documented shape.
     let text = json!([{"type": "text", "text": "ok"}]);
     let entry = |tag: &str, model: &str, input: Value, output: Value| json!({"type": tag, "model": model, "input_tokens": input, "output_tokens": output});
     // Top level 10/2 from claude-opus-5-5; a valid last entry matches it.
@@ -232,7 +237,8 @@ fn malformed_iterations_are_invalid() {
             &json!({"input_tokens": 10, "output_tokens": 2, "iterations": iterations}),
         )
     };
-    parse_response(&with(json!([serving()]))).expect("a lone serving entry is valid");
+    parse_response(&with(json!([serving()])), "claude-opus-5-5")
+        .expect("a lone serving entry is valid");
     for (iterations, needle) in [
         (
             json!([entry("message", "m", json!(-1), json!(2)), serving()]),
@@ -257,7 +263,7 @@ fn malformed_iterations_are_invalid() {
             "iterations[0] has no known type",
         ),
         (
-            json!([{"type": "message", "input_tokens": 5}, serving()]),
+            json!([{"type": "fallback_message", "input_tokens": 5}, serving()]),
             "iterations[0] has no valid model",
         ),
         (
@@ -278,6 +284,8 @@ fn malformed_iterations_are_invalid() {
 
 #[test]
 fn iterations_must_end_with_the_serving_attempt() {
+    // Fallback usage follows the documentation; no live fallback has been
+    // captured.
     let mismatch = "usage iterations do not end with the serving attempt the top level reports";
     let text = json!([{"type": "text", "text": "ok"}]);
     let body = |top: Value, iterations: Value| {
@@ -354,6 +362,8 @@ async fn contradictory_serving_usage_cannot_complete_a_session() {
 
 #[test]
 fn the_token_floor_uses_the_serving_output() {
+    // Fallback usage follows the documentation; no live fallback has been
+    // captured.
     // 300 bytes of returned text: the serving attempt must account for them.
     let long = json!([{"type": "text", "text": "x".repeat(300)}]);
     let body = |serving: u64| {
@@ -368,7 +378,7 @@ fn the_token_floor_uses_the_serving_output() {
     };
     // 2 serving tokens cannot cover 300 bytes, whatever the declined attempt spent.
     assert!(invalid(&body(2)).contains("2 completion tokens for 300 bytes"));
-    let accepted = parse_response(&body(5)).expect("5 tokens cover 300 bytes");
+    let accepted = parse_response(&body(5), "claude-opus-5-5").expect("5 tokens cover 300 bytes");
     assert_eq!(accepted.usage.output_tokens, 55, "budgets see the sum");
 }
 
@@ -689,7 +699,7 @@ fn the_envelope_and_stop_reason_are_required() {
         "end_turn",
         &usage(10, 1),
     );
-    parse_response(&good).expect("the baseline is valid");
+    parse_response(&good, "claude-opus-5-5").expect("the baseline is valid");
     let mut error_without_content = json!({"type": "error",
         "error": {"type": "overloaded_error", "message": "m"}});
     assert!(invalid(&error_without_content).contains("server reported overloaded_error"));
@@ -966,7 +976,99 @@ fn tool_blocks_without_a_tool_use_stop_are_refused() {
         ("max_tokens", kiln_harness::provider::StopReason::MaxTokens),
         ("refusal", kiln_harness::provider::StopReason::Refusal),
     ] {
-        let parsed = parse_response(&message(&call, stop, &usage(10, 10))).expect(stop);
+        let parsed =
+            parse_response(&message(&call, stop, &usage(10, 10)), "claude-opus-5-5").expect(stop);
         assert_eq!(parsed.stop_reason, expected);
     }
+}
+
+// The live usage shape: one `message` iteration with a null model.
+
+fn live_body(model: &str) -> Value {
+    let usage: Value = serde_json::from_str(common::anthropic::LIVE_USAGE).expect("fixture");
+    let mut body = message(&json!([{"type": "text", "text": "ok"}]), "end_turn", &usage);
+    body["model"] = json!(model);
+    body
+}
+
+#[test]
+fn the_captured_live_usage_parses() {
+    let fixture: Value = serde_json::from_str(common::anthropic::LIVE_USAGE).expect("fixture");
+    assert_eq!(
+        common::anthropic::live_usage(18, 4, 0, 0),
+        fixture,
+        "the test helper is the captured shape"
+    );
+    let response = parse_response(&live_body("claude-opus-5-5"), "claude-opus-5-5")
+        .expect("the real API's usage is valid");
+    assert_eq!(
+        response.usage,
+        Usage {
+            input_tokens: 18,
+            output_tokens: 4,
+            ..Usage::default()
+        },
+        "one iteration mirroring the top level is counted once"
+    );
+    // Unknown fields, now or later, at either level are ignored.
+    let mut future = live_body("claude-opus-5-5");
+    future["usage"]["server_tool_use"] = json!({"web_search_requests": 0});
+    future["usage"]["iterations"][0]["future_field"] = json!({"x": [1, 2]});
+    parse_response(&future, "claude-opus-5-5").expect("extra fields are ignored");
+}
+
+#[tokio::test]
+async fn the_captured_live_usage_runs_a_session() {
+    let server = FakeHttp::start([Reply::json(200, &live_body("claude-opus-5-5"))]).await;
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("live-shape.jsonl");
+    let provider = AnthropicProvider::new(config_with(&base(&server), KEY)).expect("provider");
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider,
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    let outcome = harness
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("completes");
+    assert_eq!(outcome.final_answer, "ok");
+    assert_eq!(
+        (outcome.usage.input_tokens, outcome.usage.output_tokens),
+        (18, 4)
+    );
+    read_journal(&path).expect("verifies");
+}
+
+#[test]
+fn a_null_iteration_model_means_the_requested_model() {
+    // Served by another model than requested, yet the entry claims the
+    // requested one: refused.
+    assert_eq!(
+        invalid(&live_body("claude-opus-4-8")),
+        "usage iterations do not end with the serving attempt the top level reports"
+    );
+    // The same body is consistent for a request that named that model.
+    parse_response(&live_body("claude-opus-4-8"), "claude-opus-4-8")
+        .expect("null model is the requested model");
+    // A fallback attempt must name its model.
+    let mut body = live_body("claude-opus-5-5");
+    body["usage"]["iterations"][0]["type"] = json!("fallback_message");
+    assert!(invalid(&body).contains("iterations[0] has no valid model"));
+    body["usage"]["iterations"][0]
+        .as_object_mut()
+        .expect("entry")
+        .remove("model");
+    assert!(invalid(&body).contains("iterations[0] has no valid model"));
+    // A message attempt may also omit it; a named one must be valid.
+    let mut body = live_body("claude-opus-5-5");
+    body["usage"]["iterations"][0]
+        .as_object_mut()
+        .expect("entry")
+        .remove("model");
+    parse_response(&body, "claude-opus-5-5").expect("absent is null");
+    body["usage"]["iterations"][0]["model"] = json!(7);
+    assert!(invalid(&body).contains("iterations[0] has no valid model"));
 }
