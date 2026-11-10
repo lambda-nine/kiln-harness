@@ -143,6 +143,8 @@ pub enum AuditError {
     Json(#[from] serde_json::Error),
     #[error("system clock is before the Unix epoch")]
     Clock,
+    #[error("audit path {0:?} does not name a file")]
+    InvalidPath(std::path::PathBuf),
 }
 
 pub trait AuditSink: Send {
@@ -172,6 +174,7 @@ impl JsonlAudit {
     ///
     /// Returns an error when the parent or file cannot be created or opened.
     pub fn open(path: &Path) -> Result<Self, AuditError> {
+        crate::outputs::validate_file_path(path).map_err(AuditError::InvalidPath)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

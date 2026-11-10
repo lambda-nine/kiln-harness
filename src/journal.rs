@@ -313,6 +313,7 @@ impl JsonlJournal {
     /// Returns an error if the path already exists, a directory is unsafe or
     /// a symlink, or the file cannot be created.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
+        crate::outputs::validate_file_path(path).map_err(JournalError::InvalidPath)?;
         let name = path
             .file_name()
             .ok_or_else(|| JournalError::InvalidPath(path.to_path_buf()))?;

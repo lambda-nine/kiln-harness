@@ -8,6 +8,7 @@ pub mod api;
 pub mod audit;
 pub mod engine;
 pub mod journal;
+mod outputs;
 pub mod provider;
 pub mod replay;
 pub mod tools;

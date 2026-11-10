@@ -1391,3 +1391,60 @@ async fn sub_millisecond_durations_are_refused_before_anything_is_journaled() {
     restored.apply_limits(&config.limits());
     assert_eq!(restored.tool_limits.timeout, Duration::from_millis(1_234));
 }
+
+#[test]
+fn output_paths_must_name_a_file() {
+    use kiln_harness::audit::{AuditError, JsonlAudit};
+
+    let temp = common::private_tempdir().expect("temp dir");
+    let base = temp.path().display().to_string();
+    for raw in [
+        String::new(),
+        "/".to_string(),
+        format!("{base}/name/"),
+        format!("{base}/name/."),
+        format!("{base}/name/.."),
+    ] {
+        let path = PathBuf::from(&raw);
+        let journal = JsonlJournal::open(&path);
+        assert!(
+            matches!(journal, Err(JournalError::InvalidPath(_))),
+            "{raw:?}: {:?}",
+            journal.err()
+        );
+        let audit = JsonlAudit::open(&path);
+        assert!(
+            matches!(audit, Err(AuditError::InvalidPath(_))),
+            "{raw:?}: {:?}",
+            audit.err()
+        );
+    }
+    assert!(
+        !temp.path().join("name").exists(),
+        "nothing is created for a refused path"
+    );
+
+    // Repeated separators inside the path are fine.
+    let repeated = PathBuf::from(format!("{base}/inner//repeated///journal.jsonl"));
+    JsonlJournal::open(&repeated).expect("repeated separators");
+    JsonlAudit::open(&PathBuf::from(format!("{base}/inner//audit.jsonl"))).expect("audit");
+    assert!(temp.path().join("inner/repeated/journal.jsonl").is_file());
+    assert!(temp.path().join("inner/audit.jsonl").is_file());
+
+    // So are relative paths. Changing the working directory is process-wide,
+    // so resolve them in the CLI, which opens both outputs before kilnd.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+        .current_dir(temp.path())
+        .args(["--socket", "no-kilnd.sock", "demo"])
+        .args([
+            "--audit",
+            "rel/audit.jsonl",
+            "--journal",
+            "rel//journal.jsonl",
+        ])
+        .output()
+        .expect("run demo");
+    assert!(!output.status.success(), "there is no kilnd");
+    assert!(temp.path().join("rel/audit.jsonl").is_file());
+    assert!(temp.path().join("rel/journal.jsonl").is_file());
+}
