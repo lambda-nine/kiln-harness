@@ -49,6 +49,8 @@ pub struct ReplayProvider {
     info: ProviderInfo,
     task: SessionTask,
     limits: SessionLimits,
+    /// The idle timeout the recorded session sent kilnd, if it used expiry.
+    sandbox_idle_ms: Option<u64>,
     turns: VecDeque<RecordedTurn>,
     tools: VecDeque<RecordedTool>,
     final_answer: Option<String>,
@@ -105,6 +107,7 @@ impl ReplayProvider {
                 prompt: task.clone(),
             },
             limits: *limits,
+            sandbox_idle_ms: None,
             turns: VecDeque::new(),
             tools: VecDeque::new(),
             final_answer: None,
@@ -153,7 +156,10 @@ impl ReplayProvider {
                     replay.outcome = Some(outcome.clone());
                     replay.final_answer.clone_from(final_answer);
                 }
-                JournalEvent::SessionStarted { .. } | JournalEvent::SandboxReady { .. } => {}
+                JournalEvent::SandboxReady { expiry_idle_ms, .. } => {
+                    replay.sandbox_idle_ms = *expiry_idle_ms;
+                }
+                JournalEvent::SessionStarted { .. } => {}
             }
         }
         // A trailing request with no answer stays a turn to account for, so
@@ -172,6 +178,27 @@ impl ReplayProvider {
     #[must_use]
     pub fn limits(&self) -> SessionLimits {
         self.limits
+    }
+
+    /// The sandbox idle timeout the recorded session sent kilnd, when it
+    /// ran against a daemon with expiry.
+    #[must_use]
+    pub fn recorded_sandbox_idle_timeout(&self) -> Option<std::time::Duration> {
+        self.sandbox_idle_ms.map(std::time::Duration::from_millis)
+    }
+
+    /// The configuration that replays this recording: `base` with the
+    /// recorded limits, and the sandbox idle timeout from
+    /// [`crate::engine::HarnessConfig::fit_replay_idle_timeout`].
+    #[must_use]
+    pub fn replay_config(
+        &self,
+        base: crate::engine::HarnessConfig,
+    ) -> crate::engine::HarnessConfig {
+        let mut config = base;
+        config.apply_limits(&self.limits);
+        config.fit_replay_idle_timeout(self.recorded_sandbox_idle_timeout());
+        config
     }
 
     /// The recorded final answer, if the recording completed with one.

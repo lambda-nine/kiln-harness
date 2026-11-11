@@ -6,6 +6,12 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Replay picks its sandbox idle timeout itself: the one the recording sent,
+  when it ran with expiry, and otherwise the smallest whole second of at
+  least 120 that fits the recorded tool timeout, so a recording with long
+  tools still replays against a daemon with expiry.
+  `ReplayProvider::replay_config` builds the configuration, and
+  `HarnessConfig::fit_replay_idle_timeout` makes the choice.
 - Fourth review round for kilnd API milestone 1. With expiry, the tool
   timeout plus the response-loss recovery window plus the renew interval
   must fit in the idle timeout sent, or the session is refused before

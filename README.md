@@ -294,7 +294,9 @@ token usage. A session whose sandbox deletion was not confirmed ends
 `cleanup_failed`.
 
 `replay` reruns the recorded task under every recorded model-visible limit in
-a fresh sandbox. It answers each model request from the journal after
+a fresh sandbox. Against a kilnd with expiry it sends the recorded idle
+timeout, or, for a recording without one, the smallest that fits its tool
+timeout (at least 120 seconds). It answers each model request from the journal after
 checking that the request, including its output-token cap, hashes the same as
 the recorded one, and compares each tool call and result with the recording as
 it completes. Before contacting kilnd it opens its outputs and refuses if any

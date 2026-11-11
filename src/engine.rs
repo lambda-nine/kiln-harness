@@ -154,6 +154,24 @@ impl HarnessConfig {
         }
     }
 
+    /// Choose the sandbox idle timeout for replaying a recording, which has
+    /// no expiry flags of its own: the recorded one when the recording ran
+    /// with expiry, and otherwise the smallest whole-second idle timeout of
+    /// at least the default whose renew interval leaves room for the
+    /// recorded tool budget (`idle >= 1.5 * budget`), at most the ceiling.
+    /// kilnd's clamp and the tool-budget check still apply when the replay
+    /// runs, and refuse it before create if it does not fit.
+    pub fn fit_replay_idle_timeout(&mut self, recorded: Option<Duration>) {
+        self.sandbox_idle_timeout = recorded.unwrap_or_else(|| {
+            let budget_ms = duration_ms(tool_rpc_budget(self));
+            let needed_ms = budget_ms.saturating_mul(3).div_ceil(2);
+            let whole_seconds = Duration::from_secs(needed_ms.div_ceil(1000));
+            whole_seconds
+                .max(Self::default().sandbox_idle_timeout)
+                .min(MAX_SANDBOX_IDLE_TIMEOUT)
+        });
+    }
+
     /// Check every limit against its hard ceilings, exactly as
     /// [`Harness::run`] does before any sandbox exists.
     ///

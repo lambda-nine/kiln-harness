@@ -762,5 +762,11 @@ path checks before that are diagnostics only. On a clash it discards both
 outputs, which removes only what their opens created, through the pinned parent
 descriptors. The recorded task and limits, which must pass the same ceilings,
 drive the replayed session, which uses a new sandbox, session ID, audit, and
-journal. Since the model side is fixed, a divergence means kilnd returned
+journal. Replay has no expiry flags. It sends the idle timeout the recording
+sent, from `sandbox_ready`, when there is one; otherwise the smallest whole
+second, at least the 120-second default and at most the 1-hour ceiling,
+that fits the recorded tool budget (`idle >= 1.5 * budget`). kilnd's clamp
+and the tool-budget check then apply as for any session, so a replay that
+cannot fit is refused before create. The largest recordable tool timeout,
+10 minutes, needs 902 seconds. Since the model side is fixed, a divergence means kilnd returned
 different tool results than during the recording.

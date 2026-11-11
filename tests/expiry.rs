@@ -1712,3 +1712,137 @@ async fn a_fatal_pre_tool_renew_leaves_the_call_audited_but_not_completed() {
     );
     assert_eq!(api.state().execs.len(), 1, "only the baseline ran");
 }
+
+/// Record the demo against `api` under `config` into a journal file and
+/// return its replay provider.
+async fn record_demo(
+    api: &FakeApi,
+    config: HarnessConfig,
+    dir: &std::path::Path,
+) -> ReplayProvider {
+    let path = dir.join("recorded.jsonl");
+    let mut recording = Harness::new(
+        api.clone(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        config,
+    );
+    recording
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("recording");
+    drop(recording);
+    ReplayProvider::from_journal(&read_journal(&path).expect("journal verifies"))
+        .expect("replayable")
+}
+
+async fn replay_against(
+    api: &FakeApi,
+    provider: ReplayProvider,
+) -> Result<SessionOutcome, HarnessError> {
+    let task = provider.task();
+    let config = provider.replay_config(HarnessConfig::default());
+    let mut replay = Harness::new(
+        api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    replay.run(&task, CancellationToken::new()).await
+}
+
+#[tokio::test]
+async fn replay_uses_the_recorded_idle_timeout() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let config = HarnessConfig {
+        sandbox_idle_timeout: Duration::from_secs(60),
+        ..HarnessConfig::default()
+    };
+    let provider = record_demo(&FakeApi::with_expiry(), config, temp.path()).await;
+    assert_eq!(
+        provider.recorded_sandbox_idle_timeout(),
+        Some(Duration::from_secs(60))
+    );
+    let api = FakeApi::with_expiry();
+    replay_against(&api, provider).await.expect("replay");
+    assert_eq!(
+        api.state().creates[0]
+            .expiry
+            .map(|policy| policy.idle_timeout_ms),
+        Some(60_000)
+    );
+}
+
+#[tokio::test]
+async fn replay_without_recorded_expiry_fits_the_idle_timeout_to_the_tool_budget() {
+    // Recorded against an old daemon with 90 s tools: 90 s plus 1 s of
+    // recovery is a 91 s budget, and 1.5 times that is 137 s, whole.
+    let temp = common::private_tempdir().expect("tempdir");
+    let mut config = HarnessConfig::default();
+    config.tool_limits.timeout = Duration::from_secs(90);
+    let provider = record_demo(&FakeApi::default(), config, temp.path()).await;
+    assert_eq!(provider.recorded_sandbox_idle_timeout(), None);
+    assert_eq!(
+        provider
+            .replay_config(HarnessConfig::default())
+            .sandbox_idle_timeout,
+        Duration::from_secs(137)
+    );
+    let api = FakeApi::with_expiry();
+    replay_against(&api, provider).await.expect("replay");
+    assert_eq!(
+        api.state().creates[0]
+            .expiry
+            .map(|policy| policy.idle_timeout_ms),
+        Some(137_000)
+    );
+
+    // Small tool budgets keep the 120 s default.
+    let temp = common::private_tempdir().expect("tempdir");
+    let provider = record_demo(&FakeApi::default(), HarnessConfig::default(), temp.path()).await;
+    assert_eq!(
+        provider
+            .replay_config(HarnessConfig::default())
+            .sandbox_idle_timeout,
+        Duration::from_secs(120)
+    );
+}
+
+#[tokio::test]
+async fn a_replay_whose_tool_budget_the_daemon_cannot_fit_is_refused() {
+    // The largest recordable tool timeout, 10 min, needs a 902 s idle
+    // timeout: within the 1 h ceiling, so the ceiling itself cannot refuse
+    // a valid recording. A daemon that caps idle below it does, before
+    // anything is created.
+    let temp = common::private_tempdir().expect("tempdir");
+    let mut config = HarnessConfig::default();
+    config.tool_limits.timeout = Duration::from_secs(600);
+    let provider = record_demo(&FakeApi::default(), config, temp.path()).await;
+    assert_eq!(
+        provider
+            .replay_config(HarnessConfig::default())
+            .sandbox_idle_timeout,
+        Duration::from_secs(902)
+    );
+    let api = FakeApi::with_expiry();
+    api.state().limits = Some(ApiLimits {
+        max_sandbox_idle_ms: 600_000,
+        ..kilnd_limits()
+    });
+    let error = replay_against(&api, provider).await.expect_err("refused");
+    assert!(matches!(error, HarnessError::InvalidTask(_)), "{error}");
+    assert!(api.state().creates.is_empty());
+}
+
+#[test]
+fn the_fitted_replay_idle_timeout_is_capped_at_the_ceiling() {
+    // Beyond what a valid recording can hold, the ceiling applies.
+    let mut config = HarnessConfig::default();
+    config.tool_limits.timeout = Duration::from_secs(3_000);
+    config.fit_replay_idle_timeout(None);
+    assert_eq!(config.sandbox_idle_timeout, Duration::from_secs(3_600));
+    config.fit_replay_idle_timeout(Some(Duration::from_secs(45)));
+    assert_eq!(config.sandbox_idle_timeout, Duration::from_secs(45));
+}
