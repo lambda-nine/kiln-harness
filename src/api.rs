@@ -27,6 +27,24 @@ pub struct SandboxRequest {
     /// Sent only when the daemon lists [`Feature::SandboxExpiry`]: an older
     /// daemon ignores the field silently. `None` never expires.
     pub expiry: Option<ExpiryPolicy>,
+    /// Sent only when the daemon lists [`Feature::IdempotentCreate`]: an
+    /// older daemon ignores the field and could create a second sandbox for
+    /// a retry. `None` is an unkeyed create, which is never retried. A retry
+    /// must send a request equal to the first, since kilnd answers any other
+    /// request under a used key `request_id_conflict`.
+    pub request_id: Option<String>,
+}
+
+/// The longest create request ID kilnd accepts.
+pub const MAX_REQUEST_ID_BYTES: usize = 64;
+
+/// Whether `id` is a create request ID kilnd accepts: 1 to 64 bytes, each
+/// printable ASCII without space (`0x21`-`0x7e`).
+#[must_use]
+pub(crate) fn request_id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_REQUEST_ID_BYTES
+        && id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 /// When kilnd may reclaim a sandbox on its own. Each field is whole
@@ -53,6 +71,59 @@ pub struct ExpiryStatus {
     pub idle_paused: bool,
 }
 
+/// A sandbox's lifecycle state, as kilnd reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxState {
+    Creating,
+    Ready,
+    Deleting,
+    Deleted,
+    Failed,
+    Lost,
+    Quarantined,
+    /// A state this schema does not name, by its protobuf number;
+    /// `Other(0)` when the state is unspecified.
+    Other(i32),
+}
+
+impl SandboxState {
+    #[must_use]
+    pub fn from_proto(value: i32) -> Self {
+        match pb::SandboxState::try_from(value) {
+            Ok(pb::SandboxState::Creating) => Self::Creating,
+            Ok(pb::SandboxState::Ready) => Self::Ready,
+            Ok(pb::SandboxState::Deleting) => Self::Deleting,
+            Ok(pb::SandboxState::Deleted) => Self::Deleted,
+            Ok(pb::SandboxState::Failed) => Self::Failed,
+            Ok(pb::SandboxState::Lost) => Self::Lost,
+            Ok(pb::SandboxState::Quarantined) => Self::Quarantined,
+            Ok(pb::SandboxState::Unspecified) | Err(_) => Self::Other(value),
+        }
+    }
+
+    /// The name after `SANDBOX_STATE_`, as the schema spells it;
+    /// `STATE_<n>` for a number this schema does not name.
+    #[must_use]
+    pub fn as_str(self) -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(match self {
+            Self::Creating => "CREATING",
+            Self::Ready => "READY",
+            Self::Deleting => "DELETING",
+            Self::Deleted => "DELETED",
+            Self::Failed => "FAILED",
+            Self::Lost => "LOST",
+            Self::Quarantined => "QUARANTINED",
+            Self::Other(value) => return std::borrow::Cow::Owned(format!("STATE_{value}")),
+        })
+    }
+}
+
+impl std::fmt::Display for SandboxState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     pub id: String,
@@ -61,6 +132,23 @@ pub struct Sandbox {
     /// `None` when the daemon reports no expiry status, as an older one
     /// never does.
     pub expiry: Option<ExpiryStatus>,
+    pub state: SandboxState,
+    /// Why kilnd failed the sandbox, when it did; empty otherwise.
+    pub failure_reason: String,
+    /// The create's request ID, echoed; empty for an unkeyed create or a
+    /// daemon without [`Feature::IdempotentCreate`].
+    pub request_id: String,
+    /// The create's request record was given up through a delete with
+    /// `release_request_id`.
+    pub request_id_released: bool,
+}
+
+/// What a successful `DeleteSandbox` reported beyond the deleted state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Deleted {
+    /// kilnd gave up the create's request record in this call or an
+    /// earlier one.
+    pub request_id_released: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +256,7 @@ pub enum Feature {
     ExecEnv,
     SandboxDefaultEnv,
     ExecStream,
+    RequestIdRelease,
     /// A feature this harness does not use, by its protobuf number.
     Other(i32),
 }
@@ -183,7 +272,8 @@ impl Feature {
             Ok(pb::Feature::ExecEnv) => Self::ExecEnv,
             Ok(pb::Feature::SandboxDefaultEnv) => Self::SandboxDefaultEnv,
             Ok(pb::Feature::ExecStream) => Self::ExecStream,
-            Ok(pb::Feature::RequestIdRelease) | Err(_) => Self::Other(value),
+            Ok(pb::Feature::RequestIdRelease) => Self::RequestIdRelease,
+            Err(_) => Self::Other(value),
         })
     }
 
@@ -199,6 +289,7 @@ impl Feature {
             Self::ExecEnv => pb::Feature::ExecEnv,
             Self::SandboxDefaultEnv => pb::Feature::SandboxDefaultEnv,
             Self::ExecStream => pb::Feature::ExecStream,
+            Self::RequestIdRelease => pb::Feature::RequestIdRelease,
             Self::Other(value) => match pb::Feature::try_from(value) {
                 Ok(feature) => feature,
                 Err(_) => return format!("feature_{value}"),
@@ -439,7 +530,16 @@ pub trait SandboxApi: Send + Sync {
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError>;
     /// Request idempotent deletion. Success acknowledges a deleted response state;
     /// callers must independently confirm absence via `non_deleted_sandboxes`.
-    async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError>;
+    ///
+    /// `release_request_id` asks kilnd to give up the create's request
+    /// record (needs [`Feature::RequestIdRelease`]). It takes effect only if
+    /// the row ends `DELETED`; otherwise nothing is released or remembered,
+    /// so repeat the call once absence is confirmed. It is irreversible and
+    /// ends retry protection for the key: pass `true` only after a
+    /// successful keyed create whose response is held, with no create retry
+    /// pending or to come.
+    async fn delete(&self, sandbox_id: &str, release_request_id: bool)
+    -> Result<Deleted, ApiError>;
     /// Record activity on a ready sandbox, restarting its idle timer; never
     /// extends its lifetime. Call only when the daemon lists
     /// [`Feature::SandboxExpiry`].
@@ -531,6 +631,39 @@ fn sandbox_from_proto(sandbox: pb::Sandbox) -> Sandbox {
             last_activity_at_unix_ms: status.last_activity_at_unix_ms,
             idle_paused: status.idle_paused,
         }),
+        state: SandboxState::from_proto(sandbox.state),
+        failure_reason: sandbox.failure_reason,
+        request_id: sandbox.request_id,
+        request_id_released: sandbox.request_id_released,
+    }
+}
+
+/// The wire form of a create. Labels are an ordered map, so equal requests
+/// encode to the same bytes and a retry is byte-identical to its first
+/// attempt.
+fn create_request_to_proto(request: SandboxRequest) -> pb::CreateSandboxRequest {
+    pb::CreateSandboxRequest {
+        spec: Some(pb::SandboxSpec {
+            image: request.image,
+            limits: Some(pb::ResourceLimits {
+                memory_bytes: request.memory_bytes,
+                cpu_millis: request.cpu_millis,
+                pids: request.pids,
+                disk_bytes: request.disk_bytes,
+            }),
+            network: Some(pb::NetworkPolicy {
+                mode: pb::NetworkMode::None as i32,
+                allow: Vec::new(),
+            }),
+            read_only_root: request.read_only_root,
+            writable_paths: request.writable_paths,
+            labels: request.labels.into_iter().collect(),
+        }),
+        expiry: request.expiry.map(|policy| pb::ExpiryPolicy {
+            max_lifetime_ms: policy.max_lifetime_ms,
+            idle_timeout_ms: policy.idle_timeout_ms,
+        }),
+        request_id: request.request_id.unwrap_or_default(),
     }
 }
 
@@ -590,28 +723,7 @@ impl SandboxApi for TonicKilnd {
         let response = self
             .client
             .clone()
-            .create_sandbox(pb::CreateSandboxRequest {
-                spec: Some(pb::SandboxSpec {
-                    image: request.image,
-                    limits: Some(pb::ResourceLimits {
-                        memory_bytes: request.memory_bytes,
-                        cpu_millis: request.cpu_millis,
-                        pids: request.pids,
-                        disk_bytes: request.disk_bytes,
-                    }),
-                    network: Some(pb::NetworkPolicy {
-                        mode: pb::NetworkMode::None as i32,
-                        allow: Vec::new(),
-                    }),
-                    read_only_root: request.read_only_root,
-                    writable_paths: request.writable_paths,
-                    labels: request.labels.into_iter().collect(),
-                }),
-                expiry: request.expiry.map(|policy| pb::ExpiryPolicy {
-                    max_lifetime_ms: policy.max_lifetime_ms,
-                    idle_timeout_ms: policy.idle_timeout_ms,
-                }),
-            })
+            .create_sandbox(create_request_to_proto(request))
             .await
             .map_err(ApiError::from)?
             .into_inner();
@@ -643,12 +755,17 @@ impl SandboxApi for TonicKilnd {
         Ok(self.final_check(sandbox_id).await?.recent)
     }
 
-    async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError> {
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
         let response = self
             .client
             .clone()
             .delete_sandbox(pb::DeleteSandboxRequest {
                 id: sandbox_id.to_string(),
+                release_request_id,
             })
             .await
             .map_err(ApiError::from)?
@@ -662,7 +779,9 @@ impl SandboxApi for TonicKilnd {
                 sandbox.state
             )));
         }
-        Ok(())
+        Ok(Deleted {
+            request_id_released: sandbox.request_id_released,
+        })
     }
 
     async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError> {
@@ -983,7 +1102,10 @@ mod status_contract_test {
     fn feature_names_are_lower_case_suffixes() {
         assert_eq!(Feature::SandboxExpiry.name(), "sandbox_expiry");
         assert_eq!(Feature::TypedReasons.name(), "typed_reasons");
-        assert_eq!(Feature::Other(8).name(), "request_id_release");
+        assert_eq!(Feature::RequestIdRelease.name(), "request_id_release");
+        assert_eq!(Feature::IdempotentCreate.name(), "idempotent_create");
+        assert_eq!(Feature::from_proto(8), Some(Feature::RequestIdRelease));
+        assert_eq!(Feature::from_proto(2), Some(Feature::IdempotentCreate));
         assert_eq!(Feature::Other(99).name(), "feature_99");
         assert_eq!(Feature::from_proto(0), None);
         assert_eq!(Feature::from_proto(7), Some(Feature::TypedReasons));
@@ -1004,5 +1126,90 @@ mod status_contract_test {
             assert_eq!(error.message, "rejected");
         }
         assert_eq!(ApiError::local("response lost").code, Code::Unknown);
+    }
+
+    #[test]
+    fn request_ids_are_printable_ascii_of_one_to_sixty_four_bytes() {
+        use super::request_id_is_valid;
+        assert!(!request_id_is_valid(""));
+        assert!(request_id_is_valid("a"));
+        assert!(request_id_is_valid(&"a".repeat(64)));
+        assert!(!request_id_is_valid(&"a".repeat(65)));
+        assert!(request_id_is_valid("!~"));
+        assert!(!request_id_is_valid("a b"));
+        assert!(!request_id_is_valid("a\u{7f}"));
+        assert!(!request_id_is_valid("a\tb"));
+        assert!(!request_id_is_valid("caf\u{e9}"));
+        // The harness's longest key before the year 10000: 12 hex digits of
+        // Unix milliseconds, a 32-bit process ID and a 64-bit counter.
+        let longest = format!(
+            "kiln-harness:hs-{}-{}-{}",
+            "f".repeat(12),
+            "f".repeat(8),
+            "f".repeat(16)
+        );
+        assert_eq!(longest.len(), 54);
+        assert!(request_id_is_valid(&longest));
+    }
+
+    #[test]
+    fn sandbox_states_map_both_ways() {
+        use super::SandboxState;
+        use crate::pb;
+        for (proto, state, name) in [
+            (
+                pb::SandboxState::Creating,
+                SandboxState::Creating,
+                "CREATING",
+            ),
+            (pb::SandboxState::Ready, SandboxState::Ready, "READY"),
+            (
+                pb::SandboxState::Deleting,
+                SandboxState::Deleting,
+                "DELETING",
+            ),
+            (pb::SandboxState::Deleted, SandboxState::Deleted, "DELETED"),
+            (pb::SandboxState::Failed, SandboxState::Failed, "FAILED"),
+            (pb::SandboxState::Lost, SandboxState::Lost, "LOST"),
+            (
+                pb::SandboxState::Quarantined,
+                SandboxState::Quarantined,
+                "QUARANTINED",
+            ),
+        ] {
+            assert_eq!(SandboxState::from_proto(proto as i32), state);
+            assert_eq!(state.as_str(), name);
+            assert_eq!(proto.as_str_name(), format!("SANDBOX_STATE_{name}"));
+        }
+        assert_eq!(SandboxState::from_proto(0), SandboxState::Other(0));
+        assert_eq!(SandboxState::from_proto(99).as_str(), "STATE_99");
+    }
+
+    #[test]
+    fn equal_create_requests_encode_to_the_same_bytes() {
+        use super::{SandboxRequest, create_request_to_proto};
+        use prost::Message as _;
+        let keys = (0..16).map(|n| format!("label-{n:02}")).collect::<Vec<_>>();
+        let request = |order: &mut dyn Iterator<Item = &String>| SandboxRequest {
+            image: "alpine".to_string(),
+            memory_bytes: 1,
+            cpu_millis: 1,
+            pids: 1,
+            disk_bytes: 1,
+            network_none: true,
+            read_only_root: true,
+            writable_paths: Vec::new(),
+            labels: order.map(|key| (key.clone(), key.clone())).collect(),
+            expiry: None,
+            request_id: Some("kiln-harness:a".to_string()),
+        };
+        let forward = create_request_to_proto(request(&mut keys.iter()));
+        let backward = create_request_to_proto(request(&mut keys.iter().rev()));
+        assert_eq!(forward.request_id, "kiln-harness:a");
+        assert_eq!(forward.encode_to_vec(), backward.encode_to_vec());
+        let encoded = forward.encode_to_vec();
+        for _ in 0..4 {
+            assert_eq!(forward.clone().encode_to_vec(), encoded);
+        }
     }
 }

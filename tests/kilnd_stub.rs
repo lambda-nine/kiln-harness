@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use common::http::{FakeHttp, Reply};
-use kiln_harness::api::{ExpiryReason, TonicKilnd};
+use kiln_harness::api::{ExpiryReason, SandboxApi as _, TonicKilnd};
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionTask};
 use kiln_harness::journal::{JournalEvent, MemoryJournal};
@@ -31,8 +31,14 @@ use tonic::{Request, Response, Status};
 struct Stub {
     /// Health answers this many calls, then never answers again.
     health_answers: u32,
-    /// Advertise expiry and typed reasons.
+    /// Advertise expiry, typed reasons, idempotent create and request-ID
+    /// release.
     current: bool,
+    /// Record the first create, then lose its response: `UNAVAILABLE`.
+    lose_first_create: bool,
+    /// Every create and delete request as it arrived on the wire.
+    create_requests: Arc<std::sync::Mutex<Vec<pb::CreateSandboxRequest>>>,
+    delete_requests: Arc<std::sync::Mutex<Vec<pb::DeleteSandboxRequest>>>,
     /// Report every non-baseline Exec as canceled by a sandbox deletion that
     /// left the sandbox unusable.
     deleted_during_exec: bool,
@@ -79,6 +85,8 @@ impl KilndService for Stub {
             features: vec![
                 pb::Feature::SandboxExpiry as i32,
                 pb::Feature::TypedReasons as i32,
+                pb::Feature::IdempotentCreate as i32,
+                pb::Feature::RequestIdRelease as i32,
             ],
             limits: Some(pb::ApiLimits {
                 min_sandbox_lifetime_ms: 10_000,
@@ -98,10 +106,39 @@ impl KilndService for Stub {
 
     async fn create_sandbox(
         &self,
-        _request: Request<pb::CreateSandboxRequest>,
+        request: Request<pb::CreateSandboxRequest>,
     ) -> Result<Response<pb::CreateSandboxResponse>, Status> {
+        let request = request.into_inner();
+        let mut requests = self.create_requests.lock().expect("creates");
+        // kilnd's keyed lookup: the one sandbox answers every equal request
+        // under its key; an unequal one is a conflict.
+        let conflict = !request.request_id.is_empty()
+            && requests
+                .iter()
+                .any(|seen| seen.request_id == request.request_id && seen != &request);
+        let first = requests.is_empty();
+        requests.push(request.clone());
+        drop(requests);
+        if conflict {
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            metadata.insert(
+                kiln_harness::api::REASON_KEY,
+                tonic::metadata::MetadataValue::from_static("request_id_conflict"),
+            );
+            return Err(Status::with_metadata(
+                tonic::Code::AlreadyExists,
+                "request_id_conflict",
+                metadata,
+            ));
+        }
+        if first && self.lose_first_create {
+            return Err(Status::unavailable("create response lost"));
+        }
         Ok(Response::new(pb::CreateSandboxResponse {
-            sandbox: Some(sandbox(pb::SandboxState::Ready)),
+            sandbox: Some(pb::Sandbox {
+                request_id: request.request_id,
+                ..sandbox(pb::SandboxState::Ready)
+            }),
         }))
     }
 
@@ -157,11 +194,25 @@ impl KilndService for Stub {
 
     async fn delete_sandbox(
         &self,
-        _request: Request<pb::DeleteSandboxRequest>,
+        request: Request<pb::DeleteSandboxRequest>,
     ) -> Result<Response<pb::DeleteSandboxResponse>, Status> {
         self.deleted.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        let request_id = self
+            .create_requests
+            .lock()
+            .expect("creates")
+            .last()
+            .map(|create| create.request_id.clone())
+            .unwrap_or_default();
+        let released = request.release_request_id && !request_id.is_empty();
+        self.delete_requests.lock().expect("deletes").push(request);
         Ok(Response::new(pb::DeleteSandboxResponse {
-            sandbox: Some(sandbox(pb::SandboxState::Deleted)),
+            sandbox: Some(pb::Sandbox {
+                request_id,
+                request_id_released: released,
+                ..sandbox(pb::SandboxState::Deleted)
+            }),
         }))
     }
 
@@ -439,6 +490,109 @@ async fn a_running_recovery_snapshot_is_followed_until_it_settles() {
         .filter(|record| matches!(record.event, JournalEvent::ModelRequested { .. }))
         .count();
     assert_eq!(requests, 1);
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_keyed_create_is_retried_on_the_wire_with_the_same_bytes_and_released() {
+    use prost::Message as _;
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        current: true,
+        lose_first_create: true,
+        ..Stub::default()
+    };
+    let creates = stub.create_requests.clone();
+    let deletes = stub.delete_requests.clone();
+    let health_calls = stub.health_calls.clone();
+    let shutdown = serve(stub, &socket);
+
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let provider = ScriptedProvider::new([ModelResponse::final_text("done")]);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        HarnessConfig::default(),
+    );
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("the retry finds the sandbox");
+
+    let session_id = harness.audit().records[0].session_id.clone();
+    let creates = creates.lock().expect("creates").clone();
+    assert_eq!(creates.len(), 2);
+    assert_eq!(creates[0].request_id, format!("kiln-harness:{session_id}"));
+    assert_eq!(creates[0].encode_to_vec(), creates[1].encode_to_vec());
+    // Discovery, then the reread before the retry.
+    assert_eq!(health_calls.load(Ordering::SeqCst), 2);
+    let deletes = deletes.lock().expect("deletes").clone();
+    assert!(!deletes.is_empty());
+    assert!(deletes.iter().all(|delete| delete.release_request_id));
+    assert!(harness.audit().records.iter().any(|record| matches!(
+        &record.event,
+        AuditEvent::SandboxCreated { request_id: Some(key), create_attempts: 2, .. }
+            if key == &creates[0].request_id
+    )));
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished {
+            outcome,
+            request_id_released: Some(true),
+            ..
+        }) if outcome == "completed"
+    ));
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn the_adapter_sends_the_key_and_reads_a_conflict_as_already_exists() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        current: true,
+        ..Stub::default()
+    };
+    let deletes = stub.delete_requests.clone();
+    let shutdown = serve(stub, &socket);
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let request = kiln_harness::api::SandboxRequest {
+        image: "alpine".to_string(),
+        memory_bytes: 1 << 20,
+        cpu_millis: 100,
+        pids: 8,
+        disk_bytes: 1 << 20,
+        network_none: true,
+        read_only_root: true,
+        writable_paths: Vec::new(),
+        labels: std::collections::BTreeMap::new(),
+        expiry: None,
+        request_id: Some("kiln-harness:wire".to_string()),
+    };
+    let sandbox = api.create(request.clone()).await.expect("create");
+    assert_eq!(sandbox.request_id, "kiln-harness:wire");
+    assert_eq!(sandbox.state, kiln_harness::api::SandboxState::Ready);
+    let mut labeled = request;
+    labeled.labels.insert("other".to_string(), "x".to_string());
+    let conflict = api.create(labeled).await.expect_err("conflict");
+    assert_eq!(conflict.code, tonic::Code::AlreadyExists);
+    assert_eq!(conflict.reason.as_deref(), Some("request_id_conflict"));
+    let released = api.delete(&sandbox.id, true).await.expect("delete");
+    assert!(released.request_id_released);
+    api.delete(&sandbox.id, false).await.expect("delete");
+    let deletes = deletes.lock().expect("deletes").clone();
+    assert_eq!(
+        deletes
+            .iter()
+            .map(|delete| delete.release_request_id)
+            .collect::<Vec<_>>(),
+        [true, false]
+    );
     let _ = shutdown.send(());
 }
 

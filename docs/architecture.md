@@ -63,7 +63,73 @@ If an ambiguous failure produces no discoverable row before the recovery
 window closes, the result is `CreateUncertain`, not a false cleanup claim.
 The adapter preserves `tonic::Code` for create rejection classification; local
 transport/protocol failures use `Unknown` and remain ambiguous.
-Idempotent create remains a control-plane roadmap item.
+
+### Create retries
+
+When a serving daemon lists `FEATURE_IDEMPOTENT_CREATE`, the create is keyed:
+`request_id` is `kiln-harness:<session ID>`, checked against kilnd's grammar
+(1 to 64 bytes of `0x21`-`0x7e`) before anything is recorded. kilnd then
+answers the original call and every retry with the same key and an equal
+request with the same sandbox, in whatever state it settled. The request is
+built once and cloned for each attempt, never rebuilt, because kilnd hashes the
+request as sent and answers any difference `ALREADY_EXISTS
+request_id_conflict`. A daemon that does not list the feature gets today's
+create: no `request_id`, one attempt, nothing released.
+
+- **What is retried.** Only a keyed create, and only after `UNAVAILABLE` (any
+  reason, `create_unsettled` included), `UNKNOWN` (local transport and protocol
+  failures), `DEADLINE_EXCEEDED` (from the server, `create_in_flight`
+  included), `ABORTED`, `INTERNAL` or `CANCELLED`. Every other code is final at
+  once, notably `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED request_id_quota`,
+  `ALREADY_EXISTS request_id_conflict`, `FAILED_PRECONDITION`,
+  `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED` and `NOT_FOUND`, and
+  goes through recovery and classification as before.
+- **No per-attempt timeout.** An attempt has no client timeout and sends no
+  `grpc-timeout`: it runs until it answers, bounded only by the session
+  deadline and cancellation, as an unkeyed create always has. So the harness
+  never abandons an attempt it might then retry while the first is still
+  running; the only way out of an attempt is ending the whole create, which
+  goes to label recovery and never releases the key.
+- **Health before every retry.** After the backoff the harness reads Health
+  again and retries only if the daemon is serving and still lists idempotent
+  create. A daemon restarted into an older build would ignore `request_id` and
+  could make a second sandbox; one that is not serving, or no longer lists the
+  feature, ends the retries with the last create error. A Health error backs
+  off and reads again without using an attempt.
+- **Bounds.** At most 8 create RPCs. The backoff before the nth sleep after the
+  first failure (Health rereads included) is `lifecycle_retry_delay × 2^(n-1)`,
+  at most 2 s. The retry phase ends `lifecycle_timeout` after the first failure:
+  a backoff that would end at or after that point is not taken, and the last
+  create error is the result, as it is when the attempts run out. Every sleep
+  and Health read waits under the same cancellation and session deadline as the
+  create, so either one during a backoff or Health read is `Canceled` or
+  `Deadline`, exactly as during the create.
+- **Settled state.** An `OK` answer is accepted only `READY` and, when keyed,
+  echoing this session's `request_id`. Any other state (`FAILED`, `DELETED`,
+  `CREATING`, `DELETING`, `LOST`, `QUARANTINED`, unknown) or a mismatched or
+  empty echo is a create failure, never retried: a local error naming the
+  sandbox, its state and kilnd's `failure_reason` (`FAILED_PRECONDITION`, or
+  `UNKNOWN` for an echo mismatch, with no `kilnd-reason`), work outcome
+  `create_failed`. Label recovery runs as for any failed create, and absence is
+  what its listing proves, not the state kilnd reported; if recovery cannot
+  confirm it the outcome is `cleanup_failed`. The same check guards an unkeyed
+  create, which kilnd never answers `OK` without `READY`.
+- **Release.** With `FEATURE_REQUEST_ID_RELEASE` also listed (decided once, at
+  session start), the normal cleanup after a `READY` create asks kilnd to give
+  up the key: every delete sends `release_request_id`, and once absence is
+  confirmed, if no delete reported the key released (one that left the row
+  `DELETING` releases nothing and kilnd remembers nothing), up to two more
+  deletes are sent within the cleanup window, `lifecycle_retry_delay` apart.
+  kilnd's contract allows release only while the client holds the create
+  response for that key with no retry pending or to come, and only after
+  absence is confirmed; the normal cleanup is the one place that holds, so label
+  recovery and the create-failure path never release. Release never makes
+  cleanup fail: absence is the cleanup result, and `session_finished` reports
+  `request_id_released` beside it.
+
+`sandbox_created` records `request_id` (only when keyed) and `create_attempts`;
+`sandbox_recovered` records `create_attempts`. The journal is unchanged, and a
+replay is a new session with its own key.
 
 ## Discovery and typed reasons
 
@@ -701,6 +767,11 @@ queries recent sandbox executions to recover any ID kilnd already assigned and
 copies that row's byte/truncation evidence; an empty ID list with unknown
 totals means no row was observable through v1 within the bounded recovery
 query. Baseline execution failures use the same recovery.
+`sandbox_created` and `sandbox_recovered` count the create RPCs sent as
+`create_attempts`; `sandbox_created` carries the create's `request_id` and
+`session_finished` its `request_id_released` only when the session used them
+(see [Create retries](#create-retries)), so a session against a daemon without
+idempotent create writes neither.
 
 ## Journal
 

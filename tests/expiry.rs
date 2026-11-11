@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use common::{
     FakeApi, RenewScript, api_error, api_error_with_reason, kilnd_limits, short_lifecycle_config,
 };
-use kiln_harness::api::{ApiLimits, ExpiryPolicy, ExpiryReason, Feature};
+use kiln_harness::api::{ApiLimits, Deleted, ExpiryPolicy, ExpiryReason, Feature};
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionOutcome, SessionTask};
 use kiln_harness::journal::{JournalEvent, JsonlJournal, MemoryJournal, read_journal};
@@ -1352,8 +1352,12 @@ impl kiln_harness::api::SandboxApi for NotifyingApi {
         self.inner.recent_executions(sandbox_id).await
     }
 
-    async fn delete(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
-        self.inner.delete(sandbox_id).await
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, kiln_harness::api::ApiError> {
+        self.inner.delete(sandbox_id, release_request_id).await
     }
 
     async fn renew(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
@@ -1944,8 +1948,12 @@ impl kiln_harness::api::SandboxApi for SlowRefusedHead {
         self.inner.recent_executions(sandbox_id).await
     }
 
-    async fn delete(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
-        self.inner.delete(sandbox_id).await
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, kiln_harness::api::ApiError> {
+        self.inner.delete(sandbox_id, release_request_id).await
     }
 
     async fn renew(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
@@ -2274,8 +2282,12 @@ impl kiln_harness::api::SandboxApi for DelayedThenHangingRenew {
         self.inner.recent_executions(sandbox_id).await
     }
 
-    async fn delete(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
-        self.inner.delete(sandbox_id).await
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, kiln_harness::api::ApiError> {
+        self.inner.delete(sandbox_id, release_request_id).await
     }
 
     async fn renew(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {

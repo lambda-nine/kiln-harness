@@ -13,7 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{
     ApiError, ApiLimits, Capabilities, Execution, ExecutionState, ExpiryPolicy, ExpiryReason,
-    Feature, FinalCheck, SandboxApi, SandboxRequest, UnusableReason, backend_unsupported_feature,
+    Feature, FinalCheck, Sandbox, SandboxApi, SandboxRequest, SandboxState, UnusableReason,
+    backend_unsupported_feature, request_id_is_valid,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
@@ -55,6 +56,13 @@ pub const MIN_SANDBOX_LIFETIME_MARGIN: Duration = Duration::from_secs(1);
 pub const MAX_SANDBOX_LIFETIME_MARGIN: Duration = Duration::from_secs(10 * 60);
 /// Shortest interval between `RenewSandbox` heartbeats.
 const MIN_RENEW_INTERVAL_MS: u64 = 1000;
+/// Most `CreateSandbox` RPCs one session sends when its create is keyed.
+const MAX_CREATE_ATTEMPTS: u32 = 8;
+/// Longest backoff before a create retry or a Health reread.
+const MAX_CREATE_BACKOFF: Duration = Duration::from_secs(2);
+/// Further `release_request_id` deletes after absence is confirmed, when no
+/// earlier delete reported the request ID released.
+const EXTRA_RELEASE_DELETES: u32 = 2;
 /// What one session is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTask {
@@ -368,6 +376,24 @@ where
         };
         let expiry = expiry_policy(&self.config, &capabilities)?;
         let typed_reasons = capabilities.supports(Feature::TypedReasons);
+        // Keyed only when a serving daemon lists idempotent create: an older
+        // daemon ignores request_id and would make a second sandbox for a
+        // retry. Release is decided here, once, and used only by the cleanup
+        // after a successful keyed create.
+        let keyed = capabilities.supports(Feature::IdempotentCreate);
+        let release = keyed && capabilities.supports(Feature::RequestIdRelease);
+        let request_id = if keyed {
+            let request_id = format!("kiln-harness:{session_id}");
+            if !request_id_is_valid(&request_id) {
+                return Err(HarnessError::Api(ApiError::new(
+                    tonic::Code::InvalidArgument,
+                    "session ID does not make a valid create request ID",
+                )));
+            }
+            Some(request_id)
+        } else {
+            None
+        };
         let heartbeat = expiry.map(|policy| Heartbeat::for_idle_ms(policy.idle_timeout_ms));
         if let Some(heartbeat) = heartbeat {
             check_tool_budget(&self.config, heartbeat)?;
@@ -404,6 +430,7 @@ where
                     work_outcome: "failed".to_string(),
                     sandbox_deleted: true,
                     renews: 0,
+                    request_id_released: None,
                 },
             );
             return Err(error.into());
@@ -413,26 +440,21 @@ where
         // Cancellation and the deadline both drop the create RPC. Its outcome
         // is then ambiguous, so either goes through label-based recovery.
         // No later than kilnd can have made the sandbox ready: the first
-        // activity anchor, on the early side.
+        // activity anchor, on the early side, when the first attempt was sent.
+        let request = sandbox_request(&session_id, expiry, request_id);
         let create_sent = Instant::now();
-        let create = tokio::select! {
-            () = cancel.cancelled() => Err(CreateStop::Canceled),
-            result = timeout_at(
-                deadline,
-                self.api.create(sandbox_request(&session_id, expiry)),
-            ) => {
-                match result {
-                    Ok(Ok(sandbox)) => Ok(sandbox),
-                    Ok(Err(error)) => Err(CreateStop::Failed(error)),
-                    Err(_) => Err(CreateStop::Deadline),
-                }
-            }
-        };
+        let (create, create_attempts) =
+            create_with_retries(&self.api, &request, &self.config, deadline, &cancel).await;
         let sandbox = match create {
             Ok(sandbox) => sandbox,
             Err(stop) => {
+                // A settled answer names a sandbox kilnd has finished with,
+                // but only the listing proves it absent.
+                let settled = matches!(stop, CreateStop::Settled(..));
                 let (error, interrupted, work_outcome) = match stop {
-                    CreateStop::Failed(error) => (error, None, "create_failed"),
+                    CreateStop::Failed(error) | CreateStop::Settled(_, error) => {
+                        (error, None, "create_failed")
+                    }
                     CreateStop::Deadline => (
                         deadline_api("create response deadline expired"),
                         Some(HarnessError::Deadline),
@@ -458,15 +480,16 @@ where
                 .await;
                 let recovered_ids = recovery.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
                 let recovered = !recovered_ids.is_empty();
-                let unambiguous = unambiguous_create_error(&error, typed_reasons);
-                let absence_confirmed =
-                    recovery.is_ok() && (recovered || (!deadline_expired && unambiguous));
+                let unambiguous = settled || unambiguous_create_error(&error, typed_reasons);
+                let absence_confirmed = recovery.is_ok()
+                    && (settled || recovered || (!deadline_expired && unambiguous));
                 let recovery_audit = self.audit.append(
                     &session_id,
                     None,
                     AuditEvent::SandboxRecovered {
                         sandbox_ids: recovered_ids,
                         deleted: absence_confirmed,
+                        create_attempts,
                     },
                 );
                 // As after work: without confirmed absence, the session's
@@ -479,6 +502,7 @@ where
                     },
                     work_outcome,
                     sandbox_deleted: absence_confirmed,
+                    request_id_released: None,
                 };
                 let finish_audit =
                     self.audit
@@ -508,6 +532,8 @@ where
                     backend_id: sandbox.backend_id,
                     expiry_lifetime_ms: expiry.map(|policy| policy.max_lifetime_ms),
                     expiry_idle_ms: expiry.map(|policy| policy.idle_timeout_ms),
+                    request_id: request.request_id.clone(),
+                    create_attempts,
                 },
             )?;
             if cancel.is_cancelled() {
@@ -655,15 +681,23 @@ where
 
         // Cleanup has a separate finite settlement window. Delete is
         // idempotently retried and independently verified after every response.
+        // This is the only path that releases the request ID: the create
+        // answered READY, its response is held, and no retry is to come.
         let cleanup_deadline = lifecycle_deadline(self.config.lifecycle_timeout);
         let cleanup = cleanup_sandbox(
             &self.api,
             &sandbox_id,
             cleanup_deadline,
             self.config.lifecycle_retry_delay,
+            release,
         )
         .await;
         let deleted = cleanup.is_ok();
+        let request_id_released = release.then(|| {
+            cleanup
+                .as_ref()
+                .is_ok_and(|outcome| outcome.request_id_released)
+        });
         let work_outcome = match &body {
             Ok(_) => "completed",
             Err(HarnessError::Canceled) => "canceled",
@@ -679,6 +713,7 @@ where
             },
             work_outcome,
             sandbox_deleted: deleted,
+            request_id_released,
         };
         let finish_audit = self.audit.append(
             &session_id,
@@ -1525,6 +1560,17 @@ fn settle_renewal<A: SandboxApi>(
 
 enum CreateStop {
     Failed(ApiError),
+    /// Create answered `OK` with a sandbox that is not `READY`, or, when
+    /// keyed, that echoes another request ID. Never retried; the error is
+    /// local and names the sandbox, its state and kilnd's failure reason.
+    Settled(
+        #[expect(
+            dead_code,
+            reason = "kept for inspection; recovery finds the row by its labels"
+        )]
+        Box<Sandbox>,
+        ApiError,
+    ),
     Deadline,
     Canceled,
 }
@@ -1534,6 +1580,9 @@ struct Terminal {
     outcome: &'static str,
     work_outcome: &'static str,
     sandbox_deleted: bool,
+    /// `None` unless cleanup was asked to release the request ID; then
+    /// whether kilnd confirmed it. Audit only.
+    request_id_released: Option<bool>,
 }
 
 impl Terminal {
@@ -1543,6 +1592,7 @@ impl Terminal {
             work_outcome: self.work_outcome.to_string(),
             sandbox_deleted: self.sandbox_deleted,
             renews: progress.renews,
+            request_id_released: self.request_id_released,
         }
     }
 
@@ -1786,7 +1836,11 @@ fn clamp_to_daemon(value: u64, min: u64, max: u64) -> u64 {
     if max == 0 { value } else { value.min(max) }
 }
 
-fn sandbox_request(session_id: &str, expiry: Option<ExpiryPolicy>) -> SandboxRequest {
+fn sandbox_request(
+    session_id: &str,
+    expiry: Option<ExpiryPolicy>,
+    request_id: Option<String>,
+) -> SandboxRequest {
     SandboxRequest {
         image: "alpine".to_string(),
         memory_bytes: 256 << 20,
@@ -1801,6 +1855,7 @@ fn sandbox_request(session_id: &str, expiry: Option<ExpiryPolicy>) -> SandboxReq
             ("session".to_string(), session_id.to_string()),
         ]),
         expiry,
+        request_id,
     }
 }
 
@@ -1872,19 +1927,181 @@ fn unambiguous_create_error(error: &ApiError, typed_reasons: bool) -> bool {
     ) || backend_unsupported_feature(error, typed_reasons).is_some()
 }
 
+/// Whether a failed create may be sent again with the same request ID and
+/// an equal request. Anything else is final at once, notably the definite
+/// refusals and `ALREADY_EXISTS request_id_conflict`.
+fn retryable_create_error(error: &ApiError) -> bool {
+    matches!(
+        error.code,
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Aborted
+            | tonic::Code::Internal
+            | tonic::Code::Cancelled
+    )
+}
+
+/// The backoff before the `n`th sleep of a create's retry phase (from 1):
+/// `retry_delay * 2^(n-1)`, at most [`MAX_CREATE_BACKOFF`].
+fn create_backoff(retry_delay: Duration, n: u32) -> Duration {
+    let factor = 1_u32 << n.saturating_sub(1).min(16);
+    retry_delay
+        .checked_mul(factor)
+        .unwrap_or(MAX_CREATE_BACKOFF)
+        .min(MAX_CREATE_BACKOFF)
+}
+
+/// Accept a create's `OK` only for a `READY` sandbox that, when keyed,
+/// echoes this request ID. kilnd answers a keyed create with the row in
+/// whatever state it settled, so anything else is a sandbox to recover, not
+/// a session's.
+fn check_settled(sandbox: Sandbox, request_id: Option<&str>) -> Result<Sandbox, CreateStop> {
+    if sandbox.state != SandboxState::Ready {
+        let mut message = format!(
+            "create settled sandbox {} as {}",
+            sandbox.id,
+            sandbox.state.as_str()
+        );
+        if !sandbox.failure_reason.is_empty() {
+            message.push_str(": ");
+            message.push_str(&sandbox.failure_reason);
+        }
+        let error = ApiError::new(tonic::Code::FailedPrecondition, message);
+        return Err(CreateStop::Settled(Box::new(sandbox), error));
+    }
+    if let Some(request_id) = request_id
+        && sandbox.request_id != request_id
+    {
+        let error = ApiError::new(
+            tonic::Code::Unknown,
+            format!(
+                "create answered sandbox {} as {} for request ID {:?}, not {request_id:?}",
+                sandbox.id,
+                sandbox.state.as_str(),
+                sandbox.request_id
+            ),
+        );
+        return Err(CreateStop::Settled(Box::new(sandbox), error));
+    }
+    Ok(sandbox)
+}
+
+/// Send the session's create, and, when it is keyed, send it again with an
+/// equal request after an ambiguous failure. Returns the result and how many
+/// create RPCs were sent.
+///
+/// No attempt has a timeout of its own: each runs until it answers, bounded
+/// only by the session deadline and cancellation, so the harness never
+/// abandons one it might retry. Before every retry it backs off and rereads
+/// Health, and retries only if the daemon is serving and still lists
+/// idempotent create; a Health error backs off and reads again without
+/// using an attempt. The retry phase ends [`HarnessConfig::lifecycle_timeout`]
+/// after the first failure, or after [`MAX_CREATE_ATTEMPTS`], with the last
+/// create error. Cancellation or the session deadline at any point, a
+/// backoff or Health read included, is `Canceled` or `Deadline`.
+async fn create_with_retries<A: SandboxApi>(
+    api: &A,
+    request: &SandboxRequest,
+    config: &HarnessConfig,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> (Result<Sandbox, CreateStop>, u32) {
+    let keyed = request.request_id.is_some();
+    let mut attempts = 0_u32;
+    let mut sleeps = 0_u32;
+    let mut window_end = None;
+    loop {
+        attempts += 1;
+        let result = tokio::select! {
+            () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
+            result = timeout_at(deadline, api.create(request.clone())) => result,
+        };
+        let error = match result {
+            Ok(Ok(sandbox)) => {
+                return (
+                    check_settled(sandbox, request.request_id.as_deref()),
+                    attempts,
+                );
+            }
+            Ok(Err(error)) => error,
+            Err(_) => return (Err(CreateStop::Deadline), attempts),
+        };
+        if !keyed || !retryable_create_error(&error) || attempts >= MAX_CREATE_ATTEMPTS {
+            return (Err(CreateStop::Failed(error)), attempts);
+        }
+        let window_end =
+            *window_end.get_or_insert_with(|| Instant::now() + config.lifecycle_timeout);
+        // Back off, then read Health until it answers.
+        loop {
+            sleeps += 1;
+            let wake = Instant::now() + create_backoff(config.lifecycle_retry_delay, sleeps);
+            // Whichever ends first decides: the window with the last create
+            // error, or the session deadline, during the sleep, as `Deadline`.
+            if wake >= window_end && window_end <= deadline {
+                return (Err(CreateStop::Failed(error)), attempts);
+            }
+            tokio::select! {
+                () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
+                slept = timeout_at(deadline, sleep_until(wake)) => {
+                    if slept.is_err() {
+                        return (Err(CreateStop::Deadline), attempts);
+                    }
+                }
+            }
+            let health = tokio::select! {
+                () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
+                health = timeout_at(window_end.min(deadline), api.health()) => health,
+            };
+            match health {
+                Ok(Ok(health))
+                    if health.serving
+                        && health.capabilities.supports(Feature::IdempotentCreate) =>
+                {
+                    break;
+                }
+                Ok(Err(_)) => {}
+                Err(_) if Instant::now() >= deadline => {
+                    return (Err(CreateStop::Deadline), attempts);
+                }
+                // Not serving, or a daemon that no longer lists the feature
+                // (perhaps an older one after a restart) would ignore the
+                // key; or the window closed during the read.
+                Ok(Ok(_)) | Err(_) => return (Err(CreateStop::Failed(error)), attempts),
+            }
+        }
+    }
+}
+
+/// What a confirmed cleanup reports beside absence.
+#[derive(Debug, Clone, Copy, Default)]
+struct CleanupOutcome {
+    /// kilnd confirmed the create's request ID released. Always false when
+    /// release was not asked for.
+    request_id_released: bool,
+}
+
+/// Delete the sandbox and confirm its absence by listing, within `deadline`.
+/// With `release`, every delete asks kilnd to release the create's request
+/// ID, and, if none reported it released, up to [`EXTRA_RELEASE_DELETES`]
+/// more are sent once absence is confirmed (a delete that left the row
+/// `DELETING` releases nothing). Release never makes cleanup fail.
 async fn cleanup_sandbox<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     deadline: Instant,
     retry_delay: Duration,
-) -> Result<(), ApiError> {
+    release: bool,
+) -> Result<CleanupOutcome, ApiError> {
     let mut last_error = deadline_api("sandbox cleanup deadline expired");
+    let mut released = false;
     loop {
         if Instant::now() >= deadline {
             return Err(last_error);
         }
-        match timeout_at(deadline, api.delete(sandbox_id)).await {
-            Ok(Ok(())) => {
+        match timeout_at(deadline, api.delete(sandbox_id, release)).await {
+            Ok(Ok(deleted)) => {
+                released |= release && deleted.request_id_released;
                 last_error = deadline_api("delete acknowledged but sandbox absence is unconfirmed");
             }
             Ok(Err(error)) => last_error = error,
@@ -1894,7 +2111,12 @@ async fn cleanup_sandbox<A: SandboxApi>(
         }
         match timeout_at(deadline, api.non_deleted_sandboxes()).await {
             Ok(Ok(sandboxes)) if sandboxes.iter().all(|sandbox| sandbox.id != sandbox_id) => {
-                return Ok(());
+                if release && !released {
+                    released = release_after_absence(api, sandbox_id, deadline, retry_delay).await;
+                }
+                return Ok(CleanupOutcome {
+                    request_id_released: released,
+                });
             }
             Ok(Ok(_)) => {}
             Ok(Err(error)) => last_error = error,
@@ -1908,6 +2130,35 @@ async fn cleanup_sandbox<A: SandboxApi>(
         }
         sleep(retry_delay.min(remaining)).await;
     }
+}
+
+/// Repeat `delete(id, true)` on a sandbox whose absence is confirmed, at
+/// most [`EXTRA_RELEASE_DELETES`] times within `deadline`, until one reports
+/// the request ID released.
+async fn release_after_absence<A: SandboxApi>(
+    api: &A,
+    sandbox_id: &str,
+    deadline: Instant,
+    retry_delay: Duration,
+) -> bool {
+    for attempt in 0..EXTRA_RELEASE_DELETES {
+        if attempt > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining <= retry_delay {
+                return false;
+            }
+            sleep(retry_delay).await;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if let Ok(Ok(deleted)) = timeout_at(deadline, api.delete(sandbox_id, true)).await
+            && deleted.request_id_released
+        {
+            return true;
+        }
+    }
+    false
 }
 
 async fn recover_session_sandboxes<A: SandboxApi>(
@@ -1942,7 +2193,8 @@ async fn recover_session_sandboxes<A: SandboxApi>(
                 }
                 for sandbox in matches {
                     recovered.insert(sandbox.id.clone());
-                    cleanup_sandbox(api, &sandbox.id, deadline, retry_delay).await?;
+                    // Never release here: the create's outcome was not held.
+                    cleanup_sandbox(api, &sandbox.id, deadline, retry_delay, false).await?;
                 }
             }
             Ok(Err(error)) => last_error = error,

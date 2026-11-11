@@ -253,6 +253,20 @@ it is not a hostile multi-tenant boundary.
   sandbox. A daemon that predates discovery lists no features, gets no
   expiry, and still leaks the sandbox of a crashed harness until an
   operator deletes it.
+- Duplicate sandboxes from create retries. A keyed create is retried only
+  while a re-read Health shows a serving daemon that still lists idempotent
+  create, so a daemon restarted into an older build, which would ignore
+  `request_id`, never gets a retry; an unkeyed create is never retried. The
+  key is released only by the normal cleanup after a `READY` create whose
+  response is held and after absence is confirmed, never by recovery. What
+  remains: an attempt the harness gave up on (transport failure, cancellation,
+  the deadline) that reaches kilnd only after the release would create a fresh
+  sandbox; over a local Unix socket that window is small, and such a sandbox
+  carries the session's labels and expiry. On legacy kiln a create that
+  crashed before its backend ID was published settles as an ambiguous
+  `FAILED` row that Delete refuses; the harness reports it as
+  `cleanup_failed`, never as a clean failure. The key is
+  `kiln-harness:<session ID>` and carries no secret.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted
   host user can modify it. Durable signing or a remote append service is out of
   scope.

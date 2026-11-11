@@ -470,6 +470,7 @@ async fn lost_create_response_is_recovered_by_session_label() {
         AuditEvent::SandboxRecovered {
             sandbox_ids,
             deleted: true,
+            create_attempts: 1,
         } if sandbox_ids == &["sb-0000000000000001"]
     )));
 }
@@ -1958,7 +1959,7 @@ async fn cancellation_interrupts_an_active_create_and_recovers_its_sandbox() {
     assert_eq!(observer.state().deleted, ["sb-0000000000000001"]);
     assert!(harness.audit().records.iter().any(|record| matches!(
         &record.event,
-        AuditEvent::SandboxRecovered { sandbox_ids, deleted: true } if sandbox_ids.len() == 1
+        AuditEvent::SandboxRecovered { sandbox_ids, deleted: true, create_attempts: 1 } if sandbox_ids.len() == 1
     )));
     assert!(matches!(
         harness.journal().records.last().map(|record| &record.event),

@@ -6,6 +6,25 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- kilnd API milestone 2 (kilnd `4baf986`, whose `kilnd.v1` schema is now
+  vendored): idempotent create. When a serving daemon lists
+  `FEATURE_IDEMPOTENT_CREATE`, the session's create carries the request ID
+  `kiln-harness:<session ID>` and is retried with an equal request after
+  `UNAVAILABLE`, `UNKNOWN`, `DEADLINE_EXCEEDED`, `ABORTED`, `INTERNAL` or
+  `CANCELLED`: at most 8 attempts, backoff from `lifecycle_retry_delay`
+  doubling to 2 s, within the lifecycle window, and only after a re-read
+  Health still lists the feature. Attempts have no client timeout. A create
+  answered `OK` but not `READY`, or echoing another request ID, is recovered
+  by its labels and fails `create_failed`. With `FEATURE_REQUEST_ID_RELEASE`,
+  the cleanup after a successful create releases the key, repeating the
+  delete after absence if needed; release never fails cleanup. The audit
+  adds `request_id` and `create_attempts` to `sandbox_created`,
+  `create_attempts` to `sandbox_recovered`, and `request_id_released` to
+  `session_finished`; older records still parse, and the journal is
+  unchanged. `SandboxApi::delete` takes `release_request_id` and returns
+  `Deleted`; `Sandbox` gains `state`, `failure_reason`, `request_id` and
+  `request_id_released`; `SandboxRequest` gains `request_id`; `Feature`
+  gains `RequestIdRelease`.
 - Seventh review round for kilnd API milestone 1. An unreadable recovery
   window with no rows now stops the session as documented, rather than
   being dropped for lack of IDs. Cancellation and the session deadline win

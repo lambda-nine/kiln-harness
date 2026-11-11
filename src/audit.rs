@@ -82,10 +82,22 @@ pub enum AuditEvent {
         expiry_lifetime_ms: Option<u64>,
         #[serde(default)]
         expiry_idle_ms: Option<u64>,
+        /// The create's request ID, present only when the daemon lists
+        /// idempotent create. It carries the session ID and nothing else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        /// `CreateSandbox` RPCs sent; more than one only for a keyed create
+        /// retried after an ambiguous failure. 0 in older records.
+        #[serde(default)]
+        create_attempts: u32,
     },
     SandboxRecovered {
         sandbox_ids: Vec<String>,
         deleted: bool,
+        /// `CreateSandbox` RPCs sent before the create failed. 0 in older
+        /// records.
+        #[serde(default)]
+        create_attempts: u32,
     },
     WorkspaceBaseline {
         ok: bool,
@@ -146,6 +158,11 @@ pub enum AuditEvent {
         /// Successful `RenewSandbox` heartbeats during provider calls.
         #[serde(default)]
         renews: u32,
+        /// Present only when cleanup asked kilnd to release the create's
+        /// request ID: whether kilnd confirmed it. Absence is still what
+        /// `sandbox_deleted` reports.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id_released: Option<bool>,
     },
 }
 
@@ -379,5 +396,80 @@ impl Write for SummaryWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compatibility_test {
+    use super::{AuditEvent, AuditRecord};
+
+    fn event(line: &str) -> AuditEvent {
+        serde_json::from_str::<AuditRecord>(line)
+            .expect("an older record still parses")
+            .event
+    }
+
+    #[test]
+    fn records_from_before_idempotent_create_still_parse() {
+        let created = event(
+            r#"{"sequence":3,"unix_ms":1,"session_id":"hs-1-2-3","sandbox_id":"sb-0000000000000001","event":"sandbox_created","backend_id":"b","expiry_lifetime_ms":100000,"expiry_idle_ms":120000}"#,
+        );
+        assert_eq!(
+            created,
+            AuditEvent::SandboxCreated {
+                backend_id: "b".to_string(),
+                expiry_lifetime_ms: Some(100_000),
+                expiry_idle_ms: Some(120_000),
+                request_id: None,
+                create_attempts: 0,
+            }
+        );
+        let recovered = event(
+            r#"{"sequence":2,"unix_ms":1,"session_id":"hs-1-2-3","sandbox_id":null,"event":"sandbox_recovered","sandbox_ids":["sb-0000000000000001"],"deleted":true}"#,
+        );
+        assert_eq!(
+            recovered,
+            AuditEvent::SandboxRecovered {
+                sandbox_ids: vec!["sb-0000000000000001".to_string()],
+                deleted: true,
+                create_attempts: 0,
+            }
+        );
+        let finished = event(
+            r#"{"sequence":9,"unix_ms":1,"session_id":"hs-1-2-3","sandbox_id":"sb-0000000000000001","event":"session_finished","outcome":"completed","work_outcome":"completed","sandbox_deleted":true,"renews":2}"#,
+        );
+        assert_eq!(
+            finished,
+            AuditEvent::SessionFinished {
+                outcome: "completed".to_string(),
+                work_outcome: "completed".to_string(),
+                sandbox_deleted: true,
+                renews: 2,
+                request_id_released: None,
+            }
+        );
+    }
+
+    #[test]
+    fn absent_optional_fields_are_not_written() {
+        let line = serde_json::to_value(AuditEvent::SessionFinished {
+            outcome: "completed".to_string(),
+            work_outcome: "completed".to_string(),
+            sandbox_deleted: true,
+            renews: 0,
+            request_id_released: None,
+        })
+        .expect("encode");
+        assert!(line.get("request_id_released").is_none());
+        let line = serde_json::to_value(AuditEvent::SandboxCreated {
+            backend_id: "b".to_string(),
+            expiry_lifetime_ms: None,
+            expiry_idle_ms: None,
+            request_id: None,
+            create_attempts: 1,
+        })
+        .expect("encode");
+        assert!(line.get("request_id").is_none());
+        assert_eq!(line["create_attempts"], 1);
     }
 }

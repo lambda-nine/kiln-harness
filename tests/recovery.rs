@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiln_harness::api::{
-    ApiError, CapturedOutput, Execution, ExecutionState, Health, Sandbox, SandboxApi, SandboxExec,
-    SandboxRequest,
+    ApiError, CapturedOutput, Deleted, Execution, ExecutionState, Health, Sandbox, SandboxApi,
+    SandboxExec, SandboxRequest,
 };
 use kiln_harness::tools::recover_execution_evidence;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +55,11 @@ impl SandboxApi for MissingExecutionApi {
         Ok(vec![running()])
     }
 
-    async fn delete(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+    async fn delete(
+        &self,
+        _sandbox_id: &str,
+        _release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
         unreachable!("recovery deletes nothing")
     }
 
@@ -140,7 +144,11 @@ impl SandboxApi for UnreadableApi {
         }
     }
 
-    async fn delete(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+    async fn delete(
+        &self,
+        _sandbox_id: &str,
+        _release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
         unreachable!("recovery deletes nothing")
     }
 
@@ -246,7 +254,11 @@ impl SandboxApi for LateTerminalRow {
         })
     }
 
-    async fn delete(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+    async fn delete(
+        &self,
+        _sandbox_id: &str,
+        _release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
         unreachable!("recovery deletes nothing")
     }
 
@@ -330,7 +342,11 @@ impl SandboxApi for HangsAtTheEnd {
         Ok(Vec::new())
     }
 
-    async fn delete(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+    async fn delete(
+        &self,
+        _sandbox_id: &str,
+        _release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
         unreachable!("recovery deletes nothing")
     }
 
@@ -426,8 +442,12 @@ impl SandboxApi for LatePublishedRow {
         Ok(rows)
     }
 
-    async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError> {
-        self.inner.delete(sandbox_id).await
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
+        self.inner.delete(sandbox_id, release_request_id).await
     }
 
     async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError> {

@@ -71,8 +71,8 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 - kiln, minimum: `e48f0e785ad484d0b2947897f6d48d0756059d7e`, the oldest kiln
   with every feature this kilnd requires (persistent-exec v1 and
   persistent-create certainty). For reference only; nothing enforces it.
-- kilnd API and runtime semantics: `853dee2a827b7f60af16f731a54309b1be97f680`
-  (parent `6543812a2db4af4493ad6c5ea8864c27d173195d`)
+- kilnd API and runtime semantics: `4baf98636d7510c45b308d979e0c85d39373118f`
+  (parent `dcecf5417810c67173ed4ee3c1a6b961e8774e9e`)
 
 The compatible `kilnd.v1` protobuf schema is vendored under `proto/` so this
 repository builds against the reviewed API even if a sibling checkout is on a
@@ -135,6 +135,17 @@ Against a daemon older than kilnd's API discovery, which lists no
 features, the harness sends no expiry and records `null` for it in the
 audit's `sandbox_created`. That is the degraded mode: the sandbox never
 expires, and a crashed harness can leak it, as before.
+
+Against kilnd with `FEATURE_IDEMPOTENT_CREATE`, the create carries the key
+`kiln-harness:<session ID>`, and a create whose answer was lost or ambiguous
+is retried with the same key and an equal request, at most 8 times within
+the 10-second lifecycle window and only while Health still lists the feature, so a lost
+response never leaves a second sandbox. A create kilnd answers in any state
+but `READY` is cleaned up and reported as a create failure. When kilnd also
+lists `FEATURE_REQUEST_ID_RELEASE`, cleanup gives the key up once the sandbox
+is confirmed gone. The audit records the key, the number of create attempts
+and whether the key was released; a daemon without the feature gets exactly
+the create it got before.
 
 ## Running against a local model
 

@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiln_harness::api::{
-    ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Execution, ExecutionState,
-    ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health, NodeReservations, Sandbox, SandboxApi,
-    SandboxExec, SandboxRequest,
+    ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Deleted, Execution,
+    ExecutionState, ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health, NodeReservations,
+    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
@@ -31,6 +31,34 @@ pub enum RenewScript {
     Expire(&'static str),
 }
 
+/// One scripted `CreateSandbox` answer, taken in order, one per call.
+#[derive(Debug, Clone)]
+pub enum CreateScript {
+    /// Refused before anything is recorded.
+    Err(ApiError),
+    /// The row is recorded (or found under its key), then the response is
+    /// lost with this error.
+    ErrAfterRecord(ApiError),
+    /// Answered `OK` with the row settled in this state, with this failure
+    /// reason. A `DELETED` row leaves the default listing.
+    Settled(SandboxState, String),
+    /// Answered `OK` and `READY`, echoing this request ID instead of the
+    /// request's.
+    EchoRequestId(String),
+}
+
+/// One scripted `Health` answer, taken in order, one per call; then the
+/// fake answers from its own state.
+#[derive(Debug, Clone)]
+pub enum HealthScript {
+    Err(ApiError),
+    NotServing,
+    /// Serving, listing exactly these features.
+    Features(BTreeSet<Feature>),
+    /// Answer from state, after this delay.
+    Delay(Duration),
+}
+
 #[derive(Default)]
 pub enum DeleteBehavior {
     #[default]
@@ -43,7 +71,24 @@ pub enum DeleteBehavior {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct FakeState {
+    /// The request of every row created; a keyed create answered from its
+    /// record adds none.
     pub creates: Vec<SandboxRequest>,
+    /// Every `CreateSandbox` request as sent, retries included, and when.
+    pub create_requests: Vec<SandboxRequest>,
+    pub create_sent_at: Vec<tokio::time::Instant>,
+    pub create_script: VecDeque<CreateScript>,
+    pub health_script: VecDeque<HealthScript>,
+    /// Each `DeleteSandbox` call's `release_request_id`, and when.
+    pub deletes_released: Vec<bool>,
+    pub delete_sent_at: Vec<tokio::time::Instant>,
+    /// Release-asking deletes of a removed keyed row that release nothing,
+    /// as one that left the row `DELETING` would, before one releases.
+    pub release_withheld: u32,
+    /// Never release, as a daemon without request-ID release.
+    pub release_refused: bool,
+    /// The keyed row's request record was released.
+    pub request_id_released: bool,
     pub execs: Vec<SandboxExec>,
     pub executions: Vec<Execution>,
     pub deleted: Vec<String>,
@@ -131,6 +176,20 @@ impl FakeApi {
         api
     }
 
+    /// A fake of kilnd with idempotent create, and, with `release`,
+    /// request-ID release, beside expiry and typed reasons.
+    pub fn keyed(release: bool) -> Self {
+        let api = Self::with_expiry();
+        {
+            let mut state = api.state();
+            state.features.insert(Feature::IdempotentCreate);
+            if release {
+                state.features.insert(Feature::RequestIdRelease);
+            }
+        }
+        api
+    }
+
     /// The scripted refusal of a non-baseline Exec and its delay, recording
     /// the request but no execution row.
     fn pre_admission_refusal(&self, request: &SandboxExec) -> Option<(ApiError, Duration)> {
@@ -171,11 +230,25 @@ pub fn expired_error(reason: &'static str) -> ApiError {
 #[async_trait]
 impl SandboxApi for FakeApi {
     async fn health(&self) -> Result<Health, ApiError> {
-        let mut state = self.state();
-        state.health_calls += 1;
+        let script = {
+            let mut state = self.state();
+            state.health_calls += 1;
+            state.health_script.pop_front()
+        };
+        let mut features = None;
+        let mut not_serving = false;
+        match script {
+            Some(HealthScript::Err(error)) => return Err(error),
+            Some(HealthScript::NotServing) => not_serving = true,
+            Some(HealthScript::Features(listed)) => features = Some(listed),
+            Some(HealthScript::Delay(delay)) => tokio::time::sleep(delay).await,
+            None => {}
+        }
+        let state = self.state();
+        let not_serving = not_serving || state.not_serving;
         Ok(Health {
-            serving: !state.not_serving,
-            detail: if state.not_serving {
+            serving: !not_serving,
+            detail: if not_serving {
                 "shutting down".to_string()
             } else {
                 String::new()
@@ -184,7 +257,7 @@ impl SandboxApi for FakeApi {
             running_executions: 0,
             reservations: NodeReservations::default(),
             capabilities: Capabilities {
-                features: state.features.clone(),
+                features: features.unwrap_or_else(|| state.features.clone()),
                 limits: state.limits,
             },
         })
@@ -192,14 +265,37 @@ impl SandboxApi for FakeApi {
 
     async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
         let labels = request.labels.clone();
-        let (delay, fail) = {
+        let echoed = request.request_id.clone().unwrap_or_default();
+        let (delay, fail, script) = {
             let mut state = self.state();
+            state.create_requests.push(request.clone());
+            state.create_sent_at.push(tokio::time::Instant::now());
+            let script = state.create_script.pop_front();
+            if let Some(CreateScript::Err(error)) = script {
+                return Err(error);
+            }
             if let Some(error) = &state.create_rejection {
                 return Err(error.clone());
             }
             let delay = state.create_delay;
             let fail = state.create_error_after_record;
-            if !state.suppress_create_record {
+            // kilnd's keyed lookup: an equal request under a recorded key is
+            // answered from its row, an unequal one is a conflict.
+            let recorded = request.request_id.as_ref().and_then(|key| {
+                state
+                    .creates
+                    .iter()
+                    .find(|row| row.request_id.as_ref() == Some(key))
+            });
+            if let Some(recorded) = recorded {
+                if recorded != &request {
+                    return Err(api_error_with_reason(
+                        Code::AlreadyExists,
+                        "request_id_conflict",
+                        "request_id_conflict: another request used this request ID",
+                    ));
+                }
+            } else if !state.suppress_create_record {
                 if state.create_record_delay.is_zero() {
                     state.creates.push(request);
                     state.create_ready_at = if state.create_allows_early_delete {
@@ -221,8 +317,12 @@ impl SandboxApi for FakeApi {
                             .push(request);
                     });
                 }
+                // A settled DELETED row is not listed.
+                if let Some(CreateScript::Settled(SandboxState::Deleted, _)) = &script {
+                    state.deleted.push("sb-0000000000000001".to_string());
+                }
             }
-            (delay, fail)
+            (delay, fail, script)
         };
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -230,12 +330,26 @@ impl SandboxApi for FakeApi {
         if fail {
             return Err(api_error(Code::Unavailable, "create response lost"));
         }
-        Ok(Sandbox {
+        let mut sandbox = Sandbox {
             id: "sb-0000000000000001".to_string(),
             backend_id: "test-backend-1".to_string(),
             labels,
             expiry: None,
-        })
+            state: SandboxState::Ready,
+            failure_reason: String::new(),
+            request_id: echoed,
+            request_id_released: false,
+        };
+        match script {
+            Some(CreateScript::ErrAfterRecord(error)) => return Err(error),
+            Some(CreateScript::Settled(state, reason)) => {
+                sandbox.state = state;
+                sandbox.failure_reason = reason;
+            }
+            Some(CreateScript::EchoRequestId(request_id)) => sandbox.request_id = request_id,
+            Some(CreateScript::Err(_)) | None => {}
+        }
+        Ok(sandbox)
     }
 
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
@@ -340,9 +454,15 @@ impl SandboxApi for FakeApi {
         Ok(execution)
     }
 
-    async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError> {
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
         let mut state = self.state();
         state.delete_attempts += 1;
+        state.deletes_released.push(release_request_id);
+        state.delete_sent_at.push(tokio::time::Instant::now());
         if state
             .create_ready_at
             .is_some_and(|ready_at| std::time::Instant::now() < ready_at)
@@ -356,20 +476,37 @@ impl SandboxApi for FakeApi {
             state.delete_failures -= 1;
             return Err(api_error(Code::Unavailable, "transient delete failure"));
         }
+        // A delete that leaves the row in place releases nothing.
+        let unreleased = Deleted {
+            request_id_released: state.request_id_released,
+        };
         if matches!(state.delete_behavior, DeleteBehavior::AcknowledgeOnly) {
-            return Ok(());
+            return Ok(unreleased);
         }
         if state.delete_acknowledgements_before_removal > 0 {
             state.delete_acknowledgements_before_removal -= 1;
-            return Ok(());
+            return Ok(unreleased);
         }
         if !state.deleted.iter().any(|id| id == sandbox_id) {
             state.deleted.push(sandbox_id.to_string());
         }
+        let keyed = state
+            .creates
+            .last()
+            .is_some_and(|request| request.request_id.is_some());
+        if release_request_id && keyed && !state.release_refused {
+            if state.release_withheld > 0 {
+                state.release_withheld -= 1;
+            } else {
+                state.request_id_released = true;
+            }
+        }
         if matches!(state.delete_behavior, DeleteBehavior::FailAfterRemoving) {
             return Err(api_error(Code::Unavailable, "delete response lost"));
         }
-        Ok(())
+        Ok(Deleted {
+            request_id_released: state.request_id_released,
+        })
     }
 
     async fn renew(&self, _sandbox_id: &str) -> Result<(), ApiError> {
@@ -491,6 +628,14 @@ impl SandboxApi for FakeApi {
                             ..ExpiryStatus::default()
                         })
                     }),
+                    state: SandboxState::Ready,
+                    failure_reason: String::new(),
+                    request_id: state
+                        .creates
+                        .last()
+                        .and_then(|request| request.request_id.clone())
+                        .unwrap_or_default(),
+                    request_id_released: false,
                 }]
             } else {
                 Vec::new()

@@ -1,9 +1,10 @@
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kiln_harness::api::{ExpiryPolicy, Feature, SandboxApi, TonicKilnd};
+use kiln_harness::api::{ExpiryPolicy, Feature, SandboxApi, SandboxRequest, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{Harness, HarnessConfig, SessionTask};
 use kiln_harness::journal::{JsonlJournal, read_journal};
@@ -29,10 +30,13 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         "integration baseline is not empty"
     );
     assert_eq!(before.running_executions, 0);
-    // kilnd 853dee2 lists expiry and typed reasons, so the harness sends an
-    // expiry and reads reason trailers.
+    // kilnd 4baf986 lists expiry, typed reasons, idempotent create and
+    // request-ID release, so the harness sends an expiry and a request ID,
+    // reads reason trailers, and releases the key at cleanup.
     assert!(before.capabilities.supports(Feature::SandboxExpiry));
     assert!(before.capabilities.supports(Feature::TypedReasons));
+    assert!(before.capabilities.supports(Feature::IdempotentCreate));
+    assert!(before.capabilities.supports(Feature::RequestIdRelease));
     // A node may keep sandboxes this test does not own, such as a failed one
     // kilnd still charges because its absence is unproven. Compare against
     // what existed before rather than against zero.
@@ -55,8 +59,8 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         .await
         .expect("real kilnd scenario succeeds");
     assert_eq!(outcome.tool_calls, 5);
-    check_expiry_and_reasons(&api, &outcome.sandbox_id).await;
     let records = std::fs::read_to_string(&audit_path).expect("read flushed audit");
+    check_expiry_and_reasons(&api, &outcome.sandbox_id, &audited_request_id(&records)).await;
     let completed = records
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("valid audit JSON"))
@@ -93,6 +97,8 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     assert!(replay.provider().exhausted());
     assert_eq!(replayed.final_answer, outcome.final_answer);
 
+    check_keyed_create(&api).await;
+
     let after = api.health().await.expect("health after");
     assert!(after.serving, "kilnd unhealthy: {}", after.detail);
     assert_eq!(after.active_sandboxes, 0);
@@ -110,7 +116,147 @@ async fn non_deleted_ids(api: &TonicKilnd) -> BTreeSet<String> {
         .collect()
 }
 
-async fn check_expiry_and_reasons(api: &TonicKilnd, sandbox_id: &str) {
+/// The session's request ID from its audit, after checking that the
+/// session released it at cleanup.
+fn audited_request_id(records: &str) -> String {
+    let events = records
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid audit JSON"))
+        .collect::<Vec<_>>();
+    let event = |name: &str| {
+        events
+            .iter()
+            .find(|record| record.get("event").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let request_id = event("sandbox_created")["request_id"]
+        .as_str()
+        .expect("a keyed create")
+        .to_string();
+    assert!(request_id.starts_with("kiln-harness:"), "{request_id}");
+    assert_eq!(event("session_finished")["request_id_released"], true);
+    request_id
+}
+
+/// Two keyed creates with one fresh key and equal requests make one sandbox;
+/// another request under the key is a conflict; a releasing delete gives
+/// the key up. The sandbox is deleted, with retries, whatever happens.
+async fn check_keyed_create(api: &TonicKilnd) {
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let key = format!("kiln-harness:it-{unix_ms:x}-{:x}", std::process::id());
+    let request = SandboxRequest {
+        image: "alpine".to_string(),
+        memory_bytes: 256 << 20,
+        cpu_millis: 500,
+        pids: 64,
+        disk_bytes: 256 << 20,
+        network_none: true,
+        read_only_root: true,
+        writable_paths: vec!["/workspace".to_string()],
+        labels: BTreeMap::from([("owner".to_string(), "kiln-harness-it".to_string())]),
+        expiry: Some(ExpiryPolicy {
+            max_lifetime_ms: 120_000,
+            idle_timeout_ms: 60_000,
+        }),
+        request_id: Some(key.clone()),
+    };
+    let mut created = BTreeSet::new();
+    let checked = keyed_create_checks(api, &request, &mut created).await;
+    let mut residue = Vec::new();
+    for sandbox_id in &created {
+        if !delete_until_absent(api, sandbox_id).await {
+            residue.push(sandbox_id.clone());
+        }
+    }
+    assert!(residue.is_empty(), "keyed create left {residue:?}");
+    let released = checked.expect("keyed create checks");
+    assert!(released, "release_request_id was never confirmed");
+    let row = api
+        .get_sandbox(created.first().expect("one sandbox"))
+        .await
+        .expect("get the deleted sandbox");
+    assert_eq!(row.request_id, key);
+    assert!(row.request_id_released);
+}
+
+/// The checks of [`check_keyed_create`], without panicking, so its caller
+/// always cleans up. Every sandbox ID seen goes into `created`. Returns
+/// whether a releasing delete reported the key released.
+async fn keyed_create_checks(
+    api: &TonicKilnd,
+    request: &SandboxRequest,
+    created: &mut BTreeSet<String>,
+) -> Result<bool, String> {
+    let first = api
+        .create(request.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    created.insert(first.id.clone());
+    let second = api
+        .create(request.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    created.insert(second.id.clone());
+    if second.id != first.id {
+        return Err(format!("retry made {} beside {}", second.id, first.id));
+    }
+    if first.request_id != request.request_id.clone().unwrap_or_default() {
+        return Err(format!("echoed {:?}", first.request_id));
+    }
+    let mut other = request.clone();
+    other
+        .labels
+        .insert("variant".to_string(), "other".to_string());
+    match api.create(other).await {
+        Ok(sandbox) => {
+            created.insert(sandbox.id.clone());
+            return Err(format!("an unequal request made {}", sandbox.id));
+        }
+        Err(error)
+            if error.code == tonic::Code::AlreadyExists
+                && error.reason.as_deref() == Some("request_id_conflict") => {}
+        Err(error) => return Err(format!("unequal request: {error}")),
+    }
+    let mut released = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Ok(deleted) = api.delete(&first.id, true).await {
+            released |= deleted.request_id_released;
+        }
+        let listed = api
+            .non_deleted_sandboxes()
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|sandbox| sandbox.id == first.id);
+        if !listed && released {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(released)
+}
+
+/// Delete `sandbox_id` until a listing no longer shows it, for at most
+/// ten seconds.
+async fn delete_until_absent(api: &TonicKilnd, sandbox_id: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let _ = api.delete(sandbox_id, true).await;
+        if let Ok(sandboxes) = api.non_deleted_sandboxes().await
+            && sandboxes.iter().all(|sandbox| sandbox.id != sandbox_id)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn check_expiry_and_reasons(api: &TonicKilnd, sandbox_id: &str, request_id: &str) {
     // The retained row keeps the effective expiry the harness set: 30 s
     // session + 10 s cleanup + 60 s margin, and the 120 s idle default.
     let sandbox = api
@@ -124,6 +270,9 @@ async fn check_expiry_and_reasons(api: &TonicKilnd, sandbox_id: &str) {
             idle_timeout_ms: 120_000,
         })
     );
+    // The row keeps the session's key, released at cleanup.
+    assert_eq!(sandbox.request_id, request_id);
+    assert!(sandbox.request_id_released);
     // A typed reason survives the wire: renewing the deleted sandbox is
     // refused with its deletion reason, not NOT_FOUND.
     let refused = api
