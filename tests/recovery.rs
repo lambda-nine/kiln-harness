@@ -13,6 +13,7 @@ use kiln_harness::api::{
     SandboxRequest,
 };
 use kiln_harness::tools::recover_execution_evidence;
+use tokio_util::sync::CancellationToken;
 use tonic::Code;
 
 /// `GetSandbox` shows one RUNNING row; `GetExecution` never finds it.
@@ -71,6 +72,13 @@ impl SandboxApi for MissingExecutionApi {
         unreachable!("recovery reads no sandbox state")
     }
 
+    async fn final_check(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, ApiError> {
+        unreachable!("recovery runs no final check")
+    }
+
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
         unreachable!("recovery lists nothing")
     }
@@ -86,6 +94,7 @@ async fn an_execution_that_never_settles_is_polled_with_backoff() {
         "sb-0000000000000001",
         &BTreeSet::new(),
         started + Duration::from_secs(1),
+        &CancellationToken::new(),
     )
     .await;
     let sandbox_reads = api.sandbox_reads.load(Ordering::SeqCst);
@@ -147,6 +156,13 @@ impl SandboxApi for UnreadableApi {
         unreachable!("recovery reads no sandbox state")
     }
 
+    async fn final_check(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, ApiError> {
+        unreachable!("recovery runs no final check")
+    }
+
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
         unreachable!("recovery lists nothing")
     }
@@ -161,6 +177,7 @@ async fn recovery_that_cannot_read_anything_fails_closed() {
         "sb-0000000000000001",
         &BTreeSet::new(),
         deadline,
+        &CancellationToken::new(),
     )
     .await;
     assert!(recovered.unreadable);
@@ -178,6 +195,7 @@ async fn recovery_that_cannot_read_anything_fails_closed() {
         "sb-0000000000000001",
         &BTreeSet::new(),
         tokio::time::Instant::now() + Duration::from_secs(1),
+        &CancellationToken::new(),
     )
     .await;
     assert!(!recovered.unreadable);
@@ -244,6 +262,13 @@ impl SandboxApi for LateTerminalRow {
         unreachable!("recovery reads no sandbox state")
     }
 
+    async fn final_check(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, ApiError> {
+        unreachable!("recovery runs no final check")
+    }
+
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
         unreachable!("recovery lists nothing")
     }
@@ -251,17 +276,24 @@ impl SandboxApi for LateTerminalRow {
 
 #[tokio::test(start_paused = true)]
 async fn a_row_published_late_in_the_window_is_still_found() {
-    // R5-03: the row becomes observable 25 ms, and then 5 ms, before the
-    // deadline. Recovery keeps reading until the deadline and finds it.
-    for before in [25, 5] {
+    // R5-03: a row that becomes observable late in the window, up to the
+    // start of the last pass (100 ms before a 1 s deadline), is found. One
+    // published inside that reserve is the final check's to catch (see
+    // a_row_recovery_missed_still_stops_a_completed_session).
+    for before in [150, 101] {
         let start = tokio::time::Instant::now();
         let deadline = start + Duration::from_secs(1);
         let api = LateTerminalRow {
             publish_at: deadline - Duration::from_millis(before),
         };
-        let recovered =
-            recover_execution_evidence(&api, "sb-0000000000000001", &BTreeSet::new(), deadline)
-                .await;
+        let recovered = recover_execution_evidence(
+            &api,
+            "sb-0000000000000001",
+            &BTreeSet::new(),
+            deadline,
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(
             recovered.execution_ids,
             ["ex-0000000000000002"],
@@ -269,4 +301,236 @@ async fn a_row_published_late_in_the_window_is_still_found() {
         );
         assert_eq!(recovered.sandbox_reusable, Some(false));
     }
+}
+
+/// `GetSandbox` answers empty until `hang_from`, then never answers.
+#[derive(Clone)]
+struct HangsAtTheEnd {
+    hang_from: tokio::time::Instant,
+}
+
+#[async_trait]
+impl SandboxApi for HangsAtTheEnd {
+    async fn health(&self) -> Result<Health, ApiError> {
+        unreachable!("recovery reads no health")
+    }
+
+    async fn create(&self, _request: SandboxRequest) -> Result<Sandbox, ApiError> {
+        unreachable!("recovery creates nothing")
+    }
+
+    async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("recovery runs nothing")
+    }
+
+    async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
+        if tokio::time::Instant::now() >= self.hang_from {
+            std::future::pending::<()>().await;
+        }
+        Ok(Vec::new())
+    }
+
+    async fn delete(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+        unreachable!("recovery deletes nothing")
+    }
+
+    async fn renew(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+        unreachable!("recovery renews nothing")
+    }
+
+    async fn get_execution(&self, _execution_id: &str) -> Result<Execution, ApiError> {
+        unreachable!("no row to follow")
+    }
+
+    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
+        unreachable!("recovery reads no sandbox state")
+    }
+
+    async fn final_check(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, ApiError> {
+        unreachable!("recovery runs no final check")
+    }
+
+    async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
+        unreachable!("recovery lists nothing")
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_last_read_that_fails_after_empty_ones_is_unreadable() {
+    // R6-01: the last pass starts 100 ms before the deadline and its read
+    // never answers. Earlier empty reads do not stand in for it.
+    let start = tokio::time::Instant::now();
+    let deadline = start + Duration::from_secs(1);
+    let api = HangsAtTheEnd {
+        hang_from: deadline - Duration::from_millis(100),
+    };
+    let recovered = recover_execution_evidence(
+        &api,
+        "sb-0000000000000001",
+        &BTreeSet::new(),
+        deadline,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(recovered.unreadable);
+    assert!(recovered.stop().is_some());
+    assert!(tokio::time::Instant::now() <= deadline);
+}
+
+/// A kilnd whose `GetSandbox` reads take 1 ms, and whose lost Exec
+/// publishes a terminal, non-reusable row 950 ms after it was sent: inside
+/// recovery's final reserve, after its last read.
+#[derive(Clone)]
+struct LatePublishedRow {
+    inner: common::FakeApi,
+    publish_at: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl LatePublishedRow {
+    fn row(&self) -> Option<Execution> {
+        let published = self
+            .publish_at
+            .lock()
+            .expect("publish time")
+            .is_some_and(|at| tokio::time::Instant::now() >= at);
+        published.then(LateTerminalRow::row)
+    }
+}
+
+#[async_trait]
+impl SandboxApi for LatePublishedRow {
+    async fn health(&self) -> Result<Health, ApiError> {
+        self.inner.health().await
+    }
+
+    async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
+        self.inner.create(request).await
+    }
+
+    async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
+        if request.argv.first().map(String::as_str) == Some("/usr/bin/find") {
+            return self.inner.exec(request).await;
+        }
+        *self.publish_at.lock().expect("publish time") =
+            Some(tokio::time::Instant::now() + Duration::from_millis(950));
+        Err(ApiError::new(Code::Unavailable, "response lost"))
+    }
+
+    async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut rows = self.inner.recent_executions(sandbox_id).await?;
+        rows.extend(self.row());
+        Ok(rows)
+    }
+
+    async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError> {
+        self.inner.delete(sandbox_id).await
+    }
+
+    async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError> {
+        self.inner.renew(sandbox_id).await
+    }
+
+    async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError> {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        match self.row() {
+            Some(row) if row.id == execution_id => Ok(row),
+            _ => self.inner.get_execution(execution_id).await,
+        }
+    }
+
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
+        self.inner.sandbox_ready(sandbox_id).await
+    }
+
+    async fn final_check(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, ApiError> {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let mut check = self.inner.final_check(sandbox_id).await?;
+        check.recent.extend(self.row());
+        Ok(check)
+    }
+
+    async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
+        self.inner.non_deleted_sandboxes().await
+    }
+}
+
+/// Asks for one Exec, then answers 100 ms later.
+struct ExecThenSlowAnswer {
+    calls: u32,
+}
+
+#[async_trait]
+impl kiln_harness::provider::Provider for ExecThenSlowAnswer {
+    fn info(&self) -> kiln_harness::provider::ProviderInfo {
+        kiln_harness::provider::ProviderInfo {
+            name: "test".to_string(),
+            model: "test".to_string(),
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        _request: kiln_harness::provider::ModelRequest<'_>,
+    ) -> Result<kiln_harness::provider::ModelResponse, kiln_harness::provider::ProviderError> {
+        use kiln_harness::provider::{ModelResponse, ToolCall};
+        self.calls += 1;
+        if self.calls == 1 {
+            return Ok(ModelResponse::tool_use([ToolCall::new(
+                "call-1",
+                "exec",
+                serde_json::json!({"argv": ["/bin/true"]}),
+            )]));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(ModelResponse::final_text(
+            "done after recovery missed the row",
+        ))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_row_recovery_missed_still_stops_a_completed_session() {
+    // R6-01: recovery's last read, 100 ms before its deadline, cannot see a
+    // row published 50 ms before it. The final check before completion does.
+    use kiln_harness::audit::{AuditEvent, MemoryAudit};
+    use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionTask};
+    use kiln_harness::journal::MemoryJournal;
+    let api = LatePublishedRow {
+        inner: common::FakeApi::with_expiry(),
+        publish_at: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let config = HarnessConfig {
+        lifecycle_timeout: Duration::from_secs(1),
+        lifecycle_retry_delay: Duration::from_millis(5),
+        ..HarnessConfig::default()
+    };
+    let mut harness = Harness::new(
+        api.clone(),
+        ExecThenSlowAnswer { calls: 0 },
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the final check finds the row");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.code == Code::FailedPrecondition
+                && error.message == "execution left the sandbox unusable"),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 2, "recovery missed the row");
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished { outcome, .. }) if outcome == "failed"
+    ));
 }

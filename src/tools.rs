@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::time::{Instant, sleep_until, timeout_at};
+use tokio_util::sync::CancellationToken;
 
 use crate::api::{
     ApiError, CancelReason, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi,
@@ -414,9 +415,10 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         &self,
         known: &BTreeSet<String>,
         deadline: Instant,
+        cancel: &CancellationToken,
     ) -> RecoveredExecutionEvidence {
         let recovered =
-            recover_execution_evidence(self.api, &self.sandbox_id, known, deadline).await;
+            recover_execution_evidence(self.api, &self.sandbox_id, known, deadline, cancel).await;
         // A settled recovered row is an execution kilnd admitted and
         // finished, so it is activity; one that left the sandbox unusable,
         // or never settled, refuses any later Exec.
@@ -446,8 +448,9 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         self.plan(tool, arguments.clone()).is_ok()
     }
 
-    /// Run one tool call. The tool timeout bounds the whole call, every
-    /// Exec it sends included: each gets the time that remains of it.
+    /// Run one tool call. The tool timeout bounds the Execs it sends
+    /// together: each gets the time that remains of it. Response-loss
+    /// recovery, if the engine runs it, comes after.
     pub async fn execute(
         &self,
         tool: &str,
@@ -935,7 +938,7 @@ struct Manifest {
 
 /// How a session ends after an execution left the sandbox unusable: as an
 /// expiry when kilnd's cancel reason proves one, and otherwise closed.
-fn unusable_stop(cause: Option<CancelReason>) -> ToolStop {
+pub(crate) fn unusable_stop(cause: Option<CancelReason>) -> ToolStop {
     match cause {
         Some(CancelReason::SandboxDeleted) => ToolStop::Expired(ExpiryReason::SandboxDeleted),
         Some(CancelReason::SandboxExpiredLifetime) => {
@@ -1180,15 +1183,39 @@ fn unknown_evidence() -> OutputEvidence {
 /// each unsettled row is followed with `GetExecution`. Recovery returns
 /// early only when it has found at least one new row and every one is
 /// terminal; an empty read proves nothing before the deadline, so otherwise
-/// it runs to the deadline. A row still unsettled then (RUNNING,
+/// it runs to its last pass. A row still unsettled then (RUNNING,
 /// `NOT_FOUND`, an error, or the wrong ID all count) is reported as such,
-/// and so is a window in which no `GetSandbox` read succeeded at all.
+/// and so is a window in which no `GetSandbox` read succeeded at all, or
+/// whose last read failed with nothing found. Recovery is best-effort: it
+/// can stop a session early, but the final check before a completed session
+/// is what proves the sandbox stayed usable. A cancellation that arrives
+/// during it returns at once.
 ///
 /// Polls back off from 10 ms to 200 ms. `GetSandbox` is read on the first
 /// pass, on every pass while no new row is known, and then every fourth
-/// pass; between those only the unsettled IDs are read. The last passes,
-/// one just before the deadline and one at it, read both.
+/// pass; between those only the unsettled IDs are read. The last pass starts
+/// `min(100 ms, window / 4)` before the deadline, so its reads have that
+/// long to answer, and reads both.
 pub async fn recover_execution_evidence<A: SandboxApi>(
+    api: &A,
+    sandbox_id: &str,
+    known: &BTreeSet<String>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> RecoveredExecutionEvidence {
+    // Recovery after a cancellation still runs its bounded window, to record
+    // what kilnd assigned; a cancellation arriving during it returns at
+    // once, and the caller's Canceled stop wins.
+    if cancel.is_cancelled() {
+        return recover_until(api, sandbox_id, known, deadline).await;
+    }
+    tokio::select! {
+        () = cancel.cancelled() => RecoveredExecutionEvidence::empty(),
+        recovered = recover_until(api, sandbox_id, known, deadline) => recovered,
+    }
+}
+
+async fn recover_until<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     known: &BTreeSet<String>,
@@ -1197,16 +1224,22 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
     const FIRST_DELAY: Duration = Duration::from_millis(10);
     const MAX_DELAY: Duration = Duration::from_millis(200);
     const RESCAN_EVERY: u32 = 4;
-    const FINAL_PASS_RESERVE: Duration = Duration::from_millis(20);
-    let final_phase = deadline.checked_sub(FINAL_PASS_RESERVE).unwrap_or(deadline);
+    // The last pass starts this long before the deadline, so its reads have
+    // time to answer.
+    let window = deadline.saturating_duration_since(Instant::now());
+    let final_reserve = Duration::from_millis(100).min(window / 4);
+    let final_pass_at = deadline.checked_sub(final_reserve).unwrap_or(deadline);
     let mut rows: Vec<Execution> = Vec::new();
     let mut listed = false;
     let mut delay = FIRST_DELAY;
     let mut pass = 0u32;
     loop {
-        let ending = Instant::now() >= final_phase;
-        if ending || rows.is_empty() || pass % RESCAN_EVERY == 0 {
-            listed |= rescan_recent(api, sandbox_id, known, deadline, &mut rows).await;
+        let last = Instant::now() >= final_pass_at;
+        let mut last_read = None;
+        if last || rows.is_empty() || pass % RESCAN_EVERY == 0 {
+            let read = rescan_recent(api, sandbox_id, known, deadline, &mut rows).await;
+            listed |= read;
+            last_read = Some(read);
         }
         for row in rows.iter_mut().filter(|row| !is_terminal(row)) {
             if let Ok(Ok(execution)) = timeout_at(deadline, api.get_execution(&row.id)).await
@@ -1216,21 +1249,18 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
             }
         }
         let settled = !rows.is_empty() && rows.iter().all(is_terminal);
-        let now = Instant::now();
-        if settled || now >= deadline {
+        if settled || last {
+            // An earlier empty read does not stand in for a last one that
+            // failed: with nothing found and the last read lost, nothing is
+            // known.
+            let unreadable = !listed || (rows.is_empty() && last && last_read == Some(false));
             let mut recovered = aggregate_recovered(rows);
-            recovered.unreadable = !listed;
+            recovered.unreadable = unreadable && !settled;
             return recovered;
         }
         pass = pass.saturating_add(1);
-        // Back off, but wake for a pass just before the deadline and once
-        // more at it.
-        let wake = if now >= final_phase {
-            deadline
-        } else {
-            (now + delay).min(final_phase)
-        };
-        sleep_until(wake).await;
+        let now = Instant::now();
+        sleep_until((now + delay).min(final_pass_at.max(now))).await;
         delay = (delay * 2).min(MAX_DELAY);
     }
 }
@@ -1265,16 +1295,23 @@ fn is_terminal(execution: &Execution) -> bool {
     execution.state != ExecutionState::Unknown
 }
 
+impl RecoveredExecutionEvidence {
+    /// Nothing found, and nothing claimed.
+    fn empty() -> Self {
+        Self {
+            execution_ids: Vec::new(),
+            stdout: empty_evidence(),
+            stderr: empty_evidence(),
+            sandbox_reusable: None,
+            cancel_reason: None,
+            unsettled: None,
+            unreadable: false,
+        }
+    }
+}
+
 fn aggregate_recovered(rows: Vec<Execution>) -> RecoveredExecutionEvidence {
-    let mut recovered = RecoveredExecutionEvidence {
-        execution_ids: Vec::new(),
-        stdout: empty_evidence(),
-        stderr: empty_evidence(),
-        sandbox_reusable: None,
-        cancel_reason: None,
-        unsettled: None,
-        unreadable: false,
-    };
+    let mut recovered = RecoveredExecutionEvidence::empty();
     for execution in rows {
         if !is_terminal(&execution) {
             recovered

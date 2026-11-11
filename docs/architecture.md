@@ -116,17 +116,23 @@ model call happens. The same holds for a row recovered after a lost Exec
 response, but only terminal evidence counts: a RUNNING row can still be
 canceled or retire the sandbox, so recovery follows every new row with
 `GetExecution`, and reads `GetSandbox` again for further rows, until each
-is terminal or the recovery deadline passes. It returns early only once it
-has found at least one new row and every one is terminal; an empty read
-proves nothing before the deadline, so otherwise it runs to the deadline.
-Polls back off from 10 ms to 200 ms; `GetSandbox` is read on the first
-pass, while no row is known, and every fourth pass after that, and the last
-two passes, 20 ms before the deadline and at it, read both, so one
-unsettled row costs about ten reads a second, not two hundred. If no
-`GetSandbox` read succeeded in the whole window, nothing is known about
-what kilnd assigned, and the session ends the same way, "execution evidence
-could not be read after its response was lost"; a read that succeeded and
-found nothing keeps the call an ordinary failure. Settled rows keep their
+is terminal or the recovery deadline passes. Recovery is best-effort: any
+finite window can miss a row published just after its last read, so it
+only stops a session early, and the final check below is what gates a
+completed session. It returns early only once it has found at least one
+new row and every one is terminal; otherwise it runs to its last pass,
+which starts `min(100 ms, window / 4)` before its deadline so its reads
+have that long to answer. Polls back off from 10 ms to 200 ms;
+`GetSandbox` is read on the first pass, while no row is known, every
+fourth pass after that, and on the last pass, so one unsettled row costs
+about ten reads a second, not two hundred. If no `GetSandbox` read
+succeeded in the whole window, or the last one failed with nothing found,
+nothing is known about what kilnd assigned, and the session ends the same
+way, "execution evidence could not be read after its response was lost";
+a read that succeeded and found nothing keeps the call an ordinary
+failure. A cancellation that arrives during recovery ends it at once, and
+the session ends as canceled; recovery after a cancellation still runs its
+window, to record what kilnd assigned. Settled rows keep their
 `sandbox_reusable` and `cancel_reason`, and one that left the sandbox
 unusable stops the session exactly as a returned one would, during the
 baseline too. A row still not terminal at the deadline fails closed: the
@@ -138,6 +144,32 @@ or `expired_lifetime`); any other cause, or none, fails closed with an
 `Api` error, "execution left the sandbox unusable". Either way cleanup still
 deletes and verifies absence. An older daemon does not send the field, and
 then nothing changes.
+
+The final check gates `completed`. kilnd refuses every Exec once the
+sandbox is not READY, and the harness stops on that refusal; what remains
+is the end of the session, when no further Exec would reveal it. So after
+a final answer, and before `session_finished` and `session_ended`, one
+`GetSandbox` (`SandboxApi::final_check`) must confirm the sandbox stayed
+usable, in every session. It is bounded by the session deadline and the
+lifecycle window, and canceled with the session. The sandbox must be
+READY, and, from a daemon that reports execution usability (one that lists
+sandbox expiry), every recent execution the session never saw must be
+terminal and reusable. A row that left the sandbox unusable ends the
+session with its mapped stop, as a returned one would; a row still
+running, or a sandbox not READY, ends it as `Api` `FAILED_PRECONDITION`,
+"sandbox was not usable when the session finished", or as `SandboxExpired`
+when kilnd's deletion reason names an expiry or deletion; and a check that
+cannot be made ends it as `Api` `UNAVAILABLE`, "could not confirm the
+sandbox at the end of the session". Deadline and cancellation keep their
+precedence. An older daemon's sandbox is checked by state only. The final
+answer stays journaled as the model's response and the terminal records
+say `failed`; the journal gains no record, so its grammar is unchanged.
+The audit gets a metadata-only `final_check` event: the state (`ready`,
+`not_ready`, or `unknown`), how many unseen executions there were, and
+whether the sandbox was usable. Replay runs the same check against its
+fresh sandbox. Every `GetSandbox` answer must name the sandbox asked
+about; anything else is a protocol error (`INTERNAL`), never an empty
+read.
 
 An Exec refused with `FAILED_PRECONDITION` and a typed `sandbox_failed`,
 `sandbox_lost`, `sandbox_quarantined` or `sandbox_not_ready` reason proves
@@ -218,18 +250,21 @@ tool timeout plus the response-loss recovery window, at most 1 s) plus the
 renew interval must fit in the idle timeout actually sent after kilnd's
 clamp, or the session is refused with `InvalidTask` naming both values; the
 defaults (30 s tools, 120 s idle, 40 s interval) fit, and a 10 s idle
-timeout allows tools of about 5 s. The tool timeout bounds the whole tool
-call, not each Exec: a tool that runs several (`read_file`) gives each the
-time that remains, a further one with none left ends the call through the
-tool `Deadline` path, and response-loss recovery ends within the same
-budget, its window counted once per call. So the budget is the true worst
+timeout allows tools of about 5 s. The tool timeout bounds the tool's
+Execs together, not each: a tool that runs several (`read_file`) gives each
+the time that remains, and a further one with none left ends the call
+through the tool `Deadline` path. Response-loss recovery may follow, for
+its window, so the budget used for the expiry fit is the tool timeout plus
+recovery, and the whole call ends by `min(session deadline, tool start +
+budget)`, never after the session deadline. So the budget is the true worst
 case for every tool. And before a kilnd-bound tool call, a renew is forced
 whenever `now + budget` would reach `last activity + idle`, whatever the
 backoff after a failed renew says, and the tool starts only after it
 succeeds: a transient failure is retried after the lifecycle retry delay,
 counting toward the failure budget, until the earlier of the session
 deadline and the estimated idle deadline, and then the session ends with
-`renew_failed`. The tool's `model_turn` audit record
+`renew_failed`. Each forced attempt is cut off at that same instant, so
+none runs past it. The tool's `model_turn` audit record
 is written before this renew, so a fatal renew leaves the call on record
 with no completion; if the session deadline has passed, or passes while
 the renew is in flight, the session ends with `Deadline`, not

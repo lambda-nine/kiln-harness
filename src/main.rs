@@ -144,11 +144,11 @@ struct RunArgs {
     /// Wall-clock limit for the session, including sandbox creation.
     #[arg(long, default_value_t = 900)]
     session_timeout_secs: u64,
-    /// Wall-clock limit for each tool call, every sandbox execution it runs
-    /// included (`read_file` runs two). When kilnd supports
-    /// expiry, this plus 1 s of recovery plus a third of the idle timeout
-    /// must fit in the idle timeout: about 5 s at most for a 10 s idle
-    /// timeout, 79 s for the default 120 s.
+    /// Wall-clock limit for each tool call's sandbox executions together
+    /// (`read_file` runs two); response-loss recovery may add up to 1 s.
+    /// When kilnd supports expiry, this plus 1 s of recovery plus a third
+    /// of the idle timeout must fit in the idle timeout: about 5 s at most
+    /// for a 10 s idle timeout, 79 s for the default 120 s.
     #[arg(long, default_value_t = 30)]
     tool_timeout_secs: u64,
     /// Idle time after which kilnd may reclaim the sandbox, when it supports

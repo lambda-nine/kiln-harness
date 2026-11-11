@@ -6,6 +6,20 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Sixth review round for kilnd API milestone 1. A session can now be
+  recorded `completed` only after a final check: one `GetSandbox`
+  (`SandboxApi::final_check`) after the final answer must show the sandbox
+  READY and every execution the session never saw finished and reusable.
+  Otherwise the session fails with the mapped stop, `not usable`, or
+  `could not confirm`, and the audit records a metadata-only
+  `final_check` event; the journal format is unchanged. Response-loss
+  recovery is best-effort: its last pass starts `min(100 ms, window / 4)`
+  before its deadline, a failed last read with nothing found fails closed,
+  and cancellation ends it at once. Every `GetSandbox` answer must name the
+  sandbox asked about. A tool call's outer deadline is
+  `min(session deadline, tool start + budget)`, and the docs now say the
+  tool timeout bounds the call's Execs, with recovery after. A forced renew
+  attempt is cut off at its give-up instant.
 - Fifth review round for kilnd API milestone 1. Response-loss recovery
   reads until its deadline unless every row it found has settled, with its
   last passes just before and at the deadline, and fails closed when no

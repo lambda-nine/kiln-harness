@@ -195,8 +195,13 @@ impl KilndService for Stub {
             row.sandbox_reusable = Some(false);
             row.cancel_reason = pb::CancelReason::DaemonShutdown as i32;
         }
+        let state = if self.deleted.load(Ordering::SeqCst) > 0 {
+            pb::SandboxState::Deleted
+        } else {
+            pb::SandboxState::Ready
+        };
         Ok(Response::new(pb::GetSandboxResponse {
-            sandbox: Some(sandbox(pb::SandboxState::Deleted)),
+            sandbox: Some(sandbox(state)),
             recent_executions: snapshot,
         }))
     }

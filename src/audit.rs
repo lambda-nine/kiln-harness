@@ -127,6 +127,15 @@ pub enum AuditEvent {
         turn: u32,
         answer: ContentSummary,
     },
+    /// The check that gates a completed session: the sandbox's state, how
+    /// many recent executions the session never saw, and whether it was
+    /// found usable. `state` is `ready`, `not_ready`, or `unknown` when the
+    /// check itself failed.
+    FinalCheck {
+        state: String,
+        unknown_executions: usize,
+        usable: bool,
+    },
     SessionFinished {
         /// `cleanup_failed` whenever sandbox deletion could not be confirmed
         /// after work; otherwise the same as `work_outcome`.

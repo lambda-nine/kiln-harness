@@ -11,8 +11,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use kiln_harness::api::{
     ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Execution, ExecutionState,
-    ExpiryStatus, Feature, Health, NodeReservations, Sandbox, SandboxApi, SandboxExec,
-    SandboxRequest,
+    ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health, NodeReservations, Sandbox, SandboxApi,
+    SandboxExec, SandboxRequest,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
@@ -105,6 +105,11 @@ pub struct FakeState {
     /// that was not a race.
     pub not_ready: bool,
     pub get_execution_calls: u32,
+    /// The final check: how often it ran, an error to answer it with, and
+    /// rows only it sees, as executions recovery missed.
+    pub final_checks: u32,
+    pub final_check_error: Option<ApiError>,
+    pub final_rows: Vec<Execution>,
 }
 
 impl FakeApi {
@@ -422,6 +427,27 @@ impl SandboxApi for FakeApi {
                 && !state.not_ready
                 && state.creates.len() > state.deleted.len(),
         )
+    }
+
+    async fn final_check(&self, _sandbox_id: &str) -> Result<FinalCheck, ApiError> {
+        let mut state = self.state();
+        state.final_checks += 1;
+        if let Some(error) = &state.final_check_error {
+            return Err(error.clone());
+        }
+        let mut recent = state.final_rows.clone();
+        recent.extend(state.executions.iter().rev().cloned());
+        Ok(FinalCheck {
+            ready: state.expired.is_none()
+                && !state.not_ready
+                && state.creates.len() > state.deleted.len(),
+            deletion: state.expired.map(|reason| match reason {
+                "expired_idle" => ExpiryReason::ExpiredIdle,
+                "expired_lifetime" => ExpiryReason::ExpiredLifetime,
+                _ => ExpiryReason::SandboxDeleted,
+            }),
+            recent,
+        })
     }
 
     async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {

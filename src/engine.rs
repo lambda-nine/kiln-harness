@@ -12,8 +12,8 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{
-    ApiError, ApiLimits, Capabilities, ExpiryPolicy, ExpiryReason, Feature, SandboxApi,
-    SandboxRequest, UnusableReason, backend_unsupported_feature,
+    ApiError, ApiLimits, Capabilities, Execution, ExecutionState, ExpiryPolicy, ExpiryReason,
+    Feature, FinalCheck, SandboxApi, SandboxRequest, UnusableReason, backend_unsupported_feature,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
@@ -26,7 +26,7 @@ use crate::provider::{
 };
 use crate::tools::{
     ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop, UNUSABLE_SANDBOX,
-    recover_execution_evidence, sanitize_call_bounded,
+    recover_execution_evidence, sanitize_call_bounded, unusable_stop,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -537,11 +537,14 @@ where
                     // The dropped baseline RPC asks kilnd to cancel it; record
                     // any execution it already assigned, then clean up.
                     let recovery_deadline = recovery_deadline(self.config.lifecycle_timeout);
+                    // Already canceled: recover on a token of its own, within
+                    // its short window.
                     let execution_ids = recover_execution_evidence(
                         &self.api,
                         &sandbox_id,
                         &BTreeSet::new(),
                         recovery_deadline,
+                        &CancellationToken::new(),
                     )
                     .await
                     .execution_ids;
@@ -566,6 +569,7 @@ where
                             &sandbox_id,
                             &BTreeSet::new(),
                             recovery_deadline,
+                            &cancel,
                         )
                         .await;
                         recovered_stop = recovered.stop();
@@ -580,6 +584,9 @@ where
                             file_count: 0,
                         },
                     )?;
+                    if cancel.is_cancelled() {
+                        return Err(HarnessError::Canceled);
+                    }
                     // A recovered baseline row that left the sandbox unusable
                     // ends the session as a returned one would.
                     if let Some(stop) = recovered_stop {
@@ -834,7 +841,9 @@ where
         } = response;
 
         if tool_calls.is_empty() {
-            return final_answer(audit, context, progress, turn, stop_reason, text);
+            let outcome = final_answer(audit, context, progress, turn, stop_reason, text)?;
+            final_check(audit, context, &known_execution_ids).await?;
+            return Ok(outcome);
         }
 
         // Tool arguments may be cut off, and a refusal must not run tools.
@@ -949,9 +958,10 @@ where
             {
                 renew_if_due(context, heartbeat, progress, Some(tool_rpc_budget(config))).await?;
             }
-            // The whole call, its Execs and any recovery, ends within one
-            // tool budget of here.
-            let tool_deadline = Instant::now() + tool_rpc_budget(config);
+            // The tool timeout bounds the call's Execs; with response-loss
+            // recovery the call ends within one tool budget of here, and
+            // never after the session deadline.
+            let tool_deadline = deadline.min(Instant::now() + tool_rpc_budget(config));
 
             let mut run = if call.arguments.is_none() {
                 rejected_tool_run("model_arguments_too_large")
@@ -978,10 +988,19 @@ where
                 {
                     let recovered = context
                         .tools
-                        .recover_new_execution_evidence(&known_execution_ids, recovery_deadline)
+                        .recover_new_execution_evidence(
+                            &known_execution_ids,
+                            recovery_deadline,
+                            cancel,
+                        )
                         .await;
                     run.attach_recovered(recovered);
                 }
+            }
+            // Cancellation during the call or its recovery ends the session
+            // as itself, whatever the recovered evidence says.
+            if cancel.is_cancelled() && !matches!(run.stop, Some(ToolStop::Deadline)) {
+                run.stop = Some(ToolStop::Canceled);
             }
             known_execution_ids.extend(run.execution_ids.iter().cloned());
             let result_summary = ContentSummary::json(&run.result)?;
@@ -1030,6 +1049,103 @@ where
         messages.push(Message::ToolResults { results });
     }
     Err(HarnessError::StepBudget(config.max_steps))
+}
+
+/// Before a session may be recorded completed, one `GetSandbox` confirms the
+/// sandbox stayed usable. Response-loss recovery is best-effort and its
+/// window finite, so a row it missed, or a sandbox lost or quarantined by
+/// the end, is caught here. It is bounded by the session deadline and the
+/// lifecycle window, and canceled with the session; its outcome is audited
+/// as metadata only.
+async fn final_check<A, S>(
+    audit: &mut S,
+    context: &LoopContext<'_, '_, A>,
+    known: &BTreeSet<String>,
+) -> Result<(), HarnessError>
+where
+    A: SandboxApi,
+    S: AuditSink,
+{
+    let check_deadline = context
+        .deadline
+        .min(Instant::now() + context.config.lifecycle_timeout);
+    let checked = tokio::select! {
+        () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
+        checked = timeout_at(check_deadline, context.api.final_check(context.sandbox_id)) => checked,
+    };
+    let (state, unknown_rows, verdict) = if let Ok(Ok(check)) = &checked {
+        let unknown = check
+            .recent
+            .iter()
+            .filter(|row| !known.contains(&row.id))
+            .collect::<Vec<_>>();
+        let state = if check.ready { "ready" } else { "not_ready" };
+        (
+            state,
+            unknown.len(),
+            judge_final_check(check, &unknown, context),
+        )
+    } else {
+        if Instant::now() >= context.deadline {
+            return Err(HarnessError::Deadline);
+        }
+        (
+            "unknown",
+            0,
+            Err(HarnessError::Api(ApiError::new(
+                tonic::Code::Unavailable,
+                "could not confirm the sandbox at the end of the session",
+            ))),
+        )
+    };
+    audit.append(
+        context.session_id,
+        Some(context.sandbox_id),
+        AuditEvent::FinalCheck {
+            state: state.to_string(),
+            unknown_executions: unknown_rows,
+            usable: verdict.is_ok(),
+        },
+    )?;
+    verdict
+}
+
+/// The final check's verdict. With a daemon that reports execution
+/// usability (one that supports expiry), an execution the session never saw
+/// must have finished and left the sandbox reusable; with an older one only
+/// the sandbox's state is checked.
+fn judge_final_check<A: SandboxApi>(
+    check: &FinalCheck,
+    unknown: &[&Execution],
+    context: &LoopContext<'_, '_, A>,
+) -> Result<(), HarnessError> {
+    let not_usable = || {
+        HarnessError::Api(ApiError::new(
+            tonic::Code::FailedPrecondition,
+            "sandbox was not usable when the session finished",
+        ))
+    };
+    let rows_reported = context.heartbeat.is_some();
+    if rows_reported
+        && let Some(row) = unknown
+            .iter()
+            .find(|row| row.state != ExecutionState::Unknown && row.sandbox_reusable == Some(false))
+    {
+        return Err(stop_error(unusable_stop(row.cancel_reason)));
+    }
+    if !check.ready {
+        return Err(check
+            .deletion
+            .map_or_else(not_usable, |reason| HarnessError::SandboxExpired { reason }));
+    }
+    if rows_reported
+        && unknown
+            .iter()
+            .any(|row| row.state == ExecutionState::Unknown)
+    {
+        return Err(not_usable());
+    }
+    Ok(())
 }
 
 fn final_answer<A, S>(
@@ -1304,12 +1420,14 @@ async fn renew_if_due<A: SandboxApi>(
         .min(context.tools.last_activity() + heartbeat.idle);
     loop {
         let started = (Instant::now(), context.tools.activity_generation());
+        // A forced attempt also stops at the give-up instant.
+        let mut attempt_deadline = (started.0 + heartbeat.interval).min(context.deadline);
+        if forced {
+            attempt_deadline = attempt_deadline.min(give_up);
+        }
         let outcome = tokio::select! {
             () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
-            outcome = timeout_at(
-                (started.0 + heartbeat.interval).min(context.deadline),
-                context.api.renew(context.sandbox_id),
-            ) => outcome,
+            outcome = timeout_at(attempt_deadline, context.api.renew(context.sandbox_id)) => outcome,
         };
         let settled = settle_renewal(outcome, started, context, heartbeat, progress);
         // A deadline that passed while the renew was in flight wins, as it

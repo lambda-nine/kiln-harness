@@ -234,15 +234,23 @@ it is not a hostile multi-tenant boundary.
   later activity is recorded, by generation rather than timestamp. One
   call kilnd never admits cannot outlive the sandbox either: the tool
   timeout plus recovery plus the renew interval must fit in the idle
-  timeout sent, checked before create; the tool timeout bounds a whole
-  tool call, every Exec and its recovery included; and a renew is forced
+  timeout sent, checked before create; the tool timeout bounds a call's
+  Execs, recovery its window after them, and both the session deadline;
+  and a renew is forced
   before any kilnd-bound call that could reach the idle deadline, which
   runs only once that renew succeeds. Activity is anchored when its
   request was sent, so a late reply cannot push the harness's idea of the
   idle deadline past kilnd's. Response-loss recovery backs off its
   polling, so a lost response costs a bounded number of reads against
-  kilnd's RPC admission; it reads until its deadline, and a window with no
-  successful read fails closed. A daemon that predates discovery lists no features, gets no
+  kilnd's RPC admission. Recovery is best-effort: a window with no
+  successful read, or whose last read failed with nothing found, fails
+  closed, but any finite window can miss a row published after its last
+  read. What gates a `completed` session is the final check: one
+  `GetSandbox` after the final answer that must show the sandbox READY and
+  every execution the session never saw finished and reusable, or the
+  session fails. kilnd refuses every Exec on a sandbox that is not READY,
+  so between them no usable-looking session can end on an unusable
+  sandbox. A daemon that predates discovery lists no features, gets no
   expiry, and still leaks the sandbox of a crashed harness until an
   operator deletes it.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted

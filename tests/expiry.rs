@@ -556,11 +556,15 @@ async fn without_typed_reasons_an_expiry_refusal_is_only_a_tool_error() {
     )
     .expiring(1, &api, "expired_idle");
     let mut harness = session(&api, provider, short_lifecycle_config());
-    let outcome = run(&mut harness)
+    let error = run(&mut harness)
         .await
-        .expect("the loop continues as before");
-    assert_eq!(outcome.steps, 2);
-    assert_eq!(finished(&harness), ("completed".to_string(), true, 0));
+        .expect_err("the final check finds the sandbox gone");
+    // The refusal was only a tool error: the model was asked again. But a
+    // session cannot complete on a sandbox that is gone, so the final check
+    // ends it with the deletion reason kilnd reports.
+    assert_eq!(harness.provider().calls, 2);
+    assert_eq!(expired(&error), Some(ExpiryReason::ExpiredIdle), "{error}");
+    assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
 }
 
 #[tokio::test]
@@ -1369,6 +1373,13 @@ impl kiln_harness::api::SandboxApi for NotifyingApi {
         self.inner.sandbox_ready(sandbox_id).await
     }
 
+    async fn final_check(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, kiln_harness::api::ApiError> {
+        self.inner.final_check(sandbox_id).await
+    }
+
     async fn non_deleted_sandboxes(
         &self,
     ) -> Result<Vec<kiln_harness::api::Sandbox>, kiln_harness::api::ApiError> {
@@ -1952,6 +1963,13 @@ impl kiln_harness::api::SandboxApi for SlowRefusedHead {
         self.inner.sandbox_ready(sandbox_id).await
     }
 
+    async fn final_check(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, kiln_harness::api::ApiError> {
+        self.inner.final_check(sandbox_id).await
+    }
+
     async fn non_deleted_sandboxes(
         &self,
     ) -> Result<Vec<kiln_harness::api::Sandbox>, kiln_harness::api::ApiError> {
@@ -2076,4 +2094,374 @@ async fn a_long_command_then_another_tool_forces_a_renew_between_them() {
     let outcome = run(&mut harness).await.expect("session completes");
     assert_eq!(harness.provider().renews_at_tools, [0, 1]);
     assert!(outcome.renews >= 1);
+}
+
+fn missed_row(
+    state: kiln_harness::api::ExecutionState,
+    reusable: Option<bool>,
+) -> kiln_harness::api::Execution {
+    kiln_harness::api::Execution {
+        id: "ex-00000000000000ff".to_string(),
+        state,
+        exit_code: None,
+        failure_reason: String::new(),
+        stdout: common::captured(Vec::new()),
+        stderr: common::captured(Vec::new()),
+        sandbox_reusable: reusable,
+        cancel_reason: Some(kiln_harness::api::CancelReason::SandboxDeleted),
+    }
+}
+
+fn final_check_event<P: Provider>(harness: &TestHarness<P>) -> Option<(String, usize, bool)> {
+    audit_events(harness)
+        .into_iter()
+        .find_map(|event| match event {
+            AuditEvent::FinalCheck {
+                state,
+                unknown_executions,
+                usable,
+            } => Some((state.clone(), *unknown_executions, *usable)),
+            _ => None,
+        })
+}
+
+#[tokio::test]
+async fn every_completed_session_passes_a_final_check() {
+    let api = FakeApi::with_expiry();
+    let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+    run(&mut harness).await.expect("demo completes");
+    assert_eq!(api.state().final_checks, 1);
+    assert_eq!(
+        final_check_event(&harness),
+        Some(("ready".to_string(), 0, true))
+    );
+}
+
+#[tokio::test]
+async fn the_final_check_refuses_completion_on_an_unusable_sandbox() {
+    use kiln_harness::api::ExecutionState;
+    let not_usable = "sandbox was not usable when the session finished";
+    // A row the session never saw left the sandbox unusable: its cause.
+    let api = FakeApi::with_expiry();
+    api.state().final_rows = vec![missed_row(ExecutionState::Canceled, Some(false))];
+    let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("not usable");
+    assert_eq!(
+        expired(&error),
+        Some(ExpiryReason::SandboxDeleted),
+        "{error}"
+    );
+    assert_eq!(
+        final_check_event(&harness),
+        Some(("ready".to_string(), 1, false))
+    );
+    assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+    // The final answer stays journaled as the model's response.
+    assert!(journal_events(&harness).iter().any(|event| matches!(
+        event,
+        JournalEvent::ModelResponded { response, .. } if response.tool_calls.is_empty()
+    )));
+
+    // A row the session never saw is still running.
+    let api = FakeApi::with_expiry();
+    api.state().final_rows = vec![missed_row(ExecutionState::Unknown, None)];
+    let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("not usable");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.code == Code::FailedPrecondition && error.message == not_usable),
+        "{error}"
+    );
+
+    // The sandbox is not ready, with no deletion reason.
+    let api = FakeApi::with_expiry();
+    let provider = Script::new(Duration::ZERO, [ModelResponse::final_text("done")]);
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    api.state().not_ready = true;
+    let error = run(&mut harness).await.expect_err("not usable");
+    assert!(
+        matches!(&error, HarnessError::Api(error) if error.message == not_usable),
+        "{error}"
+    );
+
+    // The check cannot be made.
+    let api = FakeApi::with_expiry();
+    api.state().final_check_error = Some(api_error(Code::Unavailable, "socket closed"));
+    let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("unconfirmed");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.code == Code::Unavailable
+                && error.message == "could not confirm the sandbox at the end of the session"),
+        "{error}"
+    );
+    assert_eq!(
+        final_check_event(&harness),
+        Some(("unknown".to_string(), 0, false))
+    );
+}
+
+#[tokio::test]
+async fn a_failed_final_check_journal_verifies() {
+    use kiln_harness::api::ExecutionState;
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("failed.jsonl");
+    let api = FakeApi::with_expiry();
+    api.state().final_rows = vec![missed_row(ExecutionState::Canceled, Some(false))];
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("not usable");
+    drop(harness);
+    let journal = read_journal(&path).expect("journal verifies");
+    assert!(journal.complete);
+}
+
+#[tokio::test]
+async fn an_older_daemon_is_checked_by_state_only() {
+    use kiln_harness::api::ExecutionState;
+    // Without expiry, rows do not report usability; only state counts.
+    let api = FakeApi::default();
+    api.state().final_rows = vec![missed_row(ExecutionState::Unknown, None)];
+    let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+    run(&mut harness).await.expect("completes on state");
+
+    let api = FakeApi::default();
+    let provider = Script::new(Duration::ZERO, [ModelResponse::final_text("done")]);
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    api.state().not_ready = true;
+    run(&mut harness).await.expect_err("not ready");
+}
+
+/// The first renew answers after 9 s; every later one never answers.
+#[derive(Clone)]
+struct DelayedThenHangingRenew {
+    inner: FakeApi,
+    calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait]
+impl kiln_harness::api::SandboxApi for DelayedThenHangingRenew {
+    async fn health(&self) -> Result<kiln_harness::api::Health, kiln_harness::api::ApiError> {
+        self.inner.health().await
+    }
+
+    async fn create(
+        &self,
+        request: kiln_harness::api::SandboxRequest,
+    ) -> Result<kiln_harness::api::Sandbox, kiln_harness::api::ApiError> {
+        self.inner.create(request).await
+    }
+
+    async fn exec(
+        &self,
+        request: kiln_harness::api::SandboxExec,
+    ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
+        self.inner.exec(request).await
+    }
+
+    async fn recent_executions(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Vec<kiln_harness::api::Execution>, kiln_harness::api::ApiError> {
+        self.inner.recent_executions(sandbox_id).await
+    }
+
+    async fn delete(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
+        self.inner.delete(sandbox_id).await
+    }
+
+    async fn renew(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if call == 1 {
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            return self.inner.renew(sandbox_id).await;
+        }
+        std::future::pending().await
+    }
+
+    async fn get_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
+        self.inner.get_execution(execution_id).await
+    }
+
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, kiln_harness::api::ApiError> {
+        self.inner.sandbox_ready(sandbox_id).await
+    }
+
+    async fn final_check(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<kiln_harness::api::FinalCheck, kiln_harness::api::ApiError> {
+        self.inner.final_check(sandbox_id).await
+    }
+
+    async fn non_deleted_sandboxes(
+        &self,
+    ) -> Result<Vec<kiln_harness::api::Sandbox>, kiln_harness::api::ApiError> {
+        self.inner.non_deleted_sandboxes().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forced_renew_never_runs_past_its_give_up() {
+    // R6-03: activity anchored at 10 s gives up at 40 s. The forced attempt
+    // at 20 s times out at 30 s and the retry at 35 s is cut off at 40 s,
+    // not at its own 45 s.
+    let inner = FakeApi::with_expiry();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let api = DelayedThenHangingRenew {
+        inner: inner.clone(),
+        calls: calls.clone(),
+    };
+    let mut config = long_config(30);
+    config.tool_limits.timeout = Duration::from_secs(19);
+    // A 1 s recovery window makes the tool budget 20 s.
+    config.lifecycle_timeout = Duration::from_secs(1);
+    config.lifecycle_retry_delay = Duration::from_secs(5);
+    let mut harness = Harness::new(
+        api,
+        Script::new(
+            Duration::from_secs(20),
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let started = tokio::time::Instant::now();
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("renew failed");
+    assert_eq!(expired(&error), Some(ExpiryReason::RenewFailed), "{error}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(40) && elapsed < Duration::from_secs(41),
+        "{elapsed:?}"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(inner.state().execs.len(), 1, "only the baseline ran");
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_never_runs_past_the_session_deadline() {
+    // R6-02: an Exec refused without a row at 900 ms of a 1 s session.
+    // Recovery would have a 1 s window, but the session deadline bounds it.
+    let api = FakeApi::default();
+    api.state().tool_exec_error = Some(api_error(Code::Unavailable, "refused"));
+    api.state().tool_exec_delay = Duration::from_millis(900);
+    let config = HarnessConfig {
+        session_timeout: Duration::from_secs(1),
+        lifecycle_timeout: Duration::from_secs(1),
+        lifecycle_retry_delay: Duration::from_millis(5),
+        ..HarnessConfig::default()
+    };
+    // The second model call takes 50 ms, so the session's 1 s deadline is
+    // what ends it, observed when it passes.
+    let provider = SlowAfterFirstCall {
+        inner: Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        delay: Duration::from_millis(50),
+    };
+    let mut harness = session(&api, provider, config);
+    let started = tokio::time::Instant::now();
+    let error = run(&mut harness).await.expect_err("deadline");
+    assert!(matches!(error, HarnessError::Deadline), "{error}");
+    let elapsed = started.elapsed();
+    assert!(elapsed <= Duration::from_millis(1_005), "{elapsed:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_tool_timeout_bounds_execs_and_recovery_adds_its_window() {
+    // R6-02, as documented: the tool timeout bounds the tool's Execs, and
+    // response-loss recovery may add its window (1 s here) after them.
+    let api = FakeApi::default();
+    api.state().tool_exec_error = Some(api_error(Code::Unavailable, "refused"));
+    api.state().tool_exec_delay = Duration::from_millis(900);
+    let mut config = HarnessConfig {
+        session_timeout: Duration::from_secs(60),
+        lifecycle_timeout: Duration::from_secs(1),
+        lifecycle_retry_delay: Duration::from_millis(5),
+        ..HarnessConfig::default()
+    };
+    config.tool_limits.timeout = Duration::from_secs(1);
+    let mut harness = session(
+        &api,
+        Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        config,
+    );
+    let started = tokio::time::Instant::now();
+    run(&mut harness).await.expect("completes");
+    let elapsed = started.elapsed();
+    assert!(elapsed <= Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_recovery_returns_at_once() {
+    let api = FakeApi::default();
+    api.state().tool_exec_error = Some(api_error(Code::Unavailable, "refused"));
+    let config = HarnessConfig {
+        lifecycle_timeout: Duration::from_secs(1),
+        lifecycle_retry_delay: Duration::from_millis(5),
+        ..HarnessConfig::default()
+    };
+    let mut harness = session(
+        &api,
+        Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        config,
+    );
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        trigger.cancel();
+    });
+    let started = tokio::time::Instant::now();
+    let error = harness
+        .run(&SessionTask::demo(), cancel)
+        .await
+        .expect_err("canceled");
+    assert!(matches!(error, HarnessError::Canceled), "{error}");
+    assert!(started.elapsed() < Duration::from_millis(400));
+}
+
+/// Answers the first request at once and later ones after `delay`.
+struct SlowAfterFirstCall {
+    inner: Script,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Provider for SlowAfterFirstCall {
+    fn info(&self) -> ProviderInfo {
+        self.inner.info()
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        if self.inner.calls > 0 {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.complete(request).await
+    }
 }

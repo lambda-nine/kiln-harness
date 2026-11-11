@@ -104,6 +104,18 @@ pub struct Execution {
     pub cancel_reason: Option<CancelReason>,
 }
 
+/// What one `GetSandbox` says about whether the sandbox stayed usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalCheck {
+    /// The sandbox is `READY`.
+    pub ready: bool,
+    /// Why it is being or was deleted, when it is: kilnd's deletion reason
+    /// as the expiry it proves. `None` while live, or from an older daemon.
+    pub deletion: Option<ExpiryReason>,
+    /// Its most recent executions, newest first.
+    pub recent: Vec<Execution>,
+}
+
 /// Why kilnd canceled an execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
@@ -436,6 +448,9 @@ pub trait SandboxApi: Send + Sync {
     async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError>;
     /// Whether the sandbox is `READY` now, by `GetSandbox`.
     async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError>;
+    /// The sandbox's state and recent executions, in one `GetSandbox`, for
+    /// the check that gates a completed session.
+    async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError>;
     /// Independently list every sandbox not yet deleted, including creating,
     /// deleting, and failed sandboxes. Errors or incomplete pagination must not
     /// be returned as a successful empty listing.
@@ -625,21 +640,7 @@ impl SandboxApi for TonicKilnd {
     }
 
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
-        let response = self
-            .client
-            .clone()
-            .get_sandbox(pb::GetSandboxRequest {
-                id: sandbox_id.to_string(),
-                execution_limit: 100,
-            })
-            .await
-            .map_err(ApiError::from)?
-            .into_inner();
-        Ok(response
-            .recent_executions
-            .into_iter()
-            .map(execution_from_proto)
-            .collect())
+        Ok(self.final_check(sandbox_id).await?.recent)
     }
 
     async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError> {
@@ -694,20 +695,21 @@ impl SandboxApi for TonicKilnd {
     }
 
     async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
+        Ok(self.final_check(sandbox_id).await?.ready)
+    }
+
+    async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError> {
         let response = self
             .client
             .clone()
             .get_sandbox(pb::GetSandboxRequest {
                 id: sandbox_id.to_string(),
-                execution_limit: 1,
+                execution_limit: 100,
             })
             .await
             .map_err(ApiError::from)?
             .into_inner();
-        let sandbox = response
-            .sandbox
-            .ok_or_else(|| ApiError::local("response omitted sandbox"))?;
-        Ok(sandbox.id == sandbox_id && sandbox.state == pb::SandboxState::Ready as i32)
+        final_check_from_proto(response, sandbox_id)
     }
 
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
@@ -733,6 +735,36 @@ impl SandboxApi for TonicKilnd {
         }
         Ok(sandboxes)
     }
+}
+
+/// A `GetSandbox` answer must name the sandbox asked about; anything else is
+/// a protocol error, `INTERNAL`, never an empty or unknown answer.
+fn final_check_from_proto(
+    response: pb::GetSandboxResponse,
+    sandbox_id: &str,
+) -> Result<FinalCheck, ApiError> {
+    let protocol = |message| Err(ApiError::new(tonic::Code::Internal, message));
+    let Some(sandbox) = response.sandbox else {
+        return protocol("sandbox response omitted the sandbox");
+    };
+    if sandbox.id != sandbox_id {
+        return protocol("sandbox response named another sandbox");
+    }
+    let deletion = match pb::DeletionReason::try_from(sandbox.deletion_reason) {
+        Ok(pb::DeletionReason::ExpiredIdle) => Some(ExpiryReason::ExpiredIdle),
+        Ok(pb::DeletionReason::ExpiredLifetime) => Some(ExpiryReason::ExpiredLifetime),
+        Ok(pb::DeletionReason::Requested) => Some(ExpiryReason::SandboxDeleted),
+        Ok(pb::DeletionReason::Unspecified) | Err(_) => None,
+    };
+    Ok(FinalCheck {
+        ready: sandbox.state == pb::SandboxState::Ready as i32,
+        deletion,
+        recent: response
+            .recent_executions
+            .into_iter()
+            .map(execution_from_proto)
+            .collect(),
+    })
 }
 
 /// A successful renew must answer with the renewed sandbox, still `READY`.
@@ -890,6 +922,39 @@ mod status_contract_test {
             "backend_unsupported:exec_env",
         ));
         assert_eq!(backend_unsupported_feature(&wrong_code, true), None);
+    }
+
+    #[test]
+    fn a_sandbox_answer_must_name_the_sandbox() {
+        use super::final_check_from_proto;
+        use crate::pb;
+        let deleted = pb::Sandbox {
+            id: "sb-0000000000000001".to_string(),
+            state: pb::SandboxState::Deleted as i32,
+            deletion_reason: pb::DeletionReason::ExpiredIdle as i32,
+            ..pb::Sandbox::default()
+        };
+        let check = final_check_from_proto(
+            pb::GetSandboxResponse {
+                sandbox: Some(deleted.clone()),
+                recent_executions: Vec::new(),
+            },
+            "sb-0000000000000001",
+        )
+        .expect("named");
+        assert!(!check.ready);
+        assert_eq!(check.deletion, Some(ExpiryReason::ExpiredIdle));
+        for response in [
+            pb::GetSandboxResponse::default(),
+            pb::GetSandboxResponse {
+                sandbox: Some(deleted),
+                recent_executions: Vec::new(),
+            },
+        ] {
+            let error = final_check_from_proto(response, "sb-0000000000000002")
+                .expect_err("omitted or another sandbox");
+            assert_eq!(error.code, Code::Internal);
+        }
     }
 
     #[test]
