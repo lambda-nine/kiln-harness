@@ -116,11 +116,17 @@ model call happens. The same holds for a row recovered after a lost Exec
 response, but only terminal evidence counts: a RUNNING row can still be
 canceled or retire the sandbox, so recovery follows every new row with
 `GetExecution`, and reads `GetSandbox` again for further rows, until each
-is terminal or the recovery deadline passes. Polls back off from 10 ms to
-200 ms; `GetSandbox` is read on the first pass, while no row is known, and
-every fourth pass after that, and one last pass of both runs just before
-the deadline, so one unsettled row costs about ten reads a second, not two
-hundred. Settled rows keep their
+is terminal or the recovery deadline passes. It returns early only once it
+has found at least one new row and every one is terminal; an empty read
+proves nothing before the deadline, so otherwise it runs to the deadline.
+Polls back off from 10 ms to 200 ms; `GetSandbox` is read on the first
+pass, while no row is known, and every fourth pass after that, and the last
+two passes, 20 ms before the deadline and at it, read both, so one
+unsettled row costs about ten reads a second, not two hundred. If no
+`GetSandbox` read succeeded in the whole window, nothing is known about
+what kilnd assigned, and the session ends the same way, "execution evidence
+could not be read after its response was lost"; a read that succeeded and
+found nothing keeps the call an ordinary failure. Settled rows keep their
 `sandbox_reusable` and `cancel_reason`, and one that left the sandbox
 unusable stops the session exactly as a returned one would, during the
 baseline too. A row still not terminal at the deadline fails closed: the
@@ -189,10 +195,16 @@ execution and can take minutes, so `complete_with_heartbeat` runs it beside
 a `tokio::select!` loop that sends `RenewSandbox` at
 `interval = max(ceil(idle / 3), 1 s)`. The schedule is session-wide, not per
 call: the tool session records the last activity it can prove kilnd saw
-(the sandbox becoming ready, an Exec that returned an execution, which
-proves kilnd published its finish, a terminal execution row found by
-recovery after a lost response, and every successful renew), and a renew is
-due one interval after it. A failed Exec RPC with no settled recovered row
+(the sandbox becoming ready, an Exec that returned an execution, a
+terminal execution row found by recovery after a lost response, and every
+successful renew), and a renew is due one interval after it. kilnd commits
+that activity somewhere between the request and the reply, so each is
+anchored at the moment its request was sent: create for readiness, the
+Exec for a returned or recovered execution, and the renew itself. A late
+reply cannot move the anchor past kilnd's, and the anchor never moves
+back. This is pessimistic for long commands: after a 29-second command the
+anchor is 29 seconds old, so the next kilnd-bound tool may force a
+renew. A failed Exec RPC with no settled recovered row
 proves nothing and leaves the time unchanged; while an admitted execution
 runs, kilnd pauses idle itself. So several short, execution-free turns
 cannot add up to the idle timeout. An overdue renew runs, through one
@@ -206,11 +218,18 @@ tool timeout plus the response-loss recovery window, at most 1 s) plus the
 renew interval must fit in the idle timeout actually sent after kilnd's
 clamp, or the session is refused with `InvalidTask` naming both values; the
 defaults (30 s tools, 120 s idle, 40 s interval) fit, and a 10 s idle
-timeout allows tools of about 5 s. A tool that runs several Execs proves
-activity with each one that returns and stops at the first that does not,
-so one timeout bounds it. And before a kilnd-bound tool call, a renew is
-forced whenever `now + budget` would reach `last activity + idle`, whatever
-the backoff after a failed renew says. The tool's `model_turn` audit record
+timeout allows tools of about 5 s. The tool timeout bounds the whole tool
+call, not each Exec: a tool that runs several (`read_file`) gives each the
+time that remains, a further one with none left ends the call through the
+tool `Deadline` path, and response-loss recovery ends within the same
+budget, its window counted once per call. So the budget is the true worst
+case for every tool. And before a kilnd-bound tool call, a renew is forced
+whenever `now + budget` would reach `last activity + idle`, whatever the
+backoff after a failed renew says, and the tool starts only after it
+succeeds: a transient failure is retried after the lifecycle retry delay,
+counting toward the failure budget, until the earlier of the session
+deadline and the estimated idle deadline, and then the session ends with
+`renew_failed`. The tool's `model_turn` audit record
 is written before this renew, so a fatal renew leaves the call on record
 with no completion; if the session deadline has passed, or passes while
 the renew is in flight, the session ends with `Deadline`, not

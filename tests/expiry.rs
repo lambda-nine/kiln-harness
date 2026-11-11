@@ -364,14 +364,19 @@ async fn a_slow_model_call_is_renewed_and_completes() {
 #[tokio::test(start_paused = true)]
 async fn renews_happen_only_during_model_calls() {
     let api = FakeApi::with_expiry();
-    // A slow tool call needs no heartbeat: the execution is activity.
+    // A slow tool call needs no heartbeat while it runs: the execution is
+    // activity, and kilnd pauses idle until it finishes.
     api.state().tool_exec_delay = Duration::from_secs(50);
-    let mut harness = session(
-        &api,
+    let provider = ObserveRenews::new(
         Script::new(
             Duration::ZERO,
             [exec_call(), ModelResponse::final_text("done")],
         ),
+        &api,
+    );
+    let mut harness = session(
+        &api,
+        provider,
         HarnessConfig {
             tool_limits: kiln_harness::tools::ToolLimits {
                 timeout: Duration::from_secs(60),
@@ -382,8 +387,12 @@ async fn renews_happen_only_during_model_calls() {
         },
     );
     let outcome = run(&mut harness).await.expect("session completes");
-    assert_eq!(outcome.renews, 0);
-    assert_eq!(api.state().renews, 0);
+    // Nothing renewed during the tool. Its activity is anchored where the
+    // request was sent, conservatively, 50 s before the next model call, so
+    // that call renews first.
+    assert_eq!(harness.provider().renews_at_tools, [0]);
+    assert_eq!(harness.provider().renews_at_calls, [0, 1]);
+    assert_eq!(outcome.renews, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1845,4 +1854,226 @@ fn the_fitted_replay_idle_timeout_is_capped_at_the_ceiling() {
     assert_eq!(config.sandbox_idle_timeout, Duration::from_secs(3_600));
     config.fit_replay_idle_timeout(Some(Duration::from_secs(45)));
     assert_eq!(config.sandbox_idle_timeout, Duration::from_secs(45));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_renew_reply_does_not_move_the_activity_anchor_forward() {
+    // R5-01: every renew reply arrives 9 s after kilnd committed it. The
+    // anchor is when the renew was sent (10 s), so a tool at 24 s that could
+    // run past 40 s forces a renew first.
+    let api = FakeApi::with_expiry();
+    api.state().renew_delay = Duration::from_secs(9);
+    api.state().tool_exec_error = Some(api_error(
+        Code::Unavailable,
+        "request rejected before execution admission",
+    ));
+    api.state().tool_exec_delay = Duration::from_secs(18);
+    let watcher = api.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        if watcher.state().renews == 1 {
+            watcher.expire("expired_idle");
+        }
+    });
+    let mut config = long_config(30);
+    config.tool_limits.timeout = Duration::from_secs(19);
+    let provider = ObserveRenews::new(
+        Script::new(
+            Duration::from_secs(24),
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        &api,
+    );
+    let mut harness = session(&api, provider, config);
+    run(&mut harness).await.expect("session completes");
+    assert_eq!(api.state().expired, None);
+    // The heartbeat at 10 s, another at 20 s, and the forced one at 24 s.
+    assert_eq!(harness.provider().renews_at_tools, [3]);
+}
+
+/// Answers `head` only after `delay`, refusing it before admission; every
+/// other call goes to the fake.
+#[derive(Clone)]
+struct SlowRefusedHead {
+    inner: FakeApi,
+    delay: Duration,
+}
+
+#[async_trait]
+impl kiln_harness::api::SandboxApi for SlowRefusedHead {
+    async fn health(&self) -> Result<kiln_harness::api::Health, kiln_harness::api::ApiError> {
+        self.inner.health().await
+    }
+
+    async fn create(
+        &self,
+        request: kiln_harness::api::SandboxRequest,
+    ) -> Result<kiln_harness::api::Sandbox, kiln_harness::api::ApiError> {
+        self.inner.create(request).await
+    }
+
+    async fn exec(
+        &self,
+        request: kiln_harness::api::SandboxExec,
+    ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
+        if request.argv.first().map(String::as_str) == Some("/usr/bin/head") {
+            tokio::time::sleep(self.delay).await;
+            return Err(api_error(
+                Code::Unavailable,
+                "head request rejected before execution admission",
+            ));
+        }
+        self.inner.exec(request).await
+    }
+
+    async fn recent_executions(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Vec<kiln_harness::api::Execution>, kiln_harness::api::ApiError> {
+        self.inner.recent_executions(sandbox_id).await
+    }
+
+    async fn delete(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
+        self.inner.delete(sandbox_id).await
+    }
+
+    async fn renew(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
+        self.inner.renew(sandbox_id).await
+    }
+
+    async fn get_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
+        self.inner.get_execution(execution_id).await
+    }
+
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, kiln_harness::api::ApiError> {
+        self.inner.sandbox_ready(sandbox_id).await
+    }
+
+    async fn non_deleted_sandboxes(
+        &self,
+    ) -> Result<Vec<kiln_harness::api::Sandbox>, kiln_harness::api::ApiError> {
+        self.inner.non_deleted_sandboxes().await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_multi_exec_tool_ends_within_one_tool_timeout() {
+    // R5-01: read_file's stat answers at 18 s of a 19 s tool timeout; its
+    // head would be refused only at 31 s, past the 30 s idle deadline. The
+    // tool timeout bounds the whole tool, so head gets the 1 s that remains
+    // and the tool ends at its deadline instead.
+    let inner = FakeApi::with_expiry();
+    inner
+        .state()
+        .files
+        .insert("/workspace/a.txt".to_string(), b"hello".to_vec());
+    inner.state().tool_exec_delay = Duration::from_secs(18);
+    let api = SlowRefusedHead {
+        inner: inner.clone(),
+        delay: Duration::from_secs(13),
+    };
+    let watcher = inner.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        if watcher.state().renews == 0 {
+            watcher.expire("expired_idle");
+        }
+    });
+    let mut config = long_config(30);
+    config.tool_limits.timeout = Duration::from_secs(19);
+    let read = ModelResponse::tool_use([ToolCall::new(
+        "r1",
+        "read_file",
+        json!({"path": "a.txt", "max_bytes": 64}),
+    )]);
+    let mut harness = Harness::new(
+        api,
+        Script::new(Duration::ZERO, [read, ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let started = tokio::time::Instant::now();
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the tool reaches its deadline");
+    assert!(matches!(error, HarnessError::Deadline), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(21));
+    assert_eq!(inner.state().expired, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_forced_renew_must_succeed_before_the_tool_runs() {
+    // R5-02: idle 30 s, a 19.1 s tool budget. Renews take 2 s to answer.
+    // The heartbeat renew sent at 10 s is still in flight when the model
+    // answers at 11 s, so it proves nothing. The tool could then reach the
+    // idle deadline, so the renew before it is forced; its first attempt
+    // fails, and the tool waits for the retry to succeed.
+    let api = FakeApi::with_expiry();
+    api.state().renew_delay = Duration::from_secs(2);
+    api.state().renew_script = VecDeque::from([
+        RenewScript::Ok,
+        RenewScript::Fail(api_error(Code::Unavailable, "transient")),
+    ]);
+    let provider = ObserveRenews::new(
+        Script::new(
+            Duration::from_secs(11),
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        &api,
+    );
+    let mut config = long_config(30);
+    config.tool_limits.timeout = Duration::from_secs(19);
+    let mut harness = session(&api, provider, config.clone());
+    run(&mut harness).await.expect("session completes");
+    assert_eq!(harness.provider().renews_at_tools, [3]);
+
+    // When the retry fails too, the tool never runs.
+    let api = FakeApi::with_expiry();
+    api.state().renew_delay = Duration::from_secs(2);
+    api.state().renew_script = VecDeque::from([
+        RenewScript::Ok,
+        RenewScript::Fail(api_error(Code::Unavailable, "transient")),
+        RenewScript::Fail(api_error(Code::Unavailable, "transient")),
+    ]);
+    let mut harness = session(
+        &api,
+        Script::new(
+            Duration::from_secs(11),
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        config,
+    );
+    let error = run(&mut harness).await.expect_err("renew failed");
+    assert_eq!(expired(&error), Some(ExpiryReason::RenewFailed), "{error}");
+    assert_eq!(api.state().execs.len(), 1, "only the baseline ran");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_long_command_then_another_tool_forces_a_renew_between_them() {
+    // The first Exec succeeds after 18 s. Its activity is anchored when it
+    // was sent, so the second, which could run another 19.1 s, renews first.
+    let api = FakeApi::with_expiry();
+    api.state().tool_exec_delay = Duration::from_secs(18);
+    let provider = ObserveRenews::new(
+        Script::new(
+            Duration::ZERO,
+            [
+                ModelResponse::tool_use([exec_call_id("e1"), exec_call_id("e2")]),
+                ModelResponse::final_text("done"),
+            ],
+        ),
+        &api,
+    );
+    let mut config = long_config(30);
+    config.tool_limits.timeout = Duration::from_secs(19);
+    config.max_tool_calls_per_turn = 2;
+    let mut harness = session(&api, provider, config);
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert_eq!(harness.provider().renews_at_tools, [0, 1]);
+    assert!(outcome.renews >= 1);
 }

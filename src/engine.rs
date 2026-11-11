@@ -412,6 +412,9 @@ where
 
         // Cancellation and the deadline both drop the create RPC. Its outcome
         // is then ambiguous, so either goes through label-based recovery.
+        // No later than kilnd can have made the sandbox ready: the first
+        // activity anchor, on the early side.
+        let create_sent = Instant::now();
         let create = tokio::select! {
             () = cancel.cancelled() => Err(CreateStop::Canceled),
             result = timeout_at(
@@ -518,7 +521,13 @@ where
                 () = cancel.cancelled() => None,
                 started = self
                     .registry
-                    .start_session(&self.api, sandbox_id.clone(), deadline, typed_reasons) => {
+                    .start_session(
+                        &self.api,
+                        sandbox_id.clone(),
+                        deadline,
+                        typed_reasons,
+                        create_sent,
+                    ) => {
                     Some(started)
                 }
             };
@@ -940,6 +949,9 @@ where
             {
                 renew_if_due(context, heartbeat, progress, Some(tool_rpc_budget(config))).await?;
             }
+            // The whole call, its Execs and any recovery, ends within one
+            // tool budget of here.
+            let tool_deadline = Instant::now() + tool_rpc_budget(config);
 
             let mut run = if call.arguments.is_none() {
                 rejected_tool_run("model_arguments_too_large")
@@ -960,7 +972,10 @@ where
                 && (!run.stdout.total_bytes_known || !run.stderr.total_bytes_known)
             {
                 let recovery_window = recovery_window(config);
-                if let Some(recovery_deadline) = Instant::now().checked_add(recovery_window) {
+                if let Some(recovery_deadline) = Instant::now()
+                    .checked_add(recovery_window)
+                    .map(|end| end.min(tool_deadline))
+                {
                     let recovered = context
                         .tools
                         .recover_new_execution_evidence(&known_execution_ids, recovery_deadline)
@@ -1281,21 +1296,44 @@ async fn renew_if_due<A: SandboxApi>(
     if !forced && now < renew_due(context, heartbeat, progress) {
         return Ok(());
     }
-    let started = (Instant::now(), context.tools.activity_generation());
-    let outcome = tokio::select! {
-        () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
-        outcome = timeout_at(
-            (started.0 + heartbeat.interval).min(context.deadline),
-            context.api.renew(context.sandbox_id),
-        ) => outcome,
-    };
-    let settled = settle_renewal(outcome, started, context, heartbeat, progress);
-    // A deadline that passed while the renew was in flight wins, as it does
-    // over every other outcome.
-    if settled.is_err() && Instant::now() >= context.deadline {
-        return Err(HarnessError::Deadline);
+    // A forced renew must succeed before the tool may start: retry a
+    // transient failure until the session deadline or the estimated idle
+    // deadline, whichever comes first, and fail closed after that.
+    let give_up = context
+        .deadline
+        .min(context.tools.last_activity() + heartbeat.idle);
+    loop {
+        let started = (Instant::now(), context.tools.activity_generation());
+        let outcome = tokio::select! {
+            () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
+            outcome = timeout_at(
+                (started.0 + heartbeat.interval).min(context.deadline),
+                context.api.renew(context.sandbox_id),
+            ) => outcome,
+        };
+        let settled = settle_renewal(outcome, started, context, heartbeat, progress);
+        // A deadline that passed while the renew was in flight wins, as it
+        // does over every other outcome.
+        if settled.is_err() && Instant::now() >= context.deadline {
+            return Err(HarnessError::Deadline);
+        }
+        if settled? || !forced {
+            return Ok(());
+        }
+        let retry_at = Instant::now() + context.config.lifecycle_retry_delay;
+        if retry_at >= give_up {
+            if Instant::now() >= context.deadline {
+                return Err(HarnessError::Deadline);
+            }
+            return Err(HarnessError::SandboxExpired {
+                reason: ExpiryReason::RenewFailed,
+            });
+        }
+        tokio::select! {
+            () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
+            () = sleep_until(retry_at) => {}
+        }
     }
-    settled
 }
 
 /// One interval after the later of the last activity and the start of the
@@ -1313,7 +1351,7 @@ fn renew_due<A: SandboxApi>(
         + heartbeat.interval
 }
 
-/// Apply one renew's outcome: count a success as activity, count a
+/// Apply one renew's outcome, and say whether it renewed: count a success as activity, count a
 /// transient failure toward the budget, and end the session on proof the
 /// sandbox is gone or on any other error.
 fn settle_renewal<A: SandboxApi>(
@@ -1322,15 +1360,16 @@ fn settle_renewal<A: SandboxApi>(
     context: &LoopContext<'_, '_, A>,
     heartbeat: Heartbeat,
     progress: &mut Progress,
-) -> Result<(), HarnessError> {
+) -> Result<bool, HarnessError> {
     match classify_renewal(outcome, context.typed_reasons) {
         Renewal::Renewed => {
-            context.tools.record_activity();
+            // kilnd committed it after the request was sent.
+            context.tools.record_activity(started.0);
             progress.renews = progress.renews.saturating_add(1);
             progress.renew_failures = 0;
             progress.last_renew_failure = None;
             progress.renew_failure_generation = None;
-            Ok(())
+            Ok(true)
         }
         Renewal::Transient => {
             progress.renew_failures = progress.renew_failures.saturating_add(1);
@@ -1341,7 +1380,7 @@ fn settle_renewal<A: SandboxApi>(
                     reason: ExpiryReason::RenewFailed,
                 });
             }
-            Ok(())
+            Ok(false)
         }
         Renewal::Expired(reason) => Err(HarnessError::SandboxExpired { reason }),
         Renewal::Fatal(error) => Err(HarnessError::Api(error)),

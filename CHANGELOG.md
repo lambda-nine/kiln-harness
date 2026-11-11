@@ -6,6 +6,17 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Fifth review round for kilnd API milestone 1. Response-loss recovery
+  reads until its deadline unless every row it found has settled, with its
+  last passes just before and at the deadline, and fails closed when no
+  `GetSandbox` read succeeded at all. A forced renew before a tool call must
+  succeed before the tool starts: a transient failure is retried until the
+  earlier of the session and estimated idle deadlines, then fails closed.
+  Activity is anchored when its proving request was sent (create, Exec,
+  renew), not when the reply arrived. The tool timeout now bounds a whole
+  tool call, every Exec and its recovery included, so `read_file` cannot
+  take two timeouts. `ToolRegistry::start_session` takes the time create
+  was sent, and `ToolSession::record_activity` the time the request was.
 - Replay picks its sandbox idle timeout itself: the one the recording sent,
   when it ran with expiry, and otherwise the smallest whole second of at
   least 120 that fits the recorded tool timeout, so a recording with long

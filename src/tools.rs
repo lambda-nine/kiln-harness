@@ -114,6 +114,8 @@ impl ToolRegistry {
     }
 
     /// Capture the fixed workspace baseline for a newly created sandbox.
+    /// `ready_at` is a moment no later than kilnd made it ready, such as when
+    /// create was sent: the first activity anchor, on the early side.
     /// `typed_reasons` says whether the daemon lists typed refusal reasons;
     /// only then does a tool call end on a refusal proving the sandbox gone.
     ///
@@ -126,6 +128,7 @@ impl ToolRegistry {
         sandbox_id: String,
         session_deadline: Instant,
         typed_reasons: bool,
+        ready_at: Instant,
     ) -> Result<(ToolSession<'a, A>, BaselineEvidence), ToolError> {
         let mut session = ToolSession {
             api,
@@ -134,7 +137,8 @@ impl ToolRegistry {
             baseline: BTreeSet::new(),
             typed_reasons,
             // The sandbox has just become ready.
-            activity: Mutex::new((Instant::now(), 0)),
+            activity: Mutex::new((ready_at, 0)),
+            last_exec_sent: Mutex::new(None),
             unusable: Mutex::new(None),
         };
         let manifest = session.manifest(session_deadline).await;
@@ -175,6 +179,9 @@ pub struct ToolSession<'a, A: SandboxApi> {
     /// a generation that every such record bumps, so activity in the same
     /// clock tick as something else is still ordered after it.
     activity: Mutex<(Instant, u64)>,
+    /// When the latest Exec request was sent, the anchor for an execution
+    /// found by recovery after its response was lost.
+    last_exec_sent: Mutex<Option<Instant>>,
     /// Set once an execution reported that the sandbox cannot take another
     /// call, with kilnd's cancel reason if it gave one.
     unusable: Mutex<Option<ToolStop>>,
@@ -204,6 +211,9 @@ pub struct RecoveredExecutionEvidence {
     /// A recovered execution still not terminal when recovery's deadline
     /// passed. Its outcome, and whether the sandbox survived it, is unknown.
     pub unsettled: Option<String>,
+    /// No `GetSandbox` read succeeded in the whole window, so nothing is
+    /// known about what kilnd assigned.
+    pub unreadable: bool,
 }
 
 impl RecoveredExecutionEvidence {
@@ -215,6 +225,11 @@ impl RecoveredExecutionEvidence {
             return Some(ToolStop::Unusable(format!(
                 "execution {id} did not settle after its response was lost"
             )));
+        }
+        if self.unreadable {
+            return Some(ToolStop::Unusable(
+                "execution evidence could not be read after its response was lost".to_string(),
+            ));
         }
         (self.sandbox_reusable == Some(false)).then(|| unusable_stop(self.cancel_reason))
     }
@@ -375,14 +390,16 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .1
     }
 
-    /// Record activity the engine caused, such as a successful renew.
-    pub fn record_activity(&self) {
-        let now = Instant::now();
+    /// Record activity proven by a request sent at `sent`, such as a
+    /// successful renew. kilnd committed the activity somewhere between the
+    /// send and the reply, so the send time is the anchor: early, never
+    /// late. The anchor never moves back; the generation always advances.
+    pub fn record_activity(&self, sent: Instant) {
         let mut activity = self
             .activity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        activity.0 = activity.0.max(now);
+        activity.0 = activity.0.max(sent);
         activity.1 = activity.1.saturating_add(1);
     }
 
@@ -403,8 +420,14 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         // A settled recovered row is an execution kilnd admitted and
         // finished, so it is activity; one that left the sandbox unusable,
         // or never settled, refuses any later Exec.
-        if !recovered.execution_ids.is_empty() && recovered.unsettled.is_none() {
-            self.record_activity();
+        if !recovered.execution_ids.is_empty()
+            && recovered.unsettled.is_none()
+            && let Some(sent) = *self
+                .last_exec_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            self.record_activity(sent);
         }
         if let Some(stop) = recovered.stop() {
             self.unusable
@@ -423,23 +446,24 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         self.plan(tool, arguments.clone()).is_ok()
     }
 
+    /// Run one tool call. The tool timeout bounds the whole call, every
+    /// Exec it sends included: each gets the time that remains of it.
     pub async fn execute(
         &self,
         tool: &str,
         arguments: Value,
         session_deadline: Instant,
     ) -> ToolRun {
+        let deadline = session_deadline.min(Instant::now() + self.limits.timeout);
         let run = match self.plan(tool, arguments) {
             Err(rejected) => rejected,
-            Ok(ToolPlan::Exec(plan)) => self.exec_tool(plan, session_deadline).await,
+            Ok(ToolPlan::Exec(plan)) => self.exec_tool(plan, deadline).await,
             Ok(ToolPlan::Read { path, max_bytes }) => {
-                self.read_file(path, max_bytes, session_deadline).await
+                self.read_file(path, max_bytes, deadline).await
             }
-            Ok(ToolPlan::Write { path, bytes }) => {
-                self.write_file(path, bytes, session_deadline).await
-            }
-            Ok(ToolPlan::List { path }) => self.list_dir(path, session_deadline).await,
-            Ok(ToolPlan::Diff) => self.workspace_diff(session_deadline).await,
+            Ok(ToolPlan::Write { path, bytes }) => self.write_file(path, bytes, deadline).await,
+            Ok(ToolPlan::List { path }) => self.list_dir(path, deadline).await,
+            Ok(ToolPlan::Diff) => self.workspace_diff(deadline).await,
         };
         let mut run = run.bounded(self.limits.max_result_bytes);
         // A successful RPC does not mean the sandbox survived. The result
@@ -807,6 +831,11 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         let command_timeout = wall_timeout
             .saturating_sub(Duration::from_millis(250))
             .max(Duration::from_millis(1));
+        let sent = Instant::now();
+        *self
+            .last_exec_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sent);
         let result = timeout_at(
             rpc_deadline,
             self.api.exec(SandboxExec {
@@ -826,12 +855,13 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             }
             Ok(Ok(execution)) => execution,
         };
-        // A returned execution proves kilnd published its finish, which is
-        // activity; while it ran, kilnd paused idle. A failed RPC proves
-        // nothing: an execution row found later by recovery is recorded
-        // then, and otherwise the last known activity stands, so the next
-        // provider call renews at once if a renew is overdue.
-        self.record_activity();
+        // A returned execution proves kilnd saw activity after the request
+        // was sent, so the send time is the anchor, on the early side; while
+        // it ran, kilnd paused idle. A failed RPC proves nothing: an
+        // execution row found later by recovery is recorded then, and
+        // otherwise the last known activity stands, so the next boundary
+        // renews at once if a renew is overdue.
+        self.record_activity(sent);
         if execution.sandbox_reusable == Some(false) {
             let mut unusable = self
                 .unusable
@@ -1147,15 +1177,17 @@ fn unknown_evidence() -> OutputEvidence {
 /// Find executions kilnd assigned that the harness has not seen, after a
 /// lost response. A row is evidence only once it is terminal: a RUNNING row
 /// can still be canceled, retire the sandbox, or settle any other way, so
-/// each unsettled row is followed with `GetExecution` until every new row is
-/// terminal or the deadline passes. A row still unsettled then (RUNNING,
-/// `NOT_FOUND`, an error, or the wrong ID all count) is reported as such.
+/// each unsettled row is followed with `GetExecution`. Recovery returns
+/// early only when it has found at least one new row and every one is
+/// terminal; an empty read proves nothing before the deadline, so otherwise
+/// it runs to the deadline. A row still unsettled then (RUNNING,
+/// `NOT_FOUND`, an error, or the wrong ID all count) is reported as such,
+/// and so is a window in which no `GetSandbox` read succeeded at all.
 ///
 /// Polls back off from 10 ms to 200 ms. `GetSandbox` is read on the first
 /// pass, on every pass while no new row is known, and then every fourth
-/// pass; between those only the unsettled IDs are read. One last pass of
-/// both runs just before the deadline, so the decision sees the latest
-/// state.
+/// pass; between those only the unsettled IDs are read. The last passes,
+/// one just before the deadline and one at it, read both.
 pub async fn recover_execution_evidence<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
@@ -1165,15 +1197,16 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
     const FIRST_DELAY: Duration = Duration::from_millis(10);
     const MAX_DELAY: Duration = Duration::from_millis(200);
     const RESCAN_EVERY: u32 = 4;
-    const FINAL_PASS_RESERVE: Duration = Duration::from_millis(50);
-    let final_pass_at = deadline.checked_sub(FINAL_PASS_RESERVE).unwrap_or(deadline);
+    const FINAL_PASS_RESERVE: Duration = Duration::from_millis(20);
+    let final_phase = deadline.checked_sub(FINAL_PASS_RESERVE).unwrap_or(deadline);
     let mut rows: Vec<Execution> = Vec::new();
+    let mut listed = false;
     let mut delay = FIRST_DELAY;
     let mut pass = 0u32;
     loop {
-        let final_pass = Instant::now() >= final_pass_at;
-        if final_pass || rows.is_empty() || pass % RESCAN_EVERY == 0 {
-            rescan_recent(api, sandbox_id, known, deadline, &mut rows).await;
+        let ending = Instant::now() >= final_phase;
+        if ending || rows.is_empty() || pass % RESCAN_EVERY == 0 {
+            listed |= rescan_recent(api, sandbox_id, known, deadline, &mut rows).await;
         }
         for row in rows.iter_mut().filter(|row| !is_terminal(row)) {
             if let Ok(Ok(execution)) = timeout_at(deadline, api.get_execution(&row.id)).await
@@ -1183,27 +1216,37 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
             }
         }
         let settled = !rows.is_empty() && rows.iter().all(is_terminal);
-        if settled || final_pass || Instant::now() >= deadline {
-            return aggregate_recovered(rows);
+        let now = Instant::now();
+        if settled || now >= deadline {
+            let mut recovered = aggregate_recovered(rows);
+            recovered.unreadable = !listed;
+            return recovered;
         }
         pass = pass.saturating_add(1);
-        let now = Instant::now();
-        sleep_until((now + delay).min(final_pass_at.max(now))).await;
+        // Back off, but wake for a pass just before the deadline and once
+        // more at it.
+        let wake = if now >= final_phase {
+            deadline
+        } else {
+            (now + delay).min(final_phase)
+        };
+        sleep_until(wake).await;
         delay = (delay * 2).min(MAX_DELAY);
     }
 }
 
 /// Read `GetSandbox` once and merge new rows: a row not seen before is
-/// added, and an unsettled one is replaced by its newer view.
+/// added, and an unsettled one is replaced by its newer view. Returns
+/// whether the read succeeded.
 async fn rescan_recent<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     known: &BTreeSet<String>,
     deadline: Instant,
     rows: &mut Vec<Execution>,
-) {
+) -> bool {
     let Ok(Ok(executions)) = timeout_at(deadline, api.recent_executions(sandbox_id)).await else {
-        return;
+        return false;
     };
     for execution in executions
         .into_iter()
@@ -1215,6 +1258,7 @@ async fn rescan_recent<A: SandboxApi>(
             None => rows.push(execution),
         }
     }
+    true
 }
 
 fn is_terminal(execution: &Execution) -> bool {
@@ -1229,6 +1273,7 @@ fn aggregate_recovered(rows: Vec<Execution>) -> RecoveredExecutionEvidence {
         sandbox_reusable: None,
         cancel_reason: None,
         unsettled: None,
+        unreadable: false,
     };
     for execution in rows {
         if !is_terminal(&execution) {
