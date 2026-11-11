@@ -30,6 +30,9 @@ change the CLI or audit format.
   inputs and requires `sum.sh` to keep a loop, so a lookup of the named
   values no longer passes. `eval selftest` refuses an empty suite like
   `eval run`.
+- Second eval-suite review round. The `fix-off-by-one` loop check accepts
+  every POSIX loop: `until` as well as `while` and `for`, and a keyword alone
+  at the end of its line.
 - First review round for idempotent create. Cleanup releases the request ID
   only when the create took a single attempt: after a retry an abandoned
   attempt may still reach kilnd, so the key is kept, every delete sends

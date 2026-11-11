@@ -397,6 +397,20 @@ fn fix_off_by_one_refuses_a_lookup_and_an_answer_without_its_loop() {
 }
 
 #[test]
+fn fix_off_by_one_accepts_every_posix_loop_form() {
+    // Each is a correct repair that keeps a loop: `until` with the inverted
+    // bound, and `while` alone at the end of its line with the condition on
+    // the next.
+    let until = "#!/bin/sh\nn=$1\ntotal=0\ni=1\nuntil [ \"$i\" -gt \"$n\" ]; do\n  total=$((total + i))\n  i=$((i + 1))\ndone\necho \"$total\"\n";
+    let bare_while = "#!/bin/sh\nn=$1\ntotal=0\ni=1\nwhile\n  [ \"$i\" -le \"$n\" ]\ndo\n  total=$((total + i))\n  i=$((i + 1))\ndone\necho \"$total\"\n";
+    for (name, script) in [("until", until), ("while alone on its line", bare_while)] {
+        let task = host_task("fix-off-by-one");
+        write(&task.workspace.join("sum.sh"), script.as_bytes());
+        assert!(host_sh(&task.check), "the {name} repair failed the check");
+    }
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn each_loader_rule_refuses_its_task() {
     let temp = common::private_tempdir().expect("tempdir");
