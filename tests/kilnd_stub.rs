@@ -494,7 +494,7 @@ async fn a_running_recovery_snapshot_is_followed_until_it_settles() {
 }
 
 #[tokio::test]
-async fn a_keyed_create_is_retried_on_the_wire_with_the_same_bytes_and_released() {
+async fn a_keyed_create_is_retried_on_the_wire_with_the_same_bytes_and_keeps_its_key() {
     use prost::Message as _;
     let temp = common::private_tempdir().expect("tempdir");
     let socket = temp.path().join("kilnd.sock");
@@ -531,8 +531,10 @@ async fn a_keyed_create_is_retried_on_the_wire_with_the_same_bytes_and_released(
     // Discovery, then the reread before the retry.
     assert_eq!(health_calls.load(Ordering::SeqCst), 2);
     let deletes = deletes.lock().expect("deletes").clone();
+    // After a retry, the lost first attempt could still arrive: every
+    // delete keeps the key.
     assert!(!deletes.is_empty());
-    assert!(deletes.iter().all(|delete| delete.release_request_id));
+    assert!(deletes.iter().all(|delete| !delete.release_request_id));
     assert!(harness.audit().records.iter().any(|record| matches!(
         &record.event,
         AuditEvent::SandboxCreated { request_id: Some(key), create_attempts: 2, .. }
@@ -542,7 +544,7 @@ async fn a_keyed_create_is_retried_on_the_wire_with_the_same_bytes_and_released(
         harness.audit().records.last().map(|record| &record.event),
         Some(AuditEvent::SessionFinished {
             outcome,
-            request_id_released: Some(true),
+            request_id_released: None,
             ..
         }) if outcome == "completed"
     ));

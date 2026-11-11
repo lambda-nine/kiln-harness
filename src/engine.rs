@@ -379,7 +379,7 @@ where
         // Keyed only when a serving daemon lists idempotent create: an older
         // daemon ignores request_id and would make a second sandbox for a
         // retry. Release is decided here, once, and used only by the cleanup
-        // after a successful keyed create.
+        // after a successful keyed create that sent a single attempt.
         let keyed = capabilities.supports(Feature::IdempotentCreate);
         let release = keyed && capabilities.supports(Feature::RequestIdRelease);
         let request_id = if keyed {
@@ -682,7 +682,12 @@ where
         // Cleanup has a separate finite settlement window. Delete is
         // idempotently retried and independently verified after every response.
         // This is the only path that releases the request ID: the create
-        // answered READY, its response is held, and no retry is to come.
+        // answered READY, its response is held, and no retry is to come. It
+        // releases only when exactly one create was sent. After a retry, an
+        // attempt the harness gave up on may still reach kilnd; keeping the
+        // key lets kilnd answer it with the retained DELETED row instead of
+        // creating a fresh sandbox.
+        let release = release && create_attempts == 1;
         let cleanup_deadline = lifecycle_deadline(self.config.lifecycle_timeout);
         let cleanup = cleanup_sandbox(
             &self.api,
@@ -2000,6 +2005,9 @@ fn check_settled(sandbox: Sandbox, request_id: Option<&str>) -> Result<Sandbox, 
 /// after the first failure, or after [`MAX_CREATE_ATTEMPTS`], with the last
 /// create error. Cancellation or the session deadline at any point, a
 /// backoff or Health read included, is `Canceled` or `Deadline`.
+/// Cancellation wins: every wait polls it first, and it is checked again
+/// after each Create and Health answer, before any other early return, and
+/// before an attempt is counted.
 async fn create_with_retries<A: SandboxApi>(
     api: &A,
     request: &SandboxRequest,
@@ -2012,18 +2020,28 @@ async fn create_with_retries<A: SandboxApi>(
     let mut sleeps = 0_u32;
     let mut window_end = None;
     loop {
+        // An RPC that is never polled is not an attempt.
+        if cancel.is_cancelled() {
+            return (Err(CreateStop::Canceled), attempts);
+        }
         attempts += 1;
         let result = tokio::select! {
+            biased;
             () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
             result = timeout_at(deadline, api.create(request.clone())) => result,
         };
         let error = match result {
+            // A held sandbox goes to the caller, whose cleanup deletes it by
+            // ID whether or not the session was canceled meanwhile.
             Ok(Ok(sandbox)) => {
                 return (
                     check_settled(sandbox, request.request_id.as_deref()),
                     attempts,
                 );
             }
+            // Cancellation that arrived while Create was failing outranks
+            // the deadline, the attempt cap and the retry rules.
+            _ if cancel.is_cancelled() => return (Err(CreateStop::Canceled), attempts),
             Ok(Err(error)) => error,
             Err(_) => return (Err(CreateStop::Deadline), attempts),
         };
@@ -2042,6 +2060,7 @@ async fn create_with_retries<A: SandboxApi>(
                 return (Err(CreateStop::Failed(error)), attempts);
             }
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
                 slept = timeout_at(deadline, sleep_until(wake)) => {
                     if slept.is_err() {
@@ -2050,9 +2069,13 @@ async fn create_with_retries<A: SandboxApi>(
                 }
             }
             let health = tokio::select! {
+                biased;
                 () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
                 health = timeout_at(window_end.min(deadline), api.health()) => health,
             };
+            if cancel.is_cancelled() {
+                return (Err(CreateStop::Canceled), attempts);
+            }
             match health {
                 Ok(Ok(health))
                     if health.serving

@@ -254,18 +254,25 @@ it is not a hostile multi-tenant boundary.
   expiry, and still leaks the sandbox of a crashed harness until an
   operator deletes it.
 - Duplicate sandboxes from create retries. A keyed create is retried only
-  while a re-read Health shows a serving daemon that still lists idempotent
-  create, so a daemon restarted into an older build, which would ignore
-  `request_id`, never gets a retry; an unkeyed create is never retried. The
-  key is released only by the normal cleanup after a `READY` create whose
-  response is held and after absence is confirmed, never by recovery. What
-  remains: an attempt the harness gave up on (transport failure, cancellation,
-  the deadline) that reaches kilnd only after the release would create a fresh
-  sandbox; over a local Unix socket that window is small, and such a sandbox
-  carries the session's labels and expiry. On legacy kiln a create that
-  crashed before its backend ID was published settles as an ambiguous
-  `FAILED` row that Delete refuses; the harness reports it as
-  `cleanup_failed`, never as a clean failure. The key is
+  while a Health read just before the retry shows a serving daemon that still
+  lists idempotent create; an unkeyed create is never retried. That check
+  cannot be bound to the Create that follows it: a gRPC request cannot be
+  pinned to the daemon generation that answered Health, and an older daemon
+  ignores `request_id`. So a daemon replaced by an older build inside the
+  sub-second gap between the Health read and the retry can still make a
+  second sandbox. Its answer echoes no request ID, which fails the settled
+  check, so the session stops before any work, and label recovery deletes
+  both rows before the session ends; a brief duplicate can exist in between.
+  The key is released only by the normal cleanup after a `READY` create whose
+  response is held, that took exactly one attempt, and after absence is
+  confirmed, never by recovery. After a retry an attempt the harness gave up
+  on (a transport failure that may still deliver it) could reach kilnd late,
+  so the key is kept: within kilnd's request-record retention such an attempt
+  is answered from the retained `DELETED` row and creates nothing. A create
+  ended by cancellation or the deadline goes to recovery, which never
+  releases. On legacy kiln a create that crashed before its backend ID was
+  published settles as an ambiguous `FAILED` row that Delete refuses; the
+  harness reports it as `cleanup_failed`, never as a clean failure. The key is
   `kiln-harness:<session ID>` and carries no secret.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted
   host user can modify it. Durable signing or a remote append service is out of

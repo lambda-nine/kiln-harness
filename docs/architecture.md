@@ -95,7 +95,11 @@ create: no `request_id`, one attempt, nothing released.
   create. A daemon restarted into an older build would ignore `request_id` and
   could make a second sandbox; one that is not serving, or no longer lists the
   feature, ends the retries with the last create error. A Health error backs
-  off and reads again without using an attempt.
+  off and reads again without using an attempt. The read narrows the gap but
+  cannot close it: the Create that follows is a separate RPC and may reach a
+  daemon that replaced the one that answered. An older daemon's answer echoes
+  no request ID and fails the settled check below, and label recovery deletes
+  both sandboxes (see the threat model's deliberate limits).
 - **Bounds.** At most 8 create RPCs. The backoff before the nth sleep after the
   first failure (Health rereads included) is `lifecycle_retry_delay × 2^(n-1)`,
   at most 2 s. The retry phase ends `lifecycle_timeout` after the first failure:
@@ -103,7 +107,12 @@ create: no `request_id`, one attempt, nothing released.
   create error is the result, as it is when the attempts run out. Every sleep
   and Health read waits under the same cancellation and session deadline as the
   create, so either one during a backoff or Health read is `Canceled` or
-  `Deadline`, exactly as during the create.
+  `Deadline`, exactly as during the create. Cancellation wins every tie: each
+  wait polls it first, and it is checked again after every Create and Health
+  answer, before the attempt cap, the window, the deadline or the retry rules
+  can end the phase, and before the next attempt is counted. A create that
+  answered with a sandbox is still returned, and the session's cleanup deletes
+  it by ID.
 - **Settled state.** An `OK` answer is accepted only `READY` and, when keyed,
   echoing this session's `request_id`. Any other state (`FAILED`, `DELETED`,
   `CREATING`, `DELETING`, `LOST`, `QUARANTINED`, unknown) or a mismatched or
@@ -115,17 +124,23 @@ create: no `request_id`, one attempt, nothing released.
   confirm it the outcome is `cleanup_failed`. The same check guards an unkeyed
   create, which kilnd never answers `OK` without `READY`.
 - **Release.** With `FEATURE_REQUEST_ID_RELEASE` also listed (decided once, at
-  session start), the normal cleanup after a `READY` create asks kilnd to give
-  up the key: every delete sends `release_request_id`, and once absence is
-  confirmed, if no delete reported the key released (one that left the row
-  `DELETING` releases nothing and kilnd remembers nothing), up to two more
-  deletes are sent within the cleanup window, `lifecycle_retry_delay` apart.
+  session start), the normal cleanup after a `READY` create that took exactly
+  one attempt asks kilnd to give up the key: every delete sends
+  `release_request_id`, and once absence is confirmed, if no delete reported
+  the key released (one that left the row `DELETING` releases nothing and
+  kilnd remembers nothing), up to two more deletes are sent within the cleanup
+  window, `lifecycle_retry_delay` apart.
   kilnd's contract allows release only while the client holds the create
   response for that key with no retry pending or to come, and only after
   absence is confirmed; the normal cleanup is the one place that holds, so label
-  recovery and the create-failure path never release. Release never makes
-  cleanup fail: absence is the cleanup result, and `session_finished` reports
-  `request_id_released` beside it.
+  recovery and the create-failure path never release. After a retried create
+  an earlier attempt the harness gave up on may still reach kilnd, so that
+  cleanup keeps the key: every delete sends `release_request_id = false`, no
+  extra deletes are sent, and `request_id_released` is absent, as when release
+  was never asked for. A late attempt then finds kilnd's retained `DELETED`
+  row and creates nothing. Release never makes cleanup fail: absence is the
+  cleanup result, and `session_finished` reports `request_id_released` beside
+  it.
 
 `sandbox_created` records `request_id` (only when keyed) and `create_attempts`;
 `sandbox_recovered` records `create_attempts`. The journal is unchanged, and a

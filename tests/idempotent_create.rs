@@ -3,10 +3,16 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use common::{CreateScript, DeleteBehavior, FakeApi, HealthScript, api_error};
-use kiln_harness::api::{ApiError, Feature, SandboxState};
+use kiln_harness::api::{
+    ApiError, Capabilities, Deleted, Execution, Feature, FinalCheck, Health, NodeReservations,
+    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState,
+};
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionOutcome, SessionTask};
 use kiln_harness::journal::{JournalEvent, MemoryJournal};
@@ -17,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Code;
 
 type Session = Harness<FakeApi, ScriptedProvider, MemoryAudit, MemoryJournal>;
+type Over<A> = Harness<A, ScriptedProvider, MemoryAudit, MemoryJournal>;
 
 fn session(api: &FakeApi, config: HarnessConfig) -> Session {
     Harness::new(
@@ -84,7 +91,7 @@ fn created(harness: &Session) -> Option<(Option<String>, u32)> {
 }
 
 /// `(sandbox_ids, deleted, create_attempts)` of the recovery record.
-fn recovered(harness: &Session) -> Option<(Vec<String>, bool, u32)> {
+fn recovered<A: SandboxApi>(harness: &Over<A>) -> Option<(Vec<String>, bool, u32)> {
     harness
         .audit()
         .records
@@ -100,7 +107,7 @@ fn recovered(harness: &Session) -> Option<(Vec<String>, bool, u32)> {
 }
 
 /// `(outcome, work_outcome, sandbox_deleted, request_id_released)`.
-fn finished(harness: &Session) -> (String, String, bool, Option<bool>) {
+fn finished<A: SandboxApi>(harness: &Over<A>) -> (String, String, bool, Option<bool>) {
     match harness.audit().records.last().map(|record| &record.event) {
         Some(AuditEvent::SessionFinished {
             outcome,
@@ -136,7 +143,7 @@ fn set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(ToString::to_string).collect()
 }
 
-fn model_was_asked(harness: &Session) -> bool {
+fn model_was_asked<A: SandboxApi>(harness: &Over<A>) -> bool {
     harness
         .journal()
         .records
@@ -859,4 +866,413 @@ async fn a_slow_keyed_create_is_waited_for_not_retried() {
     assert_eq!(api.state().create_requests.len(), 1);
     assert_eq!(api.state().health_calls, 1);
     assert_eq!(created(&harness).map(|record| record.1), Some(1));
+}
+
+/// Answers a create with `Some(error)` without reaching the fake.
+type CreateHook = dyn Fn(u32, &SandboxRequest) -> Option<ApiError> + Send + Sync;
+
+/// A [`FakeApi`] with hooks that run inside the Create and Health futures,
+/// before they answer, given the call's number from 1.
+#[derive(Clone)]
+struct Hooked {
+    inner: FakeApi,
+    creates: Arc<AtomicU32>,
+    healths: Arc<AtomicU32>,
+    on_create: Arc<CreateHook>,
+    on_health: Arc<dyn Fn(u32) + Send + Sync>,
+}
+
+impl Hooked {
+    fn new(inner: &FakeApi) -> Self {
+        Self {
+            inner: inner.clone(),
+            creates: Arc::default(),
+            healths: Arc::default(),
+            on_create: Arc::new(|_, _| None),
+            on_health: Arc::new(|_| {}),
+        }
+    }
+
+    fn session(&self) -> Over<Self> {
+        Harness::new(
+            self.clone(),
+            ScriptedProvider::demo(),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            HarnessConfig::default(),
+        )
+    }
+}
+
+#[async_trait]
+impl SandboxApi for Hooked {
+    async fn health(&self) -> Result<Health, ApiError> {
+        (self.on_health)(self.healths.fetch_add(1, Ordering::SeqCst) + 1);
+        self.inner.health().await
+    }
+
+    async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
+        let call = self.creates.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(error) = (self.on_create)(call, &request) {
+            return Err(error);
+        }
+        self.inner.create(request).await
+    }
+
+    async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
+        self.inner.exec(request).await
+    }
+
+    async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
+        self.inner.recent_executions(sandbox_id).await
+    }
+
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
+        self.inner.delete(sandbox_id, release_request_id).await
+    }
+
+    async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError> {
+        self.inner.renew(sandbox_id).await
+    }
+
+    async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError> {
+        self.inner.get_execution(execution_id).await
+    }
+
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
+        self.inner.sandbox_ready(sandbox_id).await
+    }
+
+    async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError> {
+        self.inner.final_check(sandbox_id).await
+    }
+
+    async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
+        self.inner.non_deleted_sandboxes().await
+    }
+}
+
+// Review round 1, F-02: after a retry, cleanup keeps the key, so an
+// abandoned attempt that reaches kilnd late is answered from the retained
+// DELETED row and creates nothing.
+#[tokio::test(start_paused = true)]
+async fn a_retried_create_keeps_its_key_so_a_late_first_attempt_creates_nothing() {
+    let fake = FakeApi::keyed(true);
+    let mut api = Hooked::new(&fake);
+    // The first attempt fails in transport before kilnd has it; the test
+    // delivers it after the session has ended.
+    let abandoned = Arc::new(Mutex::new(None));
+    let stash = abandoned.clone();
+    api.on_create = Arc::new(move |call, request| {
+        (call == 1).then(|| {
+            *stash.lock().expect("stash") = Some(request.clone());
+            api_error(Code::Unavailable, "transport failed before sending")
+        })
+    });
+    let mut harness = api.session();
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("the retry completes the session");
+
+    assert_eq!(api.creates.load(Ordering::SeqCst), 2);
+    assert!(
+        fake.state().deletes_released.iter().all(|release| !release),
+        "{:?}",
+        fake.state().deletes_released
+    );
+    // One cleanup delete, and no extra release deletes.
+    assert_eq!(fake.state().deletes_released.len(), 1);
+    assert_eq!(
+        finished(&harness),
+        ("completed".to_string(), "completed".to_string(), true, None)
+    );
+    assert!(
+        harness
+            .audit()
+            .records
+            .iter()
+            .map(|record| serde_json::to_value(record).expect("encode"))
+            .find(|record| record["event"] == "session_finished")
+            .expect("session_finished")
+            .get("request_id_released")
+            .is_none()
+    );
+
+    let late = abandoned
+        .lock()
+        .expect("stash")
+        .take()
+        .expect("first attempt");
+    let answer = fake.create(late).await.expect("answered from the record");
+    assert_eq!(answer.id, "sb-0000000000000001");
+    assert_eq!(answer.state, SandboxState::Deleted);
+    assert_eq!(fake.state().creates.len(), 1, "no new sandbox");
+    assert!(
+        fake.non_deleted_sandboxes()
+            .await
+            .expect("listing")
+            .is_empty()
+    );
+}
+
+// Review round 1, F-03: cancellation inside the last Create, as it fails,
+// wins over the attempt cap.
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_the_last_create_wins_over_the_attempt_cap() {
+    let fake = FakeApi::keyed(true);
+    for _ in 0..8 {
+        fake.state()
+            .create_script
+            .push_back(CreateScript::ErrAfterRecord(unavailable()));
+    }
+    let cancel = CancellationToken::new();
+    let mut api = Hooked::new(&fake);
+    let trigger = cancel.clone();
+    api.on_create = Arc::new(move |call, _| {
+        if call == 8 {
+            trigger.cancel();
+        }
+        None
+    });
+    let mut harness = api.session();
+    let result = harness.run(&SessionTask::demo(), cancel).await;
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    assert_eq!(fake.state().create_requests.len(), 8);
+    assert_eq!(
+        recovered(&harness),
+        Some((vec!["sb-0000000000000001".to_string()], true, 8))
+    );
+    assert_eq!(finished(&harness).1, "canceled");
+    assert!(!fake.state().deletes_released.contains(&true));
+}
+
+// Cancellation inside the Health reread wins over a daemon that is no
+// longer serving.
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_a_refusing_health_reread_is_canceled() {
+    let fake = FakeApi::keyed(true);
+    {
+        let mut state = fake.state();
+        state
+            .create_script
+            .push_back(CreateScript::ErrAfterRecord(unavailable()));
+        state
+            .health_script
+            .extend([discovery(), HealthScript::NotServing]);
+    }
+    let cancel = CancellationToken::new();
+    let mut api = Hooked::new(&fake);
+    let trigger = cancel.clone();
+    api.on_health = Arc::new(move |call| {
+        if call == 2 {
+            trigger.cancel();
+        }
+    });
+    let mut harness = api.session();
+    let result = harness.run(&SessionTask::demo(), cancel).await;
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    assert_eq!(fake.state().create_requests.len(), 1);
+    assert_eq!(fake.state().health_calls, 2);
+    assert_eq!(
+        recovered(&harness),
+        Some((vec!["sb-0000000000000001".to_string()], true, 1))
+    );
+    assert_eq!(finished(&harness).1, "canceled");
+}
+
+// A create that is never sent is not counted as an attempt. Cancellation
+// inside the discovery Health still lets discovery answer, so the session
+// reaches the create already canceled.
+#[tokio::test(start_paused = true)]
+async fn a_session_canceled_before_its_create_counts_no_attempt() {
+    let fake = FakeApi::keyed(true);
+    let cancel = CancellationToken::new();
+    let mut api = Hooked::new(&fake);
+    let trigger = cancel.clone();
+    api.on_health = Arc::new(move |_| trigger.cancel());
+    let mut harness = api.session();
+    let result = harness.run(&SessionTask::demo(), cancel).await;
+    assert!(
+        matches!(result, Err(HarnessError::CreateUncertain(ref error)) if error.code == Code::Cancelled),
+        "{result:?}"
+    );
+    assert_eq!(api.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(recovered(&harness).map(|record| record.2), Some(0));
+    assert_eq!(finished(&harness).1, "canceled");
+}
+
+/// A daemon whose endpoint is taken over by an older build that ignores
+/// `request_id` once the retry's Health reread has answered.
+#[derive(Clone, Default)]
+struct Replaced {
+    state: Arc<Mutex<ReplacedState>>,
+}
+
+#[derive(Default)]
+struct ReplacedState {
+    health_calls: u32,
+    create_calls: u32,
+    old_daemon: bool,
+    rows: Vec<Sandbox>,
+    deleted: BTreeSet<String>,
+    release_flags: Vec<bool>,
+    max_live: usize,
+}
+
+impl ReplacedState {
+    fn live(&self) -> impl Iterator<Item = &Sandbox> {
+        self.rows
+            .iter()
+            .filter(|row| !self.deleted.contains(&row.id))
+    }
+}
+
+#[async_trait]
+impl SandboxApi for Replaced {
+    async fn health(&self) -> Result<Health, ApiError> {
+        let mut state = self.state.lock().expect("state");
+        state.health_calls += 1;
+        // The reread is answered by the current daemon; the older one takes
+        // the endpoint before the retry is sent.
+        if state.health_calls == 2 {
+            state.old_daemon = true;
+        }
+        Ok(Health {
+            serving: true,
+            detail: String::new(),
+            active_sandboxes: 0,
+            running_executions: 0,
+            reservations: NodeReservations::default(),
+            capabilities: Capabilities {
+                features: BTreeSet::from([Feature::IdempotentCreate, Feature::RequestIdRelease]),
+                limits: None,
+            },
+        })
+    }
+
+    async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
+        let mut state = self.state.lock().expect("state");
+        state.create_calls += 1;
+        // The older daemon ignores the key: a new sandbox, no echo.
+        let (id, echo) = if state.old_daemon {
+            ("sb-00000000000000b2", String::new())
+        } else {
+            (
+                "sb-00000000000000a1",
+                request.request_id.clone().unwrap_or_default(),
+            )
+        };
+        let sandbox = Sandbox {
+            id: id.to_string(),
+            backend_id: format!("backend-{id}"),
+            labels: request.labels,
+            expiry: None,
+            state: SandboxState::Ready,
+            failure_reason: String::new(),
+            request_id: echo,
+            request_id_released: false,
+        };
+        state.rows.push(sandbox.clone());
+        state.max_live = state.max_live.max(state.live().count());
+        if state.create_calls == 1 {
+            return Err(api_error(Code::Unavailable, "first response lost"));
+        }
+        Ok(sandbox)
+    }
+
+    async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
+        let mut state = self.state.lock().expect("state");
+        state.release_flags.push(release_request_id);
+        state.deleted.insert(sandbox_id.to_string());
+        Ok(Deleted::default())
+    }
+
+    async fn renew(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn get_execution(&self, _execution_id: &str) -> Result<Execution, ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn final_check(&self, _sandbox_id: &str) -> Result<FinalCheck, ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
+        Ok(self.state.lock().expect("state").live().cloned().collect())
+    }
+}
+
+// Review round 1, F-01, recorded rather than fixed: the Health reread cannot
+// be bound to the Create after it. A replacement in that gap gets the retry
+// and makes a second sandbox; the empty echo stops the session, and recovery
+// deletes both rows before it ends, releasing nothing.
+#[tokio::test(start_paused = true)]
+async fn a_replacement_between_the_reread_and_the_retry_is_stopped_and_recovered() {
+    let api = Replaced::default();
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        HarnessConfig::default(),
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the empty echo is a create failure");
+    assert!(
+        matches!(error, HarnessError::Api(ref error) if error.code == Code::Unknown),
+        "{error}"
+    );
+
+    let state = api.state.lock().expect("state");
+    assert_eq!((state.health_calls, state.create_calls), (2, 2));
+    assert_eq!(state.max_live, 2, "a brief duplicate existed");
+    assert_eq!(state.live().count(), 0, "both rows are gone");
+    assert!(state.release_flags.iter().all(|release| !release));
+    drop(state);
+    assert_eq!(
+        recovered(&harness),
+        Some((
+            vec![
+                "sb-00000000000000a1".to_string(),
+                "sb-00000000000000b2".to_string()
+            ],
+            true,
+            2
+        ))
+    );
+    assert_eq!(
+        finished(&harness),
+        (
+            "create_failed".to_string(),
+            "create_failed".to_string(),
+            true,
+            None
+        )
+    );
+    assert!(!model_was_asked(&harness));
 }

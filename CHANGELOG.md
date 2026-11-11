@@ -6,6 +6,19 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- First review round for idempotent create. Cleanup releases the request ID
+  only when the create took a single attempt: after a retry an abandoned
+  attempt may still reach kilnd, so the key is kept, every delete sends
+  `release_request_id = false`, `request_id_released` stays absent, and a
+  late attempt is answered from the retained `DELETED` row instead of
+  creating a sandbox. Cancellation now wins every tie in the retry phase:
+  each wait polls it first, it is checked again after every Create and
+  Health answer before the attempt cap, window, deadline or retry rules can
+  end the phase, and an attempt is counted only once its RPC is sent. The
+  README and threat model no longer promise that a daemon replaced by an
+  older build never receives a retry: the Health reread cannot be bound to
+  the Create after it, so a replacement in that sub-second gap can make a
+  brief duplicate, which the echo check stops and label recovery deletes.
 - kilnd API milestone 2 (kilnd `4baf986`, whose `kilnd.v1` schema is now
   vendored): idempotent create. When a serving daemon lists
   `FEATURE_IDEMPOTENT_CREATE`, the session's create carries the request ID

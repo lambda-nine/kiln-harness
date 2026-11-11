@@ -139,13 +139,20 @@ expires, and a crashed harness can leak it, as before.
 Against kilnd with `FEATURE_IDEMPOTENT_CREATE`, the create carries the key
 `kiln-harness:<session ID>`, and a create whose answer was lost or ambiguous
 is retried with the same key and an equal request, at most 8 times within
-the 10-second lifecycle window and only while Health still lists the feature, so a lost
-response never leaves a second sandbox. A create kilnd answers in any state
-but `READY` is cleaned up and reported as a create failure. When kilnd also
-lists `FEATURE_REQUEST_ID_RELEASE`, cleanup gives the key up once the sandbox
-is confirmed gone. The audit records the key, the number of create attempts
-and whether the key was released; a daemon without the feature gets exactly
-the create it got before.
+the 10-second lifecycle window and only while a Health read just before the
+retry still lists the feature, so the daemon answers a retry from the first
+attempt's record instead of making a second sandbox. The client cannot pin
+that retry to the daemon that answered Health: a daemon replaced by an older
+build in the moment between the two would ignore the key. Its answer then
+fails the echo check, the session stops before any work, and label recovery
+deletes both sandboxes before the session ends. A create kilnd answers in
+any state but `READY` is cleaned up and reported as a create failure. When
+kilnd also lists `FEATURE_REQUEST_ID_RELEASE` and the create took a single
+attempt, cleanup gives the key up once the sandbox is confirmed gone; after
+a retry the key is kept, so an earlier attempt that arrives late finds the
+deleted sandbox's record rather than making a new one. The audit records the
+key, the number of create attempts and whether the key was released; a
+daemon without the feature gets exactly the create it got before.
 
 ## Running against a local model
 

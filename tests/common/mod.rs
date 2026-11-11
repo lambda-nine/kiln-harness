@@ -266,7 +266,7 @@ impl SandboxApi for FakeApi {
     async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
         let labels = request.labels.clone();
         let echoed = request.request_id.clone().unwrap_or_default();
-        let (delay, fail, script) = {
+        let (delay, fail, script, retained_deleted) = {
             let mut state = self.state();
             state.create_requests.push(request.clone());
             state.create_sent_at.push(tokio::time::Instant::now());
@@ -280,13 +280,20 @@ impl SandboxApi for FakeApi {
             let delay = state.create_delay;
             let fail = state.create_error_after_record;
             // kilnd's keyed lookup: an equal request under a recorded key is
-            // answered from its row, an unequal one is a conflict.
-            let recorded = request.request_id.as_ref().and_then(|key| {
-                state
-                    .creates
-                    .iter()
-                    .find(|row| row.request_id.as_ref() == Some(key))
-            });
+            // answered from its row, an unequal one is a conflict. A released
+            // record is gone: the key makes a new sandbox.
+            let recorded = request
+                .request_id
+                .as_ref()
+                .filter(|_| !state.request_id_released)
+                .and_then(|key| {
+                    state
+                        .creates
+                        .iter()
+                        .find(|row| row.request_id.as_ref() == Some(key))
+                });
+            let retained_deleted =
+                recorded.is_some() && state.deleted.iter().any(|id| id == "sb-0000000000000001");
             if let Some(recorded) = recorded {
                 if recorded != &request {
                     return Err(api_error_with_reason(
@@ -322,7 +329,7 @@ impl SandboxApi for FakeApi {
                     state.deleted.push("sb-0000000000000001".to_string());
                 }
             }
-            (delay, fail, script)
+            (delay, fail, script, retained_deleted)
         };
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -340,6 +347,10 @@ impl SandboxApi for FakeApi {
             request_id: echoed,
             request_id_released: false,
         };
+        // A retained record whose sandbox is gone answers with the DELETED row.
+        if retained_deleted {
+            sandbox.state = SandboxState::Deleted;
+        }
         match script {
             Some(CreateScript::ErrAfterRecord(error)) => return Err(error),
             Some(CreateScript::Settled(state, reason)) => {
