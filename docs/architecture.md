@@ -160,8 +160,9 @@ running, or a sandbox not READY, ends it as `Api` `FAILED_PRECONDITION`,
 "sandbox was not usable when the session finished", or as `SandboxExpired`
 when kilnd's deletion reason names an expiry or deletion; and a check that
 cannot be made ends it as `Api` `UNAVAILABLE`, "could not confirm the
-sandbox at the end of the session". Deadline and cancellation keep their
-precedence. An older daemon's sandbox is checked by state only. The final
+sandbox at the end of the session". Cancellation and the session deadline
+win over its verdict before the check starts, while it runs, and after it
+answers. An older daemon's sandbox is checked by state only. The final
 answer stays journaled as the model's response and the terminal records
 say `failed`; the journal gains no record, so its grammar is unchanged.
 The audit gets a metadata-only `final_check` event: the state (`ready`,

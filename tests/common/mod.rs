@@ -110,6 +110,8 @@ pub struct FakeState {
     pub final_checks: u32,
     pub final_check_error: Option<ApiError>,
     pub final_rows: Vec<Execution>,
+    /// Every recovery read of recent executions fails `UNAVAILABLE`.
+    pub recent_unavailable: bool,
 }
 
 impl FakeApi {
@@ -452,6 +454,9 @@ impl SandboxApi for FakeApi {
 
     async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
         let state = self.state();
+        if state.recent_unavailable {
+            return Err(api_error(Code::Unavailable, "listing failed"));
+        }
         Ok(state.executions.iter().rev().cloned().collect())
     }
 

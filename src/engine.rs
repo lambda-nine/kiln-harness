@@ -1066,13 +1066,31 @@ where
     A: SandboxApi,
     S: AuditSink,
 {
+    // Cancellation and the session deadline win over any verdict: before
+    // the check, while it runs, and once it has answered.
+    let interrupted = || {
+        if context.cancel.is_cancelled() {
+            Some(HarnessError::Canceled)
+        } else if Instant::now() >= context.deadline {
+            Some(HarnessError::Deadline)
+        } else {
+            None
+        }
+    };
+    if let Some(error) = interrupted() {
+        return Err(error);
+    }
     let check_deadline = context
         .deadline
         .min(Instant::now() + context.config.lifecycle_timeout);
     let checked = tokio::select! {
+        biased;
         () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
         checked = timeout_at(check_deadline, context.api.final_check(context.sandbox_id)) => checked,
     };
+    if let Some(error) = interrupted() {
+        return Err(error);
+    }
     let (state, unknown_rows, verdict) = if let Ok(Ok(check)) = &checked {
         let unknown = check
             .recent

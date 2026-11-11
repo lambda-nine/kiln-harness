@@ -316,11 +316,12 @@ impl ToolRun {
     /// left the sandbox unusable stops the session like a returned one; an
     /// interruption already recorded keeps its own stop.
     pub fn attach_recovered(&mut self, recovered: RecoveredExecutionEvidence) {
-        if recovered.execution_ids.is_empty() {
-            return;
-        }
+        // A stop needs no IDs: an unreadable window has none.
         if self.stop.is_none() {
             self.stop = recovered.stop();
+        }
+        if recovered.execution_ids.is_empty() {
+            return;
         }
         self.execution_ids = recovered.execution_ids;
         self.stdout = recovered.stdout;

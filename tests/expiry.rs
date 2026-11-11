@@ -2465,3 +2465,130 @@ impl Provider for SlowAfterFirstCall {
         self.inner.complete(request).await
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_recovery_with_no_rows_stops_the_session() {
+    // R7-01: the tool's Exec fails and every recovery read fails too. With
+    // no row and nothing read, the call ends the session; the model is not
+    // asked again.
+    let api = FakeApi::with_expiry();
+    api.state().tool_exec_error = Some(api_error(Code::Unavailable, "refused"));
+    api.state().recent_unavailable = true;
+    let mut harness = session(
+        &api,
+        Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        ),
+        short_lifecycle_config(),
+    );
+    let error = run(&mut harness).await.expect_err("unreadable");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.code == Code::FailedPrecondition
+                && error.message
+                    == "execution evidence could not be read after its response was lost"),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 1);
+    assert_eq!(api.state().final_checks, 0);
+}
+
+/// Cancels the session in the same poll that returns the final answer.
+struct CancelWithFinalAnswer {
+    cancel: CancellationToken,
+}
+
+#[async_trait]
+impl Provider for CancelWithFinalAnswer {
+    fn info(&self) -> ProviderInfo {
+        ProviderInfo {
+            name: "test".to_string(),
+            model: "test".to_string(),
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        _request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.cancel.cancel();
+        Ok(ModelResponse::final_text("done"))
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_set_before_the_final_check_always_wins() {
+    // R7-02: the check never races a cancellation that is already set.
+    for attempt in 0..128 {
+        let api = FakeApi::with_expiry();
+        let cancel = CancellationToken::new();
+        let mut harness = Harness::new(
+            api.clone(),
+            CancelWithFinalAnswer {
+                cancel: cancel.clone(),
+            },
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+        let error = harness
+            .run(&SessionTask::demo(), cancel)
+            .await
+            .expect_err("canceled");
+        assert!(
+            matches!(error, HarnessError::Canceled),
+            "{attempt}: {error}"
+        );
+        assert_eq!(api.state().final_checks, 0, "{attempt}");
+    }
+}
+
+/// An audit whose final-answer record blocks the thread for a while, as a
+/// slow disk would.
+#[derive(Default)]
+struct StallingAudit {
+    inner: MemoryAudit,
+    stall: Duration,
+}
+
+impl kiln_harness::audit::AuditSink for StallingAudit {
+    fn append(
+        &mut self,
+        session_id: &str,
+        sandbox_id: Option<&str>,
+        event: AuditEvent,
+    ) -> Result<(), kiln_harness::audit::AuditError> {
+        if matches!(event, AuditEvent::FinalAnswer { .. }) {
+            std::thread::sleep(self.stall);
+        }
+        self.inner.append(session_id, sandbox_id, event)
+    }
+}
+
+#[tokio::test]
+async fn a_final_check_after_the_deadline_cannot_complete_the_session() {
+    // R7-03: the final answer's audit record stalls past a 50 ms session
+    // deadline; the check must not record completion after it.
+    let api = FakeApi::default();
+    let config = HarnessConfig {
+        session_timeout: Duration::from_millis(50),
+        ..short_lifecycle_config()
+    };
+    let mut harness = Harness::new(
+        api.clone(),
+        Script::new(Duration::ZERO, [ModelResponse::final_text("done")]),
+        StallingAudit {
+            inner: MemoryAudit::default(),
+            stall: Duration::from_millis(100),
+        },
+        MemoryJournal::default(),
+        config,
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("deadline");
+    assert!(matches!(error, HarnessError::Deadline), "{error}");
+    assert_eq!(api.state().final_checks, 0);
+}

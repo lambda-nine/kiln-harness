@@ -6,6 +6,12 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Seventh review round for kilnd API milestone 1. An unreadable recovery
+  window with no rows now stops the session as documented, rather than
+  being dropped for lack of IDs. Cancellation and the session deadline win
+  over the final check before it starts, while it runs (cancellation is
+  polled first), and after it answers, so a session canceled or past its
+  deadline at the end is never recorded `completed`.
 - Sixth review round for kilnd API milestone 1. A session can now be
   recorded `completed` only after a final check: one `GetSandbox`
   (`SandboxApi::final_check`) after the final answer must show the sandbox
