@@ -1,10 +1,39 @@
 #!/bin/sh
 set -eu
 
+# The kiln this harness is tested against. It must match the kiln pin in
+# README.md's "Pinned control plane" section.
+PINNED_KILN=e48f0e785ad484d0b2947897f6d48d0756059d7e
+
 # The Linux ACL tests skip without these tools; this run must not. Install
 # nothing here: package changes on the shared VM go through its owner.
 if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then
     echo "setfacl/getfacl not found: install Ubuntu's acl package (sudo apt-get install acl) so the Linux ACL tests run" >&2
+    exit 1
+fi
+
+# kiln --version prints "kiln <version> (git <12-hex commit>, clean|dirty)",
+# or "(git unknown)". Only a clean build of the pinned commit passes.
+pinned_short=$(printf '%s' "$PINNED_KILN" | cut -c1-12)
+kiln_version=$(sudo /usr/local/bin/kiln --version) || {
+    echo "cannot run the installed kiln's --version" >&2
+    exit 1
+}
+installed=$(printf '%s\n' "$kiln_version" |
+    sed -n 's/^kiln [^ ]* (git \([0-9a-f]\{12\}\), \([a-z]*\))$/\1 \2/p')
+installed_short=${installed%% *}
+case "$installed" in
+"") installed_short=unknown ;;
+*" clean")
+    case "$PINNED_KILN" in
+    "$installed_short"*) installed_short= ;;
+    esac
+    ;;
+*) installed_short="$installed_short (${installed#* })" ;;
+esac
+if test -n "$installed_short"; then
+    echo "installed kiln $installed_short does not match the pinned $pinned_short; install the pinned kiln or update the pin" >&2
+    echo "kiln --version: $kiln_version" >&2
     exit 1
 fi
 

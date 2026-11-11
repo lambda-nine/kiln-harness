@@ -6,6 +6,9 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- The kiln pin moves to `e48f0e7`, the companion kiln kilnd `853dee2`
+  requires, and `scripts/integration-vm.sh` now refuses to run unless the
+  installed kiln is a clean build of that commit.
 - kilnd API milestone 1 (kilnd `853dee2`, whose `kilnd.v1` schema is now
   vendored). Each session reads Health once before create and uses only
   the features a serving daemon lists; `session_opened` records them as

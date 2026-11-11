@@ -66,13 +66,15 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 
 ## Pinned control plane
 
-- kiln behavior and persistent-exec v1: `f21ea88115fdcd10c5a3689832199d1f79c50d4b`
+- kiln behavior and persistent-exec v1: `e48f0e785ad484d0b2947897f6d48d0756059d7e`,
+  the companion kiln that this kilnd requires
 - kilnd API and runtime semantics: `853dee2a827b7f60af16f731a54309b1be97f680`
   (parent `6543812a2db4af4493ad6c5ea8864c27d173195d`)
 
 The compatible `kilnd.v1` protobuf schema is vendored under `proto/` so this
 repository builds against the reviewed API even if a sibling checkout is on a
-different branch.
+different branch. `scripts/integration-vm.sh` refuses to run against an
+installed kiln other than the pinned one.
 
 ## Deterministic demo
 
@@ -325,7 +327,8 @@ scripts/integration-vm.sh
 ```
 
 Guest prerequisites: a Rust toolchain at MSRV 1.88 or newer, `python3`, `sudo`,
-the installed kilnd and kiln, and Ubuntu's `acl` package (`setfacl` and
+the installed kilnd and kiln at the commits in
+[Pinned control plane](#pinned-control-plane), and Ubuntu's `acl` package (`setfacl` and
 `getfacl`, which the script requires so the Linux ACL tests run).
 
 It requires no active sandboxes or running executions, verifies all five tool
