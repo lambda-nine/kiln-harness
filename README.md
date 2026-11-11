@@ -67,8 +67,8 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 ## Pinned control plane
 
 - kiln behavior and persistent-exec v1: `f21ea88115fdcd10c5a3689832199d1f79c50d4b`
-- kilnd API and runtime semantics: `867d731162d4581c01c756036873732c42649c6f`
-  (parent `2c49761a3206c29c01b21bd9489e2b946263304c`)
+- kilnd API and runtime semantics: `853dee2a827b7f60af16f731a54309b1be97f680`
+  (parent `6543812a2db4af4493ad6c5ea8864c27d173195d`)
 
 The compatible `kilnd.v1` protobuf schema is vendored under `proto/` so this
 repository builds against the reviewed API even if a sibling checkout is on a

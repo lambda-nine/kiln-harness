@@ -80,6 +80,13 @@ impl KilndService for GatedKilnd {
     ) -> Result<Response<pb::GetExecutionResponse>, Status> {
         Err(Status::unimplemented("test stub"))
     }
+
+    async fn renew_sandbox(
+        &self,
+        _request: Request<pb::RenewSandboxRequest>,
+    ) -> Result<Response<pb::RenewSandboxResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
 }
 
 #[tokio::test]

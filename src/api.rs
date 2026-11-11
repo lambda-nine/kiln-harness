@@ -228,6 +228,7 @@ impl SandboxApi for TonicKilnd {
                     writable_paths: request.writable_paths,
                     labels: request.labels.into_iter().collect(),
                 }),
+                expiry: None,
             })
             .await
             .map_err(ApiError::from)?

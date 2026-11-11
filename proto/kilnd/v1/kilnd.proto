@@ -1,17 +1,69 @@
-// Vendored from kilnd commit 867d731162d4581c01c756036873732c42649c6f.
 // kilnd API, version 1.
+//
+// kilnd manages sandboxes on one node and serves this API over a Unix socket
+// (/run/kilnd/kilnd.sock by default). Nothing here names a particular
+// isolation backend: kiln is the first, and a microVM backend such as
+// Firecracker should fit the same messages.
+//
+// Compatibility: within v1, fields and RPCs are only added, never renumbered
+// or removed. Breaking changes go in a new package, kilnd.v2.
 syntax = "proto3";
 
 package kilnd.v1;
 
 service KilndService {
+  // Reports whether the daemon and its backend are usable.
   rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Creates a sandbox and waits until it is ready for Exec. A failed create
+  // is kept in SANDBOX_STATE_FAILED for inspection; failed compensation stays
+  // SANDBOX_STATE_DELETING so deletion can be retried. Canceling or timing out
+  // the RPC only stops waiting: an accepted create continues to READY or
+  // compensates its backend resource. Retrying is not idempotent and may
+  // create another sandbox. An expiry policy, if sent, is resolved once here and
+  // never changes; without one the sandbox never expires.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+
+  // Returns one sandbox and its most recent executions.
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
+
+  // Stable newest-first pages with bounded continuation cursors. Legacy calls
+  // without page_size fail RESOURCE_EXHAUSTED rather than silently truncate
+  // when the complete list cannot fit the server's count or byte bounds.
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+
+  // Removes a sandbox. A running execution in it is canceled first.
+  // Deleting a deleted sandbox succeeds, including one that expired; the
+  // first delete intent's deletion_reason is kept.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+
+  // Runs a command in a ready sandbox and waits for it. Executions in one
+  // sandbox run one at a time. Admission does not promise arrival order.
+  // The timeout includes queueing; expiry before a row exists returns
+  // DEADLINE_EXCEEDED. The command's own outcome
+  // (any exit code, a timeout, cancellation) is a successful RPC whose
+  // Execution says what happened; RPC errors mean the request was invalid or
+  // the sandbox couldn't run it. Canceling the RPC discards a queued request
+  // that has not started; once an execution row exists, it requests
+  // cancellation but the daemon retains cleanup and finalization ownership.
+  // Cancellation does not undo command side effects. A disconnected caller
+  // can find recent execution IDs with GetSandbox, then use GetExecution.
+  // A successful RPC does not mean the sandbox survived: check the execution's
+  // sandbox_reusable before assuming it can take another call. LOST and QUARANTINED
+  // sandboxes fail FAILED_PRECONDITION. Any sandbox that is not READY fails
+  // FAILED_PRECONDITION with a kilnd-reason trailer (sandbox_not_ready,
+  // sandbox_failed, sandbox_lost, sandbox_quarantined, sandbox_deleted,
+  // expired_idle or expired_lifetime), and the message starts with that token.
   rpc Exec(ExecRequest) returns (ExecResponse);
+
+  // Returns one execution, including its captured output.
   rpc GetExecution(GetExecutionRequest) returns (GetExecutionResponse);
+
+  // Records activity on a READY sandbox: restarts its idle timer and never
+  // extends max_lifetime. Owner or root only; a foreign ID is NOT_FOUND. Any
+  // other state fails FAILED_PRECONDITION with a kilnd-reason trailer. Needs
+  // FEATURE_SANDBOX_EXPIRY; an older daemon answers UNIMPLEMENTED.
+  rpc RenewSandbox(RenewSandboxRequest) returns (RenewSandboxResponse);
 }
 
 message HealthRequest {}
@@ -19,8 +71,11 @@ message HealthRequest {}
 message HealthResponse {
   enum Status {
     STATUS_UNSPECIFIED = 0;
+    // The daemon is serving and the backend answered.
     STATUS_SERVING = 1;
+    // The daemon has an operator-visible problem; see detail.
     STATUS_DEGRADED = 2;
+    // The daemon is shutting down and refuses new work.
     STATUS_SHUTTING_DOWN = 3;
   }
   Status status = 1;
@@ -29,12 +84,116 @@ message HealthResponse {
   string backend_version = 4;
   string detail = 5;
   int64 started_at_unix_ms = 6;
+  // Sandboxes not yet deleted, failed or lost.
   uint32 active_sandboxes = 7;
   uint32 running_executions = 8;
   AdmissionStats admission = 9;
   NodeResourceStats node_resources = 10;
+  RuntimeCapabilities runtime_capabilities = 11;
+  LifecycleStats lifecycle = 12;
 }
 
+// Sandbox expiry since daemon startup, unless noted.
+message LifecycleStats {
+  uint64 expired_idle = 1;
+  uint64 expired_lifetime = 2;
+  // Expiry deletes published and not yet DELETED, now.
+  uint32 pending_expiry_deletes = 3;
+  // Expiry removal attempts that failed and will be retried.
+  uint64 failed_expiry_deletes = 4;
+  // Reserved for idempotent create; zero until FEATURE_IDEMPOTENT_CREATE.
+  uint64 create_retries_answered = 5;
+  // Reserved for request-ID release; zero until FEATURE_REQUEST_ID_RELEASE.
+  uint64 request_ids_released = 6;
+}
+
+// An optional part of this API. A client sets a field or calls an RPC only if
+// its feature is in RuntimeCapabilities.features of a SERVING Health
+// response, and re-reads the list after every reconnect: an older daemon
+// ignores unknown request fields silently and lists no features. The
+// kilnd-reason token of a feature is its name after FEATURE_, in lower case.
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+  // CreateSandboxRequest.expiry, RenewSandbox, Sandbox.expiry and
+  // deletion_reason, Execution.cancel_reason.
+  FEATURE_SANDBOX_EXPIRY = 1;
+  FEATURE_IDEMPOTENT_CREATE = 2;
+  FEATURE_EXEC_CWD = 3;
+  FEATURE_EXEC_ENV = 4;
+  FEATURE_SANDBOX_DEFAULT_ENV = 5;
+  FEATURE_EXEC_STREAM = 6;
+  // Refusals carry a `kilnd-reason: <token>` trailer, and their message starts
+  // with the same token and ": ". Match the trailer, not the prose.
+  FEATURE_TYPED_REASONS = 7;
+  FEATURE_REQUEST_ID_RELEASE = 8;
+}
+
+// Caps, minimums and defaults a client could hit. A field whose feature is not
+// listed is zero.
+message ApiLimits {
+  // 0: no cap.
+  uint64 max_sandbox_lifetime_ms = 1;
+  // 0: no cap.
+  uint64 max_sandbox_idle_ms = 2;
+  // Used only for a zero field of a present ExpiryPolicy. 0: never expires.
+  uint64 default_sandbox_lifetime_ms = 3;
+  uint64 default_sandbox_idle_ms = 4;
+  uint64 create_request_retention_ms = 5;
+  uint32 max_cwd_bytes = 6;
+  uint32 max_env_entries = 7;
+  uint32 max_env_name_bytes = 8;
+  uint32 max_env_value_bytes = 9;
+  // The sum of len(name) + len(value) + 2 over all entries.
+  uint32 max_env_total_bytes = 10;
+  uint32 default_exec_timeout_ms = 11;
+  uint32 max_exec_timeout_ms = 12;
+  uint32 default_stream_timeout_ms = 13;
+  uint32 max_stream_timeout_ms = 14;
+  // Retained bytes per output stream.
+  uint64 max_output_bytes = 15;
+  uint32 stream_chunk_bytes = 16;
+  uint64 stream_buffer_bytes = 17;
+  uint64 min_sandbox_lifetime_ms = 18;
+  uint64 min_sandbox_idle_ms = 19;
+}
+
+// Generic facts about this daemon's execution backend. Clients check these
+// rather than assuming a backend's behavior.
+message RuntimeCapabilities {
+  // Network modes the backend can enforce. Other modes fail before allocation.
+  repeated NetworkMode network_modes = 1;
+  // False when any interruption after dispatch retires the sandbox.
+  bool interruption_preserves_session = 2;
+  bool checkpoint = 3;
+  // This daemon's static features plus the dynamic ones its backend has
+  // currently proven. Absent means unsupported. Read it only from a SERVING
+  // response: a failed backend probe withdraws every dynamic feature.
+  repeated Feature features = 4;
+  ApiLimits limits = 5;
+}
+
+// Where NodeResourceStats' totals came from.
+enum NodeAccountingStatus {
+  NODE_ACCOUNTING_STATUS_UNSPECIFIED = 0;
+  // This daemon's own durable reservation sums. The backend reserves no host CPU,
+  // virtual CPU slots or host PIDs, so those fields are zero.
+  NODE_ACCOUNTING_STATUS_LOCAL_LEGACY = 1;
+  // Totals from the node's accounting authority, as of the stated generation.
+  NODE_ACCOUNTING_STATUS_AUTHORITATIVE = 2;
+  // The last authoritative totals, older than the authority's freshness bound.
+  NODE_ACCOUNTING_STATUS_STALE = 3;
+  // The authority cannot be read. All totals are zero and mean nothing: a daemon
+  // never substitutes its own sums for node totals.
+  NODE_ACCOUNTING_STATUS_UNAVAILABLE = 4;
+}
+
+// Durable capacity promised to owned or ambiguous sandbox rows. These are hard
+// reservation sums, not measured live consumption. FAILED without a backend ID
+// remains reserved because a create error may be ambiguous, unless the backend
+// proved the failure preceded any allocation; that FAILED and compensated FAILED
+// with the exact removed backend ID release. LOST and QUARANTINED remain reserved.
+// A backend with allocation-level recovery releases only with durable proof that
+// the allocation is absent. Check accounting_status before reading any total.
 message NodeResourceStats {
   uint64 max_sandboxes = 1;
   uint64 reserved_sandboxes = 2;
@@ -44,9 +203,22 @@ message NodeResourceStats {
   uint64 reserved_pids = 6;
   uint64 max_disk_bytes = 7;
   uint64 reserved_disk_bytes = 8;
+  // Create requests rejected by these budgets since daemon startup.
   uint64 rejected_creates = 9;
+  uint64 max_host_cpu_millis = 10;
+  uint64 reserved_host_cpu_millis = 11;
+  uint64 max_virtual_cpu_slots = 12;
+  uint64 reserved_virtual_cpu_slots = 13;
+  uint64 max_host_pids = 14;
+  uint64 reserved_host_pids = 15;
+  NodeAccountingStatus accounting_status = 16;
+  // The authority's snapshot generation; zero when it has none.
+  uint64 accounting_generation = 17;
+  // When the authority's snapshot was observed; zero when it has none.
+  int64 accounting_observed_at_unix_ms = 18;
 }
 
+// Current use and cumulative admission rejections since daemon startup.
 message AdmissionStats {
   uint64 max_connections = 1;
   uint64 current_connections = 2;
@@ -69,59 +241,179 @@ message AdmissionStats {
 
 enum SandboxState {
   SANDBOX_STATE_UNSPECIFIED = 0;
+  // The backend is creating it.
   SANDBOX_STATE_CREATING = 1;
+  // Accepts Exec.
   SANDBOX_STATE_READY = 2;
+  // DeleteSandbox, or compensation for a failed create, is removing it.
   SANDBOX_STATE_DELETING = 3;
+  // Removed. The record stays for history.
   SANDBOX_STATE_DELETED = 4;
+  // Creation failed; see failure_reason. Delete it to clear the record.
   SANDBOX_STATE_FAILED = 5;
+  // The backend no longer has it (host reboot, crashed shim) or an interruption
+  // retired it. Delete it to clear the record.
   SANDBOX_STATE_LOST = 6;
+  // A potentially owned backend cannot safely run commands because cleanup or
+  // reuse could not be established. Exec fails FAILED_PRECONDITION; it stays
+  // charged until DeleteSandbox proves it gone.
+  SANDBOX_STATE_QUARANTINED = 7;
+}
+
+// Host commitments, stored independently of the spec's tool limits.
+message ResourceReservation {
+  uint64 memory_bytes = 1;
+  uint64 disk_bytes = 2;
+  // The conservative aggregate; host_pids is a component, not another amount.
+  uint64 pids = 3;
+  // Zero on a backend that does not reserve it.
+  uint64 host_cpu_millis = 4;
+  uint64 virtual_cpu_slots = 5;
+  uint64 host_pids = 6;
 }
 
 enum NetworkMode {
+  // Same as NETWORK_MODE_NONE.
   NETWORK_MODE_UNSPECIFIED = 0;
+  // Loopback only.
   NETWORK_MODE_NONE = 1;
+  // Public internet; private, link-local and host addresses stay blocked.
   NETWORK_MODE_FULL = 2;
+  // Only the destinations in NetworkPolicy.allow.
   NETWORK_MODE_ALLOWLIST = 3;
 }
 
 message NetworkPolicy {
   NetworkMode mode = 1;
+  // With NETWORK_MODE_ALLOWLIST: 1–64 ASCII HOST[:PORT] or
+  // IPv4[/PREFIX][:PORT] entries, each at most 260 bytes. Ports are 1–65535;
+  // prefixes are 0–32. See docs/validation.md for the hostname grammar.
   repeated string allow = 2;
 }
 
+// Zero means the daemon's default.
 message ResourceLimits {
   uint64 memory_bytes = 1;
+  // CPU in thousandths of a core: 500 is half a core.
   uint32 cpu_millis = 2;
+  // Maximum processes and threads.
   uint32 pids = 3;
+  // Everything the sandbox writes, blocks and inodes together.
   uint64 disk_bytes = 4;
 }
 
 message SandboxSpec {
+  // Root filesystem image name. Empty means the daemon's default. Effective
+  // names are 1–128 ASCII alphanumeric, '-', '_' or '.', and do not start
+  // with '-' or '.'.
   string image = 1;
   ResourceLimits limits = 2;
   NetworkPolicy network = 3;
+  // Writes are denied outside the backend's scratch paths and writable_paths.
   bool read_only_root = 4;
+  // Absolute UTF-8 paths that stay writable with read_only_root. At most 16,
+  // each at most 1024 bytes; '/', control characters, and empty, '.' or '..'
+  // components are invalid.
   repeated string writable_paths = 5;
+  // At most 32 caller-defined tags, stored and returned as given. Keys are
+  // 1–63 ASCII bytes; values are at most 256 UTF-8 bytes without controls.
   map<string, string> labels = 6;
 }
 
 message Sandbox {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
   SandboxState state = 2;
+  // The effective spec, with defaults filled in.
   SandboxSpec spec = 3;
+  // Which isolation backend runs it, like "kiln".
   string backend = 4;
+  // The backend's own ID, for operators. Empty until the backend created it.
   string backend_id = 5;
   int64 created_at_unix_ms = 6;
   int64 updated_at_unix_ms = 7;
+  // Zero unless deleted.
   int64 deleted_at_unix_ms = 8;
+  // Why it is FAILED or LOST, or why the last delete attempt failed.
   string failure_reason = 9;
+  // The uid of the local caller that created it. Fixed at creation. Only this
+  // uid and root (0) can see or use the sandbox; older sandboxes belong to root.
+  uint32 owner_uid = 10;
+  // Effective host commitments, distinct from the spec's tool limits.
+  ResourceReservation reservation = 11;
+  // Operator-selected execution profile. Descriptive, never caller-selectable;
+  // empty for historical rows.
+  string runtime_profile = 12;
+  // Backend-neutral provenance digest; empty when the backend has none.
+  string runtime_artifact_digest = 13;
+  // The effective expiry policy, both deadlines and the last activity.
+  ExpiryStatus expiry = 14;
+  // Why it is DELETING or DELETED. Unspecified on history from before expiry.
+  DeletionReason deletion_reason = 15;
 }
 
-message CreateSandboxRequest { SandboxSpec spec = 1; }
-message CreateSandboxResponse { Sandbox sandbox = 1; }
+// Sent: each nonzero field is used as given; it must be at least 10 s
+// (ApiLimits.min_*) and at most the node maximum unless that is 0, else
+// INVALID_ARGUMENT. A zero field takes the node default for that field.
+// Not sent: the sandbox never expires, whatever the node is configured with.
+message ExpiryPolicy {
+  // Counted from the first READY, whatever the activity. RenewSandbox never
+  // extends it.
+  uint64 max_lifetime_ms = 1;
+  // Counted from the later of READY and the last activity: an execution's
+  // start or finish, or RenewSandbox. Paused while an execution is running or
+  // an admitted Exec is queued.
+  uint64 idle_timeout_ms = 2;
+}
+
+message ExpiryStatus {
+  // 0 in a field: the sandbox does not expire that way.
+  ExpiryPolicy effective = 1;
+  // Wall-clock projections of monotonic deadlines, computed when read; they
+  // move if the wall clock is stepped. 0: none.
+  int64 lifetime_expires_at_unix_ms = 2;
+  // 0: none, or paused.
+  int64 idle_expires_at_unix_ms = 3;
+  // 0 before READY and on history from before expiry.
+  int64 last_activity_at_unix_ms = 4;
+  // An execution is running or an admitted Exec is queued.
+  bool idle_paused = 5;
+}
+
+enum DeletionReason {
+  // Not deleted, or history from before expiry.
+  DELETION_REASON_UNSPECIFIED = 0;
+  DELETION_REASON_REQUESTED = 1;
+  DELETION_REASON_EXPIRED_IDLE = 2;
+  DELETION_REASON_EXPIRED_LIFETIME = 3;
+}
+
+message RenewSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
+  string id = 1;
+}
+
+message RenewSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message CreateSandboxRequest {
+  SandboxSpec spec = 1;
+  // Field 2 is reserved for idempotent create.
+  // Absent: never expires. Needs FEATURE_SANDBOX_EXPIRY.
+  ExpiryPolicy expiry = 3;
+}
+
+message CreateSandboxResponse {
+  Sandbox sandbox = 1;
+}
 
 message GetSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
+  // How many recent executions to return, newest first. Zero means 10; at
+  // most 100. Output data is left out, but totals, certainty and truncation
+  // evidence are preserved; use GetExecution for retained bytes.
   uint32 execution_limit = 2;
 }
 
@@ -131,7 +423,9 @@ message GetSandboxResponse {
 }
 
 message ListSandboxesRequest {
+  // Also return DELETED sandboxes.
   bool include_deleted = 1;
+  // Absent preserves complete-list semantics; present zero uses the default.
   optional uint32 page_size = 2;
   string page_token = 3;
 }
@@ -141,45 +435,99 @@ message ListSandboxesResponse {
   string next_page_token = 2;
 }
 
-message DeleteSandboxRequest { string id = 1; }
-message DeleteSandboxResponse { Sandbox sandbox = 1; }
+message DeleteSandboxRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
+  string id = 1;
+}
+
+message DeleteSandboxResponse {
+  Sandbox sandbox = 1;
+}
 
 message ExecRequest {
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string sandbox_id = 1;
+  // 1–4096 UTF-8 arguments; argv[0] is nonempty. NUL is invalid. Newlines,
+  // other controls, Unicode, flag-like values and later empty arguments are
+  // literal data, never host-shell syntax. Run `sh -c` explicitly for shell
+  // parsing. The configurable byte limit counts UTF-8 bytes plus one per
+  // argument; accepted requests must also fit kiln's 1 MiB encoded frame.
   repeated string argv = 2;
+  // Bytes for the command's standard input; empty means /dev/null.
   bytes stdin = 3;
+  // Queue-inclusive budget. Zero means the daemon's default; values above
+  // its maximum are refused. Cleanup and finalization may finish later.
   uint32 timeout_ms = 4;
 }
 
-message ExecResponse { Execution execution = 1; }
-message GetExecutionRequest { string id = 1; }
-message GetExecutionResponse { Execution execution = 1; }
+message ExecResponse {
+  Execution execution = 1;
+}
+
+message GetExecutionRequest {
+  // `ex-` followed by exactly 16 lowercase hexadecimal digits.
+  string id = 1;
+}
+
+message GetExecutionResponse {
+  Execution execution = 1;
+}
 
 enum ExecutionState {
   EXECUTION_STATE_UNSPECIFIED = 0;
   EXECUTION_STATE_RUNNING = 1;
+  // The command finished; exit_code is set.
   EXECUTION_STATE_EXITED = 2;
+  // The timeout passed and the command was killed.
   EXECUTION_STATE_TIMED_OUT = 3;
+  // Stopped by caller disconnect, DeleteSandbox, or daemon shutdown; see
+  // failure_reason. A completed command outcome wins over a late disconnect.
   EXECUTION_STATE_CANCELED = 4;
+  // The backend couldn't run it; see failure_reason.
   EXECUTION_STATE_FAILED = 5;
+  // The daemon stopped while it ran and found it unfinished on restart.
   EXECUTION_STATE_INTERRUPTED = 6;
 }
 
+// How execution cleanup was established. No stronger attestation is claimed.
+enum CleanupEvidence {
+  // Historical rows and executions whose cleanup could not be established.
+  CLEANUP_EVIDENCE_UNKNOWN = 0;
+  CLEANUP_EVIDENCE_NO_CHILD_STARTED = 1;
+  // The trusted runtime inside the sandbox drained the command's processes.
+  CLEANUP_EVIDENCE_RUNTIME_DRAINED = 2;
+  // The whole sandbox stopped, so no process of this command can remain.
+  CLEANUP_EVIDENCE_SANDBOX_STOPPED = 3;
+}
+
+// Captured output, cut at the daemon's per-stream limit.
 message Output {
+  // The first bytes of the stream, up to the limit.
   bytes data = 1;
+  // Bytes observed by the daemon. This is the exact total only when
+  // total_bytes_known is true; otherwise it is a lower bound.
   uint64 total_bytes = 2;
+  // True when the retention limit discarded bytes the daemon observed.
+  // An unobserved tail is reported separately by total_bytes_known=false.
   bool truncated = 3;
+  // True only when capture reached clean EOF, proving total_bytes exact.
+  // False for historical rows and forced/error capture settlement.
   bool total_bytes_known = 4;
 }
 
 message Execution {
+  // `ex-` followed by exactly 16 lowercase hexadecimal digits.
   string id = 1;
+  // `sb-` followed by exactly 16 lowercase hexadecimal digits.
   string sandbox_id = 2;
   repeated string argv = 3;
   ExecutionState state = 4;
+  // Set when state is EXITED: the command's exit code, or 128 + the signal
+  // number if a signal killed it.
   optional int32 exit_code = 5;
   string failure_reason = 6;
   int64 started_at_unix_ms = 7;
+  // Zero while running.
   int64 finished_at_unix_ms = 8;
   uint32 timeout_ms = 9;
   uint64 stdin_bytes = 10;
@@ -187,6 +535,22 @@ message Execution {
   Output stderr = 12;
   CommandStatus command_status = 13;
   RuntimeDiagnostic runtime_error = 14;
+  // Absent when unknown, including every historical row. False means this sandbox
+  // cannot take another call, even when this RPC succeeded.
+  optional bool sandbox_reusable = 15;
+  CleanupEvidence cleanup_evidence = 16;
+  // Fields 17-19 are reserved for exec cwd and env.
+  // Why a CANCELED execution was canceled; unspecified otherwise and on history.
+  CancelReason cancel_reason = 20;
+}
+
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  CANCEL_REASON_CLIENT_DISCONNECTED = 1;
+  CANCEL_REASON_SANDBOX_DELETED = 2;
+  CANCEL_REASON_DAEMON_SHUTDOWN = 3;
+  // The sandbox's max_lifetime passed while the execution ran.
+  CANCEL_REASON_SANDBOX_EXPIRED_LIFETIME = 4;
 }
 
 message CommandStatus {
