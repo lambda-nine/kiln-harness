@@ -43,9 +43,11 @@ it is not a hostile multi-tenant boundary.
   create rejection definite, never widen what the harness does. Advertised
   expiry limits that leave an empty range, or a default outside it, are
   refused before create. An execution that reports its sandbox not reusable
-  ends the session even though the RPC succeeded: as an expiry when its
-  cancel reason proves one, and otherwise as an error, with no further
-  execution or model call. The CLI's only Health call before a session is
+  ends the session even though the RPC succeeded, and so does such a row
+  found by recovery after a lost response: as an expiry when its cancel
+  reason proves one, and otherwise as an error, with no further execution
+  or model call. A typed lost, quarantined, failed or not-ready refusal
+  ends it the same way. The CLI's only Health call before a session is
   the engine's, bounded by the session deadline and cancellation; the one
   after it is bounded by the lifecycle window and only warns. Feature
   names are the only daemon-supplied strings `session_opened` records, and
@@ -220,8 +222,9 @@ it is not a hostile multi-tenant boundary.
   liveness signal from a trusted host process, not a credential: anyone who
   can reach the kilnd socket as the owner can renew or delete the sandbox
   anyway. The renew schedule is session-wide, measured from the last
-  activity kilnd saw, so short execution-free turns cannot add up to the
-  idle timeout unrenewed. A daemon that predates discovery lists no features, gets no
+  activity the harness can prove kilnd saw (a returned or recovered
+  execution, not a failed RPC), so short execution-free turns and refused
+  Execs cannot add up to the idle timeout unrenewed. A daemon that predates discovery lists no features, gets no
   expiry, and still leaks the sandbox of a crashed harness until an
   operator deletes it.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted

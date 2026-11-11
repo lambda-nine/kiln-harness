@@ -9,7 +9,7 @@ use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::api::{
     ApiError, CancelReason, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi,
-    SandboxExec,
+    SandboxExec, UnusableReason,
 };
 use crate::audit::{ContentSummary, OutputEvidence};
 use crate::journal::SessionLimits;
@@ -196,6 +196,21 @@ pub struct RecoveredExecutionEvidence {
     pub execution_ids: Vec<String>,
     pub stdout: OutputEvidence,
     pub stderr: OutputEvidence,
+    /// `Some(false)` when any recovered row left the sandbox unusable;
+    /// otherwise what the rows said, or `None` from an older daemon.
+    pub sandbox_reusable: Option<bool>,
+    /// The cancel reason of the first recovered row that left the sandbox
+    /// unusable.
+    pub cancel_reason: Option<CancelReason>,
+}
+
+impl RecoveredExecutionEvidence {
+    /// How the session must end when a recovered row left the sandbox
+    /// unusable, exactly as for a directly returned one.
+    #[must_use]
+    pub fn stop(&self) -> Option<ToolStop> {
+        (self.sandbox_reusable == Some(false)).then(|| unusable_stop(self.cancel_reason))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,9 +277,15 @@ impl ToolRun {
         self
     }
 
+    /// Attach evidence recovered after a lost response. A recovered row that
+    /// left the sandbox unusable stops the session like a returned one; an
+    /// interruption already recorded keeps its own stop.
     pub fn attach_recovered(&mut self, recovered: RecoveredExecutionEvidence) {
         if recovered.execution_ids.is_empty() {
             return;
+        }
+        if self.stop.is_none() {
+            self.stop = recovered.stop();
         }
         self.execution_ids = recovered.execution_ids;
         self.stdout = recovered.stdout;
@@ -346,7 +367,20 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         known: &BTreeSet<String>,
         deadline: Instant,
     ) -> RecoveredExecutionEvidence {
-        recover_execution_evidence(self.api, &self.sandbox_id, known, deadline).await
+        let recovered =
+            recover_execution_evidence(self.api, &self.sandbox_id, known, deadline).await;
+        // A recovered row is an execution kilnd admitted, so it is activity;
+        // and one that left the sandbox unusable refuses any later Exec.
+        if !recovered.execution_ids.is_empty() {
+            self.record_activity();
+        }
+        if let Some(stop) = recovered.stop() {
+            self.unusable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(stop);
+        }
+        recovered
     }
 
     pub async fn execute(
@@ -703,9 +737,6 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         let command_timeout = wall_timeout
             .saturating_sub(Duration::from_millis(250))
             .max(Duration::from_millis(1));
-        // An execution's start and finish are kilnd activity; record both
-        // ends, whatever the outcome, so the renew schedule never runs late.
-        self.record_activity();
         let result = timeout_at(
             rpc_deadline,
             self.api.exec(SandboxExec {
@@ -716,10 +747,15 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             }),
         )
         .await;
-        self.record_activity();
         let execution = result
             .map_err(|_| ToolError::Deadline)?
             .map_err(ToolError::Api)?;
+        // A returned execution proves kilnd published its finish, which is
+        // activity; while it ran, kilnd paused idle. A failed RPC proves
+        // nothing: an execution row found later by recovery is recorded
+        // then, and otherwise the last known activity stands, so the next
+        // provider call renews at once if a renew is overdue.
+        self.record_activity();
         if execution.sandbox_reusable == Some(false) {
             let mut unusable = self
                 .unusable
@@ -900,7 +936,9 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             execution_ids: Vec::new(),
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
-            stop: ExpiryReason::of(&error, typed_reasons).map(ToolStop::Expired),
+            stop: ExpiryReason::of(&error, typed_reasons)
+                .map(ToolStop::Expired)
+                .or_else(|| UnusableReason::of(&error, typed_reasons).map(|_| ToolStop::Unusable)),
         },
         ToolError::Manifest {
             message,
@@ -1002,11 +1040,21 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
             execution_ids: Vec::new(),
             stdout: empty_evidence(),
             stderr: empty_evidence(),
+            sandbox_reusable: None,
+            cancel_reason: None,
         };
         for execution in executions
             .into_iter()
             .filter(|execution| !known.contains(&execution.id))
         {
+            if recovered.sandbox_reusable != Some(false) {
+                if execution.sandbox_reusable == Some(false) {
+                    recovered.cancel_reason = execution.cancel_reason;
+                }
+                if execution.sandbox_reusable.is_some() {
+                    recovered.sandbox_reusable = execution.sandbox_reusable;
+                }
+            }
             recovered.execution_ids.push(execution.id);
             recovered.stdout = merge_evidence(recovered.stdout, evidence(&execution.stdout));
             recovered.stderr = merge_evidence(recovered.stderr, evidence(&execution.stderr));

@@ -34,6 +34,10 @@ struct Stub {
     /// Report every non-baseline Exec as canceled by a sandbox deletion that
     /// left the sandbox unusable.
     deleted_during_exec: bool,
+    /// Publish each non-baseline Exec's row, then lose its response.
+    lose_tool_response: bool,
+    /// Rows `GetSandbox` reports, newest first.
+    recent: Arc<std::sync::Mutex<Vec<pb::Execution>>>,
     health_calls: Arc<AtomicU32>,
     execs: Arc<AtomicU32>,
     deleted: Arc<AtomicU32>,
@@ -122,6 +126,15 @@ impl KilndService for Stub {
             execution.sandbox_reusable = Some(false);
             execution.cancel_reason = pb::CancelReason::SandboxDeleted as i32;
         }
+        self.recent
+            .lock()
+            .expect("recent")
+            .insert(0, execution.clone());
+        if self.lose_tool_response && !baseline {
+            return Err(Status::unavailable(
+                "response lost after terminal execution publication",
+            ));
+        }
         Ok(Response::new(pb::ExecResponse {
             execution: Some(execution),
         }))
@@ -157,7 +170,10 @@ impl KilndService for Stub {
         &self,
         _request: Request<pb::GetSandboxRequest>,
     ) -> Result<Response<pb::GetSandboxResponse>, Status> {
-        Ok(Response::new(pb::GetSandboxResponse::default()))
+        Ok(Response::new(pb::GetSandboxResponse {
+            sandbox: Some(sandbox(pb::SandboxState::Deleted)),
+            recent_executions: self.recent.lock().expect("recent").clone(),
+        }))
     }
 
     async fn get_execution(
@@ -249,6 +265,83 @@ async fn an_exec_that_left_the_sandbox_deleted_ends_the_session() {
             .any(|record| matches!(record.event, JournalEvent::ToolExecuted { ok: false, .. }))
     );
     assert!(deleted.load(Ordering::SeqCst) >= 1);
+    assert!(matches!(
+        harness.audit().records.last().map(|record| &record.event),
+        Some(AuditEvent::SessionFinished {
+            outcome,
+            sandbox_deleted: true,
+            ..
+        }) if outcome == "failed"
+    ));
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_recovered_execution_that_left_the_sandbox_deleted_ends_the_session() {
+    // R2-01: the Exec response is lost after kilnd published a terminal row
+    // that left the sandbox unusable; recovery finds that row.
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        current: true,
+        deleted_during_exec: true,
+        lose_tool_response: true,
+        ..Stub::default()
+    };
+    let execs = stub.execs.clone();
+    let shutdown = serve(stub, &socket);
+
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let provider = ScriptedProvider::new([
+        ModelResponse::tool_use([ToolCall::new(
+            "call-1",
+            "exec",
+            json!({"argv": ["/bin/true"]}),
+        )]),
+        ModelResponse::final_text("done after recovered deletion"),
+    ]);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        HarnessConfig::default(),
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the recovered row proves the sandbox gone");
+    assert!(
+        matches!(
+            error,
+            HarnessError::SandboxExpired {
+                reason: ExpiryReason::SandboxDeleted
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(execs.load(Ordering::SeqCst), 2);
+    let events = harness
+        .journal()
+        .records
+        .iter()
+        .map(|record| &record.event)
+        .collect::<Vec<_>>();
+    // The recovered tool result is journaled, and the model is not asked
+    // again.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        JournalEvent::ToolExecuted { execution_ids, ok: false, .. }
+            if execution_ids == &["ex-0000000000000002".to_string()]
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, JournalEvent::ModelRequested { .. }))
+            .count(),
+        1
+    );
     assert!(matches!(
         harness.audit().records.last().map(|record| &record.event),
         Some(AuditEvent::SessionFinished {

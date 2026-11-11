@@ -89,6 +89,12 @@ pub struct FakeState {
     /// reports a canceled execution that left the sandbox unusable, with
     /// this cause.
     pub unusable_exec: Option<(usize, Option<CancelReason>)>,
+    /// Every non-baseline Exec is refused with this error after
+    /// `tool_exec_delay`, before admission: no execution row is recorded.
+    pub tool_exec_error: Option<ApiError>,
+    /// The Nth Exec (from 1) records its execution row, then its response
+    /// is lost: the RPC fails `UNAVAILABLE`.
+    pub lose_exec_response: Option<usize>,
 }
 
 impl FakeApi {
@@ -106,6 +112,16 @@ impl FakeApi {
             state.limits = Some(kilnd_limits());
         }
         api
+    }
+
+    /// The scripted refusal of a non-baseline Exec and its delay, recording
+    /// the request but no execution row.
+    fn pre_admission_refusal(&self, request: &SandboxExec) -> Option<(ApiError, Duration)> {
+        let mut state = self.state();
+        let baseline = request.argv.first().map(String::as_str) == Some("/usr/bin/find");
+        let error = state.tool_exec_error.clone().filter(|_| !baseline)?;
+        state.execs.push(request.clone());
+        Some((error, state.tool_exec_delay))
     }
 
     /// Expire the sandbox now, as kilnd's sweeper would.
@@ -206,7 +222,13 @@ impl SandboxApi for FakeApi {
     }
 
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
-        let (execution, delay) = {
+        let refusal = self.pre_admission_refusal(&request);
+        if let Some((error, delay)) = refusal {
+            // Refused before admission: no execution row and no activity.
+            tokio::time::sleep(delay).await;
+            return Err(error);
+        }
+        let (execution, delay, lost) = {
             let mut state = self.state();
             if let Some(reason) = state.expired {
                 return Err(expired_error(reason));
@@ -281,27 +303,21 @@ impl SandboxApi for FakeApi {
                 sandbox_reusable: (!state.features.is_empty()).then_some(true),
                 cancel_reason: None,
             };
-            if let Some((number, cause)) = state.unusable_exec
-                && number == state.execs.len()
-            {
-                // The RPC succeeds, but the sandbox did not survive it.
-                execution.state = ExecutionState::Canceled;
-                execution.exit_code = None;
-                execution.failure_reason = "sandbox is gone".to_string();
-                execution.sandbox_reusable = Some(false);
-                execution.cancel_reason = cause;
-                state.expired = Some("sandbox_deleted");
-            }
+            leave_unusable_if_scripted(&mut state, &mut execution);
             state.executions.push(execution.clone());
             let delay = if argv.first().map(String::as_str) == Some("/usr/bin/find") {
                 state.baseline_exec_delay
             } else {
                 state.tool_exec_delay
             };
-            (execution, delay)
+            let lost = state.lose_exec_response == Some(state.execs.len());
+            (execution, delay, lost)
         };
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
+        }
+        if lost {
+            return Err(api_error(Code::Unavailable, "exec response lost"));
         }
         Ok(execution)
     }
@@ -402,6 +418,21 @@ impl SandboxApi for FakeApi {
                 Vec::new()
             },
         )
+    }
+}
+
+/// Apply `unusable_exec` to the execution just recorded.
+fn leave_unusable_if_scripted(state: &mut FakeState, execution: &mut Execution) {
+    if let Some((number, cause)) = state.unusable_exec
+        && number == state.execs.len()
+    {
+        // The RPC succeeds, but the sandbox did not survive it.
+        execution.state = ExecutionState::Canceled;
+        execution.exit_code = None;
+        execution.failure_reason = "sandbox is gone".to_string();
+        execution.sandbox_reusable = Some(false);
+        execution.cancel_reason = cause;
+        state.expired = Some("sandbox_deleted");
     }
 }
 

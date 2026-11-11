@@ -112,12 +112,24 @@ A successful Exec RPC does not mean the sandbox survived. kilnd says so in
 `cancel_reason`. After any execution the harness sends, a tool's, the
 baseline's, or a workspace manifest's, `sandbox_reusable == false` ends the
 session once that tool's result is journaled, and no further execution or
-model call happens. A cancel reason of `SANDBOX_DELETED` or
+model call happens. The same holds for a row recovered after a lost Exec
+response: recovery keeps each recovered row's `sandbox_reusable` and
+`cancel_reason`, and one that left the sandbox unusable stops the session
+exactly as a returned one would, during the baseline too. A cancel reason of `SANDBOX_DELETED` or
 `SANDBOX_EXPIRED_LIFETIME` ends it as `SandboxExpired` (`sandbox_deleted`
 or `expired_lifetime`); any other cause, or none, fails closed with an
 `Api` error, "execution left the sandbox unusable". Either way cleanup still
 deletes and verifies absence. An older daemon does not send the field, and
 then nothing changes.
+
+An Exec refused with `FAILED_PRECONDITION` and a typed `sandbox_failed`,
+`sandbox_lost`, `sandbox_quarantined` or `sandbox_not_ready` reason proves
+the same thing: this session's sandbox, which was ready, cannot take
+another call. The model-visible result is still the `kilnd_error` it was,
+journaled first; then the session ends with the same `Api` error. A renew
+refused with one of these reasons is terminal too, never retried. The
+expiry and deletion tokens still map to `SandboxExpired`, and without typed
+reasons nothing changes.
 
 ## Sandbox expiry and the renew heartbeat
 
@@ -158,9 +170,14 @@ while one runs, so tool calls need nothing more. A provider call has no
 execution and can take minutes, so `complete_with_heartbeat` runs it beside
 a `tokio::select!` loop that sends `RenewSandbox` at
 `interval = max(ceil(idle / 3), 1 s)`. The schedule is session-wide, not per
-call: the tool session records the last activity kilnd saw (the sandbox
-becoming ready, the start and the finish of every Exec the harness sends,
-and every successful renew), and a renew is due one interval after it. So
+call: the tool session records the last activity it can prove kilnd saw
+(the sandbox becoming ready, an Exec that returned an execution, which
+proves kilnd published its finish, an execution row found by recovery after
+a lost response, and every successful renew), and a renew is due one
+interval after it. A failed Exec RPC with no recovered row proves nothing
+and leaves the time unchanged, so the next provider call renews at once if
+a renew is overdue; while an admitted execution runs, kilnd pauses idle
+itself. So
 several short, execution-free turns cannot add up to the idle timeout.
 Before each provider call, an overdue renew runs first; the loop then
 waits for the next due time. Each renew RPC is bounded by the next tick and

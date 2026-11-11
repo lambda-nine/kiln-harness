@@ -113,9 +113,9 @@ its cleanup window is refused before create, since the sandbox would expire
 mid-session. Executions count as activity on kilnd's side, so tool calls
 need nothing more. A model call can take minutes with no execution, so
 while one runs the harness renews the sandbox a third of the idle timeout
-(at least a second) after the last activity kilnd saw, on one schedule for
-the whole session, so several short model calls cannot add up to the idle
-timeout either. A renew refused because the sandbox
+(at least a second) after the last activity it can prove kilnd saw, on
+one schedule for the whole session, so several short model calls cannot
+add up to the idle timeout either. A renew refused because the sandbox
 expired or was deleted, or enough failed renews in a row that it has
 probably expired, ends the session with `SandboxExpired`; cleanup still
 deletes and verifies absence. Heartbeats write no audit or journal records;

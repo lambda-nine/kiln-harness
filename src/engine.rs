@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{
     ApiError, ApiLimits, Capabilities, ExpiryPolicy, ExpiryReason, Feature, SandboxApi,
-    SandboxRequest,
+    SandboxRequest, UnusableReason, backend_unsupported_feature,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
@@ -525,16 +525,18 @@ where
                 }
                 Some(Err(error)) => {
                     let (mut execution_ids, _, _) = error.execution_evidence();
+                    let mut recovered_stop = None;
                     if execution_ids.is_empty() {
                         let recovery_deadline = recovery_deadline(self.config.lifecycle_timeout);
-                        execution_ids = recover_execution_evidence(
+                        let recovered = recover_execution_evidence(
                             &self.api,
                             &sandbox_id,
                             &BTreeSet::new(),
                             recovery_deadline,
                         )
-                        .await
-                        .execution_ids;
+                        .await;
+                        recovered_stop = recovered.stop();
+                        execution_ids = recovered.execution_ids;
                     }
                     self.audit.append(
                         &session_id,
@@ -545,10 +547,24 @@ where
                             file_count: 0,
                         },
                     )?;
+                    // A recovered baseline row that left the sandbox unusable
+                    // ends the session as a returned one would.
+                    match recovered_stop {
+                        Some(ToolStop::Expired(reason)) => {
+                            return Err(HarnessError::SandboxExpired { reason });
+                        }
+                        Some(ToolStop::Unusable) => {
+                            return Err(HarnessError::Api(unusable_sandbox()));
+                        }
+                        Some(ToolStop::Deadline | ToolStop::Canceled) | None => {}
+                    }
                     match &error {
                         ToolError::Api(api_error) => {
                             if let Some(reason) = ExpiryReason::of(api_error, typed_reasons) {
                                 return Err(HarnessError::SandboxExpired { reason });
+                            }
+                            if UnusableReason::of(api_error, typed_reasons).is_some() {
+                                return Err(HarnessError::Api(unusable_sandbox()));
                             }
                         }
                         ToolError::Unusable {
@@ -1090,6 +1106,10 @@ fn classify_renewal(
         Ok(Err(error)) => {
             if let Some(reason) = ExpiryReason::of(&error, typed_reasons) {
                 Renewal::Expired(reason)
+            } else if UnusableReason::of(&error, typed_reasons).is_some() {
+                // Lost, quarantined, failed or no longer ready: terminal,
+                // never retried.
+                Renewal::Fatal(error)
             } else if matches!(
                 error.code,
                 // Unknown is also how local transport failures arrive, and
@@ -1112,8 +1132,9 @@ fn classify_renewal(
 /// renewing the sandbox beside it when the daemon supports expiry: a long
 /// model turn runs no execution, so nothing else tells kilnd the session is
 /// alive. The schedule is session-wide: a renew is due one interval after
-/// the last activity kilnd saw (ready, an execution's start or finish, or a
-/// renew), however many provider calls that spans. An overdue renew runs
+/// the last activity the harness can prove kilnd saw (ready, a returned or
+/// recovered execution, or a renew), however many provider calls that
+/// spans. An overdue renew runs
 /// before the call starts. The renew RPC runs next to the provider future,
 /// not in a spawned task, so dropping this future stops both before the
 /// engine moves on.
@@ -1575,11 +1596,7 @@ fn unambiguous_create_error(error: &ApiError, typed_reasons: bool) -> bool {
             | tonic::Code::FailedPrecondition
             | tonic::Code::PermissionDenied
             | tonic::Code::Unauthenticated
-    ) || (error.code == tonic::Code::Unimplemented
-        && error
-            .typed_reason(typed_reasons)
-            .and_then(|reason| reason.strip_prefix("backend_unsupported:"))
-            .is_some_and(|feature| !feature.is_empty()))
+    ) || backend_unsupported_feature(error, typed_reasons).is_some()
 }
 
 async fn cleanup_sandbox<A: SandboxApi>(

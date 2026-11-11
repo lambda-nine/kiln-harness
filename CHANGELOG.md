@@ -6,6 +6,17 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Second review round for kilnd API milestone 1. Evidence recovered after
+  a lost Exec response keeps each row's `sandbox_reusable` and
+  `cancel_reason`, and a recovered row that left the sandbox unusable ends
+  the session as a returned one does, during the baseline too. A typed
+  `sandbox_failed`, `sandbox_lost`, `sandbox_quarantined` or
+  `sandbox_not_ready` refusal of an Exec ends the session after its
+  `kilnd_error` result is journaled, and of a renew is terminal. The renew
+  schedule counts only activity the harness can prove: a returned or
+  recovered execution, not a failed Exec RPC. A `backend_unsupported:`
+  reason must name a feature of `[a-z0-9_]` to make a create rejection
+  definite.
 - First review round for kilnd API milestone 1. An execution whose RPC
   succeeded but whose `sandbox_reusable` is false ends the session after its
   tool result is journaled: as `SandboxExpired` when its `cancel_reason` is

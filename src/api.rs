@@ -355,6 +355,64 @@ impl ExpiryReason {
     }
 }
 
+/// Why a refusal proves the sandbox is not ready and will not become ready
+/// for this session, though it was not expired or deleted: kilnd's typed
+/// "is X, not ready" refusals. The session's sandbox was ready when it was
+/// created, so even `sandbox_not_ready` cannot be waited out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnusableReason {
+    NotReady,
+    Failed,
+    Lost,
+    Quarantined,
+}
+
+impl UnusableReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotReady => "sandbox_not_ready",
+            Self::Failed => "sandbox_failed",
+            Self::Lost => "sandbox_lost",
+            Self::Quarantined => "sandbox_quarantined",
+        }
+    }
+
+    /// `FAILED_PRECONDITION` with one of those tokens, read only when the
+    /// daemon lists typed reasons.
+    #[must_use]
+    pub fn of(error: &ApiError, typed_reasons: bool) -> Option<Self> {
+        if error.code != tonic::Code::FailedPrecondition {
+            return None;
+        }
+        match error.typed_reason(typed_reasons)? {
+            "sandbox_not_ready" => Some(Self::NotReady),
+            "sandbox_failed" => Some(Self::Failed),
+            "sandbox_lost" => Some(Self::Lost),
+            "sandbox_quarantined" => Some(Self::Quarantined),
+            _ => None,
+        }
+    }
+}
+
+/// The feature a typed `backend_unsupported:<feature>` reason names, when
+/// it names one: `[a-z0-9_]+`, as `Feature` suffixes are spelled.
+#[must_use]
+pub fn backend_unsupported_feature(error: &ApiError, typed_reasons: bool) -> Option<&str> {
+    if error.code != tonic::Code::Unimplemented {
+        return None;
+    }
+    error
+        .typed_reason(typed_reasons)?
+        .strip_prefix("backend_unsupported:")
+        .filter(|feature| {
+            !feature.is_empty()
+                && feature
+                    .bytes()
+                    .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+        })
+}
+
 impl std::fmt::Display for ExpiryReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
@@ -735,6 +793,53 @@ mod status_contract_test {
         assert_eq!(ExpiryReason::of(&error, true), None);
         let error = ApiError::from(with_reason(Code::FailedPrecondition, "sandbox_lost"));
         assert_eq!(ExpiryReason::of(&error, true), None);
+    }
+
+    #[test]
+    fn non_ready_reasons_are_unusable_only_as_typed_failed_preconditions() {
+        use super::UnusableReason;
+        for (token, reason) in [
+            ("sandbox_not_ready", UnusableReason::NotReady),
+            ("sandbox_failed", UnusableReason::Failed),
+            ("sandbox_lost", UnusableReason::Lost),
+            ("sandbox_quarantined", UnusableReason::Quarantined),
+        ] {
+            let error = ApiError::from(with_reason(Code::FailedPrecondition, token));
+            assert_eq!(UnusableReason::of(&error, true), Some(reason));
+            assert_eq!(reason.as_str(), token);
+            assert_eq!(UnusableReason::of(&error, false), None);
+            assert_eq!(ExpiryReason::of(&error, true), None);
+            let error = ApiError::from(with_reason(Code::Unavailable, token));
+            assert_eq!(UnusableReason::of(&error, true), None);
+        }
+        let error = ApiError::from(with_reason(Code::FailedPrecondition, "expired_idle"));
+        assert_eq!(UnusableReason::of(&error, true), None);
+    }
+
+    #[test]
+    fn backend_unsupported_must_name_a_feature() {
+        use super::backend_unsupported_feature;
+        let named = ApiError::from(with_reason(
+            Code::Unimplemented,
+            "backend_unsupported:exec_env",
+        ));
+        assert_eq!(backend_unsupported_feature(&named, true), Some("exec_env"));
+        assert_eq!(backend_unsupported_feature(&named, false), None);
+        for bad in [
+            "backend_unsupported:",
+            "backend_unsupported::",
+            "backend_unsupported:exec:env",
+            "backend_unsupported",
+            "sandbox_unsupported:exec_env",
+        ] {
+            let error = ApiError::from(with_reason(Code::Unimplemented, bad));
+            assert_eq!(backend_unsupported_feature(&error, true), None, "{bad}");
+        }
+        let wrong_code = ApiError::from(with_reason(
+            Code::FailedPrecondition,
+            "backend_unsupported:exec_env",
+        ));
+        assert_eq!(backend_unsupported_feature(&wrong_code, true), None);
     }
 
     #[test]

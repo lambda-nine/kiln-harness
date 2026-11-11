@@ -998,3 +998,224 @@ async fn a_multi_execution_tool_stops_at_the_first_unusable_result() {
     );
     assert_eq!(api.state().execs.len(), 2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_exec_rpc_is_not_activity() {
+    // R2-02: the tool Exec is refused before admission after 8 s of a 10 s
+    // idle window. No activity happened, so the next model call must renew
+    // at once instead of trusting an invented finish at 8 s.
+    let api = FakeApi::with_expiry();
+    api.state().tool_exec_error = Some(api_error(
+        Code::Unavailable,
+        "request rejected before execution admission",
+    ));
+    api.state().tool_exec_delay = Duration::from_secs(8);
+    let watcher = api.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if watcher.state().renews == 0 {
+            watcher.expire("expired_idle");
+        }
+    });
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut config = long_config(10);
+    config.tool_limits.timeout = Duration::from_secs(9);
+    let slow_second = SlowAfterFirst {
+        inner: provider,
+        delay: Duration::from_millis(2_500),
+    };
+    let mut harness = session(&api, slow_second, config);
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert!(outcome.renews >= 1, "renews {}", outcome.renews);
+    assert_eq!(api.state().expired, None);
+}
+
+/// Answers the first request at once and later ones after `delay`.
+struct SlowAfterFirst {
+    inner: Script,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Provider for SlowAfterFirst {
+    fn info(&self) -> ProviderInfo {
+        self.inner.info()
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        if self.inner.calls > 0 {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.complete(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_typed_non_ready_exec_refusal_ends_the_session() {
+    // R2-03: lost, quarantined, failed or not ready: the sandbox cannot run
+    // another call in this session.
+    for token in [
+        "sandbox_lost",
+        "sandbox_quarantined",
+        "sandbox_failed",
+        "sandbox_not_ready",
+    ] {
+        let api = FakeApi::with_expiry();
+        api.state().tool_exec_error = Some(api_error_with_reason(
+            Code::FailedPrecondition,
+            token,
+            &format!("{token}: sandbox sb-0000000000000001 is not ready"),
+        ));
+        let provider = Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        );
+        let mut harness = session(&api, provider, short_lifecycle_config());
+        let error = run(&mut harness).await.expect_err("sandbox unusable");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message == "execution left the sandbox unusable"),
+            "{token}: {error}"
+        );
+        assert_eq!(harness.provider().calls, 1, "{token}");
+        // The model-visible result is the same kilnd_error, journaled first.
+        let result = journal_events(&harness)
+            .into_iter()
+            .find_map(|event| match event {
+                JournalEvent::ToolExecuted { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("tool_executed");
+        assert_eq!(result["error"], "kilnd_error", "{token}");
+        assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+    }
+
+    // Without typed reasons the refusal stays an ordinary tool error.
+    let api = FakeApi::with_expiry();
+    api.state().features = BTreeSet::from([Feature::SandboxExpiry]);
+    api.state().tool_exec_error = Some(api_error_with_reason(
+        Code::FailedPrecondition,
+        "sandbox_lost",
+        "sandbox_lost: sandbox is lost, not ready",
+    ));
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    run(&mut harness)
+        .await
+        .expect("the loop continues as before");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_typed_non_ready_renew_refusal_is_terminal() {
+    for token in [
+        "sandbox_lost",
+        "sandbox_quarantined",
+        "sandbox_failed",
+        "sandbox_not_ready",
+    ] {
+        let api = FakeApi::with_expiry();
+        api.state().renew_script = VecDeque::from([
+            RenewScript::Fail(api_error_with_reason(
+                Code::FailedPrecondition,
+                token,
+                &format!("{token}: sandbox is not ready"),
+            )),
+            RenewScript::Ok,
+        ]);
+        let mut harness = session(
+            &api,
+            Script::final_after(Duration::from_secs(600)),
+            long_config(30),
+        );
+        let error = run(&mut harness).await.expect_err("terminal");
+        assert!(
+            matches!(&error, HarnessError::Api(error) if error.reason.as_deref() == Some(token)),
+            "{token}: {error}"
+        );
+        assert_eq!(api.state().renews, 1, "{token}: not retried");
+    }
+}
+
+#[tokio::test]
+async fn a_recovered_row_that_left_the_sandbox_unusable_ends_the_session() {
+    use kiln_harness::api::CancelReason;
+    // R2-01 through the fake: the tool's row is published, then its
+    // response is lost, and recovery finds it.
+    for (cause, expected) in [
+        (
+            Some(CancelReason::SandboxDeleted),
+            Some(ExpiryReason::SandboxDeleted),
+        ),
+        (
+            Some(CancelReason::SandboxExpiredLifetime),
+            Some(ExpiryReason::ExpiredLifetime),
+        ),
+        (Some(CancelReason::DaemonShutdown), None),
+        (None, None),
+    ] {
+        let api = FakeApi::with_expiry();
+        api.state().unusable_exec = Some((2, cause));
+        api.state().lose_exec_response = Some(2);
+        let provider = Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        );
+        let mut harness = session(&api, provider, short_lifecycle_config());
+        let error = run(&mut harness).await.expect_err("sandbox gone");
+        match expected {
+            Some(reason) => assert_eq!(expired(&error), Some(reason), "{cause:?}: {error}"),
+            None => assert!(
+                matches!(&error, HarnessError::Api(error)
+                    if error.message == "execution left the sandbox unusable"),
+                "{cause:?}: {error}"
+            ),
+        }
+        assert_eq!(harness.provider().calls, 1, "{cause:?}");
+        assert!(journal_events(&harness).iter().any(|event| matches!(
+            event,
+            JournalEvent::ToolExecuted { execution_ids, .. } if !execution_ids.is_empty()
+        )));
+        assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+    }
+
+    // During the baseline.
+    let api = FakeApi::with_expiry();
+    api.state().unusable_exec = Some((1, Some(CancelReason::SandboxExpiredLifetime)));
+    api.state().lose_exec_response = Some(1);
+    let mut harness = session(
+        &api,
+        Script::final_after(Duration::ZERO),
+        short_lifecycle_config(),
+    );
+    let error = run(&mut harness).await.expect_err("sandbox gone");
+    assert_eq!(
+        expired(&error),
+        Some(ExpiryReason::ExpiredLifetime),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 0);
+
+    // A lost response whose recovered row says nothing, as from an older
+    // daemon, keeps the old behavior: the loop continues.
+    let api = FakeApi::default();
+    api.state().lose_exec_response = Some(2);
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let outcome = run(&mut harness)
+        .await
+        .expect("the loop continues as before");
+    assert_eq!(outcome.steps, 2);
+}
