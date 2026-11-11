@@ -594,7 +594,11 @@ async fn backend_unsupported_is_a_definite_create_rejection_only_with_typed_reas
 
     // UNIMPLEMENTED without a reason stays ambiguous, and so does another
     // reason.
-    for reason in [None, Some("sandbox_unsupported:exec_env")] {
+    for reason in [
+        None,
+        Some("sandbox_unsupported:exec_env"),
+        Some("backend_unsupported:"),
+    ] {
         let api = FakeApi::with_expiry();
         let mut error = api_error(Code::Unimplemented, "unknown method");
         error.reason = reason.map(str::to_string);
@@ -609,7 +613,9 @@ async fn backend_unsupported_is_a_definite_create_rejection_only_with_typed_reas
 }
 
 #[test]
-fn sandbox_ready_expiry_comes_in_positive_pairs() {
+fn sandbox_ready_expiry_is_a_bounded_pair() {
+    // The recorded session timeout is 30 s.
+    let ceiling = 6 * 3_600_000 + 60_000 + 600_000;
     let temp = common::private_tempdir().expect("tempdir");
     for (lifetime, idle, valid) in [
         (None, None, true),
@@ -618,6 +624,15 @@ fn sandbox_ready_expiry_comes_in_positive_pairs() {
         (None, Some(120_000), false),
         (Some(0), Some(120_000), false),
         (Some(100_000), Some(0), false),
+        // F-06: an expiry the engine could never have sent for the session.
+        (Some(1), Some(1), false),
+        (Some(30_000), Some(120_000), false),
+        (Some(30_001), Some(10_000), true),
+        (Some(100_000), Some(9_999), false),
+        (Some(100_000), Some(3_600_000), true),
+        (Some(100_000), Some(3_600_001), false),
+        (Some(ceiling), Some(120_000), true),
+        (Some(ceiling + 1), Some(120_000), false),
     ] {
         let path = temp.path().join(format!("{lifetime:?}-{idle:?}.jsonl"));
         let lines = common::chained_lines(
@@ -728,4 +743,258 @@ async fn cancellation_during_a_renewed_model_call_stops_both_and_cleans_up() {
     // Renews at 10 s (answered) and 20 s (stalled, then dropped).
     assert_eq!(api.state().renews, 2);
     assert_eq!(finished(&harness), ("canceled".to_string(), true, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn short_turns_share_one_renew_schedule() {
+    // F-01: four 3 s turns with no execution at a 10 s idle timeout. Each
+    // is shorter than the 3.334 s interval, but together they cross the
+    // idle window, so renews must carry across turns.
+    let api = FakeApi::with_expiry();
+    let watcher = api.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if watcher.state().renews == 0 {
+            watcher.expire("expired_idle");
+        }
+    });
+    let unknown = |id: &str| ModelResponse::tool_use([ToolCall::new(id, "not_a_tool", json!({}))]);
+    let provider = Script::new(
+        Duration::from_secs(3),
+        [
+            unknown("u1"),
+            unknown("u2"),
+            unknown("u3"),
+            exec_call(),
+            ModelResponse::final_text("done"),
+        ],
+    );
+    let mut harness = session(&api, provider, long_config(10));
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert!(outcome.renews >= 3, "renews {}", outcome.renews);
+    assert_eq!(api.state().expired, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn executions_between_short_turns_need_no_renew() {
+    let api = FakeApi::with_expiry();
+    let provider = Script::new(
+        Duration::from_secs(3),
+        [
+            exec_call(),
+            exec_call(),
+            exec_call(),
+            exec_call(),
+            ModelResponse::final_text("done"),
+        ],
+    );
+    let mut harness = session(&api, provider, long_config(10));
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert_eq!(outcome.renews, 0);
+    assert_eq!(api.state().renews, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_renew_due_at_a_turn_boundary_is_not_skipped() {
+    // Idle 30 s renews every 10 s. Each call ends exactly when a renew falls
+    // due, so the renew runs at the start of the next call instead.
+    let api = FakeApi::with_expiry();
+    let unknown = |id: &str| ModelResponse::tool_use([ToolCall::new(id, "not_a_tool", json!({}))]);
+    let provider = Script::new(
+        Duration::from_secs(10),
+        [
+            unknown("u1"),
+            unknown("u2"),
+            ModelResponse::final_text("done"),
+        ],
+    );
+    let mut harness = session(&api, provider, long_config(30));
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert_eq!(outcome.renews, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn renew_admission_refusals_are_transient() {
+    // F-03: one RESOURCE_EXHAUSTED, then a healthy renew.
+    let api = FakeApi::with_expiry();
+    api.state().renew_script = VecDeque::from([
+        RenewScript::Fail(api_error(Code::ResourceExhausted, "RPC admission full")),
+        RenewScript::Ok,
+    ]);
+    let mut harness = session(
+        &api,
+        Script::final_after(Duration::from_secs(25)),
+        long_config(30),
+    );
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert_eq!(api.state().renews, 2);
+    assert_eq!(outcome.renews, 1);
+
+    // Repeated refusals still exhaust the budget.
+    let api = FakeApi::with_expiry();
+    api.state().renew_script = VecDeque::from([
+        RenewScript::Fail(api_error(Code::ResourceExhausted, "RPC admission full")),
+        RenewScript::Fail(api_error(Code::ResourceExhausted, "RPC admission full")),
+    ]);
+    let mut harness = session(
+        &api,
+        Script::final_after(Duration::from_secs(600)),
+        long_config(30),
+    );
+    let error = run(&mut harness).await.expect_err("renew failed");
+    assert_eq!(expired(&error), Some(ExpiryReason::RenewFailed), "{error}");
+}
+
+#[tokio::test]
+async fn inconsistent_advertised_limits_are_refused_before_create() {
+    // F-05: an empty range, and defaults outside the range.
+    for limits in [
+        ApiLimits {
+            min_sandbox_idle_ms: 20_000,
+            max_sandbox_idle_ms: 10_000,
+            ..kilnd_limits()
+        },
+        ApiLimits {
+            min_sandbox_lifetime_ms: 200_000,
+            max_sandbox_lifetime_ms: 100_000,
+            ..kilnd_limits()
+        },
+        ApiLimits {
+            default_sandbox_idle_ms: 5_000,
+            ..kilnd_limits()
+        },
+        ApiLimits {
+            default_sandbox_lifetime_ms: 8 * 86_400_000,
+            ..kilnd_limits()
+        },
+    ] {
+        let api = FakeApi::with_expiry();
+        api.state().limits = Some(limits);
+        let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+        let error = run(&mut harness).await.expect_err("refused");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message == "kilnd advertised inconsistent expiry limits"),
+            "{limits:?}: {error}"
+        );
+        assert!(api.state().creates.is_empty());
+        assert!(harness.audit().records.is_empty());
+    }
+    // A default inside the range is fine.
+    let api = FakeApi::with_expiry();
+    api.state().limits = Some(ApiLimits {
+        default_sandbox_idle_ms: 60_000,
+        default_sandbox_lifetime_ms: 3_600_000,
+        ..kilnd_limits()
+    });
+    let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+    run(&mut harness).await.expect("demo completes");
+}
+
+#[tokio::test]
+async fn limits_that_leave_no_recordable_policy_are_refused() {
+    // Coherent limits whose clamp would land outside what the journal
+    // grammar accepts: an idle cap under kilnd's 10 s floor.
+    let api = FakeApi::with_expiry();
+    api.state().limits = Some(ApiLimits {
+        min_sandbox_idle_ms: 0,
+        max_sandbox_idle_ms: 5_000,
+        ..kilnd_limits()
+    });
+    let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+    let error = run(&mut harness).await.expect_err("refused");
+    assert!(
+        matches!(&error, HarnessError::Api(error) if error.code == Code::FailedPrecondition),
+        "{error}"
+    );
+    assert!(api.state().creates.is_empty());
+}
+
+#[tokio::test]
+async fn a_baseline_that_left_the_sandbox_unusable_ends_the_session() {
+    use kiln_harness::api::CancelReason;
+    // F-02 during baseline capture: a proven lifetime expiry.
+    let api = FakeApi::with_expiry();
+    api.state().unusable_exec = Some((1, Some(CancelReason::SandboxExpiredLifetime)));
+    let mut harness = session(
+        &api,
+        Script::final_after(Duration::ZERO),
+        short_lifecycle_config(),
+    );
+    let error = run(&mut harness).await.expect_err("sandbox gone");
+    assert_eq!(
+        expired(&error),
+        Some(ExpiryReason::ExpiredLifetime),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 0);
+    assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+
+    // With no stated cause it fails closed as an API error.
+    let api = FakeApi::with_expiry();
+    api.state().unusable_exec = Some((1, None));
+    let mut harness = session(
+        &api,
+        Script::final_after(Duration::ZERO),
+        short_lifecycle_config(),
+    );
+    let error = run(&mut harness).await.expect_err("sandbox unusable");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.message == "execution left the sandbox unusable"),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 0);
+}
+
+#[tokio::test]
+async fn a_tool_execution_with_an_unknown_unusable_cause_fails_closed() {
+    use kiln_harness::api::CancelReason;
+    for cause in [None, Some(CancelReason::DaemonShutdown)] {
+        let api = FakeApi::with_expiry();
+        // Exec 1 is the baseline; exec 2 is the tool's.
+        api.state().unusable_exec = Some((2, cause));
+        let provider = Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        );
+        let mut harness = session(&api, provider, short_lifecycle_config());
+        let error = run(&mut harness).await.expect_err("sandbox unusable");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.message == "execution left the sandbox unusable"),
+            "{cause:?}: {error}"
+        );
+        assert_eq!(harness.provider().calls, 1, "the model is not asked again");
+        // The tool result is journaled before the session ends.
+        assert!(
+            journal_events(&harness)
+                .iter()
+                .any(|event| matches!(event, JournalEvent::ToolExecuted { ok: false, .. }))
+        );
+        assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+    }
+}
+
+#[tokio::test]
+async fn a_multi_execution_tool_stops_at_the_first_unusable_result() {
+    use kiln_harness::api::CancelReason;
+    // read_file runs stat, then head. A non-reusable stat must not be
+    // followed by another execution.
+    let api = FakeApi::with_expiry();
+    api.state()
+        .files
+        .insert("/workspace/x".to_string(), b"data".to_vec());
+    api.state().unusable_exec = Some((2, Some(CancelReason::SandboxDeleted)));
+    let read = ModelResponse::tool_use([ToolCall::new("r1", "read_file", json!({"path": "x"}))]);
+    let provider = Script::new(Duration::ZERO, [read, ModelResponse::final_text("done")]);
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("sandbox deleted");
+    assert_eq!(
+        expired(&error),
+        Some(ExpiryReason::SandboxDeleted),
+        "{error}"
+    );
+    assert_eq!(api.state().execs.len(), 2);
 }

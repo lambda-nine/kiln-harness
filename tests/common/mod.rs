@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiln_harness::api::{
-    ApiError, ApiLimits, Capabilities, CapturedOutput, Execution, ExecutionState, ExpiryStatus,
-    Feature, Health, NodeReservations, Sandbox, SandboxApi, SandboxExec, SandboxRequest,
+    ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Execution, ExecutionState,
+    ExpiryStatus, Feature, Health, NodeReservations, Sandbox, SandboxApi, SandboxExec,
+    SandboxRequest,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
@@ -84,6 +85,10 @@ pub struct FakeState {
     /// Set once the sandbox expired: Exec and Renew refuse with this
     /// `kilnd-reason`, and the row has left the default listing.
     pub expired: Option<&'static str>,
+    /// The Nth Exec (from 1, the baseline included) succeeds as an RPC but
+    /// reports a canceled execution that left the sandbox unusable, with
+    /// this cause.
+    pub unusable_exec: Option<(usize, Option<CancelReason>)>,
 }
 
 impl FakeApi {
@@ -265,14 +270,28 @@ impl SandboxApi for FakeApi {
                 Some("/bin/big-output") => (0, vec![b'x'; 100 << 10], Vec::new()),
                 _ => (127, Vec::new(), b"unsupported fake command".to_vec()),
             };
-            let execution = Execution {
+            let mut execution = Execution {
                 id,
                 state: ExecutionState::Exited,
                 exit_code: Some(exit_code),
                 failure_reason: String::new(),
                 stdout: captured(stdout),
                 stderr: captured(stderr),
+                // An older daemon does not say; a current one does.
+                sandbox_reusable: (!state.features.is_empty()).then_some(true),
+                cancel_reason: None,
             };
+            if let Some((number, cause)) = state.unusable_exec
+                && number == state.execs.len()
+            {
+                // The RPC succeeds, but the sandbox did not survive it.
+                execution.state = ExecutionState::Canceled;
+                execution.exit_code = None;
+                execution.failure_reason = "sandbox is gone".to_string();
+                execution.sandbox_reusable = Some(false);
+                execution.cancel_reason = cause;
+                state.expired = Some("sandbox_deleted");
+            }
             state.executions.push(execution.clone());
             let delay = if argv.first().map(String::as_str) == Some("/usr/bin/find") {
                 state.baseline_exec_delay

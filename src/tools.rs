@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -7,7 +8,8 @@ use thiserror::Error;
 use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::api::{
-    ApiError, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi, SandboxExec,
+    ApiError, CancelReason, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi,
+    SandboxExec,
 };
 use crate::audit::{ContentSummary, OutputEvidence};
 use crate::journal::SessionLimits;
@@ -131,8 +133,25 @@ impl ToolRegistry {
             limits: &self.limits,
             baseline: BTreeSet::new(),
             typed_reasons,
+            // The sandbox has just become ready.
+            activity: Mutex::new(Instant::now()),
+            unusable: Mutex::new(None),
         };
-        let manifest = session.manifest(session_deadline).await?;
+        let manifest = session.manifest(session_deadline).await;
+        if let Some(stop) = session.unusable() {
+            let execution_ids = match &manifest {
+                Ok(manifest) => manifest.execution_ids.clone(),
+                Err(error) => error.execution_evidence().0,
+            };
+            return Err(ToolError::Unusable {
+                expiry: match stop {
+                    ToolStop::Expired(reason) => Some(reason),
+                    _ => None,
+                },
+                execution_ids,
+            });
+        }
+        let manifest = manifest?;
         let evidence = BaselineEvidence {
             execution_ids: manifest.execution_ids,
             file_count: manifest.files.len(),
@@ -154,6 +173,12 @@ pub struct ToolSession<'a, A: SandboxApi> {
     limits: &'a ToolLimits,
     baseline: BTreeSet<String>,
     typed_reasons: bool,
+    /// The last time kilnd saw activity on the sandbox: ready, or an
+    /// execution's start or finish, or a renew the engine records.
+    activity: Mutex<Instant>,
+    /// Set once an execution reported that the sandbox cannot take another
+    /// call, with kilnd's cancel reason if it gave one.
+    unusable: Mutex<Option<ToolStop>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,8 +204,12 @@ pub enum ToolStop {
     Canceled,
     /// kilnd refused the call because the sandbox expired or was deleted.
     /// The model-visible result is the same `kilnd_error` as before typed
-    /// reasons; the session then ends.
+    /// reasons; the session then ends. Also used when an execution left the
+    /// sandbox unusable because it was deleted or reached its lifetime.
     Expired(ExpiryReason),
+    /// An execution left the sandbox unusable for another or no stated
+    /// cause. The session ends without asking the model again.
+    Unusable,
 }
 
 impl ToolRun {
@@ -249,6 +278,12 @@ pub enum ToolError {
     Api(#[from] ApiError),
     #[error("session deadline expired")]
     Deadline,
+    #[error("execution left the sandbox unusable")]
+    Unusable {
+        /// The expiry kilnd's cancel reason proves, if any.
+        expiry: Option<ExpiryReason>,
+        execution_ids: Vec<String>,
+    },
     #[error("workspace manifest was invalid: {message}")]
     Manifest {
         message: String,
@@ -268,12 +303,44 @@ impl ToolError {
                 stderr,
                 ..
             } => (execution_ids.clone(), *stdout, *stderr),
+            Self::Unusable { execution_ids, .. } => (
+                execution_ids.clone(),
+                unknown_evidence(),
+                unknown_evidence(),
+            ),
             Self::Api(_) | Self::Deadline => (Vec::new(), unknown_evidence(), unknown_evidence()),
         }
     }
 }
 
 impl<A: SandboxApi> ToolSession<'_, A> {
+    /// When kilnd last saw activity on the sandbox, as far as this session
+    /// knows.
+    #[must_use]
+    pub fn last_activity(&self) -> Instant {
+        *self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record activity the engine caused, such as a successful renew.
+    pub fn record_activity(&self) {
+        let now = Instant::now();
+        let mut last = self
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *last = (*last).max(now);
+    }
+
+    fn unusable(&self) -> Option<ToolStop> {
+        *self
+            .unusable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub async fn recover_new_execution_evidence(
         &self,
         known: &BTreeSet<String>,
@@ -296,7 +363,13 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             "workspace_diff" => self.workspace_diff(arguments, session_deadline).await,
             _ => ToolRun::rejected("unknown_tool", "tool is not registered"),
         };
-        run.bounded(self.limits.max_result_bytes)
+        let mut run = run.bounded(self.limits.max_result_bytes);
+        // A successful RPC does not mean the sandbox survived. The result
+        // stays as it is, but the session cannot go on.
+        if let Some(stop) = self.unusable() {
+            run.stop = Some(stop);
+        }
+        run
     }
 
     async fn exec_tool(&self, arguments: Value, deadline: Instant) -> ToolRun {
@@ -608,6 +681,12 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         requested_timeout: Duration,
         deadline: Instant,
     ) -> Result<Execution, ToolError> {
+        if self.unusable().is_some() {
+            return Err(ToolError::Api(ApiError::new(
+                tonic::Code::FailedPrecondition,
+                "an earlier execution left the sandbox unusable",
+            )));
+        }
         let now = Instant::now();
         let remaining = deadline.saturating_duration_since(now);
         if remaining.is_zero() {
@@ -624,7 +703,10 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         let command_timeout = wall_timeout
             .saturating_sub(Duration::from_millis(250))
             .max(Duration::from_millis(1));
-        timeout_at(
+        // An execution's start and finish are kilnd activity; record both
+        // ends, whatever the outcome, so the renew schedule never runs late.
+        self.record_activity();
+        let result = timeout_at(
             rpc_deadline,
             self.api.exec(SandboxExec {
                 sandbox_id: self.sandbox_id.clone(),
@@ -633,9 +715,19 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 timeout: command_timeout,
             }),
         )
-        .await
-        .map_err(|_| ToolError::Deadline)?
-        .map_err(ToolError::Api)
+        .await;
+        self.record_activity();
+        let execution = result
+            .map_err(|_| ToolError::Deadline)?
+            .map_err(ToolError::Api)?;
+        if execution.sandbox_reusable == Some(false) {
+            let mut unusable = self
+                .unusable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unusable.get_or_insert(unusable_stop(execution.cancel_reason));
+        }
+        Ok(execution)
     }
 }
 
@@ -677,6 +769,18 @@ struct Manifest {
     execution_ids: Vec<String>,
     stdout: OutputEvidence,
     stderr: OutputEvidence,
+}
+
+/// How a session ends after an execution left the sandbox unusable: as an
+/// expiry when kilnd's cancel reason proves one, and otherwise closed.
+fn unusable_stop(cause: Option<CancelReason>) -> ToolStop {
+    match cause {
+        Some(CancelReason::SandboxDeleted) => ToolStop::Expired(ExpiryReason::SandboxDeleted),
+        Some(CancelReason::SandboxExpiredLifetime) => {
+            ToolStop::Expired(ExpiryReason::ExpiredLifetime)
+        }
+        _ => ToolStop::Unusable,
+    }
 }
 
 fn manifest_error(execution: &Execution, message: impl Into<String>) -> ToolError {
@@ -810,6 +914,19 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stdout,
             stderr,
             stop: None,
+        },
+        // Only the baseline returns this; a tool's own check in `execute`
+        // sets the stop.
+        ToolError::Unusable {
+            expiry,
+            execution_ids,
+        } => ToolRun {
+            ok: false,
+            result: json!({"ok": false, "error": kind, "message": "execution left the sandbox unusable"}),
+            execution_ids,
+            stdout: unknown_evidence(),
+            stderr: unknown_evidence(),
+            stop: Some(expiry.map_or(ToolStop::Unusable, ToolStop::Expired)),
         },
     }
 }

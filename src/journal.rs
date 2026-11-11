@@ -587,12 +587,21 @@ const WORK_OUTCOMES: [&str; 5] = [
 const CLEANUP_FAILED: &str = "cleanup_failed";
 
 /// Expiry is not model-visible and feeds no request hash. The engine sends
-/// both fields or neither, and never a zero.
-fn check_expiry(lifetime_ms: Option<u64>, idle_ms: Option<u64>) -> Result<(), &'static str> {
+/// both fields or neither, within the bounds of
+/// [`crate::engine::expiry_problem`]: bounds, not exact equivalence, since
+/// the margin, the cleanup window and the daemon's clamping are not
+/// recorded.
+fn check_expiry(
+    session_timeout_ms: u64,
+    lifetime_ms: Option<u64>,
+    idle_ms: Option<u64>,
+) -> Result<(), &'static str> {
     match (lifetime_ms, idle_ms) {
         (None, None) => Ok(()),
-        (Some(lifetime), Some(idle)) if lifetime > 0 && idle > 0 => Ok(()),
-        _ => Err("sandbox_ready expiry needs both fields, each positive"),
+        (Some(lifetime), Some(idle)) => {
+            crate::engine::expiry_problem(session_timeout_ms, lifetime, idle).map_or(Ok(()), Err)
+        }
+        _ => Err("sandbox_ready expiry needs both fields or neither"),
     }
 }
 
@@ -604,7 +613,9 @@ fn check_expiry(lifetime_ms: Option<u64>, idle_ms: Option<u64>) -> Result<(), &'
 /// - `session_started` comes first, once, with schema 1.
 /// - `sandbox_ready` appears at most once, before any model request; no
 ///   request is allowed without it. Its optional expiry fields come as a
-///   pair of positive values or not at all.
+///   pair or not at all: a lifetime over the recorded session timeout and
+///   within the hard ceilings, and an idle timeout from kilnd's 10-second
+///   floor to 1 hour.
 /// - `model_requested` turns run 1, 2, … and each is answered by exactly one
 ///   `model_responded` or `model_failed` for that turn before the next
 ///   request. Nothing but `session_ended` follows a failure or a response
@@ -760,6 +771,26 @@ impl Grammar {
         })
     }
 
+    fn sandbox_ready(
+        &mut self,
+        expiry_lifetime_ms: Option<u64>,
+        expiry_idle_ms: Option<u64>,
+    ) -> Result<(), &'static str> {
+        if self.sandbox_ready {
+            return Err("second sandbox_ready");
+        }
+        if self.last_turn > 0 {
+            return Err("sandbox_ready after a model request");
+        }
+        let session_timeout_ms = self
+            .context
+            .as_ref()
+            .map_or(0, |context| context.limits.session_timeout_ms);
+        check_expiry(session_timeout_ms, expiry_lifetime_ms, expiry_idle_ms)?;
+        self.sandbox_ready = true;
+        Ok(())
+    }
+
     /// Apply one event after `session_started`.
     fn advance(&mut self, event: &JournalEvent) -> Result<(), &'static str> {
         match event {
@@ -768,16 +799,7 @@ impl Grammar {
                 expiry_lifetime_ms,
                 expiry_idle_ms,
                 ..
-            } => {
-                if self.sandbox_ready {
-                    return Err("second sandbox_ready");
-                }
-                if self.last_turn > 0 {
-                    return Err("sandbox_ready after a model request");
-                }
-                check_expiry(*expiry_lifetime_ms, *expiry_idle_ms)?;
-                self.sandbox_ready = true;
-            }
+            } => self.sandbox_ready(*expiry_lifetime_ms, *expiry_idle_ms)?,
             JournalEvent::ModelRequested {
                 turn,
                 request_sha256,

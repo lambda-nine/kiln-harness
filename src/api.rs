@@ -97,6 +97,36 @@ pub struct Execution {
     pub failure_reason: String,
     pub stdout: CapturedOutput,
     pub stderr: CapturedOutput,
+    /// `Some(false)`: the sandbox cannot take another call, even though
+    /// this RPC succeeded. `None` when unknown, as from an older daemon.
+    pub sandbox_reusable: Option<bool>,
+    /// Why a `Canceled` execution was canceled, when kilnd says.
+    pub cancel_reason: Option<CancelReason>,
+}
+
+/// Why kilnd canceled an execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    ClientDisconnected,
+    SandboxDeleted,
+    DaemonShutdown,
+    /// The sandbox's maximum lifetime passed while it ran.
+    SandboxExpiredLifetime,
+    /// A reason this schema does not name, by its protobuf number.
+    Other(i32),
+}
+
+impl CancelReason {
+    fn from_proto(value: i32) -> Option<Self> {
+        Some(match pb::CancelReason::try_from(value) {
+            Ok(pb::CancelReason::Unspecified) => return None,
+            Ok(pb::CancelReason::ClientDisconnected) => Self::ClientDisconnected,
+            Ok(pb::CancelReason::SandboxDeleted) => Self::SandboxDeleted,
+            Ok(pb::CancelReason::DaemonShutdown) => Self::DaemonShutdown,
+            Ok(pb::CancelReason::SandboxExpiredLifetime) => Self::SandboxExpiredLifetime,
+            Err(_) => Self::Other(value),
+        })
+    }
 }
 
 impl Execution {
@@ -582,10 +612,11 @@ impl SandboxApi for TonicKilnd {
             .await
             .map_err(ApiError::from)?
             .into_inner();
-        if response.sandbox.is_none() {
-            return Err(ApiError::local("renew response omitted sandbox"));
+        match response.sandbox {
+            Some(sandbox) if sandbox.id == sandbox_id => Ok(()),
+            Some(_) => Err(ApiError::local("renew response named another sandbox")),
+            None => Err(ApiError::local("renew response omitted sandbox")),
         }
-        Ok(())
     }
 
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
@@ -639,6 +670,8 @@ fn execution_from_proto(execution: pb::Execution) -> Execution {
         failure_reason: execution.failure_reason,
         stdout: output(execution.stdout),
         stderr: output(execution.stderr),
+        sandbox_reusable: execution.sandbox_reusable,
+        cancel_reason: CancelReason::from_proto(execution.cancel_reason),
     }
 }
 

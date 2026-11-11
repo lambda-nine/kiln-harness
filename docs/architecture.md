@@ -27,8 +27,9 @@ No harness code depends on kiln files, process layout, or CLI behavior.
    prompt at most 64 KiB each, nonempty prompt) and calculate one absolute
    session deadline.
 2. Discover the daemon: one `Health` call under that deadline and
-   cancellation. A daemon that is not `SERVING` is refused, and so is an
-   expiry the daemon's bounds would cut below the session (below). Nothing
+   cancellation. A daemon that is not `SERVING` is refused, and so are
+   incoherent advertised limits and an expiry the daemon's bounds would cut
+   below the session or outside what the journal can record (below). Nothing
    is recorded on these paths, since nothing exists yet. Then open the audit
    session, with the listed features, and journal `session_started`.
 3. Create exactly one sandbox with network none, 256 MiB memory, 0.5 CPU,
@@ -74,7 +75,17 @@ unsupported everywhere. The engine reads them once per session, before
 create, and only from a `SERVING` response, because an older daemon ignores
 request fields it does not know: an expiry sent to one would silently never
 apply. `session_opened` records the feature names (the lower-case suffix
-after `FEATURE_`), metadata only.
+after `FEATURE_`), metadata only. The CLI's `connect` only opens the
+transport, so this is the one Health call before a session, bounded like the
+rest of it. After the session the CLI checks Health once more, within the
+lifecycle window and at most 10 seconds, and only warns on stderr if kilnd
+does not answer or is not serving; it never changes the exit status.
+
+The advertised limits must be coherent before anything is created: for
+lifetime and idle each, a nonzero maximum is at least the minimum, and a
+nonzero default lies within `[min, max]`. Otherwise the session fails with
+an `Api` error (`FAILED_PRECONDITION`, "kilnd advertised inconsistent expiry
+limits"), since no value can be clamped into an empty range.
 
 With `TYPED_REASONS`, kilnd's refusals carry a `kilnd-reason` metadata
 entry. The adapter copies it into `ApiError::reason` only when it is 1 to
@@ -91,10 +102,22 @@ otherwise behaves exactly as without one. Two classifications use it:
   has left the default listing, so absence verifies. A tool call that hits
   it is journaled with the same model-visible `kilnd_error` result as
   without typed reasons, and the model is not asked again.
-- `UNIMPLEMENTED` with a `backend_unsupported:<feature>` reason is a
-  definite create rejection: kilnd refuses it before any row or backend
-  call. `UNIMPLEMENTED` without one, or with any other reason, stays
-  ambiguous.
+- `UNIMPLEMENTED` with a `backend_unsupported:<feature>` reason, the
+  feature named, is a definite create rejection: kilnd refuses it before
+  any row or backend call. `UNIMPLEMENTED` without one, with an empty
+  feature, or with any other reason, stays ambiguous.
+
+A successful Exec RPC does not mean the sandbox survived. kilnd says so in
+`Execution.sandbox_reusable`, and the adapter keeps it with the execution's
+`cancel_reason`. After any execution the harness sends, a tool's, the
+baseline's, or a workspace manifest's, `sandbox_reusable == false` ends the
+session once that tool's result is journaled, and no further execution or
+model call happens. A cancel reason of `SANDBOX_DELETED` or
+`SANDBOX_EXPIRED_LIFETIME` ends it as `SandboxExpired` (`sandbox_deleted`
+or `expired_lifetime`); any other cause, or none, fails closed with an
+`Api` error, "execution left the sandbox unusable". Either way cleanup still
+deletes and verifies absence. An older daemon does not send the field, and
+then nothing changes.
 
 ## Sandbox expiry and the renew heartbeat
 
@@ -112,7 +135,9 @@ When the daemon lists `SANDBOX_EXPIRY`, create sends
   no cap. A lifetime clamped below `session_timeout + lifecycle_timeout` is
   refused before create with `InvalidTask("daemon max lifetime is shorter
   than the session")`: a sandbox certain to expire mid-session is a
-  configuration error.
+  configuration error. A clamped policy outside the bounds the journal
+  grammar accepts (below) is refused before create as an `Api` error, so
+  the engine never sends an expiry it could not record.
 
 The audit's `sandbox_created` records the policy sent as
 `expiry_lifetime_ms` and `expiry_idle_ms`, or `null` for both when the
@@ -121,25 +146,40 @@ sent and the sandbox never expires. The journal's `sandbox_ready` carries
 the same two fields, skipped when absent, so journals without expiry are
 byte-identical to before. Expiry is not model-visible, so it is not in
 `SessionLimits`, no request hash covers it, and replay uses its own
-configuration. The grammar accepts the pair (both positive) or neither.
+configuration. The grammar accepts the pair or neither, and checks bounds,
+not exact equivalence, because the margin, the cleanup window, and the
+daemon's clamping are not recorded: the lifetime must exceed the recorded
+session timeout and be at most the sum of the session, lifecycle, and margin
+ceilings (6 h + 60 s + 10 min), and the idle timeout must be from kilnd's
+10-second floor to 1 hour. A forged expiry within those bounds verifies.
 
 kilnd counts an execution's start and finish as activity and pauses idle
 while one runs, so tool calls need nothing more. A provider call has no
 execution and can take minutes, so `complete_with_heartbeat` runs it beside
-a `tokio::select!` loop that sends `RenewSandbox` every
-`interval = max(ceil(idle / 3), 1 s)`, each RPC bounded by the next tick
-and the session deadline. It is not a spawned task: dropping the call, on
-an answer, a deadline, cancellation, or an error, drops any renew in
-flight, so nothing outlives it. A successful renew counts toward
-`renews` in `SessionOutcome` and `session_finished`; heartbeats write no
-other records. A renew refused with an expiry reason drops the provider
-call and ends the session with `SandboxExpired`. `UNAVAILABLE`,
-`DEADLINE_EXCEEDED`, `UNKNOWN` (which local transport failures use), and a
-renew that does not answer before the next tick are transient: they are
-counted, a success resets the count, and `ceil(idle / interval) - 1` in a
-row (2 for any idle of 3 s or more) end the session with
-`SandboxExpired { reason: renew_failed }`, since by then the sandbox has
-probably expired. Any other error is fatal as an `Api` error. Replay runs
+a `tokio::select!` loop that sends `RenewSandbox` at
+`interval = max(ceil(idle / 3), 1 s)`. The schedule is session-wide, not per
+call: the tool session records the last activity kilnd saw (the sandbox
+becoming ready, the start and the finish of every Exec the harness sends,
+and every successful renew), and a renew is due one interval after it. So
+several short, execution-free turns cannot add up to the idle timeout.
+Before each provider call, an overdue renew runs first; the loop then
+waits for the next due time. Each renew RPC is bounded by the next tick and
+the session deadline. Tool calls still send no renews. The loop is not a
+spawned task: dropping the call, on an answer, a deadline, cancellation, or
+an error, drops any renew in flight, so nothing outlives it. A successful
+renew counts toward `renews` in `SessionOutcome` and `session_finished`;
+heartbeats write no other records. A renew refused with an expiry reason
+drops the provider call and ends the session with `SandboxExpired`.
+`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `UNKNOWN` (which local transport
+failures use), `RESOURCE_EXHAUSTED` (kilnd's connection and RPC admission,
+which clears on its own; this applies to renew only), and a renew that does
+not answer before the next tick are transient. They are counted across
+provider calls, a failed renew is retried an interval after it started, a
+success or any later activity resets the count, and
+`ceil(idle / interval) - 1` in a row (2 for any idle of 3 s or more) end
+the session with `SandboxExpired { reason: renew_failed }`, since by then
+the sandbox has probably expired. A renew response must name the sandbox
+renewed. Any other error is fatal as an `Api` error. Replay runs
 the same engine without provider latency, so it rarely renews, and the
 journal does not change.
 

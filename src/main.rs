@@ -230,7 +230,7 @@ async fn demo(socket: PathBuf, audit_path: &Path, journal_path: &Path) -> Result
         HarnessConfig::default(),
     );
     let outcome = harness.run(&SessionTask::demo(), interrupt()).await?;
-    check_health(&api).await?;
+    warn_if_unhealthy(&api, HarnessConfig::default().lifecycle_timeout).await;
     print_outcome(&outcome);
     println!("audit: {}", audit_path.display());
     println!("journal: {}", journal_path.display());
@@ -512,6 +512,7 @@ async fn run(
         config,
         provider,
     } = prepared;
+    let lifecycle = config.lifecycle_timeout;
     let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
     let outcome = match harness.run(&task, interrupt()).await {
         Ok(outcome) => outcome,
@@ -520,7 +521,7 @@ async fn run(
             return Err(error.into());
         }
     };
-    check_health(&api).await?;
+    warn_if_unhealthy(&api, lifecycle).await;
     print_outcome(&outcome);
     println!("audit: {}", audit_path.display());
     println!("journal: {}", journal_path.display());
@@ -562,9 +563,10 @@ async fn replay(
 
     let (audit, journal) = open_sinks(Some(&source), audit_path, journal_path)?;
     let api = connect(socket).await?;
+    let lifecycle = config.lifecycle_timeout;
     let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
     let result = harness.run(&task, interrupt()).await;
-    check_health(&api).await?;
+    warn_if_unhealthy(&api, lifecycle).await;
     println!("journal: {}", journal_path.display());
     match result {
         Ok(outcome) => {
@@ -752,24 +754,32 @@ fn summarize(journal: &LoadedJournal) -> Summary {
     summary
 }
 
+/// Connect the transport only. `Harness::run` makes the one Health call a
+/// session needs, under its deadline and cancellation.
 async fn connect(socket: PathBuf) -> Result<TonicKilnd> {
-    let api = TonicKilnd::connect(socket).await?;
-    let health = api.health().await?;
-    if !health.serving {
-        bail!("kilnd is not serving: {}", health.detail);
-    }
-    Ok(api)
+    Ok(TonicKilnd::connect(socket).await?)
 }
 
-async fn check_health(api: &TonicKilnd) -> Result<()> {
-    let health = api.health().await?;
-    if !health.serving {
-        bail!(
-            "kilnd became unhealthy after the session: {}",
-            health.detail
-        );
+/// After a session, report on stderr if kilnd stopped serving, within the
+/// lifecycle window and at most 10 seconds. This never changes the
+/// session's exit status and never waits longer.
+async fn warn_if_unhealthy(api: &TonicKilnd, lifecycle: Duration) {
+    let window = lifecycle.min(Duration::from_secs(10));
+    match tokio::time::timeout(window, api.health()).await {
+        Ok(Ok(health)) if health.serving => {}
+        Ok(Ok(health)) => eprintln!(
+            "warning: kilnd is not serving after the session: {}",
+            terminal_safe(&health.detail)
+        ),
+        Ok(Err(error)) => eprintln!(
+            "warning: kilnd health after the session failed: {}",
+            terminal_safe(&error.to_string())
+        ),
+        Err(_) => eprintln!(
+            "warning: kilnd health after the session did not answer within {} ms",
+            window.as_millis()
+        ),
     }
-    Ok(())
 }
 
 /// Open both outputs without writing, then refuse if any two of the source

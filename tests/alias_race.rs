@@ -20,8 +20,9 @@ use kiln_harness::provider::ScriptedProvider;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
-/// Answers the first health call only after the test releases it, and later
-/// ones (the session's own discovery) at once; everything else fails.
+/// Answers the first health call (the session's discovery) only after the
+/// test releases it, and later ones (the check after the session) at once;
+/// everything else fails.
 struct GatedKilnd {
     health_entered: mpsc::Sender<()>,
     release_health: Arc<tokio::sync::Notify>,

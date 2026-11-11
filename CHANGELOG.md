@@ -6,6 +6,23 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- First review round for kilnd API milestone 1. An execution whose RPC
+  succeeded but whose `sandbox_reusable` is false ends the session after its
+  tool result is journaled: as `SandboxExpired` when its `cancel_reason` is
+  a deletion or a lifetime expiry, and otherwise as an `Api` error, with no
+  further execution or model call, during the baseline too; `Execution`
+  keeps both fields. The renew schedule is session-wide, one interval after
+  the last activity kilnd saw, so short execution-free turns cannot add up
+  to the idle timeout, and an overdue renew runs before the next model call.
+  `RESOURCE_EXHAUSTED` on renew is transient. The CLI's `connect` no longer
+  calls Health, so the engine's bounded discovery is the only call before a
+  session, and the check after it is bounded by the lifecycle window and
+  only warns. Incoherent advertised expiry limits are refused before
+  create. The journal grammar bounds `sandbox_ready`'s expiry: a lifetime
+  over the recorded session timeout and within the hard ceilings, and an
+  idle timeout from 10 seconds to an hour; the engine refuses before create
+  any policy outside those bounds. A renew response must name the sandbox,
+  and `backend_unsupported:` must name a feature to count as definite.
 - The README pins two kiln commits: the tested one, `00d61c5`, which
   `scripts/integration-vm.sh` now requires as a clean build before it
   touches kilnd, and the minimum, `e48f0e7`, the oldest kiln with every

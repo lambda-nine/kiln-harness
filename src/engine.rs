@@ -12,7 +12,8 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{
-    ApiError, Capabilities, ExpiryPolicy, ExpiryReason, Feature, SandboxApi, SandboxRequest,
+    ApiError, ApiLimits, Capabilities, ExpiryPolicy, ExpiryReason, Feature, SandboxApi,
+    SandboxRequest,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
@@ -268,6 +269,10 @@ struct Progress {
     usage: Usage,
     output_bytes: u64,
     renews: u32,
+    /// Transient renew failures in a row, across provider calls, and when
+    /// the last one happened.
+    renew_failures: u32,
+    last_renew_failure: Option<Instant>,
 }
 
 impl<A, P, S, J> Harness<A, P, S, J>
@@ -540,10 +545,20 @@ where
                             file_count: 0,
                         },
                     )?;
-                    if let ToolError::Api(api_error) = &error
-                        && let Some(reason) = ExpiryReason::of(api_error, typed_reasons)
-                    {
-                        return Err(HarnessError::SandboxExpired { reason });
+                    match &error {
+                        ToolError::Api(api_error) => {
+                            if let Some(reason) = ExpiryReason::of(api_error, typed_reasons) {
+                                return Err(HarnessError::SandboxExpired { reason });
+                            }
+                        }
+                        ToolError::Unusable {
+                            expiry: Some(reason),
+                            ..
+                        } => return Err(HarnessError::SandboxExpired { reason: *reason }),
+                        ToolError::Unusable { expiry: None, .. } => {
+                            return Err(HarnessError::Api(unusable_sandbox()));
+                        }
+                        ToolError::Deadline | ToolError::Manifest { .. } => {}
                     }
                     return Err(HarnessError::ToolSetup(error));
                 }
@@ -949,6 +964,7 @@ where
                 Some(ToolStop::Expired(reason)) => {
                     return Err(HarnessError::SandboxExpired { reason });
                 }
+                Some(ToolStop::Unusable) => return Err(HarnessError::Api(unusable_sandbox())),
                 None => {}
             }
             observed?;
@@ -1076,8 +1092,13 @@ fn classify_renewal(
                 Renewal::Expired(reason)
             } else if matches!(
                 error.code,
-                // Unknown is also how local transport failures arrive.
-                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Unknown
+                // Unknown is also how local transport failures arrive, and
+                // ResourceExhausted is kilnd's connection and RPC admission,
+                // which clears on its own.
+                tonic::Code::Unavailable
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Unknown
+                    | tonic::Code::ResourceExhausted
             ) {
                 Renewal::Transient
             } else {
@@ -1090,8 +1111,12 @@ fn classify_renewal(
 /// Run one provider call under the session deadline and cancellation,
 /// renewing the sandbox beside it when the daemon supports expiry: a long
 /// model turn runs no execution, so nothing else tells kilnd the session is
-/// alive. The renew RPC runs next to the provider future, not in a spawned
-/// task, so dropping this future stops both before the engine moves on.
+/// alive. The schedule is session-wide: a renew is due one interval after
+/// the last activity kilnd saw (ready, an execution's start or finish, or a
+/// renew), however many provider calls that spans. An overdue renew runs
+/// before the call starts. The renew RPC runs next to the provider future,
+/// not in a spawned task, so dropping this future stops both before the
+/// engine moves on.
 async fn complete_with_heartbeat<A, P>(
     provider: &mut P,
     request: ModelRequest<'_>,
@@ -1103,17 +1128,38 @@ where
     P: Provider,
 {
     let deadline = context.deadline;
-    let call = timeout_at(deadline, provider.complete(request));
-    tokio::pin!(call);
     let Some(heartbeat) = context.heartbeat else {
         return tokio::select! {
             () = context.cancel.cancelled() => Err(HarnessError::Canceled),
-            result = &mut call => result.map_err(|_| HarnessError::Deadline),
+            result = timeout_at(deadline, provider.complete(request)) => {
+                result.map_err(|_| HarnessError::Deadline)
+            }
         };
     };
-    let mut next_tick = Instant::now() + heartbeat.interval;
+    // Activity since the last failed renew proves the sandbox was alive
+    // after it, so earlier failures no longer count.
+    if progress
+        .last_renew_failure
+        .is_some_and(|failed| context.tools.last_activity() > failed)
+    {
+        progress.renew_failures = 0;
+    }
+    if Instant::now() >= renew_due(context, heartbeat, progress) {
+        let started = Instant::now();
+        let outcome = tokio::select! {
+            () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
+            outcome = timeout_at(
+                (started + heartbeat.interval).min(deadline),
+                context.api.renew(context.sandbox_id),
+            ) => outcome,
+        };
+        settle_renewal(outcome, started, context, heartbeat, progress)?;
+    }
+    let call = timeout_at(deadline, provider.complete(request));
+    tokio::pin!(call);
+    let mut next_tick = renew_due(context, heartbeat, progress);
     let mut renew: Option<RenewCall<'_>> = None;
-    let mut failures = 0u32;
+    let mut renew_started = Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -1123,36 +1169,68 @@ where
                 renew.as_mut().expect("polled only while a renew is in flight").await
             }, if renew.is_some() => {
                 renew = None;
-                match classify_renewal(outcome, context.typed_reasons) {
-                    Renewal::Renewed => {
-                        progress.renews = progress.renews.saturating_add(1);
-                        failures = 0;
-                    }
-                    Renewal::Transient => {
-                        failures = failures.saturating_add(1);
-                        if failures >= heartbeat.max_failures {
-                            return Err(HarnessError::SandboxExpired {
-                                reason: ExpiryReason::RenewFailed,
-                            });
-                        }
-                    }
-                    Renewal::Expired(reason) => {
-                        return Err(HarnessError::SandboxExpired { reason });
-                    }
-                    Renewal::Fatal(error) => return Err(HarnessError::Api(error)),
-                }
+                settle_renewal(outcome, renew_started, context, heartbeat, progress)?;
+                next_tick = next_tick.max(renew_due(context, heartbeat, progress));
             }
             () = sleep_until(next_tick), if renew.is_none() => {
                 // Each renew is bounded by the interval and the session
                 // deadline, so one stalled RPC cannot outlast the next tick.
-                let now = Instant::now();
-                next_tick = now + heartbeat.interval;
+                renew_started = Instant::now();
+                next_tick = renew_started + heartbeat.interval;
                 renew = Some(Box::pin(timeout_at(
                     next_tick.min(deadline),
                     context.api.renew(context.sandbox_id),
                 )));
             }
         }
+    }
+}
+
+/// One interval after the later of the last activity and the start of the
+/// last failed renew: a success is activity, and a failure is retried an
+/// interval after it started, never at once.
+fn renew_due<A: SandboxApi>(
+    context: &LoopContext<'_, '_, A>,
+    heartbeat: Heartbeat,
+    progress: &Progress,
+) -> Instant {
+    let last = context.tools.last_activity();
+    progress
+        .last_renew_failure
+        .map_or(last, |failed| last.max(failed))
+        + heartbeat.interval
+}
+
+/// Apply one renew's outcome: count a success as activity, count a
+/// transient failure toward the budget, and end the session on proof the
+/// sandbox is gone or on any other error.
+fn settle_renewal<A: SandboxApi>(
+    outcome: Result<Result<(), ApiError>, Elapsed>,
+    started: Instant,
+    context: &LoopContext<'_, '_, A>,
+    heartbeat: Heartbeat,
+    progress: &mut Progress,
+) -> Result<(), HarnessError> {
+    match classify_renewal(outcome, context.typed_reasons) {
+        Renewal::Renewed => {
+            context.tools.record_activity();
+            progress.renews = progress.renews.saturating_add(1);
+            progress.renew_failures = 0;
+            progress.last_renew_failure = None;
+            Ok(())
+        }
+        Renewal::Transient => {
+            progress.renew_failures = progress.renew_failures.saturating_add(1);
+            progress.last_renew_failure = Some(started);
+            if progress.renew_failures >= heartbeat.max_failures {
+                return Err(HarnessError::SandboxExpired {
+                    reason: ExpiryReason::RenewFailed,
+                });
+            }
+            Ok(())
+        }
+        Renewal::Expired(reason) => Err(HarnessError::SandboxExpired { reason }),
+        Renewal::Fatal(error) => Err(HarnessError::Api(error)),
     }
 }
 
@@ -1320,6 +1398,14 @@ fn expiry_policy(
     config: &HarnessConfig,
     capabilities: &Capabilities,
 ) -> Result<Option<ExpiryPolicy>, HarnessError> {
+    if let Some(limits) = &capabilities.limits
+        && !limits_are_coherent(limits)
+    {
+        return Err(HarnessError::Api(ApiError::new(
+            tonic::Code::FailedPrecondition,
+            "kilnd advertised inconsistent expiry limits",
+        )));
+    }
     if !capabilities.supports(Feature::SandboxExpiry) {
         return Ok(None);
     }
@@ -1341,10 +1427,69 @@ fn expiry_policy(
         limits.min_sandbox_idle_ms,
         limits.max_sandbox_idle_ms,
     );
+    // The journal grammar checks the same bounds, so the engine never sends
+    // an expiry it could not record.
+    if let Some(problem) = expiry_problem(
+        duration_ms(config.session_timeout),
+        max_lifetime_ms,
+        idle_timeout_ms,
+    ) {
+        return Err(HarnessError::Api(ApiError::new(
+            tonic::Code::FailedPrecondition,
+            format!("kilnd's expiry limits leave no usable policy: {problem}"),
+        )));
+    }
     Ok(Some(ExpiryPolicy {
         max_lifetime_ms,
         idle_timeout_ms,
     }))
+}
+
+/// For lifetime and idle each: a nonzero maximum is at least the minimum,
+/// and a nonzero default lies within `[min, max]` (no upper bound when the
+/// maximum is 0). Anything else leaves no range to clamp into.
+fn limits_are_coherent(limits: &ApiLimits) -> bool {
+    let coherent = |min: u64, max: u64, default: u64| {
+        (max == 0 || max >= min)
+            && (default == 0 || (default >= min && (max == 0 || default <= max)))
+    };
+    coherent(
+        limits.min_sandbox_lifetime_ms,
+        limits.max_sandbox_lifetime_ms,
+        limits.default_sandbox_lifetime_ms,
+    ) && coherent(
+        limits.min_sandbox_idle_ms,
+        limits.max_sandbox_idle_ms,
+        limits.default_sandbox_idle_ms,
+    )
+}
+
+/// kilnd's code floor for both expiry fields.
+const KILND_MIN_EXPIRY_MS: u64 = 10_000;
+
+/// Why a recorded expiry could not have come from the engine, if it could
+/// not. These are bounds, not exact equivalence: the margin, the cleanup
+/// window, and the daemon's clamping are not recorded. Shared with the
+/// journal grammar.
+pub(crate) fn expiry_problem(
+    session_timeout_ms: u64,
+    lifetime_ms: u64,
+    idle_ms: u64,
+) -> Option<&'static str> {
+    let lifetime_ceiling = duration_ms(MAX_SESSION_TIMEOUT)
+        + duration_ms(MAX_LIFECYCLE_TIMEOUT)
+        + duration_ms(MAX_SANDBOX_LIFETIME_MARGIN);
+    if lifetime_ms <= session_timeout_ms {
+        Some("the expiry lifetime must exceed the session timeout")
+    } else if lifetime_ms > lifetime_ceiling {
+        Some("the expiry lifetime exceeds its hard ceiling")
+    } else if idle_ms < KILND_MIN_EXPIRY_MS {
+        Some("the expiry idle timeout is below kilnd's 10-second floor")
+    } else if idle_ms > duration_ms(MAX_SANDBOX_IDLE_TIMEOUT) {
+        Some("the expiry idle timeout exceeds its hard ceiling")
+    } else {
+        None
+    }
 }
 
 fn clamp_to_daemon(value: u64, min: u64, max: u64) -> u64 {
@@ -1406,6 +1551,15 @@ fn recovery_deadline(timeout: Duration) -> Instant {
     lifecycle_deadline(timeout.min(Duration::from_secs(1)))
 }
 
+/// An execution reported that the sandbox cannot take another call, for a
+/// reason that is not an expiry or deletion. Nothing is retried.
+fn unusable_sandbox() -> ApiError {
+    ApiError::new(
+        tonic::Code::FailedPrecondition,
+        "execution left the sandbox unusable",
+    )
+}
+
 fn deadline_api(message: &str) -> ApiError {
     ApiError::new(tonic::Code::DeadlineExceeded, message)
 }
@@ -1424,7 +1578,8 @@ fn unambiguous_create_error(error: &ApiError, typed_reasons: bool) -> bool {
     ) || (error.code == tonic::Code::Unimplemented
         && error
             .typed_reason(typed_reasons)
-            .is_some_and(|reason| reason.starts_with("backend_unsupported:")))
+            .and_then(|reason| reason.strip_prefix("backend_unsupported:"))
+            .is_some_and(|feature| !feature.is_empty()))
 }
 
 async fn cleanup_sandbox<A: SandboxApi>(
