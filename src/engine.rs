@@ -351,6 +351,9 @@ where
         let expiry = expiry_policy(&self.config, &capabilities)?;
         let typed_reasons = capabilities.supports(Feature::TypedReasons);
         let heartbeat = expiry.map(|policy| Heartbeat::for_idle_ms(policy.idle_timeout_ms));
+        if let Some(heartbeat) = heartbeat {
+            check_tool_budget(&self.config, heartbeat)?;
+        }
         self.audit.append(
             &session_id,
             None,
@@ -887,17 +890,6 @@ where
             let next_tool_calls = progress.tool_calls.saturating_add(1);
             let over_budget = next_tool_calls > config.max_tool_calls;
             let rejected = over_budget || !call.registered || call.arguments.is_none();
-            // A renew falls due between tool calls too: a refused Exec
-            // proves no activity, so the next one must not wait for the next
-            // provider call. Host-only rejections reach no kilnd RPC.
-            if !rejected
-                && let Some(heartbeat) = context.heartbeat
-                && context
-                    .tools
-                    .contacts_kilnd(&call.visible.tool, &call.visible.arguments)
-            {
-                renew_if_due(context, heartbeat, progress).await?;
-            }
             audit.append(
                 session_id,
                 Some(sandbox_id),
@@ -915,6 +907,20 @@ where
             )?;
             if over_budget {
                 return Err(HarnessError::ToolBudget(config.max_tool_calls));
+            }
+            // The call is audited first, so a fatal renew below still leaves
+            // it on record; its completion record follows the renew. A renew
+            // falls due between tool calls too: a refused Exec proves no
+            // activity, so the next one must not wait for the next provider
+            // call, and one that could outlive the idle window renews first.
+            // Host-only rejections reach no kilnd RPC.
+            if !rejected
+                && let Some(heartbeat) = context.heartbeat
+                && context
+                    .tools
+                    .contacts_kilnd(&call.visible.tool, &call.visible.arguments)
+            {
+                renew_if_due(context, heartbeat, progress, Some(tool_rpc_budget(config))).await?;
             }
 
             let mut run = if call.arguments.is_none() {
@@ -935,7 +941,7 @@ where
             if run.execution_ids.is_empty()
                 && (!run.stdout.total_bytes_known || !run.stderr.total_bytes_known)
             {
-                let recovery_window = config.lifecycle_timeout.min(Duration::from_secs(1));
+                let recovery_window = recovery_window(config);
                 if let Some(recovery_deadline) = Instant::now().checked_add(recovery_window) {
                     let recovered = context
                         .tools
@@ -1060,9 +1066,45 @@ where
     })
 }
 
+/// How long response-loss recovery may run after a tool call: the
+/// lifecycle window, at most one second.
+fn recovery_window(config: &HarnessConfig) -> Duration {
+    config.lifecycle_timeout.min(Duration::from_secs(1))
+}
+
+/// The longest one kilnd-bound tool call can go without activity kilnd can
+/// see: one Exec's whole wall timeout, then response-loss recovery. A tool
+/// that runs several Execs (`read_file`) proves activity with each one that
+/// returns, and stops at the first that does not, so one timeout bounds it.
+fn tool_rpc_budget(config: &HarnessConfig) -> Duration {
+    config.tool_limits.timeout + recovery_window(config)
+}
+
+/// A tool call that kilnd never admits shows it no activity, and nothing
+/// renews while it runs. So the whole call, plus the renew interval before
+/// it, must fit in the idle timeout actually sent, or one slow refusal could
+/// outlive the sandbox. Checked before create, only when expiry is in use.
+fn check_tool_budget(config: &HarnessConfig, heartbeat: Heartbeat) -> Result<(), HarnessError> {
+    let budget = tool_rpc_budget(config);
+    if budget + heartbeat.interval > heartbeat.idle {
+        return Err(HarnessError::InvalidTask(format!(
+            "the tool budget of {} ms (tool timeout plus {} ms of recovery) and the {} ms \
+             renew interval exceed the sandbox idle timeout of {} ms; lower the tool \
+             timeout or raise the idle timeout",
+            duration_ms(budget),
+            duration_ms(recovery_window(config)),
+            duration_ms(heartbeat.interval),
+            duration_ms(heartbeat.idle),
+        )));
+    }
+    Ok(())
+}
+
 /// When to renew the sandbox while a provider call runs.
 #[derive(Debug, Clone, Copy)]
 struct Heartbeat {
+    /// The idle timeout kilnd was sent, after its clamp.
+    idle: Duration,
     interval: Duration,
     /// Transient renew failures in a row after which the sandbox has
     /// probably expired.
@@ -1076,6 +1118,7 @@ impl Heartbeat {
         let interval_ms = idle_ms.div_ceil(3).max(MIN_RENEW_INTERVAL_MS);
         let ticks = idle_ms.div_ceil(interval_ms);
         Self {
+            idle: Duration::from_millis(idle_ms),
             interval: Duration::from_millis(interval_ms),
             max_failures: u32::try_from(ticks.saturating_sub(1))
                 .unwrap_or(u32::MAX)
@@ -1155,7 +1198,7 @@ where
             }
         };
     };
-    renew_if_due(context, heartbeat, progress).await?;
+    renew_if_due(context, heartbeat, progress, None).await?;
     let call = timeout_at(deadline, provider.complete(request));
     tokio::pin!(call);
     let mut next_tick = renew_due(context, heartbeat, progress);
@@ -1196,7 +1239,11 @@ async fn renew_if_due<A: SandboxApi>(
     context: &LoopContext<'_, '_, A>,
     heartbeat: Heartbeat,
     progress: &mut Progress,
+    tool_budget: Option<Duration>,
 ) -> Result<(), HarnessError> {
+    if Instant::now() >= context.deadline {
+        return Err(HarnessError::Deadline);
+    }
     // Activity since the last failed renew started proves the sandbox was
     // alive after it, however close the clock readings are.
     if progress
@@ -1207,7 +1254,13 @@ async fn renew_if_due<A: SandboxApi>(
         progress.last_renew_failure = None;
         progress.renew_failure_generation = None;
     }
-    if Instant::now() < renew_due(context, heartbeat, progress) {
+    // Before a kilnd-bound tool, renew whenever the call could run past the
+    // idle deadline, whatever the retry backoff after a failed renew says:
+    // nothing renews while the call runs, and kilnd may never admit it.
+    let now = Instant::now();
+    let forced = tool_budget
+        .is_some_and(|budget| now + budget >= context.tools.last_activity() + heartbeat.idle);
+    if !forced && now < renew_due(context, heartbeat, progress) {
         return Ok(());
     }
     let started = (Instant::now(), context.tools.activity_generation());
@@ -1218,7 +1271,13 @@ async fn renew_if_due<A: SandboxApi>(
             context.api.renew(context.sandbox_id),
         ) => outcome,
     };
-    settle_renewal(outcome, started, context, heartbeat, progress)
+    let settled = settle_renewal(outcome, started, context, heartbeat, progress);
+    // A deadline that passed while the renew was in flight wins, as it does
+    // over every other outcome.
+    if settled.is_err() && Instant::now() >= context.deadline {
+        return Err(HarnessError::Deadline);
+    }
+    settled
 }
 
 /// One interval after the later of the last activity and the start of the

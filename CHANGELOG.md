@@ -6,6 +6,15 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Fourth review round for kilnd API milestone 1. With expiry, the tool
+  timeout plus the response-loss recovery window plus the renew interval
+  must fit in the idle timeout sent, or the session is refused before
+  create, and a renew is forced before a kilnd-bound tool call that could
+  otherwise reach the idle deadline, whatever the retry backoff. Recovery
+  polling backs off from 10 ms to 200 ms and rereads `GetSandbox` only
+  every fourth pass and once at the end. A tool call's `model_turn` audit
+  record now precedes its pre-tool renew, and a session deadline that
+  passes during that renew wins over `renew_failed` and `SandboxExpired`.
 - Third review round for kilnd API milestone 1. Recovery after a lost Exec
   response takes only terminal rows as evidence: it follows each new row
   with `GetExecution` (new `SandboxApi::get_execution`) until it settles,

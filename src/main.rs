@@ -144,11 +144,16 @@ struct RunArgs {
     /// Wall-clock limit for the session, including sandbox creation.
     #[arg(long, default_value_t = 900)]
     session_timeout_secs: u64,
-    /// Wall-clock limit for each sandbox execution.
+    /// Wall-clock limit for each sandbox execution. When kilnd supports
+    /// expiry, this plus 1 s of recovery plus a third of the idle timeout
+    /// must fit in the idle timeout: about 5 s at most for a 10 s idle
+    /// timeout, 79 s for the default 120 s.
     #[arg(long, default_value_t = 30)]
     tool_timeout_secs: u64,
     /// Idle time after which kilnd may reclaim the sandbox, when it supports
-    /// expiry. The harness renews it during model calls.
+    /// expiry. The harness renews it during model calls. It must exceed the
+    /// tool timeout plus 1 s by half again: 30 s tools need at least about
+    /// 47 s.
     #[arg(long, default_value_t = 120)]
     sandbox_idle_timeout_secs: u64,
     /// Added to the session and cleanup windows to form the sandbox's

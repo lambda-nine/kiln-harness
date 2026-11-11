@@ -116,7 +116,11 @@ model call happens. The same holds for a row recovered after a lost Exec
 response, but only terminal evidence counts: a RUNNING row can still be
 canceled or retire the sandbox, so recovery follows every new row with
 `GetExecution`, and reads `GetSandbox` again for further rows, until each
-is terminal or the recovery deadline passes. Settled rows keep their
+is terminal or the recovery deadline passes. Polls back off from 10 ms to
+200 ms; `GetSandbox` is read on the first pass, while no row is known, and
+every fourth pass after that, and one last pass of both runs just before
+the deadline, so one unsettled row costs about ten reads a second, not two
+hundred. Settled rows keep their
 `sandbox_reusable` and `cancel_reason`, and one that left the sandbox
 unusable stops the session exactly as a returned one would, during the
 baseline too. A row still not terminal at the deadline fails closed: the
@@ -195,7 +199,22 @@ cannot add up to the idle timeout. An overdue renew runs, through one
 bounded `renew_if_due`, before each provider call and before each tool call
 that will reach kilnd, so a refused Exec cannot be followed by another in
 the same turn without one; tool calls the host answers itself (an unknown
-tool, invalid arguments, a budget refusal) renew nothing. During a provider
+tool, invalid arguments, a budget refusal) renew nothing. Nothing renews
+while a tool call runs, and kilnd sees no activity from an Exec it never
+admits, so two rules bound one call. Before create, the tool budget (the
+tool timeout plus the response-loss recovery window, at most 1 s) plus the
+renew interval must fit in the idle timeout actually sent after kilnd's
+clamp, or the session is refused with `InvalidTask` naming both values; the
+defaults (30 s tools, 120 s idle, 40 s interval) fit, and a 10 s idle
+timeout allows tools of about 5 s. A tool that runs several Execs proves
+activity with each one that returns and stops at the first that does not,
+so one timeout bounds it. And before a kilnd-bound tool call, a renew is
+forced whenever `now + budget` would reach `last activity + idle`, whatever
+the backoff after a failed renew says. The tool's `model_turn` audit record
+is written before this renew, so a fatal renew leaves the call on record
+with no completion; if the session deadline has passed, or passes while
+the renew is in flight, the session ends with `Deadline`, not
+`renew_failed` or `SandboxExpired`. During a provider
 call, the loop then waits for the next due time. Each renew RPC is bounded
 by the next tick and the session deadline. Nothing renews while an
 execution runs. The loop is not a

@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::api::{
     ApiError, CancelReason, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi,
@@ -1147,28 +1147,33 @@ fn unknown_evidence() -> OutputEvidence {
 /// Find executions kilnd assigned that the harness has not seen, after a
 /// lost response. A row is evidence only once it is terminal: a RUNNING row
 /// can still be canceled, retire the sandbox, or settle any other way, so
-/// each unsettled row is followed with `GetExecution`, and `GetSandbox` is
-/// read again for further rows, until every new row is terminal or the
-/// deadline passes. A row still unsettled then is reported as such.
+/// each unsettled row is followed with `GetExecution` until every new row is
+/// terminal or the deadline passes. A row still unsettled then (RUNNING,
+/// `NOT_FOUND`, an error, or the wrong ID all count) is reported as such.
+///
+/// Polls back off from 10 ms to 200 ms. `GetSandbox` is read on the first
+/// pass, on every pass while no new row is known, and then every fourth
+/// pass; between those only the unsettled IDs are read. One last pass of
+/// both runs just before the deadline, so the decision sees the latest
+/// state.
 pub async fn recover_execution_evidence<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     known: &BTreeSet<String>,
     deadline: Instant,
 ) -> RecoveredExecutionEvidence {
+    const FIRST_DELAY: Duration = Duration::from_millis(10);
+    const MAX_DELAY: Duration = Duration::from_millis(200);
+    const RESCAN_EVERY: u32 = 4;
+    const FINAL_PASS_RESERVE: Duration = Duration::from_millis(50);
+    let final_pass_at = deadline.checked_sub(FINAL_PASS_RESERVE).unwrap_or(deadline);
     let mut rows: Vec<Execution> = Vec::new();
+    let mut delay = FIRST_DELAY;
+    let mut pass = 0u32;
     loop {
-        if let Ok(Ok(executions)) = timeout_at(deadline, api.recent_executions(sandbox_id)).await {
-            for execution in executions
-                .into_iter()
-                .filter(|execution| !known.contains(&execution.id))
-            {
-                match rows.iter_mut().find(|row| row.id == execution.id) {
-                    Some(row) if !is_terminal(row) => *row = execution,
-                    Some(_) => {}
-                    None => rows.push(execution),
-                }
-            }
+        let final_pass = Instant::now() >= final_pass_at;
+        if final_pass || rows.is_empty() || pass % RESCAN_EVERY == 0 {
+            rescan_recent(api, sandbox_id, known, deadline, &mut rows).await;
         }
         for row in rows.iter_mut().filter(|row| !is_terminal(row)) {
             if let Ok(Ok(execution)) = timeout_at(deadline, api.get_execution(&row.id)).await
@@ -1178,11 +1183,37 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
             }
         }
         let settled = !rows.is_empty() && rows.iter().all(is_terminal);
-        if settled || Instant::now() >= deadline {
+        if settled || final_pass || Instant::now() >= deadline {
             return aggregate_recovered(rows);
         }
-        sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
-            .await;
+        pass = pass.saturating_add(1);
+        let now = Instant::now();
+        sleep_until((now + delay).min(final_pass_at.max(now))).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+}
+
+/// Read `GetSandbox` once and merge new rows: a row not seen before is
+/// added, and an unsettled one is replaced by its newer view.
+async fn rescan_recent<A: SandboxApi>(
+    api: &A,
+    sandbox_id: &str,
+    known: &BTreeSet<String>,
+    deadline: Instant,
+    rows: &mut Vec<Execution>,
+) {
+    let Ok(Ok(executions)) = timeout_at(deadline, api.recent_executions(sandbox_id)).await else {
+        return;
+    };
+    for execution in executions
+        .into_iter()
+        .filter(|execution| !known.contains(&execution.id))
+    {
+        match rows.iter_mut().find(|row| row.id == execution.id) {
+            Some(row) if !is_terminal(row) => *row = execution,
+            Some(_) => {}
+            None => rows.push(execution),
+        }
     }
 }
 

@@ -231,7 +231,13 @@ it is not a hostile multi-tenant boundary.
   each provider call and each kilnd-bound tool call, so short
   execution-free turns and refused Execs, even several in one turn, cannot
   add up to the idle timeout unrenewed. Failed renews are forgotten once
-  later activity is recorded, by generation rather than timestamp. A daemon that predates discovery lists no features, gets no
+  later activity is recorded, by generation rather than timestamp. One
+  call kilnd never admits cannot outlive the sandbox either: the tool
+  timeout plus recovery plus the renew interval must fit in the idle
+  timeout sent, checked before create, and a renew is forced before any
+  kilnd-bound call that could reach the idle deadline. Response-loss
+  recovery backs off its polling, so a lost response costs a bounded
+  number of reads against kilnd's RPC admission. A daemon that predates discovery lists no features, gets no
   expiry, and still leaks the sandbox of a crashed harness until an
   operator deletes it.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted
