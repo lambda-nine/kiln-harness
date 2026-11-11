@@ -85,7 +85,8 @@
 //! are always checked; they describe the attempt that produced the returned
 //! message. With fallbacks on, `usage.iterations` records every attempt
 //! (the live API sends one `message` entry with a null `model` when no
-//! fallback ran): each entry must have a known `type` ([`ITERATION_TYPES`]),
+//! fallback ran; with fallbacks off it was observed to send top-level usage
+//! only, and an array that does appear is validated the same way): each entry must have a known `type` ([`ITERATION_TYPES`]),
 //! valid counters, and nonzero input; a `fallback_message` must name a valid
 //! `model`, while a `message` may leave it null or absent, meaning the
 //! requested model. The last must be the serving attempt, with the

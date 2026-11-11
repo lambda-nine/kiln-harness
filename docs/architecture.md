@@ -290,7 +290,7 @@ is 0. The top-level counters are always validated: they describe the
 attempt that produced the returned message. With fallbacks on,
 `usage.iterations` lists every attempt, each billed; the live API sends it
 on every response, with one `message` entry whose `model` is null when no
-fallback ran. When the array is present, every entry needs a known `type`
+fallback ran. With fallbacks off, the live API sent top-level usage only. When the array is present, every entry needs a known `type`
 (`message` or `fallback_message`), valid counters, and nonzero input. A
 `fallback_message` must name a valid `model`; a `message` may leave it null
 or absent, meaning the requested model. The last entry must be the serving
@@ -382,8 +382,14 @@ default the request carries no `fallbacks` field and no beta header, and a
 refusal ends the session as `ModelRefused`. Without fallbacks, a `fallback`
 block or `fallback_message` iteration is `InvalidResponse`, and
 `usage.iterations`, when present, must be `message` entries whose last one
-matches the top level; when absent, the top level is used. No fallbacks-off
-response has been captured live, so both shapes are accepted. With
+matches the top level; when absent, the top level is used. Both shapes
+come from live captures of `claude-opus-5-5`: with fallbacks on, usage
+carried `iterations` with one `message` entry whose `model` was null; with
+fallbacks off, usage was top-level only, with no `iterations`. So the
+parser follows what the API was observed to send: with fallbacks on it
+requires the array, and with fallbacks off it accepts the array's absence
+and, should one appear, validates it like any other, since nothing
+documents that the API never sends it there. With
 `fallbacks: "default"`, a safety decline is rerun server-side on a suitable
 model in the same call. The response then holds `fallback`
 blocks and names the serving model in `model`; both are stored and echoed
