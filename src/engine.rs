@@ -25,7 +25,7 @@ use crate::provider::{
     ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::{
-    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop,
+    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop, UNUSABLE_SANDBOX,
     recover_execution_evidence, sanitize_call_bounded,
 };
 
@@ -273,6 +273,9 @@ struct Progress {
     /// the last one happened.
     renew_failures: u32,
     last_renew_failure: Option<Instant>,
+    /// The activity generation when the last failed renew started; any
+    /// later activity proves the sandbox alive after it.
+    renew_failure_generation: Option<u64>,
 }
 
 impl<A, P, S, J> Harness<A, P, S, J>
@@ -549,14 +552,8 @@ where
                     )?;
                     // A recovered baseline row that left the sandbox unusable
                     // ends the session as a returned one would.
-                    match recovered_stop {
-                        Some(ToolStop::Expired(reason)) => {
-                            return Err(HarnessError::SandboxExpired { reason });
-                        }
-                        Some(ToolStop::Unusable) => {
-                            return Err(HarnessError::Api(unusable_sandbox()));
-                        }
-                        Some(ToolStop::Deadline | ToolStop::Canceled) | None => {}
+                    if let Some(stop) = recovered_stop {
+                        return Err(stop_error(stop));
                     }
                     match &error {
                         ToolError::Api(api_error) => {
@@ -564,16 +561,12 @@ where
                                 return Err(HarnessError::SandboxExpired { reason });
                             }
                             if UnusableReason::of(api_error, typed_reasons).is_some() {
-                                return Err(HarnessError::Api(unusable_sandbox()));
+                                return Err(stop_error(ToolStop::Unusable(
+                                    UNUSABLE_SANDBOX.to_string(),
+                                )));
                             }
                         }
-                        ToolError::Unusable {
-                            expiry: Some(reason),
-                            ..
-                        } => return Err(HarnessError::SandboxExpired { reason: *reason }),
-                        ToolError::Unusable { expiry: None, .. } => {
-                            return Err(HarnessError::Api(unusable_sandbox()));
-                        }
+                        ToolError::Unusable { stop, .. } => return Err(stop_error(stop.clone())),
                         ToolError::Deadline | ToolError::Manifest { .. } => {}
                     }
                     return Err(HarnessError::ToolSetup(error));
@@ -894,6 +887,17 @@ where
             let next_tool_calls = progress.tool_calls.saturating_add(1);
             let over_budget = next_tool_calls > config.max_tool_calls;
             let rejected = over_budget || !call.registered || call.arguments.is_none();
+            // A renew falls due between tool calls too: a refused Exec
+            // proves no activity, so the next one must not wait for the next
+            // provider call. Host-only rejections reach no kilnd RPC.
+            if !rejected
+                && let Some(heartbeat) = context.heartbeat
+                && context
+                    .tools
+                    .contacts_kilnd(&call.visible.tool, &call.visible.arguments)
+            {
+                renew_if_due(context, heartbeat, progress).await?;
+            }
             audit.append(
                 session_id,
                 Some(sandbox_id),
@@ -974,14 +978,8 @@ where
             // included, so replay compares exactly what was recorded. An
             // interruption still ends the session as itself.
             let observed = provider.tool_completed(turn, index, &call.visible, run.ok, &run.result);
-            match stop {
-                Some(ToolStop::Deadline) => return Err(HarnessError::Deadline),
-                Some(ToolStop::Canceled) => return Err(HarnessError::Canceled),
-                Some(ToolStop::Expired(reason)) => {
-                    return Err(HarnessError::SandboxExpired { reason });
-                }
-                Some(ToolStop::Unusable) => return Err(HarnessError::Api(unusable_sandbox())),
-                None => {}
+            if let Some(stop) = stop {
+                return Err(stop_error(stop));
             }
             observed?;
             results.push(ToolResult {
@@ -1157,30 +1155,12 @@ where
             }
         };
     };
-    // Activity since the last failed renew proves the sandbox was alive
-    // after it, so earlier failures no longer count.
-    if progress
-        .last_renew_failure
-        .is_some_and(|failed| context.tools.last_activity() > failed)
-    {
-        progress.renew_failures = 0;
-    }
-    if Instant::now() >= renew_due(context, heartbeat, progress) {
-        let started = Instant::now();
-        let outcome = tokio::select! {
-            () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
-            outcome = timeout_at(
-                (started + heartbeat.interval).min(deadline),
-                context.api.renew(context.sandbox_id),
-            ) => outcome,
-        };
-        settle_renewal(outcome, started, context, heartbeat, progress)?;
-    }
+    renew_if_due(context, heartbeat, progress).await?;
     let call = timeout_at(deadline, provider.complete(request));
     tokio::pin!(call);
     let mut next_tick = renew_due(context, heartbeat, progress);
     let mut renew: Option<RenewCall<'_>> = None;
-    let mut renew_started = Instant::now();
+    let mut renew_started = (Instant::now(), context.tools.activity_generation());
     loop {
         tokio::select! {
             biased;
@@ -1196,8 +1176,8 @@ where
             () = sleep_until(next_tick), if renew.is_none() => {
                 // Each renew is bounded by the interval and the session
                 // deadline, so one stalled RPC cannot outlast the next tick.
-                renew_started = Instant::now();
-                next_tick = renew_started + heartbeat.interval;
+                renew_started = (Instant::now(), context.tools.activity_generation());
+                next_tick = renew_started.0 + heartbeat.interval;
                 renew = Some(Box::pin(timeout_at(
                     next_tick.min(deadline),
                     context.api.renew(context.sandbox_id),
@@ -1205,6 +1185,40 @@ where
             }
         }
     }
+}
+
+/// Renew now when one is due, before work that needs the sandbox: a
+/// provider call, or a tool call that will reach kilnd. A no-op otherwise.
+/// It first forgets failed renews that later activity has outdated, then
+/// runs one renew under cancellation, bounded by the interval and the
+/// session deadline, with the same accounting as the heartbeat loop.
+async fn renew_if_due<A: SandboxApi>(
+    context: &LoopContext<'_, '_, A>,
+    heartbeat: Heartbeat,
+    progress: &mut Progress,
+) -> Result<(), HarnessError> {
+    // Activity since the last failed renew started proves the sandbox was
+    // alive after it, however close the clock readings are.
+    if progress
+        .renew_failure_generation
+        .is_some_and(|generation| context.tools.activity_generation() > generation)
+    {
+        progress.renew_failures = 0;
+        progress.last_renew_failure = None;
+        progress.renew_failure_generation = None;
+    }
+    if Instant::now() < renew_due(context, heartbeat, progress) {
+        return Ok(());
+    }
+    let started = (Instant::now(), context.tools.activity_generation());
+    let outcome = tokio::select! {
+        () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
+        outcome = timeout_at(
+            (started.0 + heartbeat.interval).min(context.deadline),
+            context.api.renew(context.sandbox_id),
+        ) => outcome,
+    };
+    settle_renewal(outcome, started, context, heartbeat, progress)
 }
 
 /// One interval after the later of the last activity and the start of the
@@ -1227,7 +1241,7 @@ fn renew_due<A: SandboxApi>(
 /// sandbox is gone or on any other error.
 fn settle_renewal<A: SandboxApi>(
     outcome: Result<Result<(), ApiError>, Elapsed>,
-    started: Instant,
+    started: (Instant, u64),
     context: &LoopContext<'_, '_, A>,
     heartbeat: Heartbeat,
     progress: &mut Progress,
@@ -1238,11 +1252,13 @@ fn settle_renewal<A: SandboxApi>(
             progress.renews = progress.renews.saturating_add(1);
             progress.renew_failures = 0;
             progress.last_renew_failure = None;
+            progress.renew_failure_generation = None;
             Ok(())
         }
         Renewal::Transient => {
             progress.renew_failures = progress.renew_failures.saturating_add(1);
-            progress.last_renew_failure = Some(started);
+            progress.last_renew_failure = Some(started.0);
+            progress.renew_failure_generation = Some(started.1);
             if progress.renew_failures >= heartbeat.max_failures {
                 return Err(HarnessError::SandboxExpired {
                     reason: ExpiryReason::RenewFailed,
@@ -1572,13 +1588,18 @@ fn recovery_deadline(timeout: Duration) -> Instant {
     lifecycle_deadline(timeout.min(Duration::from_secs(1)))
 }
 
-/// An execution reported that the sandbox cannot take another call, for a
-/// reason that is not an expiry or deletion. Nothing is retried.
-fn unusable_sandbox() -> ApiError {
-    ApiError::new(
-        tonic::Code::FailedPrecondition,
-        "execution left the sandbox unusable",
-    )
+/// How a tool's stop ends the session. An unusable sandbox, for a reason
+/// that is not an expiry or deletion, is a local `FAILED_PRECONDITION`;
+/// nothing is retried.
+fn stop_error(stop: ToolStop) -> HarnessError {
+    match stop {
+        ToolStop::Deadline => HarnessError::Deadline,
+        ToolStop::Canceled => HarnessError::Canceled,
+        ToolStop::Expired(reason) => HarnessError::SandboxExpired { reason },
+        ToolStop::Unusable(message) => {
+            HarnessError::Api(ApiError::new(tonic::Code::FailedPrecondition, message))
+        }
+    }
 }
 
 fn deadline_api(message: &str) -> ApiError {

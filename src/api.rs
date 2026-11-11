@@ -432,6 +432,10 @@ pub trait SandboxApi: Send + Sync {
     /// extends its lifetime. Call only when the daemon lists
     /// [`Feature::SandboxExpiry`].
     async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError>;
+    /// Read one execution, as `GetExecution` reports it now.
+    async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError>;
+    /// Whether the sandbox is `READY` now, by `GetSandbox`.
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError>;
     /// Independently list every sandbox not yet deleted, including creating,
     /// deleting, and failed sandboxes. Errors or incomplete pagination must not
     /// be returned as a successful empty listing.
@@ -670,11 +674,40 @@ impl SandboxApi for TonicKilnd {
             .await
             .map_err(ApiError::from)?
             .into_inner();
-        match response.sandbox {
-            Some(sandbox) if sandbox.id == sandbox_id => Ok(()),
-            Some(_) => Err(ApiError::local("renew response named another sandbox")),
-            None => Err(ApiError::local("renew response omitted sandbox")),
-        }
+        check_renewed(response.sandbox.as_ref(), sandbox_id)
+    }
+
+    async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError> {
+        let response = self
+            .client
+            .clone()
+            .get_execution(pb::GetExecutionRequest {
+                id: execution_id.to_string(),
+            })
+            .await
+            .map_err(ApiError::from)?
+            .into_inner();
+        response
+            .execution
+            .map(execution_from_proto)
+            .ok_or_else(|| ApiError::local("response omitted execution"))
+    }
+
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
+        let response = self
+            .client
+            .clone()
+            .get_sandbox(pb::GetSandboxRequest {
+                id: sandbox_id.to_string(),
+                execution_limit: 1,
+            })
+            .await
+            .map_err(ApiError::from)?
+            .into_inner();
+        let sandbox = response
+            .sandbox
+            .ok_or_else(|| ApiError::local("response omitted sandbox"))?;
+        Ok(sandbox.id == sandbox_id && sandbox.state == pb::SandboxState::Ready as i32)
     }
 
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
@@ -699,6 +732,23 @@ impl SandboxApi for TonicKilnd {
             }
         }
         Ok(sandboxes)
+    }
+}
+
+/// A successful renew must answer with the renewed sandbox, still `READY`.
+/// Anything else is a protocol error: `INTERNAL`, which the heartbeat treats
+/// as terminal rather than transient.
+fn check_renewed(sandbox: Option<&pb::Sandbox>, sandbox_id: &str) -> Result<(), ApiError> {
+    let protocol = |message| Err(ApiError::new(tonic::Code::Internal, message));
+    match sandbox {
+        None => protocol("renew response omitted sandbox"),
+        Some(sandbox) if sandbox.id != sandbox_id => {
+            protocol("renew response named another sandbox")
+        }
+        Some(sandbox) if sandbox.state != pb::SandboxState::Ready as i32 => {
+            protocol("renew response reported a sandbox that is not ready")
+        }
+        Some(_) => Ok(()),
     }
 }
 
@@ -840,6 +890,28 @@ mod status_contract_test {
             "backend_unsupported:exec_env",
         ));
         assert_eq!(backend_unsupported_feature(&wrong_code, true), None);
+    }
+
+    #[test]
+    fn a_renew_answer_must_be_the_ready_sandbox() {
+        use super::check_renewed;
+        use crate::pb;
+        let ready = pb::Sandbox {
+            id: "sb-0000000000000001".to_string(),
+            state: pb::SandboxState::Ready as i32,
+            ..pb::Sandbox::default()
+        };
+        assert!(check_renewed(Some(&ready), "sb-0000000000000001").is_ok());
+        let deleting = pb::Sandbox {
+            state: pb::SandboxState::Deleting as i32,
+            ..ready.clone()
+        };
+        let error = check_renewed(Some(&deleting), "sb-0000000000000001").expect_err("not ready");
+        assert_eq!(error.code, Code::Internal);
+        let error = check_renewed(Some(&ready), "sb-0000000000000002").expect_err("other id");
+        assert_eq!(error.code, Code::Internal);
+        let error = check_renewed(None, "sb-0000000000000001").expect_err("omitted");
+        assert_eq!(error.code, Code::Internal);
     }
 
     #[test]

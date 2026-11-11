@@ -6,6 +6,19 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Third review round for kilnd API milestone 1. Recovery after a lost Exec
+  response takes only terminal rows as evidence: it follows each new row
+  with `GetExecution` (new `SandboxApi::get_execution`) until it settles,
+  and a row still running at the recovery deadline ends the session as an
+  `Api` error, after the tool result is journaled. An overdue renew now runs
+  before each kilnd-bound tool call as well as each provider call, through
+  one `renew_if_due`. Failed renews are reset by any later activity,
+  ordered by an activity generation rather than the clock. A
+  `sandbox_not_ready` Exec refusal on a sandbox that reads READY (new
+  `SandboxApi::sandbox_ready`), kilnd's retryable insert race, is an
+  ordinary tool error. A renew answer must report the sandbox READY.
+  `ToolStop::Unusable` carries its message, and tools are checked on the
+  host before any kilnd RPC (`ToolSession::contacts_kilnd`).
 - Second review round for kilnd API milestone 1. Evidence recovered after
   a lost Exec response keeps each row's `sandbox_reusable` and
   `cancel_reason`, and a recovered row that left the sandbox unusable ends

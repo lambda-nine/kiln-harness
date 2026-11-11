@@ -113,9 +113,16 @@ A successful Exec RPC does not mean the sandbox survived. kilnd says so in
 baseline's, or a workspace manifest's, `sandbox_reusable == false` ends the
 session once that tool's result is journaled, and no further execution or
 model call happens. The same holds for a row recovered after a lost Exec
-response: recovery keeps each recovered row's `sandbox_reusable` and
-`cancel_reason`, and one that left the sandbox unusable stops the session
-exactly as a returned one would, during the baseline too. A cancel reason of `SANDBOX_DELETED` or
+response, but only terminal evidence counts: a RUNNING row can still be
+canceled or retire the sandbox, so recovery follows every new row with
+`GetExecution`, and reads `GetSandbox` again for further rows, until each
+is terminal or the recovery deadline passes. Settled rows keep their
+`sandbox_reusable` and `cancel_reason`, and one that left the sandbox
+unusable stops the session exactly as a returned one would, during the
+baseline too. A row still not terminal at the deadline fails closed: the
+tool result is journaled, then the session ends with an `Api`
+`FAILED_PRECONDITION` error, "execution <id> did not settle after its
+response was lost", and no later Exec runs. A cancel reason of `SANDBOX_DELETED` or
 `SANDBOX_EXPIRED_LIFETIME` ends it as `SandboxExpired` (`sandbox_deleted`
 or `expired_lifetime`); any other cause, or none, fails closed with an
 `Api` error, "execution left the sandbox unusable". Either way cleanup still
@@ -127,9 +134,16 @@ An Exec refused with `FAILED_PRECONDITION` and a typed `sandbox_failed`,
 the same thing: this session's sandbox, which was ready, cannot take
 another call. The model-visible result is still the `kilnd_error` it was,
 journaled first; then the session ends with the same `Api` error. A renew
-refused with one of these reasons is terminal too, never retried. The
-expiry and deletion tokens still map to `SandboxExpired`, and without typed
-reasons nothing changes.
+refused with one of these reasons is terminal too, never retried. One
+exception: kilnd also sends `sandbox_not_ready`, saying to retry, when an
+Exec lost a race with its own row insert on a READY sandbox. So on an Exec
+refused `sandbox_not_ready` the harness reads the sandbox once, within the
+call's deadline; only a sandbox that reads READY turns the refusal into an
+ordinary, recoverable `kilnd_error`, and anything else, a failed lookup
+included, stays terminal. `sandbox_failed`, `sandbox_lost` and
+`sandbox_quarantined` are terminal unconditionally, and so is any of the
+four on a renew. The expiry and deletion tokens still map to
+`SandboxExpired`, and without typed reasons nothing changes.
 
 ## Sandbox expiry and the renew heartbeat
 
@@ -172,16 +186,19 @@ a `tokio::select!` loop that sends `RenewSandbox` at
 `interval = max(ceil(idle / 3), 1 s)`. The schedule is session-wide, not per
 call: the tool session records the last activity it can prove kilnd saw
 (the sandbox becoming ready, an Exec that returned an execution, which
-proves kilnd published its finish, an execution row found by recovery after
-a lost response, and every successful renew), and a renew is due one
-interval after it. A failed Exec RPC with no recovered row proves nothing
-and leaves the time unchanged, so the next provider call renews at once if
-a renew is overdue; while an admitted execution runs, kilnd pauses idle
-itself. So
-several short, execution-free turns cannot add up to the idle timeout.
-Before each provider call, an overdue renew runs first; the loop then
-waits for the next due time. Each renew RPC is bounded by the next tick and
-the session deadline. Tool calls still send no renews. The loop is not a
+proves kilnd published its finish, a terminal execution row found by
+recovery after a lost response, and every successful renew), and a renew is
+due one interval after it. A failed Exec RPC with no settled recovered row
+proves nothing and leaves the time unchanged; while an admitted execution
+runs, kilnd pauses idle itself. So several short, execution-free turns
+cannot add up to the idle timeout. An overdue renew runs, through one
+bounded `renew_if_due`, before each provider call and before each tool call
+that will reach kilnd, so a refused Exec cannot be followed by another in
+the same turn without one; tool calls the host answers itself (an unknown
+tool, invalid arguments, a budget refusal) renew nothing. During a provider
+call, the loop then waits for the next due time. Each renew RPC is bounded
+by the next tick and the session deadline. Nothing renews while an
+execution runs. The loop is not a
 spawned task: dropping the call, on an answer, a deadline, cancellation, or
 an error, drops any renew in flight, so nothing outlives it. A successful
 renew counts toward `renews` in `SessionOutcome` and `session_finished`;
@@ -191,12 +208,16 @@ drops the provider call and ends the session with `SandboxExpired`.
 failures use), `RESOURCE_EXHAUSTED` (kilnd's connection and RPC admission,
 which clears on its own; this applies to renew only), and a renew that does
 not answer before the next tick are transient. They are counted across
-provider calls, a failed renew is retried an interval after it started, a
-success or any later activity resets the count, and
+provider calls, a failed renew is retried an interval after it started, and
+a success or any later activity resets the count. Activity is ordered by a
+generation the tool session bumps on every record, captured when a renew
+starts, so an Exec in the same clock tick as a failed renew still resets
+it. Then
 `ceil(idle / interval) - 1` in a row (2 for any idle of 3 s or more) end
 the session with `SandboxExpired { reason: renew_failed }`, since by then
 the sandbox has probably expired. A renew response must name the sandbox
-renewed. Any other error is fatal as an `Api` error. Replay runs
+renewed, still READY; anything else is a protocol error, `INTERNAL`, and
+terminal. Any other error is fatal as an `Api` error. Replay runs
 the same engine without provider latency, so it rarely renews, and the
 journal does not change.
 

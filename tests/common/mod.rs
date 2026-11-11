@@ -95,6 +95,16 @@ pub struct FakeState {
     /// The Nth Exec (from 1) records its execution row, then its response
     /// is lost: the RPC fails `UNAVAILABLE`.
     pub lose_exec_response: Option<usize>,
+    /// The Nth Exec (from 1) is published RUNNING and its response lost;
+    /// the row turns terminal only after this many `GetExecution` reads
+    /// (`u32::MAX`: never).
+    pub running_exec: Option<(usize, u32)>,
+    /// The terminal form of a RUNNING row, with the reads left.
+    pub pending_terminal: Option<(Execution, u32)>,
+    /// `GetSandbox` reports the sandbox not `READY`, as after a refusal
+    /// that was not a race.
+    pub not_ready: bool,
+    pub get_execution_calls: u32,
 }
 
 impl FakeApi {
@@ -310,7 +320,8 @@ impl SandboxApi for FakeApi {
             } else {
                 state.tool_exec_delay
             };
-            let lost = state.lose_exec_response == Some(state.execs.len());
+            let mut lost = state.lose_exec_response == Some(state.execs.len());
+            lost |= publish_running_if_scripted(&mut state, &execution);
             (execution, delay, lost)
         };
         if !delay.is_zero() {
@@ -377,6 +388,42 @@ impl SandboxApi for FakeApi {
         Ok(())
     }
 
+    async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError> {
+        let mut state = self.state();
+        state.get_execution_calls += 1;
+        if let Some((terminal, reads)) = state.pending_terminal.take() {
+            if terminal.id == execution_id && reads != u32::MAX && reads <= 1 {
+                if let Some(row) = state
+                    .executions
+                    .iter_mut()
+                    .find(|row| row.id == execution_id)
+                {
+                    *row = terminal;
+                }
+            } else if terminal.id == execution_id {
+                let reads = if reads == u32::MAX { reads } else { reads - 1 };
+                state.pending_terminal = Some((terminal, reads));
+            } else {
+                state.pending_terminal = Some((terminal, reads));
+            }
+        }
+        state
+            .executions
+            .iter()
+            .find(|row| row.id == execution_id)
+            .cloned()
+            .ok_or_else(|| api_error(Code::NotFound, "no such execution"))
+    }
+
+    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
+        let state = self.state();
+        Ok(
+            state.expired.is_none()
+                && !state.not_ready
+                && state.creates.len() > state.deleted.len(),
+        )
+    }
+
     async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
         let state = self.state();
         Ok(state.executions.iter().rev().cloned().collect())
@@ -419,6 +466,26 @@ impl SandboxApi for FakeApi {
             },
         )
     }
+}
+
+/// Apply `running_exec` to the execution just recorded: publish it RUNNING,
+/// keep its terminal form for later reads, and report the response lost.
+fn publish_running_if_scripted(state: &mut FakeState, execution: &Execution) -> bool {
+    let Some((number, reads)) = state.running_exec else {
+        return false;
+    };
+    if number != state.execs.len() {
+        return false;
+    }
+    if let Some(row) = state.executions.last_mut() {
+        *row = Execution {
+            state: ExecutionState::Unknown,
+            exit_code: None,
+            ..execution.clone()
+        };
+    }
+    state.pending_terminal = Some((execution.clone(), reads));
+    true
 }
 
 /// Apply `unusable_exec` to the execution just recorded.

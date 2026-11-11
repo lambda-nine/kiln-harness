@@ -134,7 +134,7 @@ impl ToolRegistry {
             baseline: BTreeSet::new(),
             typed_reasons,
             // The sandbox has just become ready.
-            activity: Mutex::new(Instant::now()),
+            activity: Mutex::new((Instant::now(), 0)),
             unusable: Mutex::new(None),
         };
         let manifest = session.manifest(session_deadline).await;
@@ -144,10 +144,7 @@ impl ToolRegistry {
                 Err(error) => error.execution_evidence().0,
             };
             return Err(ToolError::Unusable {
-                expiry: match stop {
-                    ToolStop::Expired(reason) => Some(reason),
-                    _ => None,
-                },
+                stop,
                 execution_ids,
             });
         }
@@ -173,9 +170,11 @@ pub struct ToolSession<'a, A: SandboxApi> {
     limits: &'a ToolLimits,
     baseline: BTreeSet<String>,
     typed_reasons: bool,
-    /// The last time kilnd saw activity on the sandbox: ready, or an
-    /// execution's start or finish, or a renew the engine records.
-    activity: Mutex<Instant>,
+    /// The last activity the harness can prove kilnd saw (ready, a returned
+    /// or settled recovered execution, or a renew the engine records), and
+    /// a generation that every such record bumps, so activity in the same
+    /// clock tick as something else is still ordered after it.
+    activity: Mutex<(Instant, u64)>,
     /// Set once an execution reported that the sandbox cannot take another
     /// call, with kilnd's cancel reason if it gave one.
     unusable: Mutex<Option<ToolStop>>,
@@ -202,6 +201,9 @@ pub struct RecoveredExecutionEvidence {
     /// The cancel reason of the first recovered row that left the sandbox
     /// unusable.
     pub cancel_reason: Option<CancelReason>,
+    /// A recovered execution still not terminal when recovery's deadline
+    /// passed. Its outcome, and whether the sandbox survived it, is unknown.
+    pub unsettled: Option<String>,
 }
 
 impl RecoveredExecutionEvidence {
@@ -209,11 +211,16 @@ impl RecoveredExecutionEvidence {
     /// unusable, exactly as for a directly returned one.
     #[must_use]
     pub fn stop(&self) -> Option<ToolStop> {
+        if let Some(id) = &self.unsettled {
+            return Some(ToolStop::Unusable(format!(
+                "execution {id} did not settle after its response was lost"
+            )));
+        }
         (self.sandbox_reusable == Some(false)).then(|| unusable_stop(self.cancel_reason))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStop {
     Deadline,
     Canceled,
@@ -223,8 +230,20 @@ pub enum ToolStop {
     /// sandbox unusable because it was deleted or reached its lifetime.
     Expired(ExpiryReason),
     /// An execution left the sandbox unusable for another or no stated
-    /// cause. The session ends without asking the model again.
-    Unusable,
+    /// cause, kilnd refused one because the sandbox is lost, quarantined,
+    /// failed or not ready, or a recovered execution never settled. The
+    /// session ends without asking the model again, with this message.
+    Unusable(String),
+}
+
+/// The message of [`ToolStop::Unusable`] for a sandbox kilnd reported
+/// unusable.
+pub const UNUSABLE_SANDBOX: &str = "execution left the sandbox unusable";
+
+impl ToolStop {
+    fn unusable() -> Self {
+        Self::Unusable(UNUSABLE_SANDBOX.to_string())
+    }
 }
 
 impl ToolRun {
@@ -299,10 +318,11 @@ pub enum ToolError {
     Api(#[from] ApiError),
     #[error("session deadline expired")]
     Deadline,
-    #[error("execution left the sandbox unusable")]
+    #[error("the baseline left the sandbox unusable: {stop:?}")]
     Unusable {
-        /// The expiry kilnd's cancel reason proves, if any.
-        expiry: Option<ExpiryReason>,
+        /// How the session ends: [`ToolStop::Expired`] when kilnd's cancel
+        /// reason proves an expiry, otherwise [`ToolStop::Unusable`].
+        stop: ToolStop,
         execution_ids: Vec<String>,
     },
     #[error("workspace manifest was invalid: {message}")]
@@ -339,27 +359,38 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     /// knows.
     #[must_use]
     pub fn last_activity(&self) -> Instant {
-        *self
-            .activity
+        self.activity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+    }
+
+    /// How many activities have been recorded. It only grows, so a larger
+    /// value proves activity after an earlier reading, whatever the clock.
+    #[must_use]
+    pub fn activity_generation(&self) -> u64 {
+        self.activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
     }
 
     /// Record activity the engine caused, such as a successful renew.
     pub fn record_activity(&self) {
         let now = Instant::now();
-        let mut last = self
+        let mut activity = self
             .activity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *last = (*last).max(now);
+        activity.0 = activity.0.max(now);
+        activity.1 = activity.1.saturating_add(1);
     }
 
     fn unusable(&self) -> Option<ToolStop> {
-        *self
-            .unusable
+        self.unusable
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub async fn recover_new_execution_evidence(
@@ -369,9 +400,10 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     ) -> RecoveredExecutionEvidence {
         let recovered =
             recover_execution_evidence(self.api, &self.sandbox_id, known, deadline).await;
-        // A recovered row is an execution kilnd admitted, so it is activity;
-        // and one that left the sandbox unusable refuses any later Exec.
-        if !recovered.execution_ids.is_empty() {
+        // A settled recovered row is an execution kilnd admitted and
+        // finished, so it is activity; one that left the sandbox unusable,
+        // or never settled, refuses any later Exec.
+        if !recovered.execution_ids.is_empty() && recovered.unsettled.is_none() {
             self.record_activity();
         }
         if let Some(stop) = recovered.stop() {
@@ -383,19 +415,31 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         recovered
     }
 
+    /// Whether `tool` with `arguments` would reach kilnd: a registered tool
+    /// whose arguments pass every host-side check. Unknown tools and invalid
+    /// arguments are answered on the host and send nothing.
+    #[must_use]
+    pub fn contacts_kilnd(&self, tool: &str, arguments: &Value) -> bool {
+        self.plan(tool, arguments.clone()).is_ok()
+    }
+
     pub async fn execute(
         &self,
         tool: &str,
         arguments: Value,
         session_deadline: Instant,
     ) -> ToolRun {
-        let run = match tool {
-            "exec" => self.exec_tool(arguments, session_deadline).await,
-            "read_file" => self.read_file(arguments, session_deadline).await,
-            "write_file" => self.write_file(arguments, session_deadline).await,
-            "list_dir" => self.list_dir(arguments, session_deadline).await,
-            "workspace_diff" => self.workspace_diff(arguments, session_deadline).await,
-            _ => ToolRun::rejected("unknown_tool", "tool is not registered"),
+        let run = match self.plan(tool, arguments) {
+            Err(rejected) => rejected,
+            Ok(ToolPlan::Exec(plan)) => self.exec_tool(plan, session_deadline).await,
+            Ok(ToolPlan::Read { path, max_bytes }) => {
+                self.read_file(path, max_bytes, session_deadline).await
+            }
+            Ok(ToolPlan::Write { path, bytes }) => {
+                self.write_file(path, bytes, session_deadline).await
+            }
+            Ok(ToolPlan::List { path }) => self.list_dir(path, session_deadline).await,
+            Ok(ToolPlan::Diff) => self.workspace_diff(session_deadline).await,
         };
         let mut run = run.bounded(self.limits.max_result_bytes);
         // A successful RPC does not mean the sandbox survived. The result
@@ -406,45 +450,113 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         run
     }
 
-    async fn exec_tool(&self, arguments: Value, deadline: Instant) -> ToolRun {
-        let args: ExecArgs = match serde_json::from_value(arguments) {
-            Ok(args) => args,
-            Err(error) => return ToolRun::rejected("invalid_arguments", error.to_string()),
-        };
+    /// Every host-side check of a tool call, before anything reaches kilnd.
+    fn plan(&self, tool: &str, arguments: Value) -> Result<ToolPlan, ToolRun> {
+        match tool {
+            "exec" => self.plan_exec(arguments).map(ToolPlan::Exec),
+            "read_file" => {
+                let args: ReadFileArgs = parse_arguments(arguments)?;
+                let path = workspace_path(&args.path, false)
+                    .map_err(|message| ToolRun::rejected("invalid_path", message))?;
+                let max_bytes = args.max_bytes.unwrap_or(self.limits.max_file_bytes);
+                if max_bytes == 0 || max_bytes > self.limits.max_file_bytes {
+                    return Err(ToolRun::rejected(
+                        "invalid_arguments",
+                        "max_bytes is outside the per-file limit",
+                    ));
+                }
+                Ok(ToolPlan::Read { path, max_bytes })
+            }
+            "write_file" => {
+                let args: WriteFileArgs = parse_arguments(arguments)?;
+                let path = workspace_path(&args.path, false)
+                    .map_err(|message| ToolRun::rejected("invalid_path", message))?;
+                if args.content.len() > self.limits.max_file_bytes {
+                    return Err(ToolRun::rejected(
+                        "invalid_arguments",
+                        "content exceeds the per-file limit",
+                    ));
+                }
+                Ok(ToolPlan::Write {
+                    path,
+                    bytes: args.content.into_bytes(),
+                })
+            }
+            "list_dir" => {
+                let args: ListDirArgs = parse_arguments(arguments)?;
+                let path = workspace_path(&args.path, true)
+                    .map_err(|message| ToolRun::rejected("invalid_path", message))?;
+                Ok(ToolPlan::List { path })
+            }
+            "workspace_diff" => {
+                if serde_json::from_value::<WorkspaceDiffArgs>(arguments).is_err() {
+                    return Err(ToolRun::rejected(
+                        "invalid_arguments",
+                        "workspace_diff accepts an empty object",
+                    ));
+                }
+                Ok(ToolPlan::Diff)
+            }
+            _ => Err(ToolRun::rejected("unknown_tool", "tool is not registered")),
+        }
+    }
+
+    fn plan_exec(&self, arguments: Value) -> Result<ExecPlan, ToolRun> {
+        let args: ExecArgs = parse_arguments(arguments)?;
         if args.argv.is_empty() || args.argv.len() > 128 || args.argv[0].is_empty() {
-            return ToolRun::rejected(
+            return Err(ToolRun::rejected(
                 "invalid_arguments",
                 "argv must contain 1..=128 entries and argv[0] must be nonempty",
-            );
+            ));
         }
         if args.argv.iter().any(|arg| arg.contains('\0')) {
-            return ToolRun::rejected("invalid_arguments", "argv may not contain NUL");
+            return Err(ToolRun::rejected(
+                "invalid_arguments",
+                "argv may not contain NUL",
+            ));
         }
         let argv_bytes = args
             .argv
             .iter()
             .try_fold(0usize, |total, arg| total.checked_add(arg.len() + 1));
         if argv_bytes.is_none_or(|bytes| bytes > self.limits.max_argv_bytes) {
-            return ToolRun::rejected("invalid_arguments", "argv exceeds the harness byte limit");
+            return Err(ToolRun::rejected(
+                "invalid_arguments",
+                "argv exceeds the harness byte limit",
+            ));
         }
         if args.stdin.len() > self.limits.max_stdin_bytes {
-            return ToolRun::rejected("invalid_arguments", "stdin exceeds the harness byte limit");
+            return Err(ToolRun::rejected(
+                "invalid_arguments",
+                "stdin exceeds the harness byte limit",
+            ));
         }
-        let requested = match args.timeout_ms {
+        let timeout = match args.timeout_ms {
             Some(0) => {
-                return ToolRun::rejected("invalid_arguments", "timeout_ms must be positive");
+                return Err(ToolRun::rejected(
+                    "invalid_arguments",
+                    "timeout_ms must be positive",
+                ));
             }
             Some(ms) => Duration::from_millis(u64::from(ms)),
             None => self.limits.timeout,
         };
-        if requested > self.limits.timeout {
-            return ToolRun::rejected(
+        if timeout > self.limits.timeout {
+            return Err(ToolRun::rejected(
                 "invalid_arguments",
                 "timeout_ms exceeds the per-tool deadline",
-            );
+            ));
         }
+        Ok(ExecPlan {
+            argv: args.argv,
+            stdin: args.stdin.into_bytes(),
+            timeout,
+        })
+    }
+
+    async fn exec_tool(&self, plan: ExecPlan, deadline: Instant) -> ToolRun {
         match self
-            .run(args.argv, args.stdin.into_bytes(), requested, deadline)
+            .run(plan.argv, plan.stdin, plan.timeout, deadline)
             .await
         {
             Ok(execution) => execution_run(&execution, self.limits.max_result_bytes / 3),
@@ -452,23 +564,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         }
     }
 
-    async fn read_file(&self, arguments: Value, deadline: Instant) -> ToolRun {
-        let args: ReadFileArgs = match serde_json::from_value(arguments) {
-            Ok(args) => args,
-            Err(error) => return ToolRun::rejected("invalid_arguments", error.to_string()),
-        };
-        let path = match workspace_path(&args.path, false) {
-            Ok(path) => path,
-            Err(message) => return ToolRun::rejected("invalid_path", message),
-        };
-        let max_bytes = args.max_bytes.unwrap_or(self.limits.max_file_bytes);
-        if max_bytes == 0 || max_bytes > self.limits.max_file_bytes {
-            return ToolRun::rejected(
-                "invalid_arguments",
-                "max_bytes is outside the per-file limit",
-            );
-        }
-
+    async fn read_file(&self, path: String, max_bytes: usize, deadline: Instant) -> ToolRun {
         let stat = match self
             .run(
                 vec![
@@ -540,19 +636,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         run
     }
 
-    async fn write_file(&self, arguments: Value, deadline: Instant) -> ToolRun {
-        let args: WriteFileArgs = match serde_json::from_value(arguments) {
-            Ok(args) => args,
-            Err(error) => return ToolRun::rejected("invalid_arguments", error.to_string()),
-        };
-        let path = match workspace_path(&args.path, false) {
-            Ok(path) => path,
-            Err(message) => return ToolRun::rejected("invalid_path", message),
-        };
-        if args.content.len() > self.limits.max_file_bytes {
-            return ToolRun::rejected("invalid_arguments", "content exceeds the per-file limit");
-        }
-        let bytes = args.content.into_bytes();
+    async fn write_file(&self, path: String, bytes: Vec<u8>, deadline: Instant) -> ToolRun {
         let byte_count = bytes.len();
         match self
             .run(
@@ -577,15 +661,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         }
     }
 
-    async fn list_dir(&self, arguments: Value, deadline: Instant) -> ToolRun {
-        let args: ListDirArgs = match serde_json::from_value(arguments) {
-            Ok(args) => args,
-            Err(error) => return ToolRun::rejected("invalid_arguments", error.to_string()),
-        };
-        let path = match workspace_path(&args.path, true) {
-            Ok(path) => path,
-            Err(message) => return ToolRun::rejected("invalid_path", message),
-        };
+    async fn list_dir(&self, path: String, deadline: Instant) -> ToolRun {
         match self
             .run(
                 // Names only, one per line, directories marked with '/'.
@@ -623,13 +699,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         }
     }
 
-    async fn workspace_diff(&self, arguments: Value, deadline: Instant) -> ToolRun {
-        if serde_json::from_value::<WorkspaceDiffArgs>(arguments).is_err() {
-            return ToolRun::rejected(
-                "invalid_arguments",
-                "workspace_diff accepts an empty object",
-            );
-        }
+    async fn workspace_diff(&self, deadline: Instant) -> ToolRun {
         match self.manifest(deadline).await {
             Ok(manifest) => {
                 let added: Vec<_> = manifest.files.difference(&self.baseline).cloned().collect();
@@ -747,9 +817,15 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             }),
         )
         .await;
-        let execution = result
-            .map_err(|_| ToolError::Deadline)?
-            .map_err(ToolError::Api)?;
+        let execution = match result {
+            Err(_) => return Err(ToolError::Deadline),
+            Ok(Err(error)) => {
+                return Err(ToolError::Api(
+                    self.settle_not_ready(error, rpc_deadline).await,
+                ));
+            }
+            Ok(Ok(execution)) => execution,
+        };
         // A returned execution proves kilnd published its finish, which is
         // activity; while it ran, kilnd paused idle. A failed RPC proves
         // nothing: an execution row found later by recovery is recorded
@@ -765,6 +841,26 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         }
         Ok(execution)
     }
+}
+
+/// A tool call that passed every host-side check.
+enum ToolPlan {
+    Exec(ExecPlan),
+    Read { path: String, max_bytes: usize },
+    Write { path: String, bytes: Vec<u8> },
+    List { path: String },
+    Diff,
+}
+
+struct ExecPlan {
+    argv: Vec<String>,
+    stdin: Vec<u8>,
+    timeout: Duration,
+}
+
+fn parse_arguments<T: serde::de::DeserializeOwned>(arguments: Value) -> Result<T, ToolRun> {
+    serde_json::from_value(arguments)
+        .map_err(|error| ToolRun::rejected("invalid_arguments", error.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -815,7 +911,7 @@ fn unusable_stop(cause: Option<CancelReason>) -> ToolStop {
         Some(CancelReason::SandboxExpiredLifetime) => {
             ToolStop::Expired(ExpiryReason::ExpiredLifetime)
         }
-        _ => ToolStop::Unusable,
+        _ => ToolStop::unusable(),
     }
 }
 
@@ -927,6 +1023,27 @@ fn combine_execution_error(first: &Execution, second: &Execution, kind: &str) ->
     run
 }
 
+impl<A: SandboxApi> ToolSession<'_, A> {
+    /// kilnd also sends `sandbox_not_ready` for a READY sandbox when an
+    /// Exec lost a race with its own row insert, and says to retry. Ask once,
+    /// within the call's deadline: only a sandbox that reads READY turns the
+    /// refusal into an ordinary, recoverable error (its reason is dropped,
+    /// its message kept). Anything else, a lookup failure included, stays
+    /// terminal.
+    async fn settle_not_ready(&self, error: ApiError, deadline: Instant) -> ApiError {
+        if UnusableReason::of(&error, self.typed_reasons) != Some(UnusableReason::NotReady) {
+            return error;
+        }
+        match timeout_at(deadline, self.api.sandbox_ready(&self.sandbox_id)).await {
+            Ok(Ok(true)) => ApiError {
+                reason: None,
+                ..error
+            },
+            _ => error,
+        }
+    }
+}
+
 fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun {
     match error {
         ToolError::Deadline => ToolRun::interrupted(ToolStop::Deadline),
@@ -938,7 +1055,9 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stderr: unknown_evidence(),
             stop: ExpiryReason::of(&error, typed_reasons)
                 .map(ToolStop::Expired)
-                .or_else(|| UnusableReason::of(&error, typed_reasons).map(|_| ToolStop::Unusable)),
+                .or_else(|| {
+                    UnusableReason::of(&error, typed_reasons).map(|_| ToolStop::unusable())
+                }),
         },
         ToolError::Manifest {
             message,
@@ -956,15 +1075,15 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
         // Only the baseline returns this; a tool's own check in `execute`
         // sets the stop.
         ToolError::Unusable {
-            expiry,
+            stop,
             execution_ids,
         } => ToolRun {
             ok: false,
-            result: json!({"ok": false, "error": kind, "message": "execution left the sandbox unusable"}),
+            result: json!({"ok": false, "error": kind, "message": UNUSABLE_SANDBOX}),
             execution_ids,
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
-            stop: Some(expiry.map_or(ToolStop::Unusable, ToolStop::Expired)),
+            stop: Some(stop),
         },
     }
 }
@@ -1025,46 +1144,79 @@ fn unknown_evidence() -> OutputEvidence {
     }
 }
 
+/// Find executions kilnd assigned that the harness has not seen, after a
+/// lost response. A row is evidence only once it is terminal: a RUNNING row
+/// can still be canceled, retire the sandbox, or settle any other way, so
+/// each unsettled row is followed with `GetExecution`, and `GetSandbox` is
+/// read again for further rows, until every new row is terminal or the
+/// deadline passes. A row still unsettled then is reported as such.
 pub async fn recover_execution_evidence<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     known: &BTreeSet<String>,
     deadline: Instant,
 ) -> RecoveredExecutionEvidence {
+    let mut rows: Vec<Execution> = Vec::new();
     loop {
-        let executions = match timeout_at(deadline, api.recent_executions(sandbox_id)).await {
-            Ok(Ok(executions)) => executions,
-            Ok(Err(_)) | Err(_) => Vec::new(),
-        };
-        let mut recovered = RecoveredExecutionEvidence {
-            execution_ids: Vec::new(),
-            stdout: empty_evidence(),
-            stderr: empty_evidence(),
-            sandbox_reusable: None,
-            cancel_reason: None,
-        };
-        for execution in executions
-            .into_iter()
-            .filter(|execution| !known.contains(&execution.id))
-        {
-            if recovered.sandbox_reusable != Some(false) {
-                if execution.sandbox_reusable == Some(false) {
-                    recovered.cancel_reason = execution.cancel_reason;
-                }
-                if execution.sandbox_reusable.is_some() {
-                    recovered.sandbox_reusable = execution.sandbox_reusable;
+        if let Ok(Ok(executions)) = timeout_at(deadline, api.recent_executions(sandbox_id)).await {
+            for execution in executions
+                .into_iter()
+                .filter(|execution| !known.contains(&execution.id))
+            {
+                match rows.iter_mut().find(|row| row.id == execution.id) {
+                    Some(row) if !is_terminal(row) => *row = execution,
+                    Some(_) => {}
+                    None => rows.push(execution),
                 }
             }
-            recovered.execution_ids.push(execution.id);
-            recovered.stdout = merge_evidence(recovered.stdout, evidence(&execution.stdout));
-            recovered.stderr = merge_evidence(recovered.stderr, evidence(&execution.stderr));
         }
-        if !recovered.execution_ids.is_empty() || Instant::now() >= deadline {
-            return recovered;
+        for row in rows.iter_mut().filter(|row| !is_terminal(row)) {
+            if let Ok(Ok(execution)) = timeout_at(deadline, api.get_execution(&row.id)).await
+                && execution.id == row.id
+            {
+                *row = execution;
+            }
+        }
+        let settled = !rows.is_empty() && rows.iter().all(is_terminal);
+        if settled || Instant::now() >= deadline {
+            return aggregate_recovered(rows);
         }
         sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
             .await;
     }
+}
+
+fn is_terminal(execution: &Execution) -> bool {
+    execution.state != ExecutionState::Unknown
+}
+
+fn aggregate_recovered(rows: Vec<Execution>) -> RecoveredExecutionEvidence {
+    let mut recovered = RecoveredExecutionEvidence {
+        execution_ids: Vec::new(),
+        stdout: empty_evidence(),
+        stderr: empty_evidence(),
+        sandbox_reusable: None,
+        cancel_reason: None,
+        unsettled: None,
+    };
+    for execution in rows {
+        if !is_terminal(&execution) {
+            recovered
+                .unsettled
+                .get_or_insert_with(|| execution.id.clone());
+        } else if recovered.sandbox_reusable != Some(false) {
+            if execution.sandbox_reusable == Some(false) {
+                recovered.cancel_reason = execution.cancel_reason;
+            }
+            if execution.sandbox_reusable.is_some() {
+                recovered.sandbox_reusable = execution.sandbox_reusable;
+            }
+        }
+        recovered.stdout = merge_evidence(recovered.stdout, evidence(&execution.stdout));
+        recovered.stderr = merge_evidence(recovered.stderr, evidence(&execution.stderr));
+        recovered.execution_ids.push(execution.id);
+    }
+    recovered
 }
 
 fn definitions() -> Vec<ToolDefinition> {

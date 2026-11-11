@@ -1072,6 +1072,9 @@ async fn a_typed_non_ready_exec_refusal_ends_the_session() {
             token,
             &format!("{token}: sandbox sb-0000000000000001 is not ready"),
         ));
+        // A not-ready refusal is terminal when the sandbox does not read
+        // READY; the other three are terminal even when it does.
+        api.state().not_ready = token == "sandbox_not_ready";
         let provider = Script::new(
             Duration::ZERO,
             [exec_call(), ModelResponse::final_text("done")],
@@ -1218,4 +1221,344 @@ async fn a_recovered_row_that_left_the_sandbox_unusable_ends_the_session() {
         .await
         .expect("the loop continues as before");
     assert_eq!(outcome.steps, 2);
+}
+
+/// Wraps a provider and records, at each completed tool call, how many
+/// renews the fake kilnd had answered.
+struct ObserveRenews {
+    inner: Script,
+    api: FakeApi,
+    renews_at_tools: Vec<u32>,
+}
+
+#[async_trait]
+impl Provider for ObserveRenews {
+    fn info(&self) -> ProviderInfo {
+        self.inner.info()
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.inner.complete(request).await
+    }
+
+    fn tool_completed(
+        &mut self,
+        _turn: u32,
+        _index: u32,
+        _call: &ToolCall,
+        _ok: bool,
+        _result: &Value,
+    ) -> Result<(), ProviderError> {
+        self.renews_at_tools.push(self.api.state().renews);
+        Ok(())
+    }
+}
+
+fn exec_call_id(id: &str) -> ToolCall {
+    ToolCall::new(id, "exec", json!({"argv": ["/usr/bin/wc", "/workspace/x"]}))
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_renew_falls_due_between_tool_calls_in_one_turn() {
+    // R3-02: one response with two Execs, each refused before admission
+    // after 6 s of a 10 s idle window. The renew must run before the second.
+    let api = FakeApi::with_expiry();
+    api.state().tool_exec_error = Some(api_error(
+        Code::Unavailable,
+        "request rejected before execution admission",
+    ));
+    api.state().tool_exec_delay = Duration::from_secs(6);
+    let watcher = api.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        if watcher.state().renews == 0 {
+            watcher.expire("expired_idle");
+        }
+    });
+    let provider = Script::new(
+        Duration::ZERO,
+        [
+            ModelResponse::tool_use([exec_call_id("e1"), exec_call_id("e2")]),
+            ModelResponse::final_text("done"),
+        ],
+    );
+    let mut config = long_config(10);
+    config.tool_limits.timeout = Duration::from_secs(9);
+    config.max_tool_calls_per_turn = 2;
+    let mut harness = session(&api, provider, config);
+    let outcome = run(&mut harness).await.expect("session completes");
+    assert!(outcome.renews >= 1);
+    assert_eq!(api.state().expired, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_only_rejections_send_no_renew() {
+    // Idle 30 s renews every 10 s. The first call ends exactly when a renew
+    // falls due, so the next kilnd-bound call renews first; an unknown tool
+    // and invalid arguments before it reach no kilnd RPC and renew nothing.
+    let api = FakeApi::with_expiry();
+    let provider = ObserveRenews {
+        inner: Script::new(
+            Duration::from_secs(10),
+            [
+                ModelResponse::tool_use([
+                    ToolCall::new("u1", "not_a_tool", json!({})),
+                    ToolCall::new("b1", "exec", json!({"argv": []})),
+                    exec_call_id("e1"),
+                ]),
+                ModelResponse::final_text("done"),
+            ],
+        ),
+        api: api.clone(),
+        renews_at_tools: Vec::new(),
+    };
+    let mut config = long_config(30);
+    config.max_tool_calls_per_turn = 3;
+    let mut harness = session(&api, provider, config);
+    run(&mut harness).await.expect("session completes");
+    assert_eq!(harness.provider().renews_at_tools, [0, 0, 1]);
+}
+
+/// A fake kilnd that wakes a waiter whenever a renew is answered.
+#[derive(Clone)]
+struct NotifyingApi {
+    inner: FakeApi,
+    renew_answered: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl kiln_harness::api::SandboxApi for NotifyingApi {
+    async fn health(&self) -> Result<kiln_harness::api::Health, kiln_harness::api::ApiError> {
+        self.inner.health().await
+    }
+
+    async fn create(
+        &self,
+        request: kiln_harness::api::SandboxRequest,
+    ) -> Result<kiln_harness::api::Sandbox, kiln_harness::api::ApiError> {
+        self.inner.create(request).await
+    }
+
+    async fn exec(
+        &self,
+        request: kiln_harness::api::SandboxExec,
+    ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
+        self.inner.exec(request).await
+    }
+
+    async fn recent_executions(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Vec<kiln_harness::api::Execution>, kiln_harness::api::ApiError> {
+        self.inner.recent_executions(sandbox_id).await
+    }
+
+    async fn delete(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
+        self.inner.delete(sandbox_id).await
+    }
+
+    async fn renew(&self, sandbox_id: &str) -> Result<(), kiln_harness::api::ApiError> {
+        let result = self.inner.renew(sandbox_id).await;
+        self.renew_answered.notify_one();
+        result
+    }
+
+    async fn get_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
+        self.inner.get_execution(execution_id).await
+    }
+
+    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, kiln_harness::api::ApiError> {
+        self.inner.sandbox_ready(sandbox_id).await
+    }
+
+    async fn non_deleted_sandboxes(
+        &self,
+    ) -> Result<Vec<kiln_harness::api::Sandbox>, kiln_harness::api::ApiError> {
+        self.inner.non_deleted_sandboxes().await
+    }
+}
+
+/// Answers its first request with an Exec as soon as a renew is answered,
+/// in the same clock tick, and its second after `delay`.
+struct ToolAfterFirstRenew {
+    renew_answered: std::sync::Arc<tokio::sync::Notify>,
+    delay: Duration,
+    calls: u32,
+}
+
+#[async_trait]
+impl Provider for ToolAfterFirstRenew {
+    fn info(&self) -> ProviderInfo {
+        ProviderInfo {
+            name: "test".to_string(),
+            model: "test".to_string(),
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        _request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        self.calls += 1;
+        if self.calls == 1 {
+            self.renew_answered.notified().await;
+            return Ok(exec_call());
+        }
+        tokio::time::sleep(self.delay).await;
+        Ok(ModelResponse::final_text("done"))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_tick_activity_resets_the_renew_failures() {
+    // R3-03: the first renew fails at 10 s, and an Exec completes in the
+    // same clock tick. That Exec proves the sandbox alive after the
+    // failure, so a second failure at 20 s is the first in a row, and the
+    // retry at 30 s succeeds.
+    let inner = FakeApi::with_expiry();
+    inner.state().renew_script = VecDeque::from([
+        RenewScript::Fail(api_error(Code::Unavailable, "first transient failure")),
+        RenewScript::Fail(api_error(Code::Unavailable, "second transient failure")),
+        RenewScript::Ok,
+    ]);
+    let renew_answered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let api = NotifyingApi {
+        inner: inner.clone(),
+        renew_answered: renew_answered.clone(),
+    };
+    let provider = ToolAfterFirstRenew {
+        renew_answered,
+        delay: Duration::from_secs(35),
+        calls: 0,
+    };
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        long_config(30),
+    );
+    let outcome = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("the stale failure no longer counts");
+    // Renews at 10 s (failed), 20 s (failed), 30 s and 40 s (both answered).
+    assert_eq!(inner.state().renews, 4);
+    assert!(inner.state().renew_script.is_empty());
+    assert_eq!(outcome.renews, 2);
+}
+
+#[tokio::test]
+async fn a_recovered_row_is_evidence_only_once_it_settles() {
+    use kiln_harness::api::CancelReason;
+    // R3-01 through the fake: the tool's Exec is published RUNNING and its
+    // response lost. Recovery follows the row until it is terminal.
+    let api = FakeApi::with_expiry();
+    api.state().running_exec = Some((2, 3));
+    api.state().unusable_exec = Some((2, Some(CancelReason::SandboxDeleted)));
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut config = short_lifecycle_config();
+    config.lifecycle_timeout = Duration::from_secs(1);
+    let mut harness = session(&api, provider, config);
+    let error = run(&mut harness).await.expect_err("sandbox gone");
+    assert_eq!(
+        expired(&error),
+        Some(ExpiryReason::SandboxDeleted),
+        "{error}"
+    );
+    assert!(api.state().get_execution_calls >= 3);
+    assert_eq!(harness.provider().calls, 1);
+
+    // A row that never settles fails closed, and no later Exec runs.
+    let api = FakeApi::with_expiry();
+    api.state().running_exec = Some((2, u32::MAX));
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("unsettled");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.code == Code::FailedPrecondition
+                && error.message
+                    == "execution ex-0000000000000002 did not settle after its response was lost"),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 1);
+    assert_eq!(api.state().execs.len(), 2);
+    assert!(journal_events(&harness).iter().any(|event| matches!(
+        event,
+        JournalEvent::ToolExecuted { execution_ids, ok: false, .. }
+            if execution_ids == &["ex-0000000000000002".to_string()]
+    )));
+    assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+
+    // During the baseline.
+    let api = FakeApi::with_expiry();
+    api.state().running_exec = Some((1, u32::MAX));
+    let mut harness = session(
+        &api,
+        Script::final_after(Duration::ZERO),
+        short_lifecycle_config(),
+    );
+    let error = run(&mut harness).await.expect_err("unsettled baseline");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.message
+                == "execution ex-0000000000000001 did not settle after its response was lost"),
+        "{error}"
+    );
+    assert_eq!(harness.provider().calls, 0);
+
+    // A row that settles without the usability field, as from an older
+    // daemon, keeps the old behavior: the loop continues.
+    let api = FakeApi::default();
+    api.state().running_exec = Some((2, 1));
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let outcome = run(&mut harness)
+        .await
+        .expect("the loop continues as before");
+    assert_eq!(outcome.steps, 2);
+}
+
+#[tokio::test]
+async fn a_not_ready_race_on_a_ready_sandbox_is_recoverable() {
+    // kilnd answers sandbox_not_ready, "retry", when an Exec lost a race
+    // with its own row insert on a READY sandbox. One lookup tells them
+    // apart: READY returns an ordinary tool error and the loop continues.
+    let api = FakeApi::with_expiry();
+    api.state().tool_exec_error = Some(api_error_with_reason(
+        Code::FailedPrecondition,
+        "sandbox_not_ready",
+        "sandbox_not_ready: execution insert lost a race; retry",
+    ));
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let outcome = run(&mut harness).await.expect("the loop continues");
+    assert_eq!(outcome.steps, 2);
+    let result = journal_events(&harness)
+        .into_iter()
+        .find_map(|event| match event {
+            JournalEvent::ToolExecuted { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("tool_executed");
+    assert_eq!(result["error"], "kilnd_error");
 }

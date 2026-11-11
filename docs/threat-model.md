@@ -46,8 +46,12 @@ it is not a hostile multi-tenant boundary.
   ends the session even though the RPC succeeded, and so does such a row
   found by recovery after a lost response: as an expiry when its cancel
   reason proves one, and otherwise as an error, with no further execution
-  or model call. A typed lost, quarantined, failed or not-ready refusal
-  ends it the same way. The CLI's only Health call before a session is
+  or model call. Recovery takes only terminal rows as evidence, following
+  a RUNNING row until it settles, and a row that never settles within the
+  recovery window ends the session too. A typed lost, quarantined or
+  failed refusal ends it the same way, and so does `sandbox_not_ready`
+  unless one lookup shows the sandbox READY (kilnd's retryable insert
+  race). The CLI's only Health call before a session is
   the engine's, bounded by the session deadline and cancellation; the one
   after it is bounded by the lifecycle window and only warns. Feature
   names are the only daemon-supplied strings `session_opened` records, and
@@ -222,9 +226,12 @@ it is not a hostile multi-tenant boundary.
   liveness signal from a trusted host process, not a credential: anyone who
   can reach the kilnd socket as the owner can renew or delete the sandbox
   anyway. The renew schedule is session-wide, measured from the last
-  activity the harness can prove kilnd saw (a returned or recovered
-  execution, not a failed RPC), so short execution-free turns and refused
-  Execs cannot add up to the idle timeout unrenewed. A daemon that predates discovery lists no features, gets no
+  activity the harness can prove kilnd saw (a returned or settled
+  recovered execution, not a failed RPC), and an overdue renew runs before
+  each provider call and each kilnd-bound tool call, so short
+  execution-free turns and refused Execs, even several in one turn, cannot
+  add up to the idle timeout unrenewed. Failed renews are forgotten once
+  later activity is recorded, by generation rather than timestamp. A daemon that predates discovery lists no features, gets no
   expiry, and still leaks the sandbox of a crashed harness until an
   operator deletes it.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted

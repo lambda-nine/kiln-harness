@@ -25,6 +25,8 @@ use tonic::{Request, Response, Status};
 
 /// A kilnd that creates one ready sandbox, answers the baseline `find`
 /// with an empty workspace, and deletes on request.
+// Independent scripted behaviors read better as flags than as a state enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct Stub {
     /// Health answers this many calls, then never answers again.
@@ -36,6 +38,10 @@ struct Stub {
     deleted_during_exec: bool,
     /// Publish each non-baseline Exec's row, then lose its response.
     lose_tool_response: bool,
+    /// Publish each non-baseline Exec's row RUNNING and lose its response;
+    /// the first `GetSandbox` reports it RUNNING and then terminalizes it as
+    /// canceled for a daemon shutdown, leaving the sandbox unusable.
+    running_then_settles: bool,
     /// Rows `GetSandbox` reports, newest first.
     recent: Arc<std::sync::Mutex<Vec<pb::Execution>>>,
     health_calls: Arc<AtomicU32>,
@@ -126,6 +132,15 @@ impl KilndService for Stub {
             execution.sandbox_reusable = Some(false);
             execution.cancel_reason = pb::CancelReason::SandboxDeleted as i32;
         }
+        if self.running_then_settles && !baseline {
+            execution.state = pb::ExecutionState::Running as i32;
+            execution.exit_code = None;
+            execution.sandbox_reusable = None;
+            self.recent.lock().expect("recent").insert(0, execution);
+            return Err(Status::unavailable(
+                "connection lost while the execution was still running",
+            ));
+        }
         self.recent
             .lock()
             .expect("recent")
@@ -170,17 +185,38 @@ impl KilndService for Stub {
         &self,
         _request: Request<pb::GetSandboxRequest>,
     ) -> Result<Response<pb::GetSandboxResponse>, Status> {
+        let mut recent = self.recent.lock().expect("recent");
+        let snapshot = recent.clone();
+        if let Some(row) = recent.first_mut()
+            && row.state == pb::ExecutionState::Running as i32
+        {
+            row.state = pb::ExecutionState::Canceled as i32;
+            row.failure_reason = "the disconnect retired the sandbox".to_string();
+            row.sandbox_reusable = Some(false);
+            row.cancel_reason = pb::CancelReason::DaemonShutdown as i32;
+        }
         Ok(Response::new(pb::GetSandboxResponse {
             sandbox: Some(sandbox(pb::SandboxState::Deleted)),
-            recent_executions: self.recent.lock().expect("recent").clone(),
+            recent_executions: snapshot,
         }))
     }
 
     async fn get_execution(
         &self,
-        _request: Request<pb::GetExecutionRequest>,
+        request: Request<pb::GetExecutionRequest>,
     ) -> Result<Response<pb::GetExecutionResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        let id = &request.get_ref().id;
+        let execution = self
+            .recent
+            .lock()
+            .expect("recent")
+            .iter()
+            .find(|row| &row.id == id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("no such execution"))?;
+        Ok(Response::new(pb::GetExecutionResponse {
+            execution: Some(execution),
+        }))
     }
 }
 
@@ -350,6 +386,54 @@ async fn a_recovered_execution_that_left_the_sandbox_deleted_ends_the_session() 
             ..
         }) if outcome == "failed"
     ));
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_running_recovery_snapshot_is_followed_until_it_settles() {
+    // R3-01: the first recovered snapshot is RUNNING; the terminal row says
+    // the disconnect left the sandbox unusable, for a non-expiry cause.
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        current: true,
+        running_then_settles: true,
+        ..Stub::default()
+    };
+    let shutdown = serve(stub, &socket);
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let provider = ScriptedProvider::new([
+        ModelResponse::tool_use([ToolCall::new(
+            "call-1",
+            "exec",
+            json!({"argv": ["/bin/true"]}),
+        )]),
+        ModelResponse::final_text("done after a running recovery snapshot"),
+    ]);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        HarnessConfig::default(),
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the settled row proves the sandbox unusable");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.message == "execution left the sandbox unusable"),
+        "{error}"
+    );
+    let requests = harness
+        .journal()
+        .records
+        .iter()
+        .filter(|record| matches!(record.event, JournalEvent::ModelRequested { .. }))
+        .count();
+    assert_eq!(requests, 1);
     let _ = shutdown.send(());
 }
 
