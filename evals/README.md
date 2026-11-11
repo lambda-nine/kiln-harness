@@ -71,7 +71,9 @@ cargo run --locked -- eval selftest --out evals-out/selftest
 ```
 
 For each task this runs two sessions through the real engine and kilnd with
-a scripted model and no model API: a bare one that answers at once, whose
+an in-process scripted model and no network provider (the solution is that
+model's `exec` call, so it is in the session's request history but is never
+sent to a model API): a bare one that answers at once, whose
 check must fail, and one that runs `solution.sh` through the `exec` tool
 (`/bin/sh -s` with the solution on stdin), whose check must pass. It prints
 `ok <id>` or `FAIL <id>: <reason>` for each task and exits non-zero if any
@@ -156,6 +158,11 @@ order).
 - The check runs in the sandbox the agent used. A model that tampers with the
   workspace, replaces tools it can write to, or leaves processes running can
   influence its own check. Evals measure; they do not prove.
+- A check is a finite script that tests behaviour on the inputs it tries. An
+  answer that special-cases those inputs can still pass, so a check samples
+  more inputs than the prompt names and may add a cheap source check (for
+  example, `fix-off-by-one` requires `sum.sh` to keep a loop), but no check
+  proves an answer correct.
 - Pass rates over few trials are noisy. Reports state the number of trials;
   compare runs with the same N, and prefer more trials before trusting a
   small difference.

@@ -207,7 +207,8 @@ enum EvalCommand {
         new: PathBuf,
     },
     /// Prove each task's check: it fails on the bare seed and passes after
-    /// the reference solution, through the real engine with no model.
+    /// the reference solution, through the real engine with a scripted
+    /// model; no network provider is built.
     Selftest {
         /// Directory of task directories.
         #[arg(long, default_value = "evals/tasks")]
@@ -1048,7 +1049,11 @@ async fn eval_selftest(
     out: &Path,
 ) -> Result<ExitCode> {
     let config = eval::selftest_config();
-    let tasks = eval::load_tasks(tasks, only, &config)?;
+    let root = tasks;
+    let tasks = eval::load_tasks(root, only, &config)?;
+    if tasks.is_empty() {
+        bail!("{} holds no tasks", root.display());
+    }
     eval::refuse_existing_out(out)?;
     let api = connect(socket).await?;
     let summary =

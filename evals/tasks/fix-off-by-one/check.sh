@@ -1,5 +1,6 @@
 cd /workspace || exit 2
 [ -f sum.sh ] || exit 1
-[ "$(sh sum.sh 1 </dev/null)" = 1 ] || exit 1
-[ "$(sh sum.sh 10 </dev/null)" = 55 ] || exit 1
-[ "$(sh sum.sh 100 </dev/null)" = 5050 ] || exit 1
+grep -Eq '^[[:space:]]*(while|for)[[:space:]]' sum.sh || exit 1
+for n in 1 2 3 7 10 13 50 99 100 1000; do
+  [ "$(sh sum.sh "$n" </dev/null)" = "$((n * (n + 1) / 2))" ] || exit 1
+done

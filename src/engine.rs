@@ -830,20 +830,42 @@ where
             // The check runs once, only after a final answer that passed
             // the final usability check, in the session's last window.
             if let Some(check) = &task.check {
-                // Like a tool call, the check renews first when a renew is
-                // due, now within the session deadline. Best effort: a
-                // sandbox that is gone shows up as the check's own error.
-                if let Some(heartbeat) = heartbeat {
-                    let check_context = LoopContext {
-                        deadline: session_deadline,
-                        ..context
+                // Cancellation wins over any verdict, as in `final_check`:
+                // before the renew or the check starts, while it runs, and
+                // once it has answered. A verdict it replaces keeps its
+                // execution ID and output as evidence.
+                let run = if cancel.is_cancelled() {
+                    CheckRun::error("canceled")
+                } else {
+                    // Like a tool call, the check renews first when a renew
+                    // is due, now within the session deadline. Best effort:
+                    // a sandbox that is gone shows up as the check's own
+                    // error.
+                    if let Some(heartbeat) = heartbeat {
+                        let check_context = LoopContext {
+                            deadline: session_deadline,
+                            ..context
+                        };
+                        let _ = renew_if_due(&check_context, heartbeat, &mut progress, None).await;
+                    }
+                    // Biased, so a cancellation already set when the
+                    // renew returns never sends the check.
+                    let run = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => CheckRun::error("canceled"),
+                        run = timeout_at(session_deadline, tools.run_check(check, session_deadline)) => {
+                            run.unwrap_or_else(|_| CheckRun::error("deadline"))
+                        }
                     };
-                    let _ = renew_if_due(&check_context, heartbeat, &mut progress, None).await;
-                }
-                let run = tokio::select! {
-                    () = cancel.cancelled() => CheckRun::error("canceled"),
-                    run = timeout_at(session_deadline, tools.run_check(check, session_deadline)) => {
-                        run.unwrap_or_else(|_| CheckRun::error("deadline"))
+                    if cancel.is_cancelled() {
+                        CheckRun {
+                            outcome: CheckOutcome::Error {
+                                reason: "canceled".to_string(),
+                            },
+                            ..run
+                        }
+                    } else {
+                        run
                     }
                 };
                 self.journal.append(

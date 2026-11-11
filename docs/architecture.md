@@ -180,15 +180,21 @@ directory; any caller of `Harness::run` may set them.
   a final answer that passed the final usability check, before cleanup: one
   Exec of `["/bin/sh", "-s"]` with the script on stdin, under the check
   timeout less the usual 250 ms settlement reserve, capped by the session
-  deadline, inside a `select!` on cancellation and the session deadline. When
-  the daemon supports expiry, a due renew runs first, best effort. Exited 0
+  deadline, inside a biased `select!` on cancellation and the session
+  deadline. When the daemon supports expiry, a due renew runs first, best
+  effort. Cancellation wins over any verdict, as in the final usability
+  check: a token already canceled before the renew or the check sends no
+  check, and one canceled by the time the check answers turns its verdict
+  into `canceled`, keeping the execution ID and output. Exited 0
   is `passed`; another exit or a timed-out execution is `failed`; any other
   execution state, an RPC error, cancellation (`canceled`) or the deadline
   (`deadline`) is `error`. There is no lost-response recovery for the check:
   an error is reported as one. The check never changes the work outcome: a
   completed session whose check fails is still `completed`, and
   `SessionOutcome::check` carries the result. The journal's `check_completed`
-  keeps at most 4 KiB of each output stream (lossy UTF-8); the audit's
+  keeps each output stream decoded as lossy UTF-8 and then cut at a
+  character boundary to at most 4 KiB, so replacement characters cannot
+  grow it past the bound; the audit's
   `check_completed` has only the result, exit code, whether it timed out, the
   script's hash and size, the execution ID and output evidence. The script
   never enters a model request.
@@ -917,8 +923,9 @@ did not complete.
 
 A recorded seed and check must pass the engine's own rules under the
 recorded limits (valid base64 included). `check_completed` is allowed only
-when a check was recorded, at most once, and only right after an accepted
-final answer in the last turn; a `session_ended` with work outcome
+when a check was recorded, at most once, only right after an accepted
+final answer in the last turn, and with neither output stream longer than
+4 KiB of UTF-8; a `session_ended` with work outcome
 `completed` requires it when a check was recorded.
 
 The grammar also applies the engine's acceptance rules with the recorded

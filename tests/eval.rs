@@ -12,7 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::{DeleteBehavior, FakeApi, ShAnswer, ShHandler, api_error, short_lifecycle_config};
 use kiln_harness::api::ExecutionState;
-use kiln_harness::audit::{AuditEvent, MemoryAudit};
+use kiln_harness::audit::{AuditError, AuditEvent, AuditSink, MemoryAudit};
 use kiln_harness::engine::{
     CheckOutcome, Harness, HarnessConfig, HarnessError, SeedFile, SessionTask, TaskCheck,
 };
@@ -295,6 +295,105 @@ fn the_starter_suite_loads() {
             task.id
         );
     }
+}
+
+/// A starter task's seed copied to a host directory, with `/workspace` in
+/// its check and solution rewritten to that directory, so both scripts can
+/// run under the host's `/bin/sh` as they would in the sandbox.
+struct HostTask {
+    _dir: tempfile::TempDir,
+    workspace: PathBuf,
+    check: String,
+    solution: String,
+}
+
+fn host_task(id: &str) -> HostTask {
+    let task = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("evals/tasks")
+        .join(id);
+    let dir = common::private_tempdir().expect("tempdir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let seed = task.join("seed");
+    if seed.exists() {
+        for file in walk(&seed) {
+            let relative = file.strip_prefix(&seed).expect("under the seed");
+            write(
+                &workspace.join(relative),
+                &std::fs::read(&file).expect("read"),
+            );
+        }
+    }
+    let rewrite = |name: &str| {
+        std::fs::read_to_string(task.join(name))
+            .expect("read")
+            .replace("/workspace", workspace.to_str().expect("utf-8"))
+    };
+    HostTask {
+        check: rewrite("check.sh"),
+        solution: rewrite("solution.sh"),
+        workspace,
+        _dir: dir,
+    }
+}
+
+/// Run a script as the sandbox runs a check: `/bin/sh -s` with the script on
+/// stdin, from `/`. True when it exits 0.
+fn host_sh(script: &str) -> bool {
+    use std::io::Write as _;
+    let mut child = Command::new("/bin/sh")
+        .arg("-s")
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn /bin/sh");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(script.as_bytes())
+        .expect("write the script");
+    child.wait().expect("wait").success()
+}
+
+#[test]
+fn each_starter_check_fails_bare_and_passes_after_its_solution_on_the_host() {
+    let mut tested = 0;
+    for entry in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tasks"))
+        .expect("read the suite")
+    {
+        let id = entry.expect("entry").file_name();
+        let id = id.to_str().expect("utf-8");
+        let task = host_task(id);
+        assert!(!host_sh(&task.check), "{id}: the bare seed passed");
+        assert!(host_sh(&task.solution), "{id}: the solution failed");
+        assert!(host_sh(&task.check), "{id}: the solved check failed");
+        tested += 1;
+    }
+    assert_eq!(tested, 8);
+}
+
+#[test]
+fn fix_off_by_one_refuses_a_lookup_and_an_answer_without_its_loop() {
+    // Right for the three values the prompt and the old check named, wrong
+    // for every other N.
+    let lookup = "#!/bin/sh\ncase \"$1\" in\n  1) echo 1 ;;\n  10) echo 55 ;;\n  100) echo 5050 ;;\n  *) echo 0 ;;\nesac\n";
+    // Right for every N, but not the loop the prompt asks to keep.
+    let closed_form = "#!/bin/sh\necho $(($1 * ($1 + 1) / 2))\n";
+    for (name, script) in [("lookup", lookup), ("closed form", closed_form)] {
+        let task = host_task("fix-off-by-one");
+        write(&task.workspace.join("sum.sh"), script.as_bytes());
+        assert!(!host_sh(&task.check), "{name} passed the check");
+    }
+    let task = host_task("fix-off-by-one");
+    assert!(!host_sh(&task.check), "the bare seed passed");
+    assert!(host_sh(&task.solution), "the solution failed");
+    assert!(
+        host_sh(&task.check),
+        "the reference solution failed the check"
+    );
 }
 
 #[test]
@@ -988,11 +1087,71 @@ async fn check_output_is_bounded_in_the_journal() {
         })
         .expect("check record");
     assert_eq!(stdout.len(), 4096);
-    assert_eq!(stderr.chars().count(), 4096, "lossy UTF-8 of 4 KiB");
+    // Decoded first, then cut: 5,000 invalid bytes are replacement
+    // characters of three bytes each, cut at a character boundary.
+    assert!(stderr.len() <= 4096, "{} bytes", stderr.len());
+    assert_eq!(stderr, "\u{fffd}".repeat(1365));
     assert!(harness.audit().records.iter().any(|record| matches!(
         &record.event,
         AuditEvent::CheckCompleted { stdout, .. } if stdout.observed_bytes == 10_000
     )));
+}
+
+/// The journal's check output for one stdout stream from the fake.
+async fn journaled_check_stdout(stdout: Vec<u8>) -> String {
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(fixed_handler(ShAnswer {
+        stdout,
+        ..ShAnswer::exit(0)
+    }));
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config(),
+    );
+    harness
+        .run(
+            &checked_task("exit 0", Duration::from_secs(10)),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("completes");
+    harness
+        .journal()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::CheckCompleted { stdout, .. } => Some(stdout.clone()),
+            _ => None,
+        })
+        .expect("check record")
+}
+
+#[tokio::test]
+async fn check_output_is_cut_at_a_character_boundary() {
+    // A two-byte character straddling the bound is dropped whole.
+    let mut straddling = vec![b'a'; 4095];
+    straddling.extend("é".repeat(10).as_bytes());
+    assert_eq!(journaled_check_stdout(straddling).await, "a".repeat(4095));
+    // One that ends exactly at the bound is kept.
+    let mut ending = vec![b'a'; 4094];
+    ending.extend("é".repeat(10).as_bytes());
+    let text = journaled_check_stdout(ending).await;
+    assert_eq!(text.len(), 4096);
+    assert!(text.ends_with('é'));
+    // A four-byte character cut by the source bound is not replaced by a
+    // replacement character that would still fit.
+    let mut cut = vec![b'a'; 4093];
+    cut.extend("😀".as_bytes());
+    cut.push(b'z');
+    assert_eq!(journaled_check_stdout(cut).await, "a".repeat(4093));
+    // Short output, invalid bytes included, is kept whole.
+    assert_eq!(
+        journaled_check_stdout(b"ok\xffend".to_vec()).await,
+        "ok\u{fffd}end"
+    );
 }
 
 #[tokio::test]
@@ -1050,6 +1209,128 @@ async fn cancellation_during_the_check_is_an_error_result() {
             reason: "canceled".to_string()
         })
     );
+    assert!(ended(harness.journal()).2, "cleanup confirmed");
+}
+
+/// An audit that cancels the session as the final usability check is
+/// audited, after that check's own last look at the token and before the
+/// task check starts.
+struct CancelAfterFinalCheck {
+    inner: MemoryAudit,
+    cancel: CancellationToken,
+}
+
+impl AuditSink for CancelAfterFinalCheck {
+    fn append(
+        &mut self,
+        session_id: &str,
+        sandbox_id: Option<&str>,
+        event: AuditEvent,
+    ) -> Result<(), AuditError> {
+        let final_check = matches!(event, AuditEvent::FinalCheck { .. });
+        self.inner.append(session_id, sandbox_id, event)?;
+        if final_check {
+            self.cancel.cancel();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_set_before_the_check_always_wins() {
+    for attempt in 0..128 {
+        let api = FakeApi::default();
+        api.state().sh_handler = Some(fixed_handler(ShAnswer::exit(0)));
+        let cancel = CancellationToken::new();
+        let audit = CancelAfterFinalCheck {
+            inner: MemoryAudit::default(),
+            cancel: cancel.clone(),
+        };
+        let mut harness = Harness::new(
+            api.clone(),
+            ScriptedProvider::new([ModelResponse::final_text("done")]),
+            audit,
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+        let outcome = harness
+            .run(
+                &checked_task("exit 0", Duration::from_secs(10)),
+                cancel.clone(),
+            )
+            .await
+            .expect("the work completed before the task check");
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            outcome.check,
+            Some(CheckOutcome::Error {
+                reason: "canceled".to_string()
+            }),
+            "attempt {attempt}"
+        );
+        assert!(
+            !argv(&api).iter().any(|argv| argv[0] == "/bin/sh"),
+            "attempt {attempt}: the check was sent"
+        );
+        assert_eq!(
+            ended(harness.journal()),
+            ("completed".to_string(), "completed".to_string(), true),
+            "attempt {attempt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_by_the_time_the_check_answers_replaces_its_verdict() {
+    let api = FakeApi::default();
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    // The check answers passed, but the session is canceled while it runs.
+    api.state().sh_handler = Some(Arc::new(move |_, _| {
+        trigger.cancel();
+        ShAnswer {
+            stdout: b"checked\n".to_vec(),
+            ..ShAnswer::exit(0)
+        }
+    }));
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config(),
+    );
+    let outcome = harness
+        .run(&checked_task("exit 0", Duration::from_secs(10)), cancel)
+        .await
+        .expect("the work completed before the cancellation");
+    assert_eq!(
+        outcome.check,
+        Some(CheckOutcome::Error {
+            reason: "canceled".to_string()
+        })
+    );
+    // The execution and its output stay as evidence.
+    let (execution_id, stdout) = harness
+        .journal()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::CheckCompleted {
+                execution_id,
+                stdout,
+                ..
+            } => Some((execution_id.clone(), stdout.clone())),
+            _ => None,
+        })
+        .expect("check record");
+    assert!(execution_id.is_some());
+    assert_eq!(stdout, "checked\n");
+    assert!(harness.audit().records.iter().any(|record| matches!(
+        &record.event,
+        AuditEvent::CheckCompleted { result, execution_ids, .. }
+            if result == "error" && execution_ids.len() == 1
+    )));
     assert!(ended(harness.journal()).2, "cleanup confirmed");
 }
 
@@ -1436,7 +1717,11 @@ async fn the_runner_writes_results_reports_and_a_manifest() {
 }
 
 #[tokio::test]
-async fn neither_script_ever_reaches_the_model() {
+async fn neither_script_reaches_the_provider_in_a_suite_run() {
+    // `eval run` never reads the solution into a session, and the check
+    // never enters a request. (The self-test is different: its scripted
+    // in-process model sends the solution to `exec`, but no network
+    // provider exists there.)
     let temp = common::private_tempdir().expect("tempdir");
     let tasks = two_tasks(&temp.path().join("tasks"));
     let out = temp.path().join("out");
@@ -1956,6 +2241,47 @@ fn eval_run_refuses_an_existing_out_before_contacting_anything() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no-such-task"), "{stderr}");
     assert!(!temp.path().join("new").exists());
+}
+
+#[test]
+fn eval_run_and_selftest_refuse_an_empty_suite_before_contacting_anything() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = temp.path().join("tasks");
+    std::fs::create_dir(&tasks).expect("tasks");
+    let socket = temp.path().join("no.sock");
+    let socket = socket.to_str().expect("utf-8");
+    let tasks = tasks.to_str().expect("utf-8");
+    let out = temp.path().join("out");
+    let out = out.to_str().expect("utf-8");
+    let run = [
+        "--socket",
+        socket,
+        "eval",
+        "run",
+        "--provider",
+        "openai-compat",
+        "--base-url",
+        "http://127.0.0.1:9/v1",
+        "--model",
+        "m",
+        "--tasks",
+        tasks,
+        "--out",
+        out,
+    ];
+    let selftest = [
+        "--socket", socket, "eval", "selftest", "--tasks", tasks, "--out", out,
+    ];
+    for args in [&run[..], &selftest[..]] {
+        let output = cli(args);
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("{tasks} holds no tasks")),
+            "{stderr}"
+        );
+        assert!(!temp.path().join("out").exists(), "{args:?}");
+    }
 }
 
 #[test]

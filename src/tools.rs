@@ -187,9 +187,9 @@ pub struct SeedEvidence {
     pub execution_ids: Vec<String>,
 }
 
-/// One run of a task's check: its verdict, the execution, and at most
-/// [`CHECK_OUTPUT_BYTES`] of each output stream (lossy UTF-8) for the
-/// journal, with the audit's evidence.
+/// One run of a task's check: its verdict, the execution, and each output
+/// stream for the journal, decoded as lossy UTF-8 and then cut to at most
+/// [`CHECK_OUTPUT_BYTES`] bytes, with the audit's evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckRun {
     pub outcome: CheckOutcome,
@@ -1235,8 +1235,8 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         CheckRun {
             outcome,
             execution_id: Some(execution.id.clone()),
-            stdout: bounded_text(&execution.stdout.data, CHECK_OUTPUT_BYTES).text,
-            stderr: bounded_text(&execution.stderr.data, CHECK_OUTPUT_BYTES).text,
+            stdout: check_output(&execution.stdout.data),
+            stderr: check_output(&execution.stderr.data),
             stdout_evidence: evidence(&execution.stdout),
             stderr_evidence: evidence(&execution.stderr),
         }
@@ -1335,6 +1335,25 @@ fn bounded_text(bytes: &[u8], limit: usize) -> BoundedText {
         text: String::from_utf8_lossy(&bytes[..end]).into_owned(),
         truncated: bytes.len() > end,
     }
+}
+
+/// One check output stream for the journal: decoded lossily first, then cut
+/// to at most [`CHECK_OUTPUT_BYTES`] at a character boundary, so replacement
+/// characters for invalid bytes cannot grow it past the bound.
+fn check_output(bytes: &[u8]) -> String {
+    // Each decoded character takes at least one input byte, and an input
+    // character is at most four bytes, so the first `CHECK_OUTPUT_BYTES + 3`
+    // input bytes decode to the same bounded prefix as the whole stream.
+    let end = bytes.len().min(CHECK_OUTPUT_BYTES + 3);
+    let mut text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    if text.len() > CHECK_OUTPUT_BYTES {
+        let mut cut = CHECK_OUTPUT_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
 }
 
 struct BoundedText {

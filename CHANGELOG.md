@@ -20,6 +20,16 @@ change the CLI or audit format.
   limit flags), `eval compare` and `eval selftest`, with eight starter tasks
   in `evals/tasks/`. `ToolRegistry::start_session` takes the seed, and
   `Provider` gains a default `check_completed` hook.
+- First eval-suite review round. Cancellation wins at the task check as it
+  does at the final usability check: a token already canceled sends no
+  check, the wait is biased toward it, and one canceled by the time the
+  check answers turns its verdict into `canceled` (the execution and output
+  are kept). Check output is decoded as lossy UTF-8 before it is cut to
+  4 KiB at a character boundary, and the journal grammar rejects a
+  `check_completed` stream longer than 4 KiB. `fix-off-by-one` checks ten
+  inputs and requires `sum.sh` to keep a loop, so a lookup of the named
+  values no longer passes. `eval selftest` refuses an empty suite like
+  `eval run`.
 - First review round for idempotent create. Cleanup releases the request ID
   only when the create took a single attempt: after a retry an abandoned
   attempt may still reach kilnd, so the key is kept, every delete sends

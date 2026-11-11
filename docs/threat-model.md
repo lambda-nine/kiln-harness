@@ -208,7 +208,10 @@ it is not a hostile multi-tenant boundary.
   script on stdin; no host shell string is ever built from either. The check
   script never enters a model request, and the audit holds only its hash and
   size. `solution.sh` is used only by the self-test, which gives it to the
-  sandbox through the `exec` tool.
+  sandbox through the `exec` tool as a call of its in-process scripted
+  model. It is therefore part of that session's request history, but the
+  self-test builds no network provider, so it is never sent to one; `eval
+  run` never reads it into a session.
 
 ## Deliberate limits
 

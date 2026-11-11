@@ -27,7 +27,7 @@ use crate::provider::{
     Message, ModelRequest, ModelResponse, ProviderContent, ProviderErrorKind, ProviderInfo,
     ToolCall, ToolDefinition, ToolResult, Usage,
 };
-use crate::tools::sanitize_call;
+use crate::tools::{CHECK_OUTPUT_BYTES, sanitize_call};
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 /// Largest journal file `read_journal` accepts and a sink will write.
@@ -93,7 +93,8 @@ pub enum JournalEvent {
         execution_ids: Vec<String>,
     },
     /// The task check's result, after the final response and before
-    /// `session_ended`, with at most 4 KiB of each output stream.
+    /// `session_ended`, with at most 4 KiB (bytes of UTF-8) of each output
+    /// stream.
     CheckCompleted {
         outcome: CheckOutcome,
         execution_id: Option<String>,
@@ -1080,7 +1081,12 @@ impl Grammar {
                 result,
                 ..
             } => self.record_tool(*turn, *index, call, result)?,
-            JournalEvent::CheckCompleted { .. } => self.check_completed()?,
+            JournalEvent::CheckCompleted { stdout, stderr, .. } => {
+                if stdout.len() > CHECK_OUTPUT_BYTES || stderr.len() > CHECK_OUTPUT_BYTES {
+                    return Err("check_completed output is longer than 4 KiB");
+                }
+                self.check_completed()?;
+            }
             JournalEvent::SessionEnded { .. } => {
                 self.check_end(event)?;
                 self.phase = Phase::Ended;

@@ -1431,7 +1431,10 @@ pub fn bare_provider() -> ScriptedProvider {
 }
 
 /// The scripted model of the self-test's solved session: one `exec` of
-/// `/bin/sh -s` with the reference solution on stdin, then the answer.
+/// `/bin/sh -s` with the reference solution on stdin, then the answer. The
+/// solution is this in-process model's own call, so it appears in the
+/// session's request history; the self-test never builds a network
+/// provider, so it is never sent to one.
 #[must_use]
 pub fn solved_provider(solution: &str) -> ScriptedProvider {
     ScriptedProvider::new([
@@ -1444,7 +1447,8 @@ pub fn solved_provider(solution: &str) -> ScriptedProvider {
     ])
 }
 
-/// Prove each task's check through the real engine, no model: a bare
+/// Prove each task's check through the real engine with a scripted model
+/// and no network provider: a bare
 /// session must fail its check, and a session that runs the reference
 /// solution must pass it. Audits and journals go under
 /// `OUT/<id>/bare/` and `OUT/<id>/solved/`. It fails closed like

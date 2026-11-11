@@ -14,7 +14,7 @@ use kiln_harness::provider::{
     ToolDefinition, ToolResult, Usage,
 };
 use kiln_harness::replay::ReplayProvider;
-use kiln_harness::tools::{ToolLimits, ToolRegistry};
+use kiln_harness::tools::{CHECK_OUTPUT_BYTES, ToolLimits, ToolRegistry};
 use serde_json::json;
 
 const SESSION: &str = "hs-grammar";
@@ -1114,6 +1114,54 @@ fn a_recorded_check_completes_once_after_the_final_answer() {
     let at = after.len() - 1;
     after.insert(at, requested(3));
     assert_rejected("a request after the check", after);
+}
+
+#[test]
+fn check_output_may_not_exceed_four_kib_of_utf8() {
+    let with_output = |stdout: String, stderr: String| {
+        let mut events = checked();
+        let at = events.len() - 2;
+        events[at] = JournalEvent::CheckCompleted {
+            outcome: CheckOutcome::Passed,
+            execution_id: Some("ex-9".to_string()),
+            stdout,
+            stderr,
+        };
+        events
+    };
+    assert_eq!(CHECK_OUTPUT_BYTES, 4096);
+    // Bytes, not characters: 1365 replacement characters are 4095 bytes.
+    let at_limit = "o".repeat(4096);
+    let replaced = "\u{fffd}".repeat(1365);
+    assert_accepted(
+        "4096 bytes of stdout",
+        with_output(at_limit.clone(), String::new()),
+    );
+    assert_accepted(
+        "4096 bytes of stderr",
+        with_output(String::new(), at_limit.clone()),
+    );
+    assert_accepted(
+        "replacement characters within the bound",
+        with_output(replaced.clone(), replaced),
+    );
+    let over = "o".repeat(4097);
+    assert_rejected_because(
+        "4097 bytes of stdout",
+        with_output(over.clone(), String::new()),
+        "longer than 4 KiB",
+    );
+    assert_rejected_because(
+        "4097 bytes of stderr",
+        with_output(String::new(), over),
+        "longer than 4 KiB",
+    );
+    // 1366 replacement characters: within 4096 characters, over 4096 bytes.
+    assert_rejected_because(
+        "replacement characters past the bound",
+        with_output(String::new(), "\u{fffd}".repeat(1366)),
+        "longer than 4 KiB",
+    );
 }
 
 #[test]
