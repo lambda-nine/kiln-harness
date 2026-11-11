@@ -718,10 +718,10 @@ async fn an_oversized_request_is_never_sent() {
 // 8. A full session, then its replay without the server.
 
 fn task() -> SessionTask {
-    SessionTask {
-        system: "Use the tools.".to_string(),
-        prompt: "Write hello to a.txt, read it back, then report.".to_string(),
-    }
+    SessionTask::new(
+        "Use the tools.".to_string(),
+        "Write hello to a.txt, read it back, then report.".to_string(),
+    )
 }
 
 fn session_script() -> Vec<Reply> {

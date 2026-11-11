@@ -550,10 +550,10 @@ fn malformed_blocks_and_tool_uses_are_invalid() {
 // 3. Round trip: response N's content is request N+1's assistant turn.
 
 fn task() -> SessionTask {
-    SessionTask {
-        system: "Use the tools.".to_string(),
-        prompt: "Write hello to a.txt, read it back, then report.".to_string(),
-    }
+    SessionTask::new(
+        "Use the tools.".to_string(),
+        "Write hello to a.txt, read it back, then report.".to_string(),
+    )
 }
 
 fn session_script() -> Vec<Reply> {

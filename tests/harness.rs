@@ -1782,18 +1782,9 @@ async fn journal_failure_before_create_never_creates_a_sandbox() {
 async fn invalid_tasks_are_rejected_before_create() {
     let oversized = "x".repeat(MAX_TASK_TEXT_BYTES + 1);
     for task in [
-        SessionTask {
-            system: String::new(),
-            prompt: String::new(),
-        },
-        SessionTask {
-            system: oversized.clone(),
-            prompt: "ok".to_string(),
-        },
-        SessionTask {
-            system: String::new(),
-            prompt: oversized.clone(),
-        },
+        SessionTask::new(String::new(), String::new()),
+        SessionTask::new(oversized.clone(), "ok".to_string()),
+        SessionTask::new(String::new(), oversized.clone()),
     ] {
         let api = FakeApi::default();
         let observer = api.clone();

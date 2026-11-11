@@ -100,6 +100,13 @@ sudo env KILND_INTEGRATION=1 "$test_bin" \
 
 assert_clean
 
+# The eval self-test proves two starter tasks' checks against kilnd.
+sudo env KILND_INTEGRATION=1 "$test_bin" \
+    --exact eval_selftest_proves_two_starter_tasks_against_installed_kilnd \
+    --nocapture
+
+assert_clean
+
 # The CLI records, verifies, and reproduces one session.
 bin=$(cargo build --locked --bin kiln-harness --message-format=json | \
     python3 -c '

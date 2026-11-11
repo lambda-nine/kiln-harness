@@ -1,0 +1,1 @@
+`/workspace/people.csv` is a CSV file with the header `name,age,city` and one person per line. Write `/workspace/sorted.csv` with the same header line first, then every person's line sorted by age in ascending numeric order, breaking ties by name in ascending order. Keep each line exactly as it is in `people.csv`, and leave `people.csv` unchanged.

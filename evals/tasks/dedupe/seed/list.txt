@@ -1,0 +1,13 @@
+pear
+apple
+Apple
+banana
+pear
+cherry
+apple
+banana split
+banana
+fig
+Fig
+cherry
+pear

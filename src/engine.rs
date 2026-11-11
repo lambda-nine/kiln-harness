@@ -18,16 +18,16 @@ use crate::api::{
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
-    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedToolLimits, SessionLimits,
-    request_sha256,
+    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedCheck, RecordedSeedFile,
+    RecordedToolLimits, SessionLimits, request_sha256,
 };
 use crate::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderError, StopReason, ToolCall,
     ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::{
-    ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop, UNUSABLE_SANDBOX,
-    recover_execution_evidence, sanitize_call_bounded, unusable_stop,
+    CheckRun, ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop,
+    UNUSABLE_SANDBOX, recover_execution_evidence, sanitize_call_bounded, unusable_stop,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -63,25 +63,144 @@ const MAX_CREATE_BACKOFF: Duration = Duration::from_secs(2);
 /// Further `release_request_id` deletes after absence is confirmed, when no
 /// earlier delete reported the request ID released.
 const EXTRA_RELEASE_DELETES: u32 = 2;
+/// Most files one session may seed into its workspace.
+pub const MAX_SEED_FILES: usize = 256;
+/// Most bytes one session may seed into its workspace, all files together.
+pub const MAX_SEED_BYTES: u64 = 4 << 20;
+/// Largest check script, before the tighter `max_stdin_bytes` tool limit.
+pub const MAX_CHECK_SCRIPT_BYTES: usize = 64 << 10;
+/// Bounds for [`TaskCheck::timeout`].
+pub const MIN_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+pub const MAX_CHECK_TIMEOUT: Duration = MAX_TOOL_TIMEOUT;
+
 /// What one session is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTask {
     pub system: String,
     pub prompt: String,
+    /// Files written into `/workspace` before the workspace baseline, in
+    /// order. Model-visible only through the workspace itself.
+    #[serde(default)]
+    pub seed: Vec<SeedFile>,
+    /// A script run in the sandbox after the final answer. Never part of
+    /// any model request.
+    #[serde(default)]
+    pub check: Option<TaskCheck>,
+}
+
+/// One seeded file: a path relative to `/workspace` and its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedFile {
+    pub path: String,
+    pub contents: Vec<u8>,
+}
+
+/// The check that runs once after a session's accepted final answer: the
+/// script goes to `/bin/sh -s` on stdin, and exit 0 passes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCheck {
+    pub script: Vec<u8>,
+    pub timeout: Duration,
+}
+
+/// How the check ended. It never changes the session's work outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CheckOutcome {
+    /// The script exited 0.
+    Passed,
+    /// The script exited non-zero, or ran out of its timeout.
+    Failed {
+        exit_code: Option<i32>,
+        timed_out: bool,
+    },
+    /// The check could not give a verdict: an RPC error, an execution that
+    /// neither exited nor timed out, cancellation (`canceled`) or the
+    /// session deadline (`deadline`).
+    Error { reason: String },
+}
+
+impl CheckOutcome {
+    /// `passed`, `failed` or `error`.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed { .. } => "failed",
+            Self::Error { .. } => "error",
+        }
+    }
+
+    /// The exit code, when the script exited.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Passed => Some(0),
+            Self::Failed { exit_code, .. } => *exit_code,
+            Self::Error { .. } => None,
+        }
+    }
+
+    /// Equal for replay: any error equals any other error, whatever its
+    /// reason, since reasons carry timing and transport detail.
+    #[must_use]
+    pub fn same_verdict(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Error { .. }, Self::Error { .. }) => true,
+            _ => self == other,
+        }
+    }
+}
+
+impl std::fmt::Display for CheckOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Passed => formatter.write_str("passed"),
+            Self::Failed {
+                timed_out: true, ..
+            } => formatter.write_str("failed (timed out)"),
+            Self::Failed {
+                exit_code: Some(code),
+                ..
+            } => write!(formatter, "failed (exit {code})"),
+            Self::Failed { .. } => formatter.write_str("failed"),
+            Self::Error { reason } => write!(formatter, "error ({reason})"),
+        }
+    }
 }
 
 impl SessionTask {
+    /// Check the task as [`Harness::run`] does before anything exists: the
+    /// prompt and system sizes, and the seed and check rules under
+    /// `config`'s limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarnessError::InvalidTask`] naming the first problem.
+    pub fn validate(&self, config: &HarnessConfig) -> Result<(), HarnessError> {
+        validate_task(self, config)
+    }
+
+    /// A task with no seed and no check.
+    #[must_use]
+    pub fn new(system: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            system: system.into(),
+            prompt: prompt.into(),
+            seed: Vec::new(),
+            check: None,
+        }
+    }
+
     /// The task the deterministic demo script carries out.
     #[must_use]
     pub fn demo() -> Self {
-        Self {
-            system: "You operate one no-network kiln sandbox through typed tools. \
-                     Work only under /workspace."
-                .to_string(),
-            prompt: "Write demo.txt, read it back, list the workspace, check the workspace \
-                     diff, count the file's bytes with wc, then report what you did."
-                .to_string(),
-        }
+        Self::new(
+            "You operate one no-network kiln sandbox through typed tools. \
+             Work only under /workspace.",
+            "Write demo.txt, read it back, list the workspace, check the workspace \
+             diff, count the file's bytes with wc, then report what you did.",
+        )
     }
 }
 
@@ -229,6 +348,8 @@ pub struct SessionOutcome {
     pub usage: Usage,
     /// Successful `RenewSandbox` heartbeats during provider calls.
     pub renews: u32,
+    /// The task check's result, when the task has one.
+    pub check: Option<CheckOutcome>,
 }
 
 #[derive(Debug, Error)]
@@ -245,6 +366,9 @@ pub enum HarnessError {
     ToolSetup(#[from] ToolError),
     #[error("invalid session task: {0}")]
     InvalidTask(String),
+    /// Writing the task's seed files failed before the first model call.
+    #[error("seeding the workspace failed: {0}")]
+    Seed(String),
     #[error("session deadline expired")]
     Deadline,
     #[error("session canceled")]
@@ -352,11 +476,19 @@ where
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
         validate_config(&self.config)?;
-        validate_task(task)?;
+        validate_task(task, &self.config)?;
         let session_id = session_id()?;
-        let deadline = Instant::now()
+        let session_deadline = Instant::now()
             .checked_add(self.config.session_timeout)
             .ok_or(HarnessError::Deadline)?;
+        // A task check runs in the last `check.timeout` of the session, so
+        // everything before it, model work included, ends that much earlier.
+        // validate_task keeps the check to at most half the session.
+        let deadline = task
+            .check
+            .as_ref()
+            .and_then(|check| session_deadline.checked_sub(check.timeout))
+            .unwrap_or(session_deadline);
         // Discovery comes before any use: an older daemon ignores fields it
         // does not know, so expiry is sent and reasons are read only when a
         // serving daemon lists them. Nothing exists yet if this fails.
@@ -417,6 +549,8 @@ where
                 task: task.prompt.clone(),
                 tools: self.registry.definitions().to_vec(),
                 limits: self.config.limits(),
+                seed: task.seed.iter().map(RecordedSeedFile::new).collect(),
+                check: task.check.as_ref().map(RecordedCheck::new),
             },
         );
         if let Err(error) = started {
@@ -553,11 +687,12 @@ where
                         deadline,
                         typed_reasons,
                         create_sent,
+                        &task.seed,
                     ) => {
                     Some(started)
                 }
             };
-            let (tools, baseline) = match started {
+            let (tools, seeded, baseline) = match started {
                 Some(Ok(value)) => value,
                 None => {
                     // The dropped baseline RPC asks kilnd to cancel it; record
@@ -584,6 +719,11 @@ where
                         },
                     )?;
                     return Err(HarnessError::Canceled);
+                }
+                // Seeding failed before the baseline: the session fails
+                // before any model call, and cleanup runs as for any failure.
+                Some(Err(ToolError::Seed { message, .. })) => {
+                    return Err(HarnessError::Seed(message));
                 }
                 Some(Err(error)) => {
                     let (mut execution_ids, _, _) = error.execution_evidence();
@@ -630,11 +770,22 @@ where
                             }
                         }
                         ToolError::Unusable { stop, .. } => return Err(stop_error(stop.clone())),
-                        ToolError::Deadline | ToolError::Manifest { .. } => {}
+                        ToolError::Deadline | ToolError::Manifest { .. } | ToolError::Seed { .. } => {}
                     }
                     return Err(HarnessError::ToolSetup(error));
                 }
             };
+            if let Some(seeded) = seeded {
+                self.audit.append(
+                    &session_id,
+                    Some(&sandbox_id),
+                    AuditEvent::WorkspaceSeeded {
+                        files: seeded.files,
+                        bytes: seeded.bytes,
+                        execution_ids: seeded.execution_ids,
+                    },
+                )?;
+            }
             let baseline_execution_ids = baseline.execution_ids.clone();
             self.audit.append(
                 &session_id,
@@ -667,7 +818,7 @@ where
                 deadline,
                 cancel: &cancel,
             };
-            run_loop(
+            let mut outcome = run_loop(
                 &mut self.provider,
                 &mut self.audit,
                 &mut self.journal,
@@ -675,7 +826,58 @@ where
                 &mut progress,
                 baseline_execution_ids,
             )
-            .await
+            .await?;
+            // The check runs once, only after a final answer that passed
+            // the final usability check, in the session's last window.
+            if let Some(check) = &task.check {
+                // Like a tool call, the check renews first when a renew is
+                // due, now within the session deadline. Best effort: a
+                // sandbox that is gone shows up as the check's own error.
+                if let Some(heartbeat) = heartbeat {
+                    let check_context = LoopContext {
+                        deadline: session_deadline,
+                        ..context
+                    };
+                    let _ = renew_if_due(&check_context, heartbeat, &mut progress, None).await;
+                }
+                let run = tokio::select! {
+                    () = cancel.cancelled() => CheckRun::error("canceled"),
+                    run = timeout_at(session_deadline, tools.run_check(check, session_deadline)) => {
+                        run.unwrap_or_else(|_| CheckRun::error("deadline"))
+                    }
+                };
+                self.journal.append(
+                    &session_id,
+                    JournalEvent::CheckCompleted {
+                        outcome: run.outcome.clone(),
+                        execution_id: run.execution_id.clone(),
+                        stdout: run.stdout,
+                        stderr: run.stderr,
+                    },
+                )?;
+                self.audit.append(
+                    &session_id,
+                    Some(&sandbox_id),
+                    AuditEvent::CheckCompleted {
+                        result: run.outcome.label().to_string(),
+                        exit_code: run.outcome.exit_code(),
+                        timed_out: matches!(
+                            run.outcome,
+                            CheckOutcome::Failed {
+                                timed_out: true,
+                                ..
+                            }
+                        ),
+                        script: ContentSummary::bytes(&check.script),
+                        execution_ids: run.execution_id.into_iter().collect(),
+                        stdout: run.stdout_evidence,
+                        stderr: run.stderr_evidence,
+                    },
+                )?;
+                self.provider.check_completed(&run.outcome);
+                outcome.check = Some(run.outcome);
+            }
+            Ok(outcome)
         }
         .await;
 
@@ -1270,6 +1472,7 @@ where
         tool_calls: progress.tool_calls,
         usage: progress.usage,
         renews: progress.renews,
+        check: None,
     })
 }
 
@@ -1614,9 +1817,112 @@ impl Terminal {
     }
 }
 
-fn validate_task(task: &SessionTask) -> Result<(), HarnessError> {
-    task_problem(&task.system, &task.prompt)
-        .map_or(Ok(()), |problem| Err(HarnessError::InvalidTask(problem)))
+fn validate_task(task: &SessionTask, config: &HarnessConfig) -> Result<(), HarnessError> {
+    let problem = task_problem(&task.system, &task.prompt)
+        .or_else(|| {
+            seed_problem(
+                task.seed
+                    .iter()
+                    .map(|file| (file.path.as_str(), file.contents.len())),
+                config.tool_limits.max_file_bytes,
+            )
+        })
+        .or_else(|| {
+            task.check.as_ref().and_then(|check| {
+                check_problem(
+                    check.timeout,
+                    check.script.len(),
+                    config.session_timeout,
+                    config.tool_limits.max_stdin_bytes,
+                )
+            })
+        });
+    problem.map_or(Ok(()), |problem| Err(HarnessError::InvalidTask(problem)))
+}
+
+/// Why a task's seed would be refused, if it would: more than
+/// [`MAX_SEED_FILES`] files, a file over `max_file_bytes`, more than
+/// [`MAX_SEED_BYTES`] in total, a path that is not the normalized relative
+/// form the tools accept, paths out of strictly ascending order (so no
+/// duplicates), or one file's path under another's. Shared with the
+/// journal grammar.
+pub(crate) fn seed_problem<'a>(
+    files: impl IntoIterator<Item = (&'a str, usize)>,
+    max_file_bytes: usize,
+) -> Option<String> {
+    let mut paths = BTreeSet::new();
+    let mut previous: Option<&str> = None;
+    let mut total = 0u64;
+    for (path, bytes) in files {
+        if paths.len() >= MAX_SEED_FILES {
+            return Some(format!("a seed has at most {MAX_SEED_FILES} files"));
+        }
+        if crate::tools::workspace_path(path, false).ok().as_deref()
+            != Some(format!("/workspace/{path}").as_str())
+        {
+            return Some(format!(
+                "seed path {path:?} must be relative to /workspace and normalized"
+            ));
+        }
+        if previous.is_some_and(|previous| previous >= path) {
+            return Some("seed paths must be unique and in ascending order".to_string());
+        }
+        if bytes > max_file_bytes {
+            return Some(format!(
+                "seed file {path:?} exceeds the {max_file_bytes}-byte file limit"
+            ));
+        }
+        total = total.saturating_add(bytes as u64);
+        if total > MAX_SEED_BYTES {
+            return Some(format!(
+                "a seed has at most {MAX_SEED_BYTES} bytes in total"
+            ));
+        }
+        previous = Some(path);
+        paths.insert(path);
+    }
+    // A file cannot also be a directory another seed file lives in.
+    for path in &paths {
+        let mut ancestor = *path;
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if paths.contains(parent) {
+                return Some(format!("seed file {parent:?} is also a directory"));
+            }
+            ancestor = parent;
+        }
+    }
+    None
+}
+
+/// Why a check would be refused, if it would: a timeout outside
+/// [`MIN_CHECK_TIMEOUT`]..=[`MAX_CHECK_TIMEOUT`], not whole milliseconds,
+/// or more than half the session timeout (the model works in the rest), or
+/// an empty script, or one over [`MAX_CHECK_SCRIPT_BYTES`] or the tools'
+/// stdin limit. Shared with the journal grammar.
+pub(crate) fn check_problem(
+    timeout: Duration,
+    script_bytes: usize,
+    session_timeout: Duration,
+    max_stdin_bytes: usize,
+) -> Option<String> {
+    if timeout < MIN_CHECK_TIMEOUT
+        || timeout > MAX_CHECK_TIMEOUT
+        || timeout.subsec_nanos() % 1_000_000 != 0
+    {
+        return Some(format!(
+            "the check timeout must be whole milliseconds from {} to {} seconds",
+            MIN_CHECK_TIMEOUT.as_secs(),
+            MAX_CHECK_TIMEOUT.as_secs()
+        ));
+    }
+    if timeout.saturating_mul(2) > session_timeout {
+        return Some("the check timeout may be at most half the session timeout".to_string());
+    }
+    let limit = MAX_CHECK_SCRIPT_BYTES.min(max_stdin_bytes);
+    if script_bytes == 0 || script_bytes > limit {
+        return Some(format!("the check script must be 1 to {limit} bytes"));
+    }
+    None
 }
 
 /// Why the engine would refuse a task, if it would. Shared with the journal

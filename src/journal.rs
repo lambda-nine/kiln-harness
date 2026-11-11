@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,6 +18,9 @@ use thiserror::Error;
 // The harness reaches kilnd over a Unix socket and is Unix-only.
 use std::os::unix::fs::MetadataExt;
 
+use crate::engine::{
+    CheckOutcome, MAX_SEED_FILES, SeedFile, TaskCheck, check_problem, seed_problem,
+};
 pub use crate::outputs::DirectoryProblem;
 use crate::outputs::{Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{
@@ -45,6 +48,14 @@ pub enum JournalEvent {
         task: String,
         tools: Vec<ToolDefinition>,
         limits: SessionLimits,
+        /// The task's seed files, contents included, so replay can seed a
+        /// fresh sandbox. Absent when the task has none, so journals
+        /// without a seed are byte-identical to before.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        seed: Vec<RecordedSeedFile>,
+        /// The task's check, script included. Never model-visible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check: Option<RecordedCheck>,
     },
     SandboxReady {
         sandbox_id: String,
@@ -81,6 +92,14 @@ pub enum JournalEvent {
         result: Value,
         execution_ids: Vec<String>,
     },
+    /// The task check's result, after the final response and before
+    /// `session_ended`, with at most 4 KiB of each output stream.
+    CheckCompleted {
+        outcome: CheckOutcome,
+        execution_id: Option<String>,
+        stdout: String,
+        stderr: String,
+    },
     SessionEnded {
         /// `cleanup_failed` whenever sandbox deletion could not be confirmed
         /// after work; otherwise the same as `work_outcome`.
@@ -93,6 +112,132 @@ pub enum JournalEvent {
         usage: Usage,
         sandbox_deleted: bool,
     },
+}
+
+/// A seeded file as the journal records it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedSeedFile {
+    pub path: String,
+    /// Standard base64 with padding.
+    pub contents_b64: String,
+}
+
+/// A task check as the journal records it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedCheck {
+    /// Standard base64 with padding.
+    pub script_b64: String,
+    pub timeout_ms: u64,
+}
+
+impl RecordedSeedFile {
+    #[must_use]
+    pub fn new(file: &SeedFile) -> Self {
+        Self {
+            path: file.path.clone(),
+            contents_b64: base64_encode(&file.contents),
+        }
+    }
+
+    /// The seed file this records, or `None` when the base64 is invalid.
+    #[must_use]
+    pub fn decode(&self) -> Option<SeedFile> {
+        Some(SeedFile {
+            path: self.path.clone(),
+            contents: base64_decode(&self.contents_b64)?,
+        })
+    }
+}
+
+impl RecordedCheck {
+    #[must_use]
+    pub fn new(check: &TaskCheck) -> Self {
+        Self {
+            script_b64: base64_encode(&check.script),
+            timeout_ms: u64::try_from(check.timeout.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The check this records, or `None` when the base64 is invalid.
+    #[must_use]
+    pub fn decode(&self) -> Option<TaskCheck> {
+        Some(TaskCheck {
+            script: base64_decode(&self.script_b64)?,
+            timeout: Duration::from_millis(self.timeout_ms),
+        })
+    }
+}
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (RFC 4648) with padding.
+#[must_use]
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let triple = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (position, byte)| {
+                acc | u32::from(*byte) << (16 - 8 * position)
+            });
+        for position in 0..4 {
+            if position <= chunk.len() {
+                let index = (triple >> (18 - 6 * position)) & 0x3f;
+                encoded.push(char::from(BASE64_ALPHABET[index as usize]));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    encoded
+}
+
+/// Decode standard padded base64, refusing anything else: a length that
+/// is not a multiple of 4, characters outside the alphabet, misplaced
+/// padding, or nonzero bits after the last byte, so each byte string has
+/// exactly one accepted encoding.
+#[must_use]
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let value = |byte: u8| -> Option<u32> {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        Some(u32::from(value))
+    };
+    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+    let quads = bytes.len() / 4;
+    for (number, quad) in bytes.chunks(4).enumerate() {
+        let padding = quad.iter().rev().take_while(|byte| **byte == b'=').count();
+        if padding > 2 || (padding > 0 && number + 1 != quads) {
+            return None;
+        }
+        let mut triple = 0u32;
+        for (position, byte) in quad[..4 - padding].iter().enumerate() {
+            triple |= value(*byte)? << (18 - 6 * position);
+        }
+        let kept = 3 - padding;
+        // Bits past the last kept byte must be zero.
+        if triple & ((1u32 << (8 * (3 - kept))) - 1) != 0 {
+            return None;
+        }
+        for position in 0..kept {
+            decoded.push(((triple >> (16 - 8 * position)) & 0xff) as u8);
+        }
+    }
+    Some(decoded)
 }
 
 /// Every limit that can change model-visible behavior, recorded so replay
@@ -586,6 +731,37 @@ const WORK_OUTCOMES: [&str; 5] = [
 ];
 const CLEANUP_FAILED: &str = "cleanup_failed";
 
+/// Why a recorded seed or check could not have come from the engine, if it
+/// could not: invalid base64, or the engine's own seed and check rules under
+/// the recorded limits.
+fn recorded_task_problem(
+    seed: &[RecordedSeedFile],
+    check: Option<&RecordedCheck>,
+    limits: &SessionLimits,
+) -> Option<String> {
+    let mut files = Vec::with_capacity(seed.len().min(MAX_SEED_FILES + 1));
+    // One file past the cap is enough for the seed rules to refuse it.
+    for file in seed.iter().take(MAX_SEED_FILES + 1) {
+        let Some(contents) = base64_decode(&file.contents_b64) else {
+            return Some(format!("seed file {:?} is not valid base64", file.path));
+        };
+        files.push((file.path.as_str(), contents.len()));
+    }
+    if let Some(problem) = seed_problem(files, limits.tool_limits.max_file_bytes) {
+        return Some(problem);
+    }
+    let check = check?;
+    let Some(script) = base64_decode(&check.script_b64) else {
+        return Some("the check script is not valid base64".to_string());
+    };
+    check_problem(
+        Duration::from_millis(check.timeout_ms),
+        script.len(),
+        Duration::from_millis(limits.session_timeout_ms),
+        limits.tool_limits.max_stdin_bytes,
+    )
+}
+
 /// Expiry is not model-visible and feeds no request hash. The engine sends
 /// both fields or neither, within the bounds of
 /// [`crate::engine::expiry_problem`]: bounds, not exact equivalence, since
@@ -629,6 +805,10 @@ fn check_expiry(
 ///   confirmed deletion; `cleanup_failed` means deletion was not confirmed;
 ///   and a request may be left unanswered only when the work did not
 ///   complete.
+/// - A recorded seed and check pass the engine's rules under the recorded
+///   limits. `check_completed` appears only when a check was recorded, at
+///   most once, right after an accepted final answer, and completed work
+///   with a recorded check needs it.
 #[derive(Debug, Clone, Default)]
 pub struct Grammar {
     phase: Phase,
@@ -641,6 +821,17 @@ pub struct Grammar {
     tool_calls: u32,
     usage: Usage,
     output_bytes: u64,
+    check: CheckState,
+}
+
+/// Whether `session_started` recorded a check, and whether
+/// `check_completed` has been fed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CheckState {
+    #[default]
+    None,
+    Recorded,
+    Completed,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -729,6 +920,8 @@ impl Grammar {
                 task,
                 tools,
                 limits,
+                seed,
+                check,
                 ..
             } = event
             else {
@@ -752,6 +945,15 @@ impl Grammar {
                     sequence,
                     reason: "recorded limits are not positive or exceed a hard ceiling".to_string(),
                 });
+            }
+            if let Some(problem) = recorded_task_problem(seed, check.as_ref(), limits) {
+                return Err(JournalError::Grammar {
+                    sequence,
+                    reason: format!("recorded task is invalid: {problem}"),
+                });
+            }
+            if check.is_some() {
+                self.check = CheckState::Recorded;
             }
             self.context = Some(SessionContext {
                 system: system.clone(),
@@ -878,11 +1080,30 @@ impl Grammar {
                 result,
                 ..
             } => self.record_tool(*turn, *index, call, result)?,
+            JournalEvent::CheckCompleted { .. } => self.check_completed()?,
             JournalEvent::SessionEnded { .. } => {
                 self.check_end(event)?;
                 self.phase = Phase::Ended;
             }
         }
+        Ok(())
+    }
+
+    /// The check runs once, only for a session that recorded one, and only
+    /// after an accepted final answer in the last turn.
+    fn check_completed(&mut self) -> Result<(), &'static str> {
+        match self.check {
+            CheckState::None => return Err("check_completed without a recorded check"),
+            CheckState::Completed => return Err("second check_completed"),
+            CheckState::Recorded => {}
+        }
+        let final_answer = self.last_response.as_ref().is_some_and(|last| {
+            last.turn == self.last_turn && last.calls.is_empty() && last.accepted
+        });
+        if self.pending.is_some() || self.turn_failed || !final_answer {
+            return Err("check_completed needs an accepted final answer in the last turn");
+        }
+        self.check = CheckState::Completed;
         Ok(())
     }
 
@@ -1056,6 +1277,9 @@ impl Grammar {
                 || final_response.and_then(|last| last.text.as_ref()) != final_answer.as_ref()
             {
                 return Err("final_answer differs from the final response text");
+            }
+            if self.check == CheckState::Recorded {
+                return Err("completed work with a recorded check needs check_completed");
             }
         } else if final_answer.is_some() {
             return Err("final_answer without completed work");

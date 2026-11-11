@@ -9,12 +9,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kiln_harness::api::{SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{
-    Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST, MAX_SANDBOX_IDLE_TIMEOUT,
-    MAX_SANDBOX_LIFETIME_MARGIN, MAX_SESSION_TIMEOUT, MAX_STEPS, MAX_TASK_TEXT_BYTES,
-    MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT, MAX_TOTAL_MODEL_OUTPUT_BYTES,
-    MAX_TOTAL_TOKENS, MIN_SANDBOX_IDLE_TIMEOUT, MIN_SANDBOX_LIFETIME_MARGIN, SessionOutcome,
-    SessionTask,
+    CheckOutcome, Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST,
+    MAX_SANDBOX_IDLE_TIMEOUT, MAX_SANDBOX_LIFETIME_MARGIN, MAX_SESSION_TIMEOUT, MAX_STEPS,
+    MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
+    MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, MIN_SANDBOX_IDLE_TIMEOUT,
+    MIN_SANDBOX_LIFETIME_MARGIN, SessionOutcome, SessionTask,
 };
+use kiln_harness::eval;
 use kiln_harness::files::read_regular_file;
 use kiln_harness::journal::{
     JournalEvent, JournalLimits, JsonlJournal, LoadedJournal, open_journal_source, read_journal,
@@ -72,6 +73,11 @@ enum Command {
         #[command(subcommand)]
         command: JournalCommand,
     },
+    /// Run, compare, and self-test the eval suite.
+    Eval {
+        #[command(subcommand)]
+        command: EvalCommand,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -85,8 +91,9 @@ enum ProviderKind {
     Anthropic,
 }
 
+/// The provider and limit flags `run` and `eval run` share.
 #[derive(clap::Args)]
-struct RunArgs {
+struct ModelArgs {
     #[arg(long, value_enum)]
     provider: ProviderKind,
     /// API root, such as `http://192.168.1.20:11434/v1`. Required for
@@ -97,19 +104,6 @@ struct RunArgs {
     /// anthropic defaults to `claude-opus-5-5`.
     #[arg(long)]
     model: Option<String>,
-    /// The task.
-    #[arg(
-        long,
-        conflicts_with = "prompt_file",
-        required_unless_present = "prompt_file"
-    )]
-    prompt: Option<String>,
-    /// Read the task from a UTF-8 file.
-    #[arg(long)]
-    prompt_file: Option<PathBuf>,
-    /// Read the system prompt from a UTF-8 file instead of the default.
-    #[arg(long)]
-    system_file: Option<PathBuf>,
     /// Environment variable holding the API key; the key is never a flag.
     /// Without it, anthropic needs a `--base-url` naming a host-side proxy
     /// that adds the key.
@@ -174,12 +168,82 @@ struct RunArgs {
     /// locally whatever the server reports as usage.
     #[arg(long, default_value_t = 8 << 20)]
     max_total_output_bytes: u64,
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    #[command(flatten)]
+    model: ModelArgs,
+    /// The task.
+    #[arg(
+        long,
+        conflicts_with = "prompt_file",
+        required_unless_present = "prompt_file"
+    )]
+    prompt: Option<String>,
+    /// Read the task from a UTF-8 file.
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+    /// Read the system prompt from a UTF-8 file instead of the default.
+    #[arg(long)]
+    system_file: Option<PathBuf>,
     /// Append-only metadata audit destination.
     #[arg(long, default_value = "audit/run.jsonl")]
     audit: PathBuf,
     /// New session journal; defaults to `journal/run-<unix_ms>.jsonl`.
     #[arg(long)]
     journal: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum EvalCommand {
+    /// Run every eval task N times against one provider and write a report.
+    Run(Box<EvalRunArgs>),
+    /// Compare two eval reports as Markdown on stdout.
+    Compare {
+        /// Output directory of the base run.
+        base: PathBuf,
+        /// Output directory of the new run.
+        new: PathBuf,
+    },
+    /// Prove each task's check: it fails on the bare seed and passes after
+    /// the reference solution, through the real engine with no model.
+    Selftest {
+        /// Directory of task directories.
+        #[arg(long, default_value = "evals/tasks")]
+        tasks: PathBuf,
+        /// Test only this task; repeatable.
+        #[arg(long = "task", value_name = "ID")]
+        only: Vec<String>,
+        /// New directory for audits and journals; must not exist.
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(clap::Args)]
+struct EvalRunArgs {
+    #[command(flatten)]
+    model: ModelArgs,
+    /// Directory of task directories.
+    #[arg(long, default_value = "evals/tasks")]
+    tasks: PathBuf,
+    /// Run only this task; repeatable.
+    #[arg(long = "task", value_name = "ID")]
+    only: Vec<String>,
+    /// Runs per task, 1 to 100.
+    #[arg(long, default_value_t = 1)]
+    trials: u32,
+    /// New directory for every run's audit and journal, the results and
+    /// the report; must not exist.
+    #[arg(long)]
+    out: PathBuf,
+    /// Free text for the report, at most 128 bytes.
+    #[arg(long)]
+    label: Option<String>,
+    /// Replay each completed run's journal against a fresh sandbox.
+    #[arg(long)]
+    replay: bool,
 }
 
 #[derive(Subcommand)]
@@ -218,6 +282,15 @@ async fn main() -> Result<ExitCode> {
         Command::Journal {
             command: JournalCommand::Verify { path },
         } => Ok(verify(&path)),
+        Command::Eval {
+            command: EvalCommand::Run(args),
+        } => eval_run(cli.socket, &args).await,
+        Command::Eval {
+            command: EvalCommand::Compare { base, new },
+        } => eval_compare(&base, &new),
+        Command::Eval {
+            command: EvalCommand::Selftest { tasks, only, out },
+        } => eval_selftest(cli.socket, &tasks, &only, &out).await,
     }
 }
 
@@ -304,6 +377,35 @@ fn check_secs(flag: &str, value: u64, min: Duration, max: Duration) -> Result<()
 }
 
 fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
+    let config = model_config(&args.model)?;
+
+    let prompt = match (&args.prompt, &args.prompt_file) {
+        (Some(prompt), None) => prompt.clone(),
+        (None, Some(path)) => read_text_file("--prompt-file", path)?,
+        _ => bail!("give exactly one of --prompt and --prompt-file"),
+    };
+    if prompt.trim().is_empty() {
+        bail!("the prompt is empty");
+    }
+    if prompt.len() > MAX_TASK_TEXT_BYTES {
+        bail!("the prompt is longer than {MAX_TASK_TEXT_BYTES} bytes");
+    }
+    let system = match &args.system_file {
+        Some(path) => read_text_file("--system-file", path)?,
+        None => default_system_prompt(&config.tool_limits),
+    };
+
+    let provider = build_provider(&args.model)?;
+    Ok(PreparedRun {
+        task: SessionTask::new(system, prompt),
+        config,
+        provider,
+    })
+}
+
+/// Check the shared provider and limit flags and build the configuration
+/// they ask for.
+fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
     check_provider_flags(args)?;
     check_limit("--max-steps", args.max_steps, MAX_STEPS)?;
     check_limit("--max-tool-calls", args.max_tool_calls, MAX_TOOL_CALLS)?;
@@ -372,34 +474,25 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
         ..HarnessConfig::default()
     };
     config.validate()?;
+    Ok(config)
+}
 
-    let prompt = match (&args.prompt, &args.prompt_file) {
-        (Some(prompt), None) => prompt.clone(),
-        (None, Some(path)) => read_text_file("--prompt-file", path)?,
-        _ => bail!("give exactly one of --prompt and --prompt-file"),
+/// The base URL's host alone, for the eval manifest: never a user,
+/// password, port, path, query or fragment.
+fn base_url_host(args: &ModelArgs) -> Option<String> {
+    let base_url = match args.provider {
+        ProviderKind::OpenAiCompat => args.base_url.as_deref()?,
+        ProviderKind::Anthropic => args.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL),
     };
-    if prompt.trim().is_empty() {
-        bail!("the prompt is empty");
-    }
-    if prompt.len() > MAX_TASK_TEXT_BYTES {
-        bail!("the prompt is longer than {MAX_TASK_TEXT_BYTES} bytes");
-    }
-    let system = match &args.system_file {
-        Some(path) => read_text_file("--system-file", path)?,
-        None => default_system_prompt(&config.tool_limits),
-    };
-
-    let provider = build_provider(args)?;
-    Ok(PreparedRun {
-        task: SessionTask { system, prompt },
-        config,
-        provider,
-    })
+    reqwest::Url::parse(base_url)
+        .ok()?
+        .host_str()
+        .map(str::to_string)
 }
 
 /// The provider `run` was asked for, from its flags. Errors name flags and
 /// variables, never a key.
-fn build_provider(args: &RunArgs) -> Result<RunProvider> {
+fn build_provider(args: &ModelArgs) -> Result<RunProvider> {
     Ok(match args.provider {
         ProviderKind::OpenAiCompat => {
             let (Some(base_url), Some(model)) = (&args.base_url, &args.model) else {
@@ -435,7 +528,7 @@ fn build_provider(args: &RunArgs) -> Result<RunProvider> {
 
 /// Refuse flags that mean nothing to the chosen provider, before anything
 /// else is checked.
-fn check_provider_flags(args: &RunArgs) -> Result<()> {
+fn check_provider_flags(args: &ModelArgs) -> Result<()> {
     let (name, foreign): (&str, &[(&str, bool)]) = match args.provider {
         ProviderKind::OpenAiCompat => (
             "openai-compat",
@@ -588,6 +681,9 @@ async fn replay(
             } else if !replay.exhausted() {
                 println!("diverged: recorded turns were left unreplayed");
                 Ok(ExitCode::FAILURE)
+            } else if replay.check_diverged() {
+                println!("diverged at check");
+                Ok(ExitCode::FAILURE)
             } else {
                 println!("reproduced");
                 Ok(ExitCode::SUCCESS)
@@ -712,6 +808,12 @@ fn verify(path: &Path) -> ExitCode {
     );
     println!("turns: {}", summary.turns);
     println!("tool calls: {}", summary.tool_calls);
+    if summary.seed_files > 0 {
+        println!("seed: {} files", summary.seed_files);
+    }
+    if let Some(check) = &summary.check {
+        println!("check: {}", terminal_safe(&check.to_string()));
+    }
     println!(
         "usage: input {}, output {}, cache read {}, cache creation {}",
         summary.usage.input_tokens,
@@ -728,6 +830,8 @@ struct Summary {
     turns: u32,
     tool_calls: u32,
     usage: Usage,
+    seed_files: usize,
+    check: Option<CheckOutcome>,
 }
 
 fn summarize(journal: &LoadedJournal) -> Summary {
@@ -737,9 +841,13 @@ fn summarize(journal: &LoadedJournal) -> Summary {
         turns: 0,
         tool_calls: 0,
         usage: Usage::default(),
+        seed_files: 0,
+        check: None,
     };
     for record in &journal.records {
         match &record.event {
+            JournalEvent::SessionStarted { seed, .. } => summary.seed_files = seed.len(),
+            JournalEvent::CheckCompleted { outcome, .. } => summary.check = Some(outcome.clone()),
             JournalEvent::ModelRequested { .. } => summary.turns += 1,
             JournalEvent::ModelResponded { response, .. } => {
                 summary.usage = summary.usage + response.usage;
@@ -866,6 +974,107 @@ fn terminal_safe(text: &str) -> String {
     safe
 }
 
+async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
+    // Everything is checked, every task loaded, and the key read, before
+    // any output is made or kilnd is contacted.
+    let config = model_config(&args.model)?;
+    eval::validate_trials_and_label(args.trials, args.label.as_deref())?;
+    let tasks = eval::load_tasks(&args.tasks, &args.only, &config)?;
+    if tasks.is_empty() {
+        bail!("{} holds no tasks", args.tasks.display());
+    }
+    let provider = build_provider(&args.model)?.info();
+    eval::refuse_existing_out(&args.out)?;
+    let api = connect(socket).await?;
+    let options = eval::SuiteOptions {
+        out: args.out.clone(),
+        trials: args.trials,
+        replay: args.replay,
+        label: args.label.clone(),
+        base_config: config,
+        provider,
+        base_url_host: base_url_host(&args.model),
+    };
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &options,
+        || build_provider(&args.model).map_err(|error| error.to_string()),
+        &interrupt(),
+        &mut |result| {
+            println!(
+                "{} #{}: {} (check {}){}",
+                result.task,
+                result.trial,
+                result.outcome,
+                result.check.as_deref().unwrap_or("not run"),
+                result
+                    .replay
+                    .as_deref()
+                    .map_or_else(String::new, |replay| format!(", replay {replay}"))
+            );
+        },
+    )
+    .await?;
+    warn_if_unhealthy(&api, options.base_config.lifecycle_timeout).await;
+    let overall = &summary.report.overall;
+    println!(
+        "passed {} of {} runs; macro pass rate {}",
+        overall.passed,
+        overall.runs,
+        overall
+            .macro_pass_rate
+            .map_or_else(|| "n/a".to_string(), |rate| format!("{:.1}%", rate * 100.0))
+    );
+    println!("report: {}", args.out.join("report.md").display());
+    if let Some(stopped) = &summary.stopped {
+        eprintln!("stopped early: {stopped}");
+        return Ok(ExitCode::FAILURE);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn eval_compare(base: &Path, new: &Path) -> Result<ExitCode> {
+    let base = eval::read_report(base)?;
+    let new = eval::read_report(new)?;
+    print!("{}", eval::compare(&base, &new));
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn eval_selftest(
+    socket: PathBuf,
+    tasks: &Path,
+    only: &[String],
+    out: &Path,
+) -> Result<ExitCode> {
+    let config = eval::selftest_config();
+    let tasks = eval::load_tasks(tasks, only, &config)?;
+    eval::refuse_existing_out(out)?;
+    let api = connect(socket).await?;
+    let summary =
+        eval::selftest(
+            &api,
+            &tasks,
+            &config,
+            out,
+            &interrupt(),
+            &mut |result| match &result.problem {
+                None => println!("ok {}", result.task),
+                Some(problem) => println!("FAIL {}: {}", result.task, terminal_safe(problem)),
+            },
+        )
+        .await?;
+    warn_if_unhealthy(&api, config.lifecycle_timeout).await;
+    if let Some(stopped) = &summary.stopped {
+        eprintln!("stopped early: {stopped}");
+    }
+    Ok(if summary.ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
 fn print_outcome(outcome: &SessionOutcome) {
     println!("{}", terminal_safe(&outcome.final_answer));
     println!("session: {}", outcome.session_id);
@@ -878,6 +1087,9 @@ fn print_outcome(outcome: &SessionOutcome) {
         "usage: input {}, output {}",
         outcome.usage.input_tokens, outcome.usage.output_tokens
     );
+    if let Some(check) = &outcome.check {
+        println!("check: {}", terminal_safe(&check.to_string()));
+    }
 }
 
 #[cfg(test)]
@@ -892,6 +1104,37 @@ mod tests {
             .tempdir()?;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
         Ok(dir)
+    }
+
+    fn model_args(provider: &str, base_url: Option<&str>) -> ModelArgs {
+        let mut argv = vec![
+            "kiln-harness",
+            "run",
+            "--provider",
+            provider,
+            "--prompt",
+            "x",
+        ];
+        if let Some(base_url) = base_url {
+            argv.extend(["--base-url", base_url]);
+        }
+        match Cli::parse_from(argv).command {
+            Command::Run(run) => run.model,
+            _ => panic!("parsed as run"),
+        }
+    }
+
+    #[test]
+    fn the_manifest_keeps_only_the_base_url_host() {
+        let args = model_args(
+            "openai-compat",
+            Some("http://user:secret@models.example.com:8443/v1/chat?key=sk-123#frag"),
+        );
+        assert_eq!(base_url_host(&args).as_deref(), Some("models.example.com"));
+        let args = model_args("anthropic", None);
+        assert_eq!(base_url_host(&args).as_deref(), Some("api.anthropic.com"));
+        let args = model_args("openai-compat", Some("not a url"));
+        assert_eq!(base_url_host(&args), None);
     }
 
     #[test]

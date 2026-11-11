@@ -59,6 +59,39 @@ pub enum HealthScript {
     Delay(Duration),
 }
 
+/// How the fake answers `/bin/sh -s`, given the script on stdin and the
+/// fake's files, which it may change.
+pub type ShHandler = Arc<dyn Fn(&[u8], &mut BTreeMap<String, Vec<u8>>) -> ShAnswer + Send + Sync>;
+
+/// One `/bin/sh` execution's terminal state.
+#[derive(Debug, Clone)]
+pub struct ShAnswer {
+    pub state: ExecutionState,
+    pub exit_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl ShAnswer {
+    pub fn exit(code: i32) -> Self {
+        Self {
+            state: ExecutionState::Exited,
+            exit_code: Some(code),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    pub fn state(state: ExecutionState) -> Self {
+        Self {
+            state,
+            exit_code: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub enum DeleteBehavior {
     #[default]
@@ -157,6 +190,16 @@ pub struct FakeState {
     pub final_rows: Vec<Execution>,
     /// Every recovery read of recent executions fails `UNAVAILABLE`.
     pub recent_unavailable: bool,
+    /// Answers `/bin/sh`; without one it exits 127 like any unknown command.
+    pub sh_handler: Option<ShHandler>,
+    /// `/bin/sh` answers after this delay.
+    pub sh_delay: Duration,
+    /// `/bin/sh` is refused with this error, after `sh_delay`, with no row.
+    pub sh_error: Option<ApiError>,
+    /// `/bin/dd` exits 1 without writing, from the Nth `dd` on (from 1).
+    pub fail_dd_from: Option<usize>,
+    /// `dd` executions so far.
+    pub dd_count: usize,
 }
 
 impl FakeApi {
@@ -304,6 +347,10 @@ impl SandboxApi for FakeApi {
                 }
             } else if !state.suppress_create_record {
                 if state.create_record_delay.is_zero() {
+                    // A later session's sandbox starts with an empty workspace.
+                    if !state.creates.is_empty() {
+                        state.files.clear();
+                    }
                     state.creates.push(request);
                     state.create_ready_at = if state.create_allows_early_delete {
                         None
@@ -363,7 +410,24 @@ impl SandboxApi for FakeApi {
         Ok(sandbox)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
+        let sh_refusal = {
+            let mut state = self.state();
+            if request.argv.first().map(String::as_str) == Some("/bin/sh") {
+                state
+                    .sh_error
+                    .clone()
+                    .map(|error| (error, state.sh_delay))
+                    .inspect(|_| state.execs.push(request.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((error, delay)) = sh_refusal {
+            tokio::time::sleep(delay).await;
+            return Err(error);
+        }
         let refusal = self.pre_admission_refusal(&request);
         if let Some((error, delay)) = refusal {
             // Refused before admission: no execution row and no activity.
@@ -379,7 +443,20 @@ impl SandboxApi for FakeApi {
             let id = format!("ex-{:016x}", state.next_execution);
             state.execs.push(request.clone());
             let argv = &request.argv;
+            let mut sh_state = None;
             let (exit_code, stdout, stderr) = match argv.first().map(String::as_str) {
+                Some("/bin/sh") => {
+                    let handler = state.sh_handler.clone();
+                    match handler {
+                        Some(handler) => {
+                            let answer = handler(&request.stdin, &mut state.files);
+                            sh_state = Some((answer.state, answer.exit_code));
+                            (answer.exit_code.unwrap_or(0), answer.stdout, answer.stderr)
+                        }
+                        None => (127, Vec::new(), b"no sh handler".to_vec()),
+                    }
+                }
+                Some("/bin/mkdir") => (0, Vec::new(), Vec::new()),
                 Some("/usr/bin/find") => {
                     if state.fail_baseline && state.execs.len() == 1 {
                         (1, Vec::new(), b"find failed".to_vec())
@@ -393,13 +470,21 @@ impl SandboxApi for FakeApi {
                     }
                 }
                 Some("/bin/dd") => {
+                    state.dd_count += 1;
                     let path = argv
                         .iter()
                         .find_map(|arg| arg.strip_prefix("of="))
                         .expect("dd output path")
                         .to_string();
-                    state.files.insert(path, request.stdin.clone());
-                    (0, Vec::new(), Vec::new())
+                    if state
+                        .fail_dd_from
+                        .is_some_and(|from| state.dd_count >= from)
+                    {
+                        (1, Vec::new(), b"dd: write error".to_vec())
+                    } else {
+                        state.files.insert(path, request.stdin.clone());
+                        (0, Vec::new(), Vec::new())
+                    }
                 }
                 Some("/bin/stat") => {
                     let path = argv.last().expect("stat path");
@@ -445,10 +530,16 @@ impl SandboxApi for FakeApi {
                 sandbox_reusable: (!state.features.is_empty()).then_some(true),
                 cancel_reason: None,
             };
+            if let Some((exec_state, exec_code)) = sh_state {
+                execution.state = exec_state;
+                execution.exit_code = exec_code;
+            }
             leave_unusable_if_scripted(&mut state, &mut execution);
             state.executions.push(execution.clone());
             let delay = if argv.first().map(String::as_str) == Some("/usr/bin/find") {
                 state.baseline_exec_delay
+            } else if argv.first().map(String::as_str) == Some("/bin/sh") {
+                state.sh_delay
             } else {
                 state.tool_exec_delay
             };
@@ -498,7 +589,9 @@ impl SandboxApi for FakeApi {
             state.delete_acknowledgements_before_removal -= 1;
             return Ok(unreleased);
         }
-        if !state.deleted.iter().any(|id| id == sandbox_id) {
+        // One fake can serve sessions one after another: a delete counts
+        // only while a created sandbox is still undeleted.
+        if state.deleted.len() < state.creates.len() {
             state.deleted.push(sandbox_id.to_string());
         }
         let keyed = state

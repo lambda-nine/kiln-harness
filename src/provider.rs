@@ -347,6 +347,10 @@ pub trait Provider: Send {
     ) -> Result<(), ProviderError> {
         Ok(())
     }
+
+    /// Observe the task check's outcome, after it is journaled. Live
+    /// providers ignore this; replay compares it with the recording.
+    fn check_completed(&mut self, _outcome: &crate::engine::CheckOutcome) {}
 }
 
 /// The bytes the demo writes, reads back, and counts.

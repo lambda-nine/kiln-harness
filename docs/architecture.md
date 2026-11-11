@@ -24,8 +24,10 @@ No harness code depends on kiln files, process layout, or CLI behavior.
 ## Session lifecycle
 
 1. Validate the limits against their hard ceilings and the task (system and
-   prompt at most 64 KiB each, nonempty prompt) and calculate one absolute
-   session deadline.
+   prompt at most 64 KiB each, nonempty prompt, and any seed and check; see
+   [Eval tasks](#eval-tasks)) and calculate one absolute session deadline.
+   A task with a check also gets a work deadline `check.timeout` earlier;
+   everything up to the final answer uses it.
 2. Discover the daemon: one `Health` call under that deadline and
    cancellation. A daemon that is not `SERVING` is refused, and so are
    incoherent advertised limits and an expiry the daemon's bounds would cut
@@ -35,8 +37,8 @@ No harness code depends on kiln files, process layout, or CLI behavior.
 3. Create exactly one sandbox with network none, 256 MiB memory, 0.5 CPU,
    64 PIDs, 256 MiB disk, read-only root, writable `/workspace`, and, when
    the daemon lists sandbox expiry, an expiry policy.
-4. Capture a bounded `/workspace` file-set baseline through kilnd and journal
-   `sandbox_ready`.
+4. Write the task's seed files, if any, then capture a bounded `/workspace`
+   file-set baseline through kilnd and journal `sandbox_ready`.
 5. Alternate model turns and their tool results until a final answer or a
    budget/cancellation/error ends work. Each provider call runs beside a
    renew heartbeat when the daemon supports expiry.
@@ -145,6 +147,51 @@ create: no `request_id`, one attempt, nothing released.
 `sandbox_created` records `request_id` (only when keyed) and `create_attempts`;
 `sandbox_recovered` records `create_attempts`. The journal is unchanged, and a
 replay is a new session with its own key.
+
+## Eval tasks
+
+A session task may carry a seed and a check besides its system prompt and
+prompt. The eval suite (see `evals/README.md`) loads both from a task
+directory; any caller of `Harness::run` may set them.
+
+- **Seed.** At most 256 files and 4 MiB in total, each at most the file
+  limit, with paths in the normalized relative form the file tools accept
+  (no `/workspace/` prefix, no empty, `.` or `..` component, no control
+  characters), strictly ascending, and no file inside another file's path.
+  In `ToolRegistry::start_session`, before the baseline, each file is written
+  in order with exactly the `write_file` Exec (`/bin/dd of=<path>
+  status=none`, the bytes on stdin), one Exec per file, after a fixed
+  `/bin/mkdir -p -- /workspace/<dir>` for each parent directory not made yet.
+  Each Exec is bounded by the tool timeout and the work deadline, and the
+  whole step by cancellation like the baseline. Any failure (an RPC error, a
+  non-zero exit, an unusable sandbox, the deadline) ends the session with
+  `HarnessError::Seed` and work outcome `failed` before any model call, and
+  cleanup deletes and verifies as for any failure. The baseline therefore
+  includes the seed, so `workspace_diff` shows only the agent's changes. The
+  audit records `workspace_seeded` (files, bytes, execution IDs) once seeding
+  succeeds, only for a task with a seed.
+- **Check.** A script of 1 byte to 64 KiB (and at most the tools' stdin
+  limit) with a timeout of 1 to 600 seconds, whole milliseconds, at most half
+  the session timeout. The model's work deadline is the session deadline less
+  the check timeout: the loop, its provider calls, its tools, seeding, create
+  and discovery all use it, so the check always has its window before the
+  session deadline. The sandbox's expiry lifetime is computed from the whole
+  session timeout as before. The check runs once, only after the loop returns
+  a final answer that passed the final usability check, before cleanup: one
+  Exec of `["/bin/sh", "-s"]` with the script on stdin, under the check
+  timeout less the usual 250 ms settlement reserve, capped by the session
+  deadline, inside a `select!` on cancellation and the session deadline. When
+  the daemon supports expiry, a due renew runs first, best effort. Exited 0
+  is `passed`; another exit or a timed-out execution is `failed`; any other
+  execution state, an RPC error, cancellation (`canceled`) or the deadline
+  (`deadline`) is `error`. There is no lost-response recovery for the check:
+  an error is reported as one. The check never changes the work outcome: a
+  completed session whose check fails is still `completed`, and
+  `SessionOutcome::check` carries the result. The journal's `check_completed`
+  keeps at most 4 KiB of each output stream (lossy UTF-8); the audit's
+  `check_completed` has only the result, exit code, whether it timed out, the
+  script's hash and size, the execution ID and output evidence. The script
+  never enters a model request.
 
 ## Discovery and typed reasons
 
@@ -800,9 +847,16 @@ Each JSONL record has a contiguous `sequence` from 0, a timestamp, the single
 session ID, one event, and `prev_sha256`: the SHA-256 of the previous record's
 exact line bytes (64 zeros for the first). Events are `session_started`,
 `sandbox_ready`, `model_requested`, `model_responded`, `model_failed`,
-`tool_executed`, and `session_ended`. `session_started` records every
+`tool_executed`, `check_completed`, and `session_ended`. `session_started` records every
 model-visible limit (steps, calls, timeouts, token budgets, argument and
 final-answer bounds, and all tool limits); lifecycle windows are not recorded.
+For a task with a seed or a check it also records `seed` (each file's path
+and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
+replay is self-contained. Both are omitted when absent, so a journal without
+them is byte-identical to one written before they existed, and the schema
+stays 1. `check_completed` holds the check's outcome, its execution ID and at
+most 4 KiB of each output stream, after the final `model_responded` and
+before `session_ended`.
 
 The journal and the audit share one opener. It refuses a path whose raw bytes
 are empty, end in `/`, or end in `.` or `..`, resolves the parent once to an
@@ -861,6 +915,12 @@ response in the last turn whose text is the final answer, the outcome
 deletion was not confirmed, and a request may stay unanswered only if the work
 did not complete.
 
+A recorded seed and check must pass the engine's own rules under the
+recorded limits (valid base64 included). `check_completed` is allowed only
+when a check was recorded, at most once, and only right after an accepted
+final answer in the last turn; a `session_ended` with work outcome
+`completed` requires it when a check was recorded.
+
 The grammar also applies the engine's acceptance rules with the recorded
 limits. Requests stop at `max_steps`, and tool records at `max_tool_calls` in
 total and `max_tool_calls_per_turn` in a turn. A response the engine refuses (a
@@ -911,3 +971,31 @@ and the tool-budget check then apply as for any session, so a replay that
 cannot fit is refused before create. The largest recordable tool timeout,
 10 minutes, needs 902 seconds. Since the model side is fixed, a divergence means kilnd returned
 different tool results than during the recording.
+
+Replay rebuilds the whole task from `session_started`, seed and check
+included, seeds the fresh sandbox the same way, and reruns the check after
+the replayed final answer. `Provider::check_completed` hands the result to
+`ReplayProvider`, which compares it with the recorded `check_completed`:
+the verdict and exit code must match, and any `error` equals any other
+whatever its reason, since reasons carry timing detail. A mismatch sets
+`check_diverged`, and the CLI prints `diverged at check` and exits non-zero.
+Model-turn divergence is unchanged.
+
+## Eval runner
+
+`eval run` loads and validates every task before anything runs, refuses an
+existing `--out`, reads kilnd's Health once for the manifest's feature list,
+then creates `--out` with mode 0700 through the same descriptor walk as the
+journal. Runs are sequential, one sandbox at a time, tasks in ID order and
+trials 1 to N, each with a fresh provider. Each run's results line is built
+from its journal (session ID, outcome, steps, tool calls, usage, check) and
+appended to `results.jsonl` before the next run starts. With `--replay`, a
+completed run is replayed against a fresh sandbox right after it. The suite
+fails closed: after a run or replay whose sandbox deletion was not confirmed
+(`cleanup_failed`, `Cleanup` or `CreateUncertain`), or replay outputs that
+cannot be opened, it stops, writes `manifest.json`, `report.json` and
+`report.md` for the runs so far, and exits non-zero. Cancellation stops it
+after the current run's cleanup the same way. The manifest records the base
+URL's host only, never a key, user, port, path or query. `eval selftest`
+runs a bare and a solved session per task with scripted providers and fails
+closed the same way.

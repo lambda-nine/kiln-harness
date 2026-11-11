@@ -1,0 +1,1 @@
+`/workspace/sum.sh` should print the sum of the integers from 1 to N, where N is its first argument (`sh /workspace/sum.sh 10` should print `55`), but it prints the wrong total. Find and fix the bug in place. Keep it a POSIX `sh` script that computes the sum with its loop.

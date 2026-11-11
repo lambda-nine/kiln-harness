@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "csv-sort",
+  "description": "Sort a CSV by a numeric column with a tie-breaker, header first.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 300,
+  "max_steps": 30,
+  "max_tool_calls": 60
+}

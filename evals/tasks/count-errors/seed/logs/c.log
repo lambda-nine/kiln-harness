@@ -1,0 +1,6 @@
+2026-11-01T12:00:00Z INFO service started
+2026-11-01T12:00:10Z ERROR upstream returned 502
+2026-11-01T12:00:11Z INFO upstream recovered
+2026-11-01T12:00:12Z ERRORS 0 since restart
+2026-11-01T12:00:13Z error lowercase level is not ERROR
+2026-11-01T12:00:14Z ERROR upstream returned 503

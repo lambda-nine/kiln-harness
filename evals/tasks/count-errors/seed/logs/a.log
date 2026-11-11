@@ -1,0 +1,6 @@
+2026-11-01T10:00:00Z INFO service started
+2026-11-01T10:00:05Z ERROR could not open /var/cache/app
+2026-11-01T10:00:06Z WARN retrying cache open
+2026-11-01T10:00:07Z INFO cache opened after an error
+2026-11-01T10:01:00Z ERROR request 17 failed: timeout
+2026-11-01T10:02:00Z DEBUG heartbeat

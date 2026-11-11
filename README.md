@@ -307,8 +307,8 @@ recorded limits against the hard ceilings, and the event grammar: pairing,
 order, each tool record against the model's sanitized call, each request's
 message count and hash against the history rebuilt from the records, and a
 terminal record consistent with the session. It then prints the session,
-record count, outcome, whether the sandbox was deleted, turns, tool calls, and
-token usage. A session whose sandbox deletion was not confirmed ends
+record count, outcome, whether the sandbox was deleted, turns, tool calls,
+token usage, and, when the session had them, its seed and check result. A session whose sandbox deletion was not confirmed ends
 `cleanup_failed`.
 
 `replay` reruns the recorded task under every recorded model-visible limit in
@@ -322,7 +322,9 @@ of them is the same open file as the source. It prints `reproduced` only when a
 completed recording replays to the same final answer with every turn and tool
 call consumed. Otherwise it prints `diverged at turn N`, the first turn where
 a tool result or a request differed because the sandbox answered differently,
-and exits non-zero.
+and exits non-zero. A recording with a task check reruns the check after the
+replayed final answer and prints `diverged at check` when its verdict
+differs.
 
 Journal and audit directories follow ssh's `StrictModes`: the output's own
 directory must belong to you and be writable by no one else, and every
@@ -342,6 +344,15 @@ inheritable ACLs.
 Journal and audit paths must name a file: an empty path, a trailing `/`, or a
 final `.` or `..` is refused. Durations in the configuration must be whole
 milliseconds, the unit the journal records.
+
+## Evals
+
+`evals/tasks/` holds a starter suite of eight small coding tasks, each a
+seeded workspace, a prompt, and a check script the model never sees, run in
+the sandbox after the final answer. `eval selftest` proves every check against
+kilnd with no model, `eval run` runs the suite N times against one provider
+(optionally replaying each journal) and writes a per-model report, and
+`eval compare` diffs two reports. See [evals/README.md](evals/README.md).
 
 ## Checks
 

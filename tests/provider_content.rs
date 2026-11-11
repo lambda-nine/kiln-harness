@@ -91,10 +91,7 @@ impl Provider for Capturing {
 }
 
 fn task() -> SessionTask {
-    SessionTask {
-        system: "Use the tools.".to_string(),
-        prompt: "Write a.txt.".to_string(),
-    }
+    SessionTask::new("Use the tools.".to_string(), "Write a.txt.".to_string())
 }
 
 #[test]

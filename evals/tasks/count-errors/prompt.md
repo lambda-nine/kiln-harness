@@ -1,0 +1,1 @@
+The directory `/workspace/logs` holds three log files, `a.log`, `b.log` and `c.log`. Each line is a timestamp, a space, a level, a space, and a message. Count the lines, across all three files, whose level is exactly `ERROR`. Write that count to `/workspace/answer.txt` as decimal digits followed by a single newline, with nothing else in the file.

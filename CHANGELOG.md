@@ -6,6 +6,20 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- An eval suite. `SessionTask` gains an optional `seed` (files written into
+  `/workspace` with the `write_file` Exec before the baseline; a failure is
+  `HarnessError::Seed`) and `check` (a script run once as `/bin/sh -s` after
+  an accepted final answer, in the last `check.timeout` of the session, which
+  the model's work deadline leaves free). `SessionOutcome::check` carries
+  its `CheckOutcome`, which never changes the work outcome. The journal keeps
+  schema 1: `session_started` gains `seed` and `check` only when present, and
+  a new `check_completed` record follows the final answer; the grammar checks
+  both. Replay seeds and checks the fresh sandbox and reports
+  `diverged at check`. The audit adds `workspace_seeded` and a metadata-only
+  `check_completed`. New commands: `eval run` (shares `run`'s provider and
+  limit flags), `eval compare` and `eval selftest`, with eight starter tasks
+  in `evals/tasks/`. `ToolRegistry::start_session` takes the seed, and
+  `Provider` gains a default `check_completed` hook.
 - First review round for idempotent create. Cleanup releases the request ID
   only when the create took a single attempt: after a retry an abandoned
   attempt may still reach kilnd, so the key is kept, every delete sends

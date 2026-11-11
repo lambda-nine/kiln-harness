@@ -70,10 +70,7 @@ fn raw(body: String) -> Reply {
 }
 
 fn task() -> SessionTask {
-    SessionTask {
-        system: String::new(),
-        prompt: "answer".to_string(),
-    }
+    SessionTask::new(String::new(), "answer".to_string())
 }
 
 fn harness_for(
@@ -938,10 +935,7 @@ async fn strict_requests_keep_a_stable_prefix() {
     let mut harness = harness_for(provider, short_lifecycle_config());
     harness
         .run(
-            &SessionTask {
-                system: "Use the tools.".to_string(),
-                prompt: "List twice.".to_string(),
-            },
+            &SessionTask::new("Use the tools.".to_string(), "List twice.".to_string()),
             CancellationToken::new(),
         )
         .await

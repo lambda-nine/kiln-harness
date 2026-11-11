@@ -57,6 +57,8 @@ impl Fixture {
                 task: "task".to_string(),
                 tools: self.tools.clone(),
                 limits: HarnessConfig::default().limits(),
+                seed: Vec::new(),
+                check: None,
             },
             JournalEvent::SandboxReady {
                 sandbox_id: "sb-1".to_string(),

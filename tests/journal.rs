@@ -98,6 +98,7 @@ fn event_names(journal: &LoadedJournal) -> Vec<&'static str> {
             JournalEvent::ModelResponded { .. } => "model_responded",
             JournalEvent::ModelFailed { .. } => "model_failed",
             JournalEvent::ToolExecuted { .. } => "tool_executed",
+            JournalEvent::CheckCompleted { .. } => "check_completed",
             JournalEvent::SessionEnded { .. } => "session_ended",
         })
         .collect()
@@ -468,6 +469,8 @@ fn unsupported_schema_is_rejected() {
             task: "t".to_string(),
             tools: Vec::new(),
             limits: HarnessConfig::default().limits(),
+            seed: Vec::new(),
+            check: None,
         },
     };
     let temp = common::private_tempdir().expect("temp dir");
@@ -1607,6 +1610,8 @@ fn discarding_an_unwritten_output_removes_its_new_directories() {
                 task: "task".to_string(),
                 tools: Vec::new(),
                 limits: HarnessConfig::default().limits(),
+                seed: Vec::new(),
+                check: None,
             },
         )
         .expect("first record");

@@ -685,6 +685,8 @@ fn common_session_started() -> JournalEvent {
             .definitions()
             .to_vec(),
         limits: HarnessConfig::default().limits(),
+        seed: Vec::new(),
+        check: None,
     }
 }
 

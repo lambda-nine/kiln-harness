@@ -2,11 +2,12 @@
 mod common;
 
 use common::{chained_lines, write_journal_lines};
+use kiln_harness::engine::CheckOutcome;
 use kiln_harness::engine::HarnessConfig;
 use kiln_harness::journal::request_sha256;
 use kiln_harness::journal::{
     JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, LoadedJournal, MemoryJournal,
-    read_journal,
+    RecordedCheck, RecordedSeedFile, base64_decode, base64_encode, read_journal,
 };
 use kiln_harness::provider::{
     Message, ModelRequest, ModelResponse, ProviderErrorKind, ProviderInfo, ToolCall,
@@ -38,6 +39,8 @@ fn started() -> JournalEvent {
         task: "task".to_string(),
         tools: tools(),
         limits: HarnessConfig::default().limits(),
+        seed: Vec::new(),
+        check: None,
     }
 }
 
@@ -984,4 +987,240 @@ fn recorded_tasks_must_be_ones_the_engine_accepts() {
     *system = at.clone();
     *task = at;
     write_all(&events).expect("a task at the limit is valid");
+}
+
+/// The valid session with a recorded seed and check, and the check's
+/// result after the final answer.
+fn checked() -> Vec<JournalEvent> {
+    let mut events = valid();
+    set_task(
+        &mut events,
+        vec![seed_file("a/b.txt", b"seeded\n"), seed_file("c.txt", b"")],
+        Some(check("exit 0\n", 15_000)),
+    );
+    let end = events.pop().expect("session_ended");
+    events.push(check_completed(CheckOutcome::Passed));
+    events.push(end);
+    events
+}
+
+fn seed_file(path: &str, contents: &[u8]) -> RecordedSeedFile {
+    RecordedSeedFile {
+        path: path.to_string(),
+        contents_b64: base64_encode(contents),
+    }
+}
+
+fn check(script: &str, timeout_ms: u64) -> RecordedCheck {
+    RecordedCheck {
+        script_b64: base64_encode(script.as_bytes()),
+        timeout_ms,
+    }
+}
+
+fn check_completed(outcome: CheckOutcome) -> JournalEvent {
+    JournalEvent::CheckCompleted {
+        outcome,
+        execution_id: Some("ex-9".to_string()),
+        stdout: String::new(),
+        stderr: String::new(),
+    }
+}
+
+fn set_task(
+    events: &mut [JournalEvent],
+    new_seed: Vec<RecordedSeedFile>,
+    new_check: Option<RecordedCheck>,
+) {
+    let JournalEvent::SessionStarted { seed, check, .. } = &mut events[0] else {
+        panic!("session start");
+    };
+    *seed = new_seed;
+    *check = new_check;
+}
+
+#[test]
+fn a_recorded_check_completes_once_after_the_final_answer() {
+    assert_accepted("seed, check and its result", checked());
+    for outcome in [
+        CheckOutcome::Failed {
+            exit_code: Some(1),
+            timed_out: false,
+        },
+        CheckOutcome::Error {
+            reason: "deadline".to_string(),
+        },
+    ] {
+        let mut events = checked();
+        let at = events.len() - 2;
+        events[at] = check_completed(outcome);
+        assert_accepted("a check that did not pass still completes", events);
+    }
+
+    // Work that did not complete may end without the check.
+    let mut failed = checked();
+    failed.truncate(5);
+    failed.push(
+        Ended {
+            outcome: "failed",
+            work_outcome: "failed",
+            final_answer: None,
+            steps: 1,
+            tool_calls: 1,
+            usage: usage(10),
+            sandbox_deleted: true,
+        }
+        .event(),
+    );
+    assert_accepted("failed work without a check result", failed);
+
+    let mut missing = checked();
+    missing.remove(missing.len() - 2);
+    assert_rejected_because(
+        "completed without the recorded check's result",
+        missing,
+        "needs check_completed",
+    );
+
+    let mut unrecorded = valid();
+    let end = unrecorded.pop().expect("end");
+    unrecorded.push(check_completed(CheckOutcome::Passed));
+    unrecorded.push(end);
+    assert_rejected_because(
+        "a result without a recorded check",
+        unrecorded,
+        "without a recorded check",
+    );
+
+    let mut twice = checked();
+    let at = twice.len() - 1;
+    twice.insert(at, check_completed(CheckOutcome::Passed));
+    assert_rejected_because("two results", twice, "second check_completed");
+
+    // Before the final answer: after the tool turn, and after the last
+    // request but before its response.
+    let mut early = checked();
+    early.insert(6, check_completed(CheckOutcome::Passed));
+    assert_rejected_because("after a tool turn", early, "accepted final answer");
+    let mut pending = checked();
+    pending.insert(7, check_completed(CheckOutcome::Passed));
+    assert_rejected_because(
+        "while a request is pending",
+        pending,
+        "accepted final answer",
+    );
+    // Nothing but session_ended follows it.
+    let mut after = checked();
+    let at = after.len() - 1;
+    after.insert(at, requested(3));
+    assert_rejected("a request after the check", after);
+}
+
+#[test]
+fn recorded_seeds_and_checks_must_be_ones_the_engine_accepts() {
+    let limits = HarnessConfig::default().limits();
+    let max_file = limits.tool_limits.max_file_bytes;
+    let too_many = (0..=256)
+        .map(|index| seed_file(&format!("f{index:04}"), b"x"))
+        .collect::<Vec<_>>();
+    let bad_seeds: Vec<(&str, Vec<RecordedSeedFile>)> = vec![
+        ("a parent component", vec![seed_file("../x", b"")]),
+        ("a dot component", vec![seed_file("a/./x", b"")]),
+        ("an absolute path", vec![seed_file("/etc/passwd", b"")]),
+        ("the workspace prefix", vec![seed_file("/workspace/x", b"")]),
+        ("an empty component", vec![seed_file("a//x", b"")]),
+        ("a NUL", vec![seed_file("a\0x", b"")]),
+        ("a control character", vec![seed_file("a\nx", b"")]),
+        (
+            "out of order",
+            vec![seed_file("b", b""), seed_file("a", b"")],
+        ),
+        (
+            "a duplicate",
+            vec![seed_file("a", b""), seed_file("a", b"")],
+        ),
+        (
+            "a file that is also a directory",
+            vec![seed_file("a", b""), seed_file("a/b", b"")],
+        ),
+        ("too many files", too_many),
+        (
+            "a file over the limit",
+            vec![seed_file("big", &vec![0; max_file + 1])],
+        ),
+        (
+            "invalid base64",
+            vec![RecordedSeedFile {
+                path: "x".to_string(),
+                contents_b64: "not base64!".to_string(),
+            }],
+        ),
+        (
+            "non-canonical base64",
+            vec![RecordedSeedFile {
+                path: "x".to_string(),
+                contents_b64: "QR==".to_string(),
+            }],
+        ),
+    ];
+    for (name, seed) in bad_seeds {
+        let mut events = vec![started()];
+        set_task(&mut events, seed, None);
+        assert_rejected_because(name, events, "recorded task is invalid");
+    }
+
+    let half = limits.session_timeout_ms / 2;
+    let bad_checks = [
+        ("a sub-second timeout", check("exit 0", 999)),
+        ("a timeout over ten minutes", check("exit 0", 600_001)),
+        ("more than half the session", check("exit 0", half + 1)),
+        ("an empty script", check("", 1_000)),
+        (
+            "a script over the stdin limit",
+            check(&"x".repeat(limits.tool_limits.max_stdin_bytes + 1), 1_000),
+        ),
+        (
+            "invalid base64",
+            RecordedCheck {
+                script_b64: "@@@@".to_string(),
+                timeout_ms: 1_000,
+            },
+        ),
+    ];
+    for (name, bad) in bad_checks {
+        let mut events = vec![started()];
+        set_task(&mut events, Vec::new(), Some(bad));
+        assert_rejected_because(name, events, "recorded task is invalid");
+    }
+
+    // At the limits: 256 files, a file of exactly the file limit, half the
+    // session, and a one-byte script.
+    let at_limit = (0..256)
+        .map(|index| seed_file(&format!("f{index:04}"), b"x"))
+        .collect::<Vec<_>>();
+    let mut events = vec![started()];
+    set_task(&mut events, at_limit, Some(check("x", half)));
+    write_all(&events).expect("256 files and a check of half the session are valid");
+    let mut events = vec![started()];
+    set_task(
+        &mut events,
+        vec![seed_file("big", &vec![0; max_file])],
+        Some(check("x", 1_000)),
+    );
+    write_all(&events).expect("a file at the limit is valid");
+}
+
+#[test]
+fn base64_round_trips_and_refuses_other_encodings() {
+    for bytes in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar"] {
+        let encoded = base64_encode(bytes);
+        assert_eq!(base64_decode(&encoded).as_deref(), Some(bytes));
+    }
+    assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    assert_eq!(base64_encode(b"fo"), "Zm8=");
+    let all = (0..=255).collect::<Vec<u8>>();
+    assert_eq!(base64_decode(&base64_encode(&all)), Some(all));
+    for bad in ["Zm8", "Zm8=Zm8=", "Zg===", "Z===", "Zm9=", "Zm-v", "Zm\nv"] {
+        assert_eq!(base64_decode(bad), None, "{bad:?}");
+    }
 }

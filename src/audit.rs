@@ -99,6 +99,14 @@ pub enum AuditEvent {
         #[serde(default)]
         create_attempts: u32,
     },
+    /// The task's seed files were written before the baseline: how many,
+    /// their bytes, and every execution seeding ran. Only for a task with a
+    /// seed, and only once seeding succeeded.
+    WorkspaceSeeded {
+        files: usize,
+        bytes: u64,
+        execution_ids: Vec<String>,
+    },
     WorkspaceBaseline {
         ok: bool,
         execution_ids: Vec<String>,
@@ -147,6 +155,19 @@ pub enum AuditEvent {
         state: String,
         unknown_executions: usize,
         usable: bool,
+    },
+    /// The task check after the final answer: its result (`passed`,
+    /// `failed` or `error`), exit code and timeout, the script's hash and
+    /// size, the execution, and output evidence. The script and its output
+    /// go only to the journal.
+    CheckCompleted {
+        result: String,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        script: ContentSummary,
+        execution_ids: Vec<String>,
+        stdout: OutputEvidence,
+        stderr: OutputEvidence,
     },
     SessionFinished {
         /// `cleanup_failed` whenever sandbox deletion could not be confirmed

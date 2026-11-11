@@ -113,6 +113,8 @@ fn started() -> JournalEvent {
         task: "task".to_string(),
         tools: Vec::new(),
         limits: HarnessConfig::default().limits(),
+        seed: Vec::new(),
+        check: None,
     }
 }
 

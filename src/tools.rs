@@ -13,6 +13,7 @@ use crate::api::{
     SandboxExec, UnusableReason,
 };
 use crate::audit::{ContentSummary, OutputEvidence};
+use crate::engine::{CheckOutcome, SeedFile, TaskCheck};
 use crate::journal::SessionLimits;
 use crate::provider::{ToolCall, ToolDefinition};
 
@@ -130,7 +131,8 @@ impl ToolRegistry {
         session_deadline: Instant,
         typed_reasons: bool,
         ready_at: Instant,
-    ) -> Result<(ToolSession<'a, A>, BaselineEvidence), ToolError> {
+        seed: &[SeedFile],
+    ) -> Result<(ToolSession<'a, A>, Option<SeedEvidence>, BaselineEvidence), ToolError> {
         let mut session = ToolSession {
             api,
             sandbox_id,
@@ -141,6 +143,13 @@ impl ToolRegistry {
             activity: Mutex::new((ready_at, 0)),
             last_exec_sent: Mutex::new(None),
             unusable: Mutex::new(None),
+        };
+        // The seed goes in before the baseline, so the baseline includes it
+        // and `workspace_diff` shows only the agent's changes.
+        let seeded = if seed.is_empty() {
+            None
+        } else {
+            Some(session.seed(seed, session_deadline).await?)
         };
         let manifest = session.manifest(session_deadline).await;
         if let Some(stop) = session.unusable() {
@@ -159,7 +168,7 @@ impl ToolRegistry {
             file_count: manifest.files.len(),
         };
         session.baseline = manifest.files;
-        Ok((session, evidence))
+        Ok((session, seeded, evidence))
     }
 }
 
@@ -168,6 +177,31 @@ pub struct BaselineEvidence {
     pub execution_ids: Vec<String>,
     pub file_count: usize,
 }
+
+/// What seeding the workspace did: the files and bytes written and every
+/// execution it ran, directory creations included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedEvidence {
+    pub files: usize,
+    pub bytes: u64,
+    pub execution_ids: Vec<String>,
+}
+
+/// One run of a task's check: its verdict, the execution, and at most
+/// [`CHECK_OUTPUT_BYTES`] of each output stream (lossy UTF-8) for the
+/// journal, with the audit's evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckRun {
+    pub outcome: CheckOutcome,
+    pub execution_id: Option<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_evidence: OutputEvidence,
+    pub stderr_evidence: OutputEvidence,
+}
+
+/// How much of each check output stream the journal keeps.
+pub const CHECK_OUTPUT_BYTES: usize = 4 << 10;
 
 pub struct ToolSession<'a, A: SandboxApi> {
     api: &'a A,
@@ -342,6 +376,11 @@ pub enum ToolError {
         stop: ToolStop,
         execution_ids: Vec<String>,
     },
+    #[error("{message}")]
+    Seed {
+        message: String,
+        execution_ids: Vec<String>,
+    },
     #[error("workspace manifest was invalid: {message}")]
     Manifest {
         message: String,
@@ -361,7 +400,7 @@ impl ToolError {
                 stderr,
                 ..
             } => (execution_ids.clone(), *stdout, *stderr),
-            Self::Unusable { execution_ids, .. } => (
+            Self::Unusable { execution_ids, .. } | Self::Seed { execution_ids, .. } => (
                 execution_ids.clone(),
                 unknown_evidence(),
                 unknown_evidence(),
@@ -667,16 +706,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     async fn write_file(&self, path: String, bytes: Vec<u8>, deadline: Instant) -> ToolRun {
         let byte_count = bytes.len();
         match self
-            .run(
-                vec![
-                    "/bin/dd".to_string(),
-                    format!("of={path}"),
-                    "status=none".to_string(),
-                ],
-                bytes,
-                self.limits.timeout,
-                deadline,
-            )
+            .run(write_argv(&path), bytes, self.limits.timeout, deadline)
             .await
         {
             Ok(execution) if execution.succeeded() => ToolRun::from_execution(
@@ -877,6 +907,33 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     }
 }
 
+impl CheckRun {
+    /// A check that gave no verdict, with no execution or output.
+    #[must_use]
+    pub fn error(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: CheckOutcome::Error {
+                reason: reason.into(),
+            },
+            execution_id: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_evidence: unknown_evidence(),
+            stderr_evidence: unknown_evidence(),
+        }
+    }
+}
+
+/// The fixed argv `write_file` and seeding write a file with: `dd` reads
+/// the bytes from stdin, and the validated path is one argv entry.
+fn write_argv(path: &str) -> Vec<String> {
+    vec![
+        "/bin/dd".to_string(),
+        format!("of={path}"),
+        "status=none".to_string(),
+    ]
+}
+
 /// A tool call that passed every host-side check.
 enum ToolPlan {
     Exec(ExecPlan),
@@ -967,7 +1024,7 @@ fn manifest_error(execution: &Execution, message: impl Into<String>) -> ToolErro
 /// `.`, names the workspace itself, which only `list_dir` accepts. Every
 /// other absolute path, including `/workspacefoo` and `//workspace/x`, is
 /// refused.
-fn workspace_path(raw: &str, allow_root: bool) -> Result<String, String> {
+pub(crate) fn workspace_path(raw: &str, allow_root: bool) -> Result<String, String> {
     let relative = match raw.strip_prefix(WORKSPACE) {
         Some("" | "/") => ".",
         Some(rest) => match rest.strip_prefix('/') {
@@ -1058,6 +1115,133 @@ fn combine_execution_error(first: &Execution, second: &Execution, kind: &str) ->
 }
 
 impl<A: SandboxApi> ToolSession<'_, A> {
+    /// Write every seed file in order with exactly the `write_file` argv,
+    /// one Exec per file, after a fixed `mkdir -p -- <dir>` for each parent
+    /// directory not made yet (the paths were validated, and each is one
+    /// argv entry). Each Exec is bounded by the tool timeout and the session
+    /// deadline. The first failure stops seeding.
+    async fn seed(&self, files: &[SeedFile], deadline: Instant) -> Result<SeedEvidence, ToolError> {
+        let mut evidence = SeedEvidence {
+            files: 0,
+            bytes: 0,
+            execution_ids: Vec::new(),
+        };
+        let mut directories = BTreeSet::new();
+        for file in files {
+            let path = workspace_path(&file.path, false).map_err(|message| ToolError::Seed {
+                message: format!("seed path {:?} is invalid: {message}", file.path),
+                execution_ids: evidence.execution_ids.clone(),
+            })?;
+            if let Some((parent, _)) = file.path.rsplit_once('/')
+                && !directories.contains(parent)
+            {
+                let argv = vec![
+                    "/bin/mkdir".to_string(),
+                    "-p".to_string(),
+                    "--".to_string(),
+                    format!("{WORKSPACE}/{parent}"),
+                ];
+                self.seed_exec(argv, Vec::new(), deadline, &mut evidence, &file.path)
+                    .await?;
+                let mut directory = parent;
+                directories.insert(directory.to_string());
+                while let Some((up, _)) = directory.rsplit_once('/') {
+                    directories.insert(up.to_string());
+                    directory = up;
+                }
+            }
+            self.seed_exec(
+                write_argv(&path),
+                file.contents.clone(),
+                deadline,
+                &mut evidence,
+                &file.path,
+            )
+            .await?;
+            evidence.files += 1;
+            evidence.bytes = evidence.bytes.saturating_add(file.contents.len() as u64);
+        }
+        Ok(evidence)
+    }
+
+    /// One seeding Exec, which must exit 0 and leave the sandbox usable.
+    async fn seed_exec(
+        &self,
+        argv: Vec<String>,
+        stdin: Vec<u8>,
+        deadline: Instant,
+        evidence: &mut SeedEvidence,
+        path: &str,
+    ) -> Result<(), ToolError> {
+        let failed = |evidence: &SeedEvidence, detail: String| ToolError::Seed {
+            message: format!("seed file {path:?}: {detail}"),
+            execution_ids: evidence.execution_ids.clone(),
+        };
+        let execution = match self.run(argv, stdin, self.limits.timeout, deadline).await {
+            Ok(execution) => execution,
+            Err(ToolError::Deadline) => {
+                return Err(failed(evidence, "the session deadline expired".to_string()));
+            }
+            Err(error) => return Err(failed(evidence, error.to_string())),
+        };
+        evidence.execution_ids.push(execution.id.clone());
+        if let Some(stop) = self.unusable() {
+            return Err(failed(
+                evidence,
+                format!("the sandbox is no longer usable ({stop:?})"),
+            ));
+        }
+        if !execution.succeeded() {
+            return Err(failed(
+                evidence,
+                format!(
+                    "execution {}, exit {:?}",
+                    state_name(execution.state),
+                    execution.exit_code
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Run a task's check once: `/bin/sh -s` with the script on stdin, under
+    /// the check's timeout less the settlement reserve every Exec keeps,
+    /// capped by `deadline`. There is no response-loss recovery: an RPC
+    /// error is reported as an error verdict.
+    pub async fn run_check(&self, check: &TaskCheck, deadline: Instant) -> CheckRun {
+        let argv = vec!["/bin/sh".to_string(), "-s".to_string()];
+        let execution = match self
+            .run(argv, check.script.clone(), check.timeout, deadline)
+            .await
+        {
+            Ok(execution) => execution,
+            Err(ToolError::Deadline) => return CheckRun::error("deadline"),
+            Err(error) => return CheckRun::error(error.to_string()),
+        };
+        let outcome = match (execution.state, execution.exit_code) {
+            (ExecutionState::Exited, Some(0)) => CheckOutcome::Passed,
+            (ExecutionState::Exited, Some(code)) => CheckOutcome::Failed {
+                exit_code: Some(code),
+                timed_out: false,
+            },
+            (ExecutionState::TimedOut, exit_code) => CheckOutcome::Failed {
+                exit_code,
+                timed_out: true,
+            },
+            (state, _) => CheckOutcome::Error {
+                reason: format!("the check execution ended {}", state_name(state)),
+            },
+        };
+        CheckRun {
+            outcome,
+            execution_id: Some(execution.id.clone()),
+            stdout: bounded_text(&execution.stdout.data, CHECK_OUTPUT_BYTES).text,
+            stderr: bounded_text(&execution.stderr.data, CHECK_OUTPUT_BYTES).text,
+            stdout_evidence: evidence(&execution.stdout),
+            stderr_evidence: evidence(&execution.stderr),
+        }
+    }
+
     /// kilnd also sends `sandbox_not_ready` for a READY sandbox when an
     /// Exec lost a race with its own row insert, and says to retry. Ask once,
     /// within the call's deadline: only a sandbox that reads READY turns the
@@ -1104,6 +1288,18 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             execution_ids,
             stdout,
             stderr,
+            stop: None,
+        },
+        // Only seeding returns this, and never through a tool.
+        ToolError::Seed {
+            message,
+            execution_ids,
+        } => ToolRun {
+            ok: false,
+            result: json!({"ok": false, "error": kind, "message": message}),
+            execution_ids,
+            stdout: unknown_evidence(),
+            stderr: unknown_evidence(),
             stop: None,
         },
         // Only the baseline returns this; a tool's own check in `execute`

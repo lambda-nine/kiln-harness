@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "config-edit",
+  "description": "Change one setting in a config file, leaving every other line identical.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 300,
+  "max_steps": 30,
+  "max_tool_calls": 60
+}

@@ -198,6 +198,18 @@ it is not a hostile multi-tenant boundary.
   tool names only produce a model-visible `unknown_tool` result. Configured and
   recorded limits are capped by fixed ceilings before any sandbox exists.
 
+- Eval task directories, their seed files, check scripts and reference
+  solutions are trusted author input, loaded defensively: regular files and
+  directories only (symlinks, FIFOs, sockets and devices refused), files
+  opened without following a final symlink, bounded sizes and counts, and
+  seed paths held to the file tools' path rules. Seeds reach the sandbox only
+  through the `write_file` argv (`dd` with the validated path as one argv
+  entry and the bytes on stdin), and the check only as `/bin/sh -s` with the
+  script on stdin; no host shell string is ever built from either. The check
+  script never enters a model request, and the audit holds only its hash and
+  size. `solution.sh` is used only by the self-test, which gives it to the
+  sandbox through the `exec` tool.
+
 ## Deliberate limits
 
 - Lexical workspace validation is not a filesystem capability system. A
@@ -295,3 +307,7 @@ it is not a hostile multi-tenant boundary.
 - kilnd persists bounded command output in its root-only SQLite database. The
   harness audit excludes it, but callers must still avoid printing host secrets
   into a sandbox command.
+- An eval check runs in the same sandbox the agent used, after it. A model
+  that tampers with the workspace, replaces programs it can write, or leaves
+  processes running can influence its own check. Eval results measure
+  behavior; they do not prove it.

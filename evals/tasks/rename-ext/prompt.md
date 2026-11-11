@@ -1,0 +1,1 @@
+The directory `/workspace/docs` holds four `.txt` files. Rename each of them to the same name with a `.md` extension instead (for example `install.txt` becomes `install.md`), keeping every file's contents byte-for-byte unchanged. When you are done, no `.txt` files may remain under `/workspace/docs`.

@@ -10,8 +10,10 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::engine::SessionTask;
-use crate::journal::{Grammar, JournalEvent, LoadedJournal, SessionLimits, request_sha256};
+use crate::engine::{CheckOutcome, SessionTask};
+use crate::journal::{
+    Grammar, JournalEvent, LoadedJournal, RecordedSeedFile, SessionLimits, request_sha256,
+};
 use crate::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo, ToolCall,
 };
@@ -23,6 +25,8 @@ pub enum ReplayError {
     MissingSessionStarted,
     #[error("journal is not a valid session: {0}")]
     Grammar(String),
+    #[error("journal records a seed or check that does not decode")]
+    InvalidTask,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,10 @@ pub struct ReplayProvider {
     diverged_at: Option<u32>,
     /// Requests and tool calls the recording did not match.
     unexpected: u32,
+    /// The recorded check's outcome, when the recording ran one.
+    recorded_check: Option<CheckOutcome>,
+    /// The replayed check's verdict differed from the recorded one.
+    check_diverged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,16 +103,31 @@ impl ReplayProvider {
             system,
             task,
             limits,
+            seed,
+            check,
             ..
         }) = records.next().map(|record| &record.event)
         else {
             return Err(ReplayError::MissingSessionStarted);
         };
+        // The grammar checked that both decode; a forged record that
+        // bypassed it is refused here as well.
+        let seed = seed
+            .iter()
+            .map(RecordedSeedFile::decode)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ReplayError::InvalidTask)?;
+        let check = check
+            .as_ref()
+            .map(|check| check.decode().ok_or(ReplayError::InvalidTask))
+            .transpose()?;
         let mut replay = Self {
             info: provider.clone(),
             task: SessionTask {
                 system: system.clone(),
                 prompt: task.clone(),
+                seed,
+                check,
             },
             limits: *limits,
             sandbox_idle_ms: None,
@@ -114,6 +137,8 @@ impl ReplayProvider {
             outcome: None,
             diverged_at: None,
             unexpected: 0,
+            recorded_check: None,
+            check_diverged: false,
         };
         // The grammar has paired every request with one answer in turn order.
         let mut pending: Option<(u32, String)> = None;
@@ -155,6 +180,9 @@ impl ReplayProvider {
                 } => {
                     replay.outcome = Some(outcome.clone());
                     replay.final_answer.clone_from(final_answer);
+                }
+                JournalEvent::CheckCompleted { outcome, .. } => {
+                    replay.recorded_check = Some(outcome.clone());
                 }
                 JournalEvent::SandboxReady { expiry_idle_ms, .. } => {
                     replay.sandbox_idle_ms = *expiry_idle_ms;
@@ -241,6 +269,20 @@ impl ReplayProvider {
     pub fn diverged_at(&self) -> Option<u32> {
         self.diverged_at
     }
+
+    /// The recorded check's outcome, when the recording ran one.
+    #[must_use]
+    pub fn recorded_check(&self) -> Option<&CheckOutcome> {
+        self.recorded_check.as_ref()
+    }
+
+    /// True when the replayed check's verdict differed from the recorded
+    /// one (any error equals any other error), or a check ran that the
+    /// recording has no outcome for.
+    #[must_use]
+    pub fn check_diverged(&self) -> bool {
+        self.check_diverged
+    }
 }
 
 #[async_trait]
@@ -273,6 +315,14 @@ impl Provider for ReplayProvider {
             ProviderErrorKind::ReplayDiverged,
             format!("turn {turn} tool call {index} differs from the recording"),
         ))
+    }
+
+    fn check_completed(&mut self, outcome: &CheckOutcome) {
+        let same = self
+            .recorded_check
+            .as_ref()
+            .is_some_and(|recorded| recorded.same_verdict(outcome));
+        self.check_diverged |= !same;
     }
 
     fn info(&self) -> ProviderInfo {

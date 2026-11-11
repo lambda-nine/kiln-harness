@@ -77,10 +77,7 @@ async fn complete_with(config: OpenAiCompatConfig) -> Result<ModelResponse, Prov
 }
 
 fn task() -> SessionTask {
-    SessionTask {
-        system: "Be brief.".to_string(),
-        prompt: "Answer.".to_string(),
-    }
+    SessionTask::new("Be brief.".to_string(), "Answer.".to_string())
 }
 
 fn assert_credential_echo(result: Result<ModelResponse, ProviderError>) {

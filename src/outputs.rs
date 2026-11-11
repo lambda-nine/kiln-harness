@@ -254,6 +254,61 @@ pub(crate) fn open_output(
     }
 }
 
+/// Create a new private directory at `path`, mode 0700, under the same
+/// policy as an output file's directory: its parents are walked (and made
+/// 0700 when missing) through pinned descriptors and checked, and the final
+/// directory must not exist yet. On failure, whatever this call created is
+/// removed again.
+pub(crate) fn create_new_directory(path: &Path) -> Result<(), OutputError> {
+    validate_file_path(path).map_err(OutputError::InvalidPath)?;
+    let invalid = || OutputError::InvalidPath(path.to_path_buf());
+    let name = path.file_name().ok_or_else(invalid)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let start = resolved_directory(parent).map_err(|error| match error {
+        OutputError::InvalidPath(_) => invalid(),
+        other => other,
+    })?;
+    let mut rollback = Rollback {
+        file: None,
+        directories: Vec::new(),
+    };
+    let result = (|| {
+        let directory = open_verified_directory(&start, &mut rollback.directories)?;
+        let parent = directory.try_clone()?;
+        rollback
+            .directories
+            .try_reserve(1)
+            .map_err(std::io::Error::other)?;
+        // EEXIST refuses a directory, file or link already there.
+        rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o700))?;
+        let fd = record_created_directory(&directory, name, parent, &mut rollback.directories)
+            .inspect_err(|_| {
+                let _ = rustix::fs::unlinkat(&directory, name, AtFlags::REMOVEDIR);
+            })?;
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))?;
+        check_directory(
+            &fd,
+            &start.join(name),
+            rustix::process::geteuid().as_raw(),
+            true,
+        )
+    })();
+    if let Err(error) = result {
+        rollback.undo();
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Create a new private file at `path`, refusing one that exists, under the
+/// output directory policy.
+pub(crate) fn create_new_file(path: &Path) -> Result<File, OutputError> {
+    open_output(path, Existing::Refuse).map(|(file, _)| file)
+}
+
 fn create_in(
     parent: &Path,
     name: &OsStr,

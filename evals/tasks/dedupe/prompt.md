@@ -1,0 +1,1 @@
+`/workspace/list.txt` has one item per line, and some lines repeat. Remove the repeated lines in place: keep only the first occurrence of each distinct line, in the original order. Lines that differ in any way, such as by letter case, are distinct.

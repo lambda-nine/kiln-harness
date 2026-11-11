@@ -1,0 +1,1 @@
+In `/workspace/app.conf`, change the line that sets `port` from `port=8080` to `port=9090`. Leave every other line byte-for-byte unchanged, including the comments, the blank line and the `admin_port` setting.

@@ -299,3 +299,66 @@ fn check_audited_expiry(records: &str) {
     assert_eq!(created["expiry_lifetime_ms"], 100_000);
     assert_eq!(created["expiry_idle_ms"], 120_000);
 }
+
+/// The eval self-test against installed kilnd: `hello-file` and
+/// `config-edit` fail their checks on the bare seed and pass after their
+/// reference solutions, and the four sessions leave nothing behind.
+#[tokio::test]
+async fn eval_selftest_proves_two_starter_tasks_against_installed_kilnd() {
+    if std::env::var_os("KILND_INTEGRATION").is_none() {
+        return;
+    }
+    let socket = std::env::var_os("KILND_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/kilnd/kilnd.sock"), PathBuf::from);
+    let api = TonicKilnd::connect(socket)
+        .await
+        .expect("connect to installed kilnd");
+    let before = api.health().await.expect("health before");
+    assert!(before.serving, "kilnd unhealthy: {}", before.detail);
+    assert_eq!(
+        before.active_sandboxes, 0,
+        "integration baseline is not empty"
+    );
+    assert_eq!(before.running_executions, 0);
+    let sandboxes_before = non_deleted_ids(&api).await;
+
+    let config = kiln_harness::eval::selftest_config();
+    let tasks = kiln_harness::eval::load_tasks(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("evals/tasks"),
+        &["hello-file".to_string(), "config-edit".to_string()],
+        &config,
+    )
+    .expect("the starter tasks load");
+    assert_eq!(tasks.len(), 2);
+    let temp = common::private_tempdir().expect("temporary output directory");
+    let out = temp.path().join("selftest");
+    let summary = kiln_harness::eval::selftest(
+        &api,
+        &tasks,
+        &config,
+        &out,
+        &CancellationToken::new(),
+        &mut |_| {},
+    )
+    .await
+    .expect("the self-test runs");
+    assert_eq!(summary.stopped, None);
+    for result in &summary.results {
+        assert_eq!(result.problem, None, "{}", result.task);
+    }
+    assert_eq!(summary.results.len(), 2);
+    for task in ["hello-file", "config-edit"] {
+        for kind in ["bare", "solved"] {
+            let journal = read_journal(&out.join(task).join(kind).join("journal.jsonl"))
+                .expect("self-test journal verifies");
+            assert!(journal.complete);
+        }
+    }
+
+    let after = api.health().await.expect("health after");
+    assert!(after.serving, "kilnd unhealthy: {}", after.detail);
+    assert_eq!(after.active_sandboxes, 0);
+    assert_eq!(after.running_executions, 0);
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
+}
