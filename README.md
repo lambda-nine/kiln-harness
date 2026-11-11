@@ -93,6 +93,33 @@ waiting on an active RPC, including sandbox create and the workspace baseline;
 kilnd is asked to cancel it, then deletion is retried and verified within a
 separate bounded cleanup window.
 
+## Sandbox expiry
+
+Each session first reads kilnd's Health and uses only the features a
+serving daemon lists. When it lists sandbox expiry, the create request
+carries an expiry policy, so a harness that crashes or is killed cannot
+hold its sandbox forever: kilnd reclaims it once it has been idle for
+`--sandbox-idle-timeout-secs` (120 by default, 10 to 3,600), or at its
+maximum lifetime, whichever comes first. The lifetime is the session
+timeout plus the 10-second cleanup window plus
+`--sandbox-lifetime-margin-secs` (60 by default, 1 to 600), clamped into
+the daemon's advertised bounds; a daemon cap shorter than the session and
+its cleanup window is refused before create, since the sandbox would expire
+mid-session. Executions count as activity on kilnd's side, so tool calls
+need nothing more. A model call can take minutes with no execution, so
+while one runs the harness renews the sandbox every third of the idle
+timeout (at most once a second). A renew refused because the sandbox
+expired or was deleted, or enough failed renews in a row that it has
+probably expired, ends the session with `SandboxExpired`; cleanup still
+deletes and verifies absence. Heartbeats write no audit or journal records;
+`session_finished` counts them as `renews`. When kilnd lists typed reasons,
+an expiry refusal from any sandbox call ends the session the same way.
+
+Against a daemon older than kilnd's API discovery, which lists no
+features, the harness sends no expiry and records `null` for it in the
+audit's `sandbox_created`. That is the degraded mode: the sandbox never
+expires, and a crashed harness can leak it, as before.
+
 ## Running against a local model
 
 `run` carries out one task with a real model through any server that speaks
@@ -126,7 +153,8 @@ replaces the default system prompt, which describes the sandbox and the
 tools. Limits default to 40 steps, 120 tool calls (8 per turn), a 900-second
 session, a 30-second tool timeout, 16,384 output tokens per request, and
 2,000,000 input and 600,000 output tokens per session; each has a flag, and
-the hard ceilings in `docs/architecture.md` still apply. Reasoning tokens
+the hard ceilings in `docs/architecture.md` still apply. The sandbox expiry
+flags are described above. Reasoning tokens
 count toward the output budgets: a thinking model such as Qwen3 can spend
 thousands of hidden tokens per turn before it answers, and with too small a
 cap the turn is truncated and the session fails. Lower `--max-output-tokens`

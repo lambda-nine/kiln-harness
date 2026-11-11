@@ -3,7 +3,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use kiln_harness::api::{SandboxApi, TonicKilnd};
+use kiln_harness::api::{ExpiryPolicy, Feature, SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{Harness, HarnessConfig, SessionTask};
 use kiln_harness::journal::{JsonlJournal, read_journal};
@@ -29,6 +29,10 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         "integration baseline is not empty"
     );
     assert_eq!(before.running_executions, 0);
+    // kilnd 853dee2 lists expiry and typed reasons, so the harness sends an
+    // expiry and reads reason trailers.
+    assert!(before.capabilities.supports(Feature::SandboxExpiry));
+    assert!(before.capabilities.supports(Feature::TypedReasons));
     // A node may keep sandboxes this test does not own, such as a failed one
     // kilnd still charges because its absence is unproven. Compare against
     // what existed before rather than against zero.
@@ -51,6 +55,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         .await
         .expect("real kilnd scenario succeeds");
     assert_eq!(outcome.tool_calls, 5);
+    check_expiry_and_reasons(&api, &outcome.sandbox_id).await;
     let records = std::fs::read_to_string(&audit_path).expect("read flushed audit");
     let completed = records
         .lines()
@@ -58,6 +63,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         .filter(|record| record.get("event").and_then(Value::as_str) == Some("tool_completed"))
         .collect::<Vec<_>>();
     assert_eq!(completed.len(), 5);
+    check_audited_expiry(&records);
     assert!(completed.iter().all(|record| {
         record.get("ok").and_then(Value::as_bool) == Some(true)
             && record
@@ -103,4 +109,45 @@ async fn non_deleted_ids(api: &TonicKilnd) -> BTreeSet<String> {
         .into_iter()
         .map(|sandbox| sandbox.id)
         .collect()
+}
+
+async fn check_expiry_and_reasons(api: &TonicKilnd, sandbox_id: &str) {
+    // The retained row keeps the effective expiry the harness set: 30 s
+    // session + 10 s cleanup + 60 s margin, and the 120 s idle default.
+    let sandbox = api
+        .get_sandbox(sandbox_id)
+        .await
+        .expect("get the deleted sandbox");
+    assert_eq!(
+        sandbox.expiry.and_then(|status| status.effective),
+        Some(ExpiryPolicy {
+            max_lifetime_ms: 100_000,
+            idle_timeout_ms: 120_000,
+        })
+    );
+    // A typed reason survives the wire: renewing the deleted sandbox is
+    // refused with its deletion reason, not NOT_FOUND.
+    let refused = api
+        .renew(sandbox_id)
+        .await
+        .expect_err("a deleted sandbox cannot be renewed");
+    assert_eq!(refused.code, tonic::Code::FailedPrecondition);
+    assert_eq!(refused.reason.as_deref(), Some("sandbox_deleted"));
+}
+
+fn check_audited_expiry(records: &str) {
+    let event = |name: &str| {
+        records
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid audit JSON"))
+            .find(|record| record.get("event").and_then(Value::as_str) == Some(name))
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let opened = event("session_opened");
+    let features = opened["features"].as_array().expect("features");
+    assert!(features.contains(&Value::from("sandbox_expiry")));
+    assert!(features.contains(&Value::from("typed_reasons")));
+    let created = event("sandbox_created");
+    assert_eq!(created["expiry_lifetime_ms"], 100_000);
+    assert_eq!(created["expiry_idle_ms"], 120_000);
 }

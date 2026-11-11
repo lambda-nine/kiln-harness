@@ -31,8 +31,9 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
-# The fake HTTP server in tests/common/http.rs reads and writes sockets.
-tokio = { version = "1.47", features = ["io-util"] }
+# The fake HTTP server in tests/common/http.rs reads and writes sockets, and
+# the heartbeat tests run on paused time.
+tokio = { version = "1.47", features = ["io-util", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

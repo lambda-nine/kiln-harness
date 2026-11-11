@@ -9,9 +9,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kiln_harness::api::{SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{
-    Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST, MAX_SESSION_TIMEOUT,
-    MAX_STEPS, MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
-    MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, SessionOutcome, SessionTask,
+    Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST, MAX_SANDBOX_IDLE_TIMEOUT,
+    MAX_SANDBOX_LIFETIME_MARGIN, MAX_SESSION_TIMEOUT, MAX_STEPS, MAX_TASK_TEXT_BYTES,
+    MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT, MAX_TOTAL_MODEL_OUTPUT_BYTES,
+    MAX_TOTAL_TOKENS, MIN_SANDBOX_IDLE_TIMEOUT, MIN_SANDBOX_LIFETIME_MARGIN, SessionOutcome,
+    SessionTask,
 };
 use kiln_harness::files::read_regular_file;
 use kiln_harness::journal::{
@@ -145,6 +147,14 @@ struct RunArgs {
     /// Wall-clock limit for each sandbox execution.
     #[arg(long, default_value_t = 30)]
     tool_timeout_secs: u64,
+    /// Idle time after which kilnd may reclaim the sandbox, when it supports
+    /// expiry. The harness renews it during model calls.
+    #[arg(long, default_value_t = 120)]
+    sandbox_idle_timeout_secs: u64,
+    /// Added to the session and cleanup windows to form the sandbox's
+    /// maximum lifetime, when kilnd supports expiry.
+    #[arg(long, default_value_t = 60)]
+    sandbox_lifetime_margin_secs: u64,
     /// Output tokens per model request, hidden reasoning included.
     #[arg(long, default_value_t = 16_384)]
     max_output_tokens: u32,
@@ -275,6 +285,18 @@ fn check_limit<T: Copy + PartialOrd + Default + std::fmt::Display>(
     Ok(())
 }
 
+/// A whole number of seconds within `[min, max]`.
+fn check_secs(flag: &str, value: u64, min: Duration, max: Duration) -> Result<()> {
+    if value < min.as_secs() || value > max.as_secs() {
+        bail!(
+            "{flag} must be between {} and {}",
+            min.as_secs(),
+            max.as_secs()
+        );
+    }
+    Ok(())
+}
+
 fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
     check_provider_flags(args)?;
     check_limit("--max-steps", args.max_steps, MAX_STEPS)?;
@@ -314,6 +336,18 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
         args.max_total_output_bytes,
         MAX_TOTAL_MODEL_OUTPUT_BYTES,
     )?;
+    check_secs(
+        "--sandbox-idle-timeout-secs",
+        args.sandbox_idle_timeout_secs,
+        MIN_SANDBOX_IDLE_TIMEOUT,
+        MAX_SANDBOX_IDLE_TIMEOUT,
+    )?;
+    check_secs(
+        "--sandbox-lifetime-margin-secs",
+        args.sandbox_lifetime_margin_secs,
+        MIN_SANDBOX_LIFETIME_MARGIN,
+        MAX_SANDBOX_LIFETIME_MARGIN,
+    )?;
     let config = HarnessConfig {
         max_steps: args.max_steps,
         max_tool_calls: args.max_tool_calls,
@@ -327,6 +361,8 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
             timeout: Duration::from_secs(args.tool_timeout_secs),
             ..ToolLimits::default()
         },
+        sandbox_idle_timeout: Duration::from_secs(args.sandbox_idle_timeout_secs),
+        sandbox_lifetime_margin: Duration::from_secs(args.sandbox_lifetime_margin_secs),
         ..HarnessConfig::default()
     };
     config.validate()?;

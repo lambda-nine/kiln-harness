@@ -563,7 +563,7 @@ fn assert_unconfirmed_terminal(
     ));
     assert!(matches!(
         harness.audit().records.last().map(|record| &record.event),
-        Some(AuditEvent::SessionFinished { outcome, work_outcome, sandbox_deleted: false })
+        Some(AuditEvent::SessionFinished { outcome, work_outcome, sandbox_deleted: false, .. })
             if outcome == "cleanup_failed" && work_outcome == work
     ));
 }
@@ -571,10 +571,7 @@ fn assert_unconfirmed_terminal(
 #[tokio::test]
 async fn ambiguous_create_with_empty_listings_ends_cleanup_failed() {
     let api = FakeApi::default();
-    api.state().create_rejection = Some(ApiError {
-        code: Code::Unknown,
-        message: "response is ambiguous".to_string(),
-    });
+    api.state().create_rejection = Some(ApiError::new(Code::Unknown, "response is ambiguous"));
     let mut config = short_lifecycle_config();
     config.lifecycle_timeout = Duration::from_millis(25);
     let mut harness = Harness::new(

@@ -6,6 +6,28 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- kilnd API milestone 1 (kilnd `853dee2`, whose `kilnd.v1` schema is now
+  vendored). Each session reads Health once before create and uses only
+  the features a serving daemon lists; `session_opened` records them as
+  `features`. With sandbox expiry, create sends an idle timeout
+  (`--sandbox-idle-timeout-secs`, 120 by default) and a maximum lifetime
+  (the session, its cleanup window, and `--sandbox-lifetime-margin-secs`,
+  60 by default), clamped into the daemon's bounds, so kilnd reclaims a
+  crashed harness's sandbox; a lifetime cap shorter than the session is
+  refused before create. During each provider call a `RenewSandbox`
+  heartbeat keeps the sandbox from idling out; `SessionOutcome` and
+  `session_finished` count successful renews as `renews`. With typed
+  reasons, an `expired_idle`, `expired_lifetime` or `sandbox_deleted`
+  refusal from any sandbox call, or too many failed renews in a row, ends
+  the session with `SandboxExpired` after the usual verified cleanup, and
+  `UNIMPLEMENTED` with `backend_unsupported:*` is a definite create
+  rejection. `sandbox_created` records the expiry sent, or `null` against
+  an older daemon, which gets none and behaves as before. Journal
+  `sandbox_ready` carries the expiry as optional fields, skipped when
+  absent, so older journals are unchanged. `SandboxApi` gains `renew`,
+  `SandboxRequest` and `Sandbox` an expiry, `Health` its capabilities,
+  `ApiError` a validated `reason`, and `ToolRegistry::start_session` a
+  `typed_reasons` flag.
 - Sixth review round for the anthropic provider: without fallback
   evidence (no `fallback` block and no `fallback_message` iteration), the
   response's `model` and every named `message` iteration must equal the

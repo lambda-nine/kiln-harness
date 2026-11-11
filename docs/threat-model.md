@@ -32,7 +32,17 @@ it is not a hostile multi-tenant boundary.
 - Create recovery classifies typed gRPC status codes: invalid argument, resource
   exhausted, failed precondition, permission denied, and unauthenticated are
   definite rejections only after successful recovery listings. Other codes and
-  local transport/protocol failures remain ambiguous without a recovered row.
+  local transport/protocol failures remain ambiguous without a recovered row,
+  except `UNIMPLEMENTED` with a typed `backend_unsupported:*` reason, which
+  kilnd sends before allocating anything.
+- Daemon features are used only when a `SERVING` Health response lists them,
+  read once per session before create. Typed `kilnd-reason` tokens are read
+  only from the metadata entry, only when the daemon lists typed reasons, and
+  only when they are 1 to 128 bytes of `[a-z0-9_:]`; message prose is never
+  parsed. A reason can end a session (expired or deleted sandbox) or make a
+  create rejection definite, never widen what the harness does. Feature
+  names are the only daemon-supplied strings `session_opened` records, and
+  they come from the harness's own schema, not the wire.
 - Audit records omit content. They store hashes, byte/truncation evidence,
   token usage, host-generated call correlation IDs, sandbox IDs, and kilnd
   execution IDs. Raw provider call IDs stay out of the audit.
@@ -193,9 +203,18 @@ it is not a hostile multi-tenant boundary.
   labels. Lifecycle recovery may outlive the work deadline; its default is 10
   seconds and configurations above 60 seconds are rejected. Exhaustion is an
   explicit `Cleanup` or `CreateUncertain` error.
-- SIGKILL, host loss, or a harness crash can prevent client-side delete. kilnd
-  reconciliation handles known state; a future sandbox TTL is still needed for
-  unattended client crashes.
+- SIGKILL, host loss, or a harness crash can prevent client-side delete. On a
+  daemon that lists sandbox expiry, every sandbox is created with an idle
+  timeout and a maximum lifetime, so kilnd reclaims a crashed harness's
+  sandbox within the idle timeout (120 s by default), and at the latest at
+  its lifetime (the session, its cleanup window, and a margin). This closes
+  the gap a sandbox TTL was needed for. The renew heartbeat that keeps a
+  live session's sandbox from idling out during a long model call is a
+  liveness signal from a trusted host process, not a credential: anyone who
+  can reach the kilnd socket as the owner can renew or delete the sandbox
+  anyway. A daemon that predates discovery lists no features, gets no
+  expiry, and still leaks the sandbox of a crashed harness until an
+  operator deletes it.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted
   host user can modify it. Durable signing or a remote append service is out of
   scope.

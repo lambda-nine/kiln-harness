@@ -4,6 +4,7 @@
 mod common;
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,10 +20,12 @@ use kiln_harness::provider::ScriptedProvider;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
-/// Answers health only after the test releases it; everything else fails.
+/// Answers the first health call only after the test releases it, and later
+/// ones (the session's own discovery) at once; everything else fails.
 struct GatedKilnd {
     health_entered: mpsc::Sender<()>,
     release_health: Arc<tokio::sync::Notify>,
+    gate_passed: AtomicBool,
 }
 
 #[async_trait]
@@ -31,8 +34,10 @@ impl KilndService for GatedKilnd {
         &self,
         _request: Request<pb::HealthRequest>,
     ) -> Result<Response<pb::HealthResponse>, Status> {
-        let _ = self.health_entered.send(());
-        self.release_health.notified().await;
+        if !self.gate_passed.swap(true, Ordering::SeqCst) {
+            let _ = self.health_entered.send(());
+            self.release_health.notified().await;
+        }
         Ok(Response::new(pb::HealthResponse {
             status: pb::health_response::Status::Serving as i32,
             ..pb::HealthResponse::default()
@@ -131,6 +136,7 @@ async fn relinking_an_output_to_the_source_after_the_checks_cannot_touch_it() {
                     KilndServiceServer::new(GatedKilnd {
                         health_entered: health_tx,
                         release_health: server_release,
+                        gate_passed: AtomicBool::new(false),
                     }),
                     UnixListenerStream::new(listener),
                     async {

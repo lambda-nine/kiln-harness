@@ -55,7 +55,7 @@ async fn unconfirmed_cleanup_is_recorded_and_printed_as_cleanup_failed() {
     assert!(matches!(error, HarnessError::Cleanup(_)));
     assert!(matches!(
         harness.audit().records.last().map(|record| &record.event),
-        Some(AuditEvent::SessionFinished { outcome, work_outcome, sandbox_deleted: false })
+        Some(AuditEvent::SessionFinished { outcome, work_outcome, sandbox_deleted: false, .. })
             if outcome == "cleanup_failed" && work_outcome == "completed"
     ));
     let journal = read_journal(&path).expect("journal verifies");
@@ -153,6 +153,8 @@ fn verify_rejects_a_complete_journal_with_a_request_after_the_final_answer() {
             JournalEvent::SandboxReady {
                 sandbox_id: "sb-1".to_string(),
                 baseline_file_count: 0,
+                expiry_lifetime_ms: None,
+                expiry_idle_ms: None,
             },
             request(1),
             JournalEvent::ModelResponded {

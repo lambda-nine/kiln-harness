@@ -69,9 +69,19 @@ pub enum AuditEvent {
     SessionOpened {
         session_timeout_ms: u64,
         network: String,
+        /// The daemon's listed features, as lower-case `FEATURE_` suffixes.
+        /// Empty for a daemon that predates discovery.
+        #[serde(default)]
+        features: Vec<String>,
     },
     SandboxCreated {
         backend_id: String,
+        /// The expiry the harness sent, or null when the daemon does not
+        /// list sandbox expiry and the sandbox never expires.
+        #[serde(default)]
+        expiry_lifetime_ms: Option<u64>,
+        #[serde(default)]
+        expiry_idle_ms: Option<u64>,
     },
     SandboxRecovered {
         sandbox_ids: Vec<String>,
@@ -124,6 +134,9 @@ pub enum AuditEvent {
         /// How the work itself ended, before cleanup.
         work_outcome: String,
         sandbox_deleted: bool,
+        /// Successful `RenewSandbox` heartbeats during provider calls.
+        #[serde(default)]
+        renews: u32,
     },
 }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -24,6 +24,33 @@ pub struct SandboxRequest {
     pub read_only_root: bool,
     pub writable_paths: Vec<String>,
     pub labels: BTreeMap<String, String>,
+    /// Sent only when the daemon lists [`Feature::SandboxExpiry`]: an older
+    /// daemon ignores the field silently. `None` never expires.
+    pub expiry: Option<ExpiryPolicy>,
+}
+
+/// When kilnd may reclaim a sandbox on its own. Each field is whole
+/// milliseconds; kilnd reads a zero field as its node default, which the
+/// harness never sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryPolicy {
+    /// Counted from the first `READY`, whatever the activity.
+    pub max_lifetime_ms: u64,
+    /// Counted from the last execution start or finish or `RenewSandbox`,
+    /// and paused while an execution runs or is queued.
+    pub idle_timeout_ms: u64,
+}
+
+/// A sandbox's effective expiry as kilnd reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpiryStatus {
+    /// Zero in a field: the sandbox does not expire that way.
+    pub effective: Option<ExpiryPolicy>,
+    /// Wall-clock projections computed when read; 0 means none.
+    pub lifetime_expires_at_unix_ms: i64,
+    pub idle_expires_at_unix_ms: i64,
+    pub last_activity_at_unix_ms: i64,
+    pub idle_paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +58,9 @@ pub struct Sandbox {
     pub id: String,
     pub backend_id: String,
     pub labels: BTreeMap<String, String>,
+    /// `None` when the daemon reports no expiry status, as an older one
+    /// never does.
+    pub expiry: Option<ExpiryStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +114,94 @@ pub struct NodeReservations {
     pub disk_bytes: u64,
 }
 
+/// An optional part of `kilnd.v1`. A client uses one only when a `SERVING`
+/// Health response lists it: an older daemon ignores unknown request fields
+/// silently and lists none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Feature {
+    SandboxExpiry,
+    TypedReasons,
+    IdempotentCreate,
+    ExecCwd,
+    ExecEnv,
+    SandboxDefaultEnv,
+    ExecStream,
+    /// A feature this harness does not use, by its protobuf number.
+    Other(i32),
+}
+
+impl Feature {
+    fn from_proto(value: i32) -> Option<Self> {
+        Some(match pb::Feature::try_from(value) {
+            Ok(pb::Feature::Unspecified) => return None,
+            Ok(pb::Feature::SandboxExpiry) => Self::SandboxExpiry,
+            Ok(pb::Feature::TypedReasons) => Self::TypedReasons,
+            Ok(pb::Feature::IdempotentCreate) => Self::IdempotentCreate,
+            Ok(pb::Feature::ExecCwd) => Self::ExecCwd,
+            Ok(pb::Feature::ExecEnv) => Self::ExecEnv,
+            Ok(pb::Feature::SandboxDefaultEnv) => Self::SandboxDefaultEnv,
+            Ok(pb::Feature::ExecStream) => Self::ExecStream,
+            Ok(pb::Feature::RequestIdRelease) | Err(_) => Self::Other(value),
+        })
+    }
+
+    /// The name after `FEATURE_`, in lower case, as kilnd's reason tokens
+    /// spell it; `feature_<n>` for a number this schema does not name.
+    #[must_use]
+    pub fn name(self) -> String {
+        let named = match self {
+            Self::SandboxExpiry => pb::Feature::SandboxExpiry,
+            Self::TypedReasons => pb::Feature::TypedReasons,
+            Self::IdempotentCreate => pb::Feature::IdempotentCreate,
+            Self::ExecCwd => pb::Feature::ExecCwd,
+            Self::ExecEnv => pb::Feature::ExecEnv,
+            Self::SandboxDefaultEnv => pb::Feature::SandboxDefaultEnv,
+            Self::ExecStream => pb::Feature::ExecStream,
+            Self::Other(value) => match pb::Feature::try_from(value) {
+                Ok(feature) => feature,
+                Err(_) => return format!("feature_{value}"),
+            },
+        };
+        let name = named.as_str_name();
+        name.strip_prefix("FEATURE_")
+            .unwrap_or(name)
+            .to_ascii_lowercase()
+    }
+}
+
+/// The daemon's expiry bounds. Each `max_*` of 0 means no cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApiLimits {
+    pub min_sandbox_lifetime_ms: u64,
+    pub max_sandbox_lifetime_ms: u64,
+    /// Used by kilnd only for a zero field of a sent policy; 0 never expires.
+    pub default_sandbox_lifetime_ms: u64,
+    pub min_sandbox_idle_ms: u64,
+    pub max_sandbox_idle_ms: u64,
+    pub default_sandbox_idle_ms: u64,
+}
+
+/// What a daemon supports. An older daemon reports no features and no
+/// limits, which reads as "unsupported" everywhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub features: BTreeSet<Feature>,
+    pub limits: Option<ApiLimits>,
+}
+
+impl Capabilities {
+    #[must_use]
+    pub fn supports(&self, feature: Feature) -> bool {
+        self.features.contains(&feature)
+    }
+
+    /// Every listed feature's [`Feature::name`], in order.
+    #[must_use]
+    pub fn feature_names(&self) -> Vec<String> {
+        self.features.iter().map(|feature| feature.name()).collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Health {
     pub serving: bool,
@@ -91,31 +209,125 @@ pub struct Health {
     pub active_sandboxes: u32,
     pub running_executions: u32,
     pub reservations: NodeReservations,
+    /// Meaningful only when `serving`: a failed backend probe withdraws
+    /// every dynamic feature.
+    pub capabilities: Capabilities,
 }
+
+/// The metadata key of kilnd's typed refusal reasons.
+pub const REASON_KEY: &str = "kilnd-reason";
+/// Longest `kilnd-reason` token accepted.
+pub const MAX_REASON_BYTES: usize = 128;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("kilnd {code}: {message}")]
 pub struct ApiError {
     pub code: tonic::Code,
     pub message: String,
+    /// The `kilnd-reason` trailer when it is a well-formed token: 1 to 128
+    /// bytes of `[a-z0-9_:]`. It means something only when the daemon lists
+    /// [`Feature::TypedReasons`]; the message prose is never parsed.
+    pub reason: Option<String>,
 }
 
 impl ApiError {
-    fn local(message: impl Into<String>) -> Self {
+    #[must_use]
+    pub fn new(code: tonic::Code, message: impl Into<String>) -> Self {
         Self {
-            // Local transport/protocol failures cannot prove create rejection.
-            code: tonic::Code::Unknown,
+            code,
             message: message.into(),
+            reason: None,
+        }
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        // Local transport/protocol failures cannot prove create rejection.
+        Self::new(tonic::Code::Unknown, message)
+    }
+
+    /// The reason token, if the session's daemon lists typed reasons.
+    #[must_use]
+    pub fn typed_reason(&self, typed_reasons: bool) -> Option<&str> {
+        if typed_reasons {
+            self.reason.as_deref()
+        } else {
+            None
         }
     }
 }
 
+/// Whether `token` is a reason the harness will act on.
+#[must_use]
+pub fn reason_is_valid(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_REASON_BYTES
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b':'))
+}
+
 impl From<tonic::Status> for ApiError {
     fn from(status: tonic::Status) -> Self {
+        let reason = status
+            .metadata()
+            .get(REASON_KEY)
+            .and_then(|value| value.to_str().ok())
+            .filter(|token| reason_is_valid(token))
+            .map(str::to_string);
         Self {
             code: status.code(),
             message: status.message().to_string(),
+            reason,
         }
+    }
+}
+
+/// Why a sandbox stopped being usable before the session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryReason {
+    /// kilnd reclaimed it after its idle timeout.
+    ExpiredIdle,
+    /// kilnd reclaimed it at its maximum lifetime.
+    ExpiredLifetime,
+    /// Someone deleted it.
+    SandboxDeleted,
+    /// The harness could not renew it for long enough that kilnd has
+    /// probably reclaimed it.
+    RenewFailed,
+}
+
+impl ExpiryReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExpiredIdle => "expired_idle",
+            Self::ExpiredLifetime => "expired_lifetime",
+            Self::SandboxDeleted => "sandbox_deleted",
+            Self::RenewFailed => "renew_failed",
+        }
+    }
+
+    /// The reason a sandbox RPC refusal proves the sandbox is gone:
+    /// `FAILED_PRECONDITION` with an `expired_idle`, `expired_lifetime` or
+    /// `sandbox_deleted` trailer, read only when the daemon lists typed
+    /// reasons.
+    #[must_use]
+    pub fn of(error: &ApiError, typed_reasons: bool) -> Option<Self> {
+        if error.code != tonic::Code::FailedPrecondition {
+            return None;
+        }
+        match error.typed_reason(typed_reasons)? {
+            "expired_idle" => Some(Self::ExpiredIdle),
+            "expired_lifetime" => Some(Self::ExpiredLifetime),
+            "sandbox_deleted" => Some(Self::SandboxDeleted),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ExpiryReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -128,6 +340,10 @@ pub trait SandboxApi: Send + Sync {
     /// Request idempotent deletion. Success acknowledges a deleted response state;
     /// callers must independently confirm absence via `non_deleted_sandboxes`.
     async fn delete(&self, sandbox_id: &str) -> Result<(), ApiError>;
+    /// Record activity on a ready sandbox, restarting its idle timer; never
+    /// extends its lifetime. Call only when the daemon lists
+    /// [`Feature::SandboxExpiry`].
+    async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError>;
     /// Independently list every sandbox not yet deleted, including creating,
     /// deleting, and failed sandboxes. Errors or incomplete pagination must not
     /// be returned as a successful empty listing.
@@ -167,13 +383,68 @@ impl TonicKilnd {
 
     fn sandbox(message: Option<pb::Sandbox>) -> Result<Sandbox, ApiError> {
         let sandbox = message.ok_or_else(|| ApiError::local("response omitted sandbox"))?;
-        Ok(Sandbox {
-            id: sandbox.id,
-            backend_id: sandbox.backend_id,
-            labels: sandbox
-                .spec
-                .map_or_else(BTreeMap::new, |spec| spec.labels.into_iter().collect()),
-        })
+        Ok(sandbox_from_proto(sandbox))
+    }
+
+    /// Read one sandbox, a retained deleted one included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the RPC's error, or a local one if the response omits the
+    /// sandbox.
+    pub async fn get_sandbox(&self, sandbox_id: &str) -> Result<Sandbox, ApiError> {
+        let response = self
+            .client
+            .clone()
+            .get_sandbox(pb::GetSandboxRequest {
+                id: sandbox_id.to_string(),
+                execution_limit: 1,
+            })
+            .await
+            .map_err(ApiError::from)?
+            .into_inner();
+        Self::sandbox(response.sandbox)
+    }
+}
+
+fn sandbox_from_proto(sandbox: pb::Sandbox) -> Sandbox {
+    Sandbox {
+        id: sandbox.id,
+        backend_id: sandbox.backend_id,
+        labels: sandbox
+            .spec
+            .map_or_else(BTreeMap::new, |spec| spec.labels.into_iter().collect()),
+        expiry: sandbox.expiry.map(|status| ExpiryStatus {
+            effective: status.effective.map(|policy| ExpiryPolicy {
+                max_lifetime_ms: policy.max_lifetime_ms,
+                idle_timeout_ms: policy.idle_timeout_ms,
+            }),
+            lifetime_expires_at_unix_ms: status.lifetime_expires_at_unix_ms,
+            idle_expires_at_unix_ms: status.idle_expires_at_unix_ms,
+            last_activity_at_unix_ms: status.last_activity_at_unix_ms,
+            idle_paused: status.idle_paused,
+        }),
+    }
+}
+
+fn capabilities_from_proto(capabilities: Option<pb::RuntimeCapabilities>) -> Capabilities {
+    let Some(capabilities) = capabilities else {
+        return Capabilities::default();
+    };
+    Capabilities {
+        features: capabilities
+            .features
+            .into_iter()
+            .filter_map(Feature::from_proto)
+            .collect(),
+        limits: capabilities.limits.map(|limits| ApiLimits {
+            min_sandbox_lifetime_ms: limits.min_sandbox_lifetime_ms,
+            max_sandbox_lifetime_ms: limits.max_sandbox_lifetime_ms,
+            default_sandbox_lifetime_ms: limits.default_sandbox_lifetime_ms,
+            min_sandbox_idle_ms: limits.min_sandbox_idle_ms,
+            max_sandbox_idle_ms: limits.max_sandbox_idle_ms,
+            default_sandbox_idle_ms: limits.default_sandbox_idle_ms,
+        }),
     }
 }
 
@@ -199,6 +470,7 @@ impl SandboxApi for TonicKilnd {
                 pids: resources.reserved_pids,
                 disk_bytes: resources.reserved_disk_bytes,
             },
+            capabilities: capabilities_from_proto(response.runtime_capabilities),
         })
     }
 
@@ -228,7 +500,10 @@ impl SandboxApi for TonicKilnd {
                     writable_paths: request.writable_paths,
                     labels: request.labels.into_iter().collect(),
                 }),
-                expiry: None,
+                expiry: request.expiry.map(|policy| pb::ExpiryPolicy {
+                    max_lifetime_ms: policy.max_lifetime_ms,
+                    idle_timeout_ms: policy.idle_timeout_ms,
+                }),
             })
             .await
             .map_err(ApiError::from)?
@@ -297,6 +572,22 @@ impl SandboxApi for TonicKilnd {
         Ok(())
     }
 
+    async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError> {
+        let response = self
+            .client
+            .clone()
+            .renew_sandbox(pb::RenewSandboxRequest {
+                id: sandbox_id.to_string(),
+            })
+            .await
+            .map_err(ApiError::from)?
+            .into_inner();
+        if response.sandbox.is_none() {
+            return Err(ApiError::local("renew response omitted sandbox"));
+        }
+        Ok(())
+    }
+
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
         let mut page_token = String::new();
         let mut sandboxes = Vec::new();
@@ -312,15 +603,7 @@ impl SandboxApi for TonicKilnd {
                 .await
                 .map_err(ApiError::from)?
                 .into_inner();
-            for sandbox in response.sandboxes {
-                sandboxes.push(Sandbox {
-                    id: sandbox.id,
-                    backend_id: sandbox.backend_id,
-                    labels: sandbox
-                        .spec
-                        .map_or_else(BTreeMap::new, |spec| spec.labels.into_iter().collect()),
-                });
-            }
+            sandboxes.extend(response.sandboxes.into_iter().map(sandbox_from_proto));
             page_token = response.next_page_token;
             if page_token.is_empty() {
                 break;
@@ -361,8 +644,76 @@ fn execution_from_proto(execution: pb::Execution) -> Execution {
 
 #[cfg(test)]
 mod status_contract_test {
-    use super::ApiError;
+    use super::{ApiError, ExpiryReason, Feature, REASON_KEY};
+    use tonic::metadata::{MetadataMap, MetadataValue};
     use tonic::{Code, Status};
+
+    fn with_reason(code: Code, reason: &'static str) -> Status {
+        let mut metadata = MetadataMap::new();
+        metadata.insert(REASON_KEY, MetadataValue::from_static(reason));
+        Status::with_metadata(code, format!("{reason}: prose"), metadata)
+    }
+
+    #[test]
+    fn reason_trailers_are_validated_tokens() {
+        let error = ApiError::from(with_reason(Code::FailedPrecondition, "expired_idle"));
+        assert_eq!(error.reason.as_deref(), Some("expired_idle"));
+        assert_eq!(error.message, "expired_idle: prose");
+        let error = ApiError::from(with_reason(
+            Code::Unimplemented,
+            "backend_unsupported:exec_env",
+        ));
+        assert_eq!(
+            error.reason.as_deref(),
+            Some("backend_unsupported:exec_env")
+        );
+        for bad in ["Expired_idle", "expired idle", "expired-idle", "", "\u{e9}"] {
+            let mut metadata = MetadataMap::new();
+            if let Ok(value) = MetadataValue::try_from(bad) {
+                metadata.insert(REASON_KEY, value);
+            }
+            let status = Status::with_metadata(Code::FailedPrecondition, "x", metadata);
+            assert_eq!(ApiError::from(status).reason, None, "{bad:?}");
+        }
+        let long = "a".repeat(129);
+        let mut metadata = MetadataMap::new();
+        metadata.insert(REASON_KEY, MetadataValue::try_from(&long).expect("ascii"));
+        let status = Status::with_metadata(Code::FailedPrecondition, "x", metadata);
+        assert_eq!(ApiError::from(status).reason, None);
+        let exact = "a".repeat(128);
+        let mut metadata = MetadataMap::new();
+        metadata.insert(REASON_KEY, MetadataValue::try_from(&exact).expect("ascii"));
+        let status = Status::with_metadata(Code::FailedPrecondition, "x", metadata);
+        assert_eq!(ApiError::from(status).reason, Some(exact));
+        // The prose prefix alone is never parsed.
+        let error = ApiError::from(Status::failed_precondition("expired_idle: prose"));
+        assert_eq!(error.reason, None);
+    }
+
+    #[test]
+    fn expiry_needs_the_code_the_token_and_the_feature() {
+        let error = ApiError::from(with_reason(Code::FailedPrecondition, "expired_lifetime"));
+        assert_eq!(
+            ExpiryReason::of(&error, true),
+            Some(ExpiryReason::ExpiredLifetime)
+        );
+        assert_eq!(ExpiryReason::of(&error, false), None);
+        let error = ApiError::from(with_reason(Code::NotFound, "expired_idle"));
+        assert_eq!(ExpiryReason::of(&error, true), None);
+        let error = ApiError::from(with_reason(Code::FailedPrecondition, "sandbox_lost"));
+        assert_eq!(ExpiryReason::of(&error, true), None);
+    }
+
+    #[test]
+    fn feature_names_are_lower_case_suffixes() {
+        assert_eq!(Feature::SandboxExpiry.name(), "sandbox_expiry");
+        assert_eq!(Feature::TypedReasons.name(), "typed_reasons");
+        assert_eq!(Feature::Other(8).name(), "request_id_release");
+        assert_eq!(Feature::Other(99).name(), "feature_99");
+        assert_eq!(Feature::from_proto(0), None);
+        assert_eq!(Feature::from_proto(7), Some(Feature::TypedReasons));
+        assert_eq!(Feature::from_proto(99), Some(Feature::Other(99)));
+    }
 
     #[test]
     fn tonic_status_codes_survive_adapter_conversion() {

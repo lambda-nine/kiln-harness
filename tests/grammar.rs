@@ -79,6 +79,8 @@ fn ready() -> JournalEvent {
     JournalEvent::SandboxReady {
         sandbox_id: "sb-1".to_string(),
         baseline_file_count: 0,
+        expiry_lifetime_ms: None,
+        expiry_idle_ms: None,
     }
 }
 

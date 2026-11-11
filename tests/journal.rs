@@ -425,6 +425,8 @@ fn first_record_must_start_the_session() {
         event: JournalEvent::SandboxReady {
             sandbox_id: "sb-1".to_string(),
             baseline_file_count: 0,
+            expiry_lifetime_ms: None,
+            expiry_idle_ms: None,
         },
     };
     let temp = common::private_tempdir().expect("temp dir");
@@ -857,6 +859,8 @@ fn distinct_config() -> HarnessConfig {
             max_manifest_bytes: 105,
             max_manifest_entries: 106,
         },
+        sandbox_idle_timeout: Duration::from_secs(33),
+        sandbox_lifetime_margin: Duration::from_secs(4),
     }
 }
 
@@ -865,6 +869,10 @@ fn limits_round_trip_every_model_visible_setting() {
     let recorded = distinct_config();
     let mut restored = HarnessConfig::default();
     let lifecycle = (restored.lifecycle_timeout, restored.lifecycle_retry_delay);
+    let expiry = (
+        restored.sandbox_idle_timeout,
+        restored.sandbox_lifetime_margin,
+    );
     let limits = recorded.limits();
 
     // Through JSON, as replay reads them.
@@ -886,6 +894,14 @@ fn limits_round_trip_every_model_visible_setting() {
         (restored.lifecycle_timeout, restored.lifecycle_retry_delay),
         lifecycle,
         "lifecycle windows are not model-visible and are not replayed"
+    );
+    assert_eq!(
+        (
+            restored.sandbox_idle_timeout,
+            restored.sandbox_lifetime_margin
+        ),
+        expiry,
+        "sandbox expiry is not model-visible and is not replayed"
     );
     let mut unknown = serde_json::to_value(limits).expect("value");
     unknown["surprise"] = json!(1);

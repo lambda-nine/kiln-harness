@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::time::{Instant, sleep, timeout_at};
 
-use crate::api::{ApiError, CapturedOutput, Execution, ExecutionState, SandboxApi, SandboxExec};
+use crate::api::{
+    ApiError, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi, SandboxExec,
+};
 use crate::audit::{ContentSummary, OutputEvidence};
 use crate::journal::SessionLimits;
 use crate::provider::{ToolCall, ToolDefinition};
@@ -110,6 +112,8 @@ impl ToolRegistry {
     }
 
     /// Capture the fixed workspace baseline for a newly created sandbox.
+    /// `typed_reasons` says whether the daemon lists typed refusal reasons;
+    /// only then does a tool call end on a refusal proving the sandbox gone.
     ///
     /// # Errors
     ///
@@ -119,12 +123,14 @@ impl ToolRegistry {
         api: &'a A,
         sandbox_id: String,
         session_deadline: Instant,
+        typed_reasons: bool,
     ) -> Result<(ToolSession<'a, A>, BaselineEvidence), ToolError> {
         let mut session = ToolSession {
             api,
             sandbox_id,
             limits: &self.limits,
             baseline: BTreeSet::new(),
+            typed_reasons,
         };
         let manifest = session.manifest(session_deadline).await?;
         let evidence = BaselineEvidence {
@@ -147,6 +153,7 @@ pub struct ToolSession<'a, A: SandboxApi> {
     sandbox_id: String,
     limits: &'a ToolLimits,
     baseline: BTreeSet<String>,
+    typed_reasons: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +177,10 @@ pub struct RecoveredExecutionEvidence {
 pub enum ToolStop {
     Deadline,
     Canceled,
+    /// kilnd refused the call because the sandbox expired or was deleted.
+    /// The model-visible result is the same `kilnd_error` as before typed
+    /// reasons; the session then ends.
+    Expired(ExpiryReason),
 }
 
 impl ToolRun {
@@ -330,7 +341,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .await
         {
             Ok(execution) => execution_run(&execution, self.limits.max_result_bytes / 3),
-            Err(error) => tool_error_run(error, "kilnd_error"),
+            Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
         }
     }
 
@@ -367,7 +378,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .await
         {
             Ok(execution) => execution,
-            Err(error) => return tool_error_run(error, "kilnd_error"),
+            Err(error) => return tool_error_run(error, "kilnd_error", self.typed_reasons),
         };
         if !stat.succeeded() {
             return execution_error(&stat, "stat_failed");
@@ -394,7 +405,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .await
         {
             Ok(execution) => execution,
-            Err(error) => return tool_error_run(error, "kilnd_error"),
+            Err(error) => return tool_error_run(error, "kilnd_error", self.typed_reasons),
         };
         if !read.succeeded() {
             return combine_execution_error(&stat, &read, "read_failed");
@@ -455,7 +466,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 true,
             ),
             Ok(execution) => execution_error(&execution, "write_failed"),
-            Err(error) => tool_error_run(error, "kilnd_error"),
+            Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
         }
     }
 
@@ -501,7 +512,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 run
             }
             Ok(execution) => execution_error(&execution, "list_failed"),
-            Err(error) => tool_error_run(error, "kilnd_error"),
+            Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
         }
     }
 
@@ -525,7 +536,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                     stop: None,
                 }
             }
-            Err(error) => tool_error_run(error, "workspace_diff_failed"),
+            Err(error) => tool_error_run(error, "workspace_diff_failed", self.typed_reasons),
         }
     }
 
@@ -776,7 +787,7 @@ fn combine_execution_error(first: &Execution, second: &Execution, kind: &str) ->
     run
 }
 
-fn tool_error_run(error: ToolError, kind: &str) -> ToolRun {
+fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun {
     match error {
         ToolError::Deadline => ToolRun::interrupted(ToolStop::Deadline),
         ToolError::Api(error) => ToolRun {
@@ -785,7 +796,7 @@ fn tool_error_run(error: ToolError, kind: &str) -> ToolRun {
             execution_ids: Vec::new(),
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
-            stop: None,
+            stop: ExpiryReason::of(&error, typed_reasons).map(ToolStop::Expired),
         },
         ToolError::Manifest {
             message,

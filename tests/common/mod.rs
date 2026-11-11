@@ -4,14 +4,14 @@
 pub mod anthropic;
 pub mod http;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use kiln_harness::api::{
-    ApiError, CapturedOutput, Execution, ExecutionState, Health, NodeReservations, Sandbox,
-    SandboxApi, SandboxExec, SandboxRequest,
+    ApiError, ApiLimits, Capabilities, CapturedOutput, Execution, ExecutionState, ExpiryStatus,
+    Feature, Health, NodeReservations, Sandbox, SandboxApi, SandboxExec, SandboxRequest,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
@@ -19,6 +19,15 @@ use tonic::Code;
 #[derive(Clone, Default)]
 pub struct FakeApi {
     pub state: Arc<Mutex<FakeState>>,
+}
+
+/// One scripted `RenewSandbox` answer.
+pub enum RenewScript {
+    Ok,
+    Fail(ApiError),
+    /// Expire the sandbox with this reason and refuse the renew, as kilnd
+    /// does when expiry wins the race.
+    Expire(&'static str),
 }
 
 #[derive(Default)]
@@ -62,24 +71,84 @@ pub struct FakeState {
     /// Record the created row this long after the request, independently of
     /// the RPC.
     pub create_record_delay: Duration,
+    /// What Health lists; empty, like a daemon that predates discovery.
+    pub features: BTreeSet<Feature>,
+    pub limits: Option<ApiLimits>,
+    pub not_serving: bool,
+    pub health_calls: u32,
+    /// Every `RenewSandbox` call, answered from `renew_script` and then
+    /// with success (or the expiry refusal once expired).
+    pub renews: u32,
+    pub renew_script: VecDeque<RenewScript>,
+    pub renew_delay: Duration,
+    /// Set once the sandbox expired: Exec and Renew refuse with this
+    /// `kilnd-reason`, and the row has left the default listing.
+    pub expired: Option<&'static str>,
 }
 
 impl FakeApi {
     pub fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().expect("fake state lock")
     }
+
+    /// A fake of kilnd 853dee2: sandbox expiry and typed reasons with its
+    /// default bounds.
+    pub fn with_expiry() -> Self {
+        let api = Self::default();
+        {
+            let mut state = api.state();
+            state.features = BTreeSet::from([Feature::SandboxExpiry, Feature::TypedReasons]);
+            state.limits = Some(kilnd_limits());
+        }
+        api
+    }
+
+    /// Expire the sandbox now, as kilnd's sweeper would.
+    pub fn expire(&self, reason: &'static str) {
+        self.state().expired = Some(reason);
+    }
+}
+
+/// kilnd 853dee2's default expiry bounds.
+pub fn kilnd_limits() -> ApiLimits {
+    ApiLimits {
+        min_sandbox_lifetime_ms: 10_000,
+        max_sandbox_lifetime_ms: 7 * 86_400_000,
+        default_sandbox_lifetime_ms: 0,
+        min_sandbox_idle_ms: 10_000,
+        max_sandbox_idle_ms: 86_400_000,
+        default_sandbox_idle_ms: 0,
+    }
+}
+
+/// The refusal kilnd sends for a sandbox that is gone.
+pub fn expired_error(reason: &'static str) -> ApiError {
+    api_error_with_reason(
+        Code::FailedPrecondition,
+        reason,
+        &format!("{reason}: sandbox sb-0000000000000001 is deleted, not ready"),
+    )
 }
 
 #[async_trait]
 impl SandboxApi for FakeApi {
     async fn health(&self) -> Result<Health, ApiError> {
-        let state = self.state();
+        let mut state = self.state();
+        state.health_calls += 1;
         Ok(Health {
-            serving: true,
-            detail: String::new(),
+            serving: !state.not_serving,
+            detail: if state.not_serving {
+                "shutting down".to_string()
+            } else {
+                String::new()
+            },
             active_sandboxes: u32::from(state.creates.len() > state.deleted.len()),
             running_executions: 0,
             reservations: NodeReservations::default(),
+            capabilities: Capabilities {
+                features: state.features.clone(),
+                limits: state.limits,
+            },
         })
     }
 
@@ -127,12 +196,16 @@ impl SandboxApi for FakeApi {
             id: "sb-0000000000000001".to_string(),
             backend_id: "test-backend-1".to_string(),
             labels,
+            expiry: None,
         })
     }
 
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
         let (execution, delay) = {
             let mut state = self.state();
+            if let Some(reason) = state.expired {
+                return Err(expired_error(reason));
+            }
             state.next_execution += 1;
             let id = format!("ex-{:016x}", state.next_execution);
             state.execs.push(request.clone());
@@ -246,6 +319,29 @@ impl SandboxApi for FakeApi {
         Ok(())
     }
 
+    async fn renew(&self, _sandbox_id: &str) -> Result<(), ApiError> {
+        let delay = {
+            let mut state = self.state();
+            state.renews += 1;
+            if let Some(reason) = state.expired {
+                return Err(expired_error(reason));
+            }
+            match state.renew_script.pop_front() {
+                Some(RenewScript::Fail(error)) => return Err(error),
+                Some(RenewScript::Expire(reason)) => {
+                    state.expired = Some(reason);
+                    return Err(expired_error(reason));
+                }
+                Some(RenewScript::Ok) | None => {}
+            }
+            state.renew_delay
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(())
+    }
+
     async fn recent_executions(&self, _sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
         let state = self.state();
         Ok(state.executions.iter().rev().cloned().collect())
@@ -265,25 +361,40 @@ impl SandboxApi for FakeApi {
             tokio::time::sleep(delay).await;
         }
         let state = self.state();
-        Ok(if state.creates.len() > state.deleted.len() {
-            vec![Sandbox {
-                id: "sb-0000000000000001".to_string(),
-                backend_id: "test-backend-1".to_string(),
-                labels: state
-                    .creates
-                    .last()
-                    .map_or_else(BTreeMap::new, |request| request.labels.clone()),
-            }]
-        } else {
-            Vec::new()
-        })
+        // An expired sandbox is deleted by kilnd itself and leaves the
+        // default listing.
+        Ok(
+            if state.creates.len() > state.deleted.len() && state.expired.is_none() {
+                vec![Sandbox {
+                    id: "sb-0000000000000001".to_string(),
+                    backend_id: "test-backend-1".to_string(),
+                    labels: state
+                        .creates
+                        .last()
+                        .map_or_else(BTreeMap::new, |request| request.labels.clone()),
+                    expiry: state.creates.last().and_then(|request| {
+                        request.expiry.map(|policy| ExpiryStatus {
+                            effective: Some(policy),
+                            ..ExpiryStatus::default()
+                        })
+                    }),
+                }]
+            } else {
+                Vec::new()
+            },
+        )
     }
 }
 
 pub fn api_error(code: Code, message: &str) -> ApiError {
+    ApiError::new(code, message)
+}
+
+/// An error carrying a `kilnd-reason` trailer, as the adapter maps one.
+pub fn api_error_with_reason(code: Code, reason: &str, message: &str) -> ApiError {
     ApiError {
-        code,
-        message: message.to_string(),
+        reason: Some(reason.to_string()),
+        ..ApiError::new(code, message)
     }
 }
 

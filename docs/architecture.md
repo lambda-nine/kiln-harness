@@ -24,24 +24,32 @@ No harness code depends on kiln files, process layout, or CLI behavior.
 ## Session lifecycle
 
 1. Validate the limits against their hard ceilings and the task (system and
-   prompt at most 64 KiB each, nonempty prompt), calculate one absolute session deadline, open the audit
-   session, and journal `session_started`.
-2. Create exactly one sandbox with network none, 256 MiB memory, 0.5 CPU,
-   64 PIDs, 256 MiB disk, read-only root, and writable `/workspace`.
-3. Capture a bounded `/workspace` file-set baseline through kilnd and journal
+   prompt at most 64 KiB each, nonempty prompt) and calculate one absolute
+   session deadline.
+2. Discover the daemon: one `Health` call under that deadline and
+   cancellation. A daemon that is not `SERVING` is refused, and so is an
+   expiry the daemon's bounds would cut below the session (below). Nothing
+   is recorded on these paths, since nothing exists yet. Then open the audit
+   session, with the listed features, and journal `session_started`.
+3. Create exactly one sandbox with network none, 256 MiB memory, 0.5 CPU,
+   64 PIDs, 256 MiB disk, read-only root, writable `/workspace`, and, when
+   the daemon lists sandbox expiry, an expiry policy.
+4. Capture a bounded `/workspace` file-set baseline through kilnd and journal
    `sandbox_ready`.
-4. Alternate model turns and their tool results until a final answer or a
-   budget/cancellation/error ends work.
-5. Retry idempotent `DeleteSandbox` and independently verify absence with a
+5. Alternate model turns and their tool results until a final answer or a
+   budget/cancellation/error ends work. Each provider call runs beside a
+   renew heartbeat when the daemon supports expiry.
+6. Retry idempotent `DeleteSandbox` and independently verify absence with a
    complete non-deleted listing after every acknowledgement or ambiguous error.
    Cleanup has a separate 10-second wall window because kilnd may need to drain
    descendants and publish terminal state after the work deadline. Failure to
    confirm deletion is returned as a cleanup error.
-6. Write audit `session_finished` and journal `session_ended` with the outcome,
+7. Write audit `session_finished` and journal `session_ended` with the outcome,
    the work outcome, counters, usage, and whether deletion was confirmed. When
    deletion is unconfirmed the outcome is `cleanup_failed`, never the work's
    own result. Every path after step 1 does this, including create failure,
-   cancellation, and a create deadline whose sandbox was never observed.
+   cancellation, a create deadline whose sandbox was never observed, and a
+   sandbox that expired.
 
 Create shares the 30-second session wall deadline. Every request has unique
 `owner` and `session` labels. If its response is lost or times out, the harness
@@ -54,8 +62,89 @@ If an ambiguous failure produces no discoverable row before the recovery
 window closes, the result is `CreateUncertain`, not a false cleanup claim.
 The adapter preserves `tonic::Code` for create rejection classification; local
 transport/protocol failures use `Unknown` and remain ambiguous.
-Idempotent create and sandbox TTLs remain control-plane roadmap items. Forced
-process death still depends on kilnd reconciliation and a future TTL.
+Idempotent create remains a control-plane roadmap item.
+
+## Discovery and typed reasons
+
+`Health.runtime_capabilities` maps to `Capabilities`: a set of `Feature`s
+(the ones the harness knows by name, and `Other(n)` for the rest) and the
+expiry bounds from `ApiLimits` (minimum, maximum and default lifetime and
+idle). An older daemon lists no features and no limits, which reads as
+unsupported everywhere. The engine reads them once per session, before
+create, and only from a `SERVING` response, because an older daemon ignores
+request fields it does not know: an expiry sent to one would silently never
+apply. `session_opened` records the feature names (the lower-case suffix
+after `FEATURE_`), metadata only.
+
+With `TYPED_REASONS`, kilnd's refusals carry a `kilnd-reason` metadata
+entry. The adapter copies it into `ApiError::reason` only when it is 1 to
+128 ASCII bytes of `[a-z0-9_:]`; anything else is no reason. The status
+message starts with the same token, but the harness never parses prose. The
+engine reads a reason only when the session's daemon lists the feature, and
+otherwise behaves exactly as without one. Two classifications use it:
+
+- `FAILED_PRECONDITION` with `expired_idle`, `expired_lifetime` or
+  `sandbox_deleted` on any sandbox RPC (the baseline, a tool's executions,
+  or a renew) means the sandbox is gone. The session ends with
+  `HarnessError::SandboxExpired`, work outcome `failed`, and the normal
+  cleanup barrier still runs. Delete of an expired row succeeds, and the row
+  has left the default listing, so absence verifies. A tool call that hits
+  it is journaled with the same model-visible `kilnd_error` result as
+  without typed reasons, and the model is not asked again.
+- `UNIMPLEMENTED` with a `backend_unsupported:<feature>` reason is a
+  definite create rejection: kilnd refuses it before any row or backend
+  call. `UNIMPLEMENTED` without one, or with any other reason, stays
+  ambiguous.
+
+## Sandbox expiry and the renew heartbeat
+
+When the daemon lists `SANDBOX_EXPIRY`, create sends
+`ExpiryPolicy { max_lifetime_ms, idle_timeout_ms }`:
+
+- `max_lifetime_ms` is `session_timeout + lifecycle_timeout +
+  sandbox_lifetime_margin`: the session, its cleanup window, and a margin
+  (60 s by default, 1 s to 10 min) for the short evidence recoveries that
+  can follow a deadline. kilnd counts it from `READY`, after create
+  started, so it is conservative.
+- `idle_timeout_ms` is `sandbox_idle_timeout` (120 s by default, 10 s to
+  1 h).
+- Both are clamped into the daemon's `[min, max]`, where a maximum of 0 is
+  no cap. A lifetime clamped below `session_timeout + lifecycle_timeout` is
+  refused before create with `InvalidTask("daemon max lifetime is shorter
+  than the session")`: a sandbox certain to expire mid-session is a
+  configuration error.
+
+The audit's `sandbox_created` records the policy sent as
+`expiry_lifetime_ms` and `expiry_idle_ms`, or `null` for both when the
+daemon does not support expiry. That is the degraded mode: no expiry is
+sent and the sandbox never expires. The journal's `sandbox_ready` carries
+the same two fields, skipped when absent, so journals without expiry are
+byte-identical to before. Expiry is not model-visible, so it is not in
+`SessionLimits`, no request hash covers it, and replay uses its own
+configuration. The grammar accepts the pair (both positive) or neither.
+
+kilnd counts an execution's start and finish as activity and pauses idle
+while one runs, so tool calls need nothing more. A provider call has no
+execution and can take minutes, so `complete_with_heartbeat` runs it beside
+a `tokio::select!` loop that sends `RenewSandbox` every
+`interval = max(ceil(idle / 3), 1 s)`, each RPC bounded by the next tick
+and the session deadline. It is not a spawned task: dropping the call, on
+an answer, a deadline, cancellation, or an error, drops any renew in
+flight, so nothing outlives it. A successful renew counts toward
+`renews` in `SessionOutcome` and `session_finished`; heartbeats write no
+other records. A renew refused with an expiry reason drops the provider
+call and ends the session with `SandboxExpired`. `UNAVAILABLE`,
+`DEADLINE_EXCEEDED`, `UNKNOWN` (which local transport failures use), and a
+renew that does not answer before the next tick are transient: they are
+counted, a success resets the count, and `ceil(idle / interval) - 1` in a
+row (2 for any idle of 3 s or more) end the session with
+`SandboxExpired { reason: renew_failed }`, since by then the sandbox has
+probably expired. Any other error is fatal as an `Api` error. Replay runs
+the same engine without provider latency, so it rarely renews, and the
+journal does not change.
+
+Forced process death no longer leaks a sandbox on a daemon with expiry:
+kilnd reclaims it within the idle timeout, or at most at its lifetime.
 
 ## Model turns
 

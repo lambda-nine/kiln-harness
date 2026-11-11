@@ -175,6 +175,18 @@ fn budgets_over_their_ceilings_are_refused() {
             .output();
         refused(dir, &output, &format!("{flag} must be between 1 and"));
     }
+    for (flag, value, range) in [
+        ("--sandbox-idle-timeout-secs", "9", "10 and 3600"),
+        ("--sandbox-idle-timeout-secs", "3601", "10 and 3600"),
+        ("--sandbox-lifetime-margin-secs", "0", "1 and 600"),
+        ("--sandbox-lifetime-margin-secs", "601", "1 and 600"),
+    ] {
+        let output = Run::new(dir)
+            .arg("--prompt", "hi")
+            .arg(flag, value)
+            .output();
+        refused(dir, &output, &format!("{flag} must be between {range}"));
+    }
     for (flag, value) in [("--temperature", "2.5"), ("--model", "")] {
         let output = Run::new(dir)
             .arg("--prompt", "hi")

@@ -49,6 +49,13 @@ pub enum JournalEvent {
     SandboxReady {
         sandbox_id: String,
         baseline_file_count: usize,
+        /// The expiry the harness sent kilnd, when the daemon supports it.
+        /// Not model-visible, so not in `SessionLimits`; skipped when absent
+        /// so journals without it are byte-identical to before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expiry_lifetime_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expiry_idle_ms: Option<u64>,
     },
     ModelRequested {
         turn: u32,
@@ -579,6 +586,16 @@ const WORK_OUTCOMES: [&str; 5] = [
 ];
 const CLEANUP_FAILED: &str = "cleanup_failed";
 
+/// Expiry is not model-visible and feeds no request hash. The engine sends
+/// both fields or neither, and never a zero.
+fn check_expiry(lifetime_ms: Option<u64>, idle_ms: Option<u64>) -> Result<(), &'static str> {
+    match (lifetime_ms, idle_ms) {
+        (None, None) => Ok(()),
+        (Some(lifetime), Some(idle)) if lifetime > 0 && idle > 0 => Ok(()),
+        _ => Err("sandbox_ready expiry needs both fields, each positive"),
+    }
+}
+
 /// The event grammar of one session journal.
 ///
 /// Writers feed every event before appending it and readers feed every
@@ -586,7 +603,8 @@ const CLEANUP_FAILED: &str = "cleanup_failed";
 ///
 /// - `session_started` comes first, once, with schema 1.
 /// - `sandbox_ready` appears at most once, before any model request; no
-///   request is allowed without it.
+///   request is allowed without it. Its optional expiry fields come as a
+///   pair of positive values or not at all.
 /// - `model_requested` turns run 1, 2, … and each is answered by exactly one
 ///   `model_responded` or `model_failed` for that turn before the next
 ///   request. Nothing but `session_ended` follows a failure or a response
@@ -746,13 +764,18 @@ impl Grammar {
     fn advance(&mut self, event: &JournalEvent) -> Result<(), &'static str> {
         match event {
             JournalEvent::SessionStarted { .. } => unreachable!("handled by feed"),
-            JournalEvent::SandboxReady { .. } => {
+            JournalEvent::SandboxReady {
+                expiry_lifetime_ms,
+                expiry_idle_ms,
+                ..
+            } => {
                 if self.sandbox_ready {
                     return Err("second sandbox_ready");
                 }
                 if self.last_turn > 0 {
                     return Err("sandbox_ready after a model request");
                 }
+                check_expiry(*expiry_lifetime_ms, *expiry_idle_ms)?;
                 self.sandbox_ready = true;
             }
             JournalEvent::ModelRequested {

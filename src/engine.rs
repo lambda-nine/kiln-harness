@@ -1,14 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::time::error::Elapsed;
+use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{ApiError, SandboxApi, SandboxRequest};
+use crate::api::{
+    ApiError, Capabilities, ExpiryPolicy, ExpiryReason, Feature, SandboxApi, SandboxRequest,
+};
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
     JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedToolLimits, SessionLimits,
@@ -41,6 +46,14 @@ pub const MAX_TOTAL_MODEL_OUTPUT_BYTES: u64 = 256 << 20;
 pub const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
 /// Largest accepted system prompt or task prompt.
 pub const MAX_TASK_TEXT_BYTES: usize = 64 << 10;
+/// Bounds for [`HarnessConfig::sandbox_idle_timeout`].
+pub const MIN_SANDBOX_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_SANDBOX_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Bounds for [`HarnessConfig::sandbox_lifetime_margin`].
+pub const MIN_SANDBOX_LIFETIME_MARGIN: Duration = Duration::from_secs(1);
+pub const MAX_SANDBOX_LIFETIME_MARGIN: Duration = Duration::from_secs(10 * 60);
+/// Shortest interval between `RenewSandbox` heartbeats.
+const MIN_RENEW_INTERVAL_MS: u64 = 1000;
 /// What one session is asked to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTask {
@@ -81,6 +94,13 @@ pub struct HarnessConfig {
     /// a session stays bounded even when reported token usage is wrong.
     pub max_total_model_output_bytes: u64,
     pub tool_limits: ToolLimits,
+    /// How long kilnd may leave the sandbox idle before reclaiming it, when
+    /// the daemon supports expiry. A heartbeat renews it during provider
+    /// calls; executions count as activity on their own.
+    pub sandbox_idle_timeout: Duration,
+    /// Added to the session and lifecycle windows to form the sandbox's
+    /// maximum lifetime, so it outlives every path that still uses it.
+    pub sandbox_lifetime_margin: Duration,
 }
 
 impl Default for HarnessConfig {
@@ -99,6 +119,8 @@ impl Default for HarnessConfig {
             max_total_output_tokens: 200_000,
             max_total_model_output_bytes: 8 << 20,
             tool_limits: ToolLimits::default(),
+            sandbox_idle_timeout: Duration::from_secs(120),
+            sandbox_lifetime_margin: Duration::from_secs(60),
         }
     }
 }
@@ -143,8 +165,9 @@ impl HarnessConfig {
     }
 
     /// Replace every recorded limit with the given ones. Lifecycle windows
-    /// are kept. `Harness::run` validates the result before any sandbox
-    /// exists, so recorded limits cannot exceed the hard ceilings.
+    /// and sandbox expiry are kept. `Harness::run` validates the result
+    /// before any sandbox exists, so recorded limits cannot exceed the hard
+    /// ceilings.
     pub fn apply_limits(&mut self, limits: &SessionLimits) {
         self.max_steps = limits.max_steps;
         self.max_tool_calls = limits.max_tool_calls;
@@ -177,6 +200,8 @@ pub struct SessionOutcome {
     pub steps: u32,
     pub tool_calls: u32,
     pub usage: Usage,
+    /// Successful `RenewSandbox` heartbeats during provider calls.
+    pub renews: u32,
 }
 
 #[derive(Debug, Error)]
@@ -219,6 +244,11 @@ pub enum HarnessError {
     Cleanup(ApiError),
     #[error("create outcome is ambiguous after recovery window: {0}")]
     CreateUncertain(ApiError),
+    /// kilnd reclaimed or deleted the sandbox before the session ended, or
+    /// it could not be renewed for long enough that kilnd probably has.
+    /// Cleanup still runs and verifies absence.
+    #[error("sandbox is gone before the session ended: {reason}")]
+    SandboxExpired { reason: ExpiryReason },
 }
 
 pub struct Harness<A, P, S, J> {
@@ -237,6 +267,7 @@ struct Progress {
     tool_calls: u32,
     usage: Usage,
     output_bytes: u64,
+    renews: u32,
 }
 
 impl<A, P, S, J> Harness<A, P, S, J>
@@ -292,12 +323,33 @@ where
         let deadline = Instant::now()
             .checked_add(self.config.session_timeout)
             .ok_or(HarnessError::Deadline)?;
+        // Discovery comes before any use: an older daemon ignores fields it
+        // does not know, so expiry is sent and reasons are read only when a
+        // serving daemon lists them. Nothing exists yet if this fails.
+        let capabilities = tokio::select! {
+            () = cancel.cancelled() => return Err(HarnessError::Canceled),
+            health = timeout_at(deadline, self.api.health()) => match health {
+                Ok(Ok(health)) if health.serving => health.capabilities,
+                Ok(Ok(health)) => {
+                    return Err(HarnessError::Api(ApiError::new(
+                        tonic::Code::Unavailable,
+                        format!("kilnd is not serving: {}", health.detail),
+                    )));
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => return Err(HarnessError::Deadline),
+            },
+        };
+        let expiry = expiry_policy(&self.config, &capabilities)?;
+        let typed_reasons = capabilities.supports(Feature::TypedReasons);
+        let heartbeat = expiry.map(|policy| Heartbeat::for_idle_ms(policy.idle_timeout_ms));
         self.audit.append(
             &session_id,
             None,
             AuditEvent::SessionOpened {
                 session_timeout_ms: duration_ms(self.config.session_timeout),
                 network: "none".to_string(),
+                features: capabilities.feature_names(),
             },
         )?;
         let started = self.journal.append(
@@ -322,6 +374,7 @@ where
                     outcome: "failed".to_string(),
                     work_outcome: "failed".to_string(),
                     sandbox_deleted: true,
+                    renews: 0,
                 },
             );
             return Err(error.into());
@@ -332,7 +385,10 @@ where
         // is then ambiguous, so either goes through label-based recovery.
         let create = tokio::select! {
             () = cancel.cancelled() => Err(CreateStop::Canceled),
-            result = timeout_at(deadline, self.api.create(sandbox_request(&session_id))) => {
+            result = timeout_at(
+                deadline,
+                self.api.create(sandbox_request(&session_id, expiry)),
+            ) => {
                 match result {
                     Ok(Ok(sandbox)) => Ok(sandbox),
                     Ok(Err(error)) => Err(CreateStop::Failed(error)),
@@ -351,10 +407,10 @@ where
                         "create_failed",
                     ),
                     CreateStop::Canceled => (
-                        ApiError {
-                            code: tonic::Code::Cancelled,
-                            message: "create canceled before its response".to_string(),
-                        },
+                        ApiError::new(
+                            tonic::Code::Cancelled,
+                            "create canceled before its response",
+                        ),
                         Some(HarnessError::Canceled),
                         "canceled",
                     ),
@@ -370,8 +426,9 @@ where
                 .await;
                 let recovered_ids = recovery.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
                 let recovered = !recovered_ids.is_empty();
-                let absence_confirmed = recovery.is_ok()
-                    && (recovered || (!deadline_expired && unambiguous_create_error(&error)));
+                let unambiguous = unambiguous_create_error(&error, typed_reasons);
+                let absence_confirmed =
+                    recovery.is_ok() && (recovered || (!deadline_expired && unambiguous));
                 let recovery_audit = self.audit.append(
                     &session_id,
                     None,
@@ -391,7 +448,9 @@ where
                     work_outcome,
                     sandbox_deleted: absence_confirmed,
                 };
-                let finish_audit = self.audit.append(&session_id, None, terminal.audit_event());
+                let finish_audit =
+                    self.audit
+                        .append(&session_id, None, terminal.audit_event(&progress));
                 let finish_journal = self
                     .journal
                     .append(&session_id, terminal.journal_event(None, &progress));
@@ -401,7 +460,7 @@ where
                 recovery_audit?;
                 finish_audit?;
                 finish_journal?;
-                if !recovered && (deadline_expired || !unambiguous_create_error(&error)) {
+                if !recovered && (deadline_expired || !unambiguous) {
                     return Err(HarnessError::CreateUncertain(error));
                 }
                 return Err(interrupted.unwrap_or(HarnessError::Api(error)));
@@ -415,6 +474,8 @@ where
                 Some(&sandbox_id),
                 AuditEvent::SandboxCreated {
                     backend_id: sandbox.backend_id,
+                    expiry_lifetime_ms: expiry.map(|policy| policy.max_lifetime_ms),
+                    expiry_idle_ms: expiry.map(|policy| policy.idle_timeout_ms),
                 },
             )?;
             if cancel.is_cancelled() {
@@ -428,7 +489,9 @@ where
                 () = cancel.cancelled() => None,
                 started = self
                     .registry
-                    .start_session(&self.api, sandbox_id.clone(), deadline) => Some(started),
+                    .start_session(&self.api, sandbox_id.clone(), deadline, typed_reasons) => {
+                    Some(started)
+                }
             };
             let (tools, baseline) = match started {
                 Some(Ok(value)) => value,
@@ -477,6 +540,11 @@ where
                             file_count: 0,
                         },
                     )?;
+                    if let ToolError::Api(api_error) = &error
+                        && let Some(reason) = ExpiryReason::of(api_error, typed_reasons)
+                    {
+                        return Err(HarnessError::SandboxExpired { reason });
+                    }
                     return Err(HarnessError::ToolSetup(error));
                 }
             };
@@ -495,9 +563,14 @@ where
                 JournalEvent::SandboxReady {
                     sandbox_id: sandbox_id.clone(),
                     baseline_file_count: baseline.file_count,
+                    expiry_lifetime_ms: expiry.map(|policy| policy.max_lifetime_ms),
+                    expiry_idle_ms: expiry.map(|policy| policy.idle_timeout_ms),
                 },
             )?;
             let context = LoopContext {
+                api: &self.api,
+                heartbeat,
+                typed_reasons,
                 config: &self.config,
                 task,
                 definitions: self.registry.definitions(),
@@ -546,9 +619,11 @@ where
             work_outcome,
             sandbox_deleted: deleted,
         };
-        let finish_audit =
-            self.audit
-                .append(&session_id, Some(&sandbox_id), terminal.audit_event());
+        let finish_audit = self.audit.append(
+            &session_id,
+            Some(&sandbox_id),
+            terminal.audit_event(&progress),
+        );
         let final_answer = body
             .as_ref()
             .ok()
@@ -567,6 +642,10 @@ where
 }
 
 struct LoopContext<'a, 'r, A: SandboxApi> {
+    api: &'a A,
+    /// Present only when the daemon supports expiry.
+    heartbeat: Option<Heartbeat>,
+    typed_reasons: bool,
     config: &'a HarnessConfig,
     task: &'a SessionTask,
     definitions: &'a [ToolDefinition],
@@ -636,12 +715,7 @@ where
         // always agrees with the records before it.
         progress.steps = turn;
         let requested_at = Instant::now();
-        let response = tokio::select! {
-            () = cancel.cancelled() => return Err(HarnessError::Canceled),
-            result = timeout_at(deadline, provider.complete(request)) => {
-                result.map_err(|_| HarnessError::Deadline)?
-            }
-        };
+        let response = complete_with_heartbeat(provider, request, context, progress).await?;
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -872,6 +946,9 @@ where
             match stop {
                 Some(ToolStop::Deadline) => return Err(HarnessError::Deadline),
                 Some(ToolStop::Canceled) => return Err(HarnessError::Canceled),
+                Some(ToolStop::Expired(reason)) => {
+                    return Err(HarnessError::SandboxExpired { reason });
+                }
                 None => {}
             }
             observed?;
@@ -949,7 +1026,134 @@ where
         steps: turn,
         tool_calls: progress.tool_calls,
         usage: progress.usage,
+        renews: progress.renews,
     })
+}
+
+/// When to renew the sandbox while a provider call runs.
+#[derive(Debug, Clone, Copy)]
+struct Heartbeat {
+    interval: Duration,
+    /// Transient renew failures in a row after which the sandbox has
+    /// probably expired.
+    max_failures: u32,
+}
+
+impl Heartbeat {
+    /// Renew three times per idle window, at most once a second, and give up
+    /// once `ceil(idle / interval) - 1` renews in a row have failed.
+    fn for_idle_ms(idle_ms: u64) -> Self {
+        let interval_ms = idle_ms.div_ceil(3).max(MIN_RENEW_INTERVAL_MS);
+        let ticks = idle_ms.div_ceil(interval_ms);
+        Self {
+            interval: Duration::from_millis(interval_ms),
+            max_failures: u32::try_from(ticks.saturating_sub(1))
+                .unwrap_or(u32::MAX)
+                .max(1),
+        }
+    }
+}
+
+type RenewCall<'a> =
+    Pin<Box<dyn Future<Output = Result<Result<(), ApiError>, Elapsed>> + Send + 'a>>;
+
+enum Renewal {
+    Renewed,
+    Transient,
+    Expired(ExpiryReason),
+    Fatal(ApiError),
+}
+
+fn classify_renewal(
+    outcome: Result<Result<(), ApiError>, Elapsed>,
+    typed_reasons: bool,
+) -> Renewal {
+    match outcome {
+        Ok(Ok(())) => Renewal::Renewed,
+        Err(_) => Renewal::Transient,
+        Ok(Err(error)) => {
+            if let Some(reason) = ExpiryReason::of(&error, typed_reasons) {
+                Renewal::Expired(reason)
+            } else if matches!(
+                error.code,
+                // Unknown is also how local transport failures arrive.
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Unknown
+            ) {
+                Renewal::Transient
+            } else {
+                Renewal::Fatal(error)
+            }
+        }
+    }
+}
+
+/// Run one provider call under the session deadline and cancellation,
+/// renewing the sandbox beside it when the daemon supports expiry: a long
+/// model turn runs no execution, so nothing else tells kilnd the session is
+/// alive. The renew RPC runs next to the provider future, not in a spawned
+/// task, so dropping this future stops both before the engine moves on.
+async fn complete_with_heartbeat<A, P>(
+    provider: &mut P,
+    request: ModelRequest<'_>,
+    context: &LoopContext<'_, '_, A>,
+    progress: &mut Progress,
+) -> Result<Result<ModelResponse, ProviderError>, HarnessError>
+where
+    A: SandboxApi,
+    P: Provider,
+{
+    let deadline = context.deadline;
+    let call = timeout_at(deadline, provider.complete(request));
+    tokio::pin!(call);
+    let Some(heartbeat) = context.heartbeat else {
+        return tokio::select! {
+            () = context.cancel.cancelled() => Err(HarnessError::Canceled),
+            result = &mut call => result.map_err(|_| HarnessError::Deadline),
+        };
+    };
+    let mut next_tick = Instant::now() + heartbeat.interval;
+    let mut renew: Option<RenewCall<'_>> = None;
+    let mut failures = 0u32;
+    loop {
+        tokio::select! {
+            biased;
+            () = context.cancel.cancelled() => return Err(HarnessError::Canceled),
+            result = &mut call => return result.map_err(|_| HarnessError::Deadline),
+            outcome = async {
+                renew.as_mut().expect("polled only while a renew is in flight").await
+            }, if renew.is_some() => {
+                renew = None;
+                match classify_renewal(outcome, context.typed_reasons) {
+                    Renewal::Renewed => {
+                        progress.renews = progress.renews.saturating_add(1);
+                        failures = 0;
+                    }
+                    Renewal::Transient => {
+                        failures = failures.saturating_add(1);
+                        if failures >= heartbeat.max_failures {
+                            return Err(HarnessError::SandboxExpired {
+                                reason: ExpiryReason::RenewFailed,
+                            });
+                        }
+                    }
+                    Renewal::Expired(reason) => {
+                        return Err(HarnessError::SandboxExpired { reason });
+                    }
+                    Renewal::Fatal(error) => return Err(HarnessError::Api(error)),
+                }
+            }
+            () = sleep_until(next_tick), if renew.is_none() => {
+                // Each renew is bounded by the interval and the session
+                // deadline, so one stalled RPC cannot outlast the next tick.
+                let now = Instant::now();
+                next_tick = now + heartbeat.interval;
+                renew = Some(Box::pin(timeout_at(
+                    next_tick.min(deadline),
+                    context.api.renew(context.sandbox_id),
+                )));
+            }
+        }
+    }
 }
 
 enum CreateStop {
@@ -966,11 +1170,12 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn audit_event(&self) -> AuditEvent {
+    fn audit_event(&self, progress: &Progress) -> AuditEvent {
         AuditEvent::SessionFinished {
             outcome: self.outcome.to_string(),
             work_outcome: self.work_outcome.to_string(),
             sandbox_deleted: self.sandbox_deleted,
+            renews: progress.renews,
         }
     }
 
@@ -1039,7 +1244,9 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         && !tools.timeout.is_zero()
         && tools.max_result_bytes >= 64
         && tools.max_manifest_entries > 0
-        && byte_limits.iter().all(|limit| *limit > 0);
+        && byte_limits.iter().all(|limit| *limit > 0)
+        && config.sandbox_idle_timeout >= MIN_SANDBOX_IDLE_TIMEOUT
+        && config.sandbox_lifetime_margin >= MIN_SANDBOX_LIFETIME_MARGIN;
     // Hard ceilings apply to every configuration, including limits loaded
     // from a journal, so a crafted recording cannot request absurd budgets.
     let bounded = config.max_steps <= MAX_STEPS
@@ -1053,7 +1260,9 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         && config.max_total_output_tokens <= MAX_TOTAL_TOKENS
         && config.max_total_model_output_bytes <= MAX_TOTAL_MODEL_OUTPUT_BYTES
         && tools.max_manifest_entries <= MAX_MANIFEST_ENTRIES
-        && byte_limits.iter().all(|limit| *limit <= MAX_BYTE_LIMIT);
+        && byte_limits.iter().all(|limit| *limit <= MAX_BYTE_LIMIT)
+        && config.sandbox_idle_timeout <= MAX_SANDBOX_IDLE_TIMEOUT
+        && config.sandbox_lifetime_margin <= MAX_SANDBOX_LIFETIME_MARGIN;
     if !positive || !bounded {
         return Err(HarnessError::InvalidModelCall(
             "harness budgets must be positive and within their hard ceilings".to_string(),
@@ -1066,13 +1275,16 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         tools.timeout,
         config.lifecycle_timeout,
         config.lifecycle_retry_delay,
+        config.sandbox_idle_timeout,
+        config.sandbox_lifetime_margin,
     ];
     if durations
         .iter()
         .any(|duration| duration.subsec_nanos() % 1_000_000 != 0)
     {
         return Err(HarnessError::InvalidModelCall(
-            "session, tool, and lifecycle durations must be whole milliseconds".to_string(),
+            "session, tool, lifecycle, and sandbox expiry durations must be whole milliseconds"
+                .to_string(),
         ));
     }
     Ok(())
@@ -1096,7 +1308,51 @@ fn validate_call_id(call_id: &str) -> Result<(), HarnessError> {
     Ok(())
 }
 
-fn sandbox_request(session_id: &str) -> SandboxRequest {
+/// The expiry to send, or `None` when the daemon does not list sandbox
+/// expiry (an older daemon would ignore the field, and a crashed harness can
+/// then leak the sandbox, as before expiry existed).
+///
+/// The lifetime covers the whole session, its cleanup window, and a margin;
+/// both values are clamped into the daemon's bounds, where a maximum of 0 is
+/// no cap. A lifetime the daemon caps below the session would expire the
+/// sandbox mid-session, so it is refused before create.
+fn expiry_policy(
+    config: &HarnessConfig,
+    capabilities: &Capabilities,
+) -> Result<Option<ExpiryPolicy>, HarnessError> {
+    if !capabilities.supports(Feature::SandboxExpiry) {
+        return Ok(None);
+    }
+    let limits = capabilities.limits.unwrap_or_default();
+    let session_ms =
+        duration_ms(config.session_timeout).saturating_add(duration_ms(config.lifecycle_timeout));
+    let max_lifetime_ms = clamp_to_daemon(
+        session_ms.saturating_add(duration_ms(config.sandbox_lifetime_margin)),
+        limits.min_sandbox_lifetime_ms,
+        limits.max_sandbox_lifetime_ms,
+    );
+    if max_lifetime_ms < session_ms {
+        return Err(HarnessError::InvalidTask(
+            "daemon max lifetime is shorter than the session".to_string(),
+        ));
+    }
+    let idle_timeout_ms = clamp_to_daemon(
+        duration_ms(config.sandbox_idle_timeout),
+        limits.min_sandbox_idle_ms,
+        limits.max_sandbox_idle_ms,
+    );
+    Ok(Some(ExpiryPolicy {
+        max_lifetime_ms,
+        idle_timeout_ms,
+    }))
+}
+
+fn clamp_to_daemon(value: u64, min: u64, max: u64) -> u64 {
+    let value = value.max(min);
+    if max == 0 { value } else { value.min(max) }
+}
+
+fn sandbox_request(session_id: &str, expiry: Option<ExpiryPolicy>) -> SandboxRequest {
     SandboxRequest {
         image: "alpine".to_string(),
         memory_bytes: 256 << 20,
@@ -1110,6 +1366,7 @@ fn sandbox_request(session_id: &str) -> SandboxRequest {
             ("owner".to_string(), "kiln-harness".to_string()),
             ("session".to_string(), session_id.to_string()),
         ]),
+        expiry,
     }
 }
 
@@ -1150,13 +1407,13 @@ fn recovery_deadline(timeout: Duration) -> Instant {
 }
 
 fn deadline_api(message: &str) -> ApiError {
-    ApiError {
-        code: tonic::Code::DeadlineExceeded,
-        message: message.to_string(),
-    }
+    ApiError::new(tonic::Code::DeadlineExceeded, message)
 }
 
-fn unambiguous_create_error(error: &ApiError) -> bool {
+/// Whether a create error proves nothing was allocated. `UNIMPLEMENTED`
+/// alone may be any failure, but with a typed `backend_unsupported:*`
+/// reason kilnd refused before any row or backend call.
+fn unambiguous_create_error(error: &ApiError, typed_reasons: bool) -> bool {
     matches!(
         error.code,
         tonic::Code::InvalidArgument
@@ -1164,7 +1421,10 @@ fn unambiguous_create_error(error: &ApiError) -> bool {
             | tonic::Code::FailedPrecondition
             | tonic::Code::PermissionDenied
             | tonic::Code::Unauthenticated
-    )
+    ) || (error.code == tonic::Code::Unimplemented
+        && error
+            .typed_reason(typed_reasons)
+            .is_some_and(|reason| reason.starts_with("backend_unsupported:")))
 }
 
 async fn cleanup_sandbox<A: SandboxApi>(
@@ -1256,5 +1516,24 @@ fn empty_output() -> OutputEvidence {
         observed_bytes: 0,
         total_bytes_known: true,
         truncated: false,
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_test {
+    use super::Heartbeat;
+    use std::time::Duration;
+
+    #[test]
+    fn three_renews_per_idle_window_and_two_failures_allowed() {
+        for (idle_ms, interval_ms) in [(120_000, 40_000), (10_000, 3_334), (3_600_000, 1_200_000)] {
+            let heartbeat = Heartbeat::for_idle_ms(idle_ms);
+            assert_eq!(heartbeat.interval, Duration::from_millis(interval_ms));
+            assert_eq!(heartbeat.max_failures, 2, "{idle_ms}");
+        }
+        // At most one renew a second, however short the idle timeout.
+        let heartbeat = Heartbeat::for_idle_ms(1_500);
+        assert_eq!(heartbeat.interval, Duration::from_secs(1));
+        assert_eq!(heartbeat.max_failures, 1);
     }
 }
