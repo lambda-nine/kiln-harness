@@ -66,15 +66,18 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 
 ## Pinned control plane
 
-- kiln behavior and persistent-exec v1: `e48f0e785ad484d0b2947897f6d48d0756059d7e`,
-  the companion kiln that this kilnd requires
+- kiln, tested: `00d61c546db7aa67ad283d10c2ca6165ca5f8166`. The integration
+  run requires exactly this kiln.
+- kiln, minimum: `e48f0e785ad484d0b2947897f6d48d0756059d7e`, the oldest kiln
+  with every feature this kilnd requires (persistent-exec v1 and
+  persistent-create certainty). For reference only; nothing enforces it.
 - kilnd API and runtime semantics: `853dee2a827b7f60af16f731a54309b1be97f680`
   (parent `6543812a2db4af4493ad6c5ea8864c27d173195d`)
 
 The compatible `kilnd.v1` protobuf schema is vendored under `proto/` so this
 repository builds against the reviewed API even if a sibling checkout is on a
 different branch. `scripts/integration-vm.sh` refuses to run against an
-installed kiln other than the pinned one.
+installed kiln other than the tested one.
 
 ## Deterministic demo
 

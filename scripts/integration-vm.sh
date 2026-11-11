@@ -1,9 +1,11 @@
 #!/bin/sh
 set -eu
 
-# The kiln this harness is tested against. It must match the kiln pin in
-# README.md's "Pinned control plane" section.
-PINNED_KILN=e48f0e785ad484d0b2947897f6d48d0756059d7e
+# The kiln pins in README.md's "Pinned control plane" section; keep both
+# equal to it. The installed kiln must be a clean build of TESTED_KILN.
+# MINIMUM_KILN, the oldest kiln kilnd accepts, is documentation only.
+TESTED_KILN=00d61c546db7aa67ad283d10c2ca6165ca5f8166
+MINIMUM_KILN=e48f0e785ad484d0b2947897f6d48d0756059d7e
 
 # The Linux ACL tests skip without these tools; this run must not. Install
 # nothing here: package changes on the shared VM go through its owner.
@@ -13,8 +15,8 @@ if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1;
 fi
 
 # kiln --version prints "kiln <version> (git <12-hex commit>, clean|dirty)",
-# or "(git unknown)". Only a clean build of the pinned commit passes.
-pinned_short=$(printf '%s' "$PINNED_KILN" | cut -c1-12)
+# or "(git unknown)". Only a clean build of the tested commit passes.
+tested_short=$(printf '%s' "$TESTED_KILN" | cut -c1-12)
 kiln_version=$(sudo /usr/local/bin/kiln --version) || {
     echo "cannot run the installed kiln's --version" >&2
     exit 1
@@ -25,15 +27,15 @@ installed_short=${installed%% *}
 case "$installed" in
 "") installed_short=unknown ;;
 *" clean")
-    case "$PINNED_KILN" in
+    case "$TESTED_KILN" in
     "$installed_short"*) installed_short= ;;
     esac
     ;;
 *) installed_short="$installed_short (${installed#* })" ;;
 esac
 if test -n "$installed_short"; then
-    echo "installed kiln $installed_short does not match the pinned $pinned_short; install the pinned kiln or update the pin" >&2
-    echo "kiln --version: $kiln_version" >&2
+    echo "installed kiln $installed_short does not match the tested pin $tested_short; install the tested kiln or update the pin" >&2
+    echo "kiln --version: $kiln_version (minimum for kilnd: $MINIMUM_KILN)" >&2
     exit 1
 fi
 
