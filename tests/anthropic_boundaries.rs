@@ -122,7 +122,7 @@ fn fallback_body(primary: &Value, fallback: &Value, top: &Value) -> Value {
 
 #[tokio::test]
 async fn fallback_attempts_count_against_the_session_budgets() {
-    // Daybreak repro-01: 535/4 declined, then 412/2 served.
+    // Reviewer repro-01: 535/4 declined, then 412/2 served.
     let body = fallback_body(
         &json!([535, 4, 0, 0]),
         &json!([412, 2, 0, 0]),
@@ -307,7 +307,7 @@ fn iterations_must_end_with_the_serving_attempt() {
     };
     let declined = json!({"type": "message", "model": "claude-opus-5-5",
                           "input_tokens": 1, "output_tokens": 3});
-    // Daybreak r2-repro-01: 900/500 at the top level, 1/1 in the last entry.
+    // Reviewer r2-repro-01: 900/500 at the top level, 1/1 in the last entry.
     let contradiction = body(
         json!({"input_tokens": 900, "output_tokens": 500}),
         json!([declined, {"type": "fallback_message", "model": "claude-opus-4-8",
@@ -355,7 +355,7 @@ fn iterations_must_end_with_the_serving_attempt() {
 
 #[tokio::test]
 async fn contradictory_serving_usage_cannot_complete_a_session() {
-    // Daybreak r2-repro-01 end to end: refused before any budget is checked.
+    // Reviewer r2-repro-01 end to end: refused before any budget is checked.
     let body = fallback_body(&json!([1, 3, 0, 0]), &json!([1, 1, 0, 0]), &usage(900, 500));
     let server = FakeHttp::start([Reply::json(200, &body)]).await;
     let provider = AnthropicProvider::new(fallback_config(&base(&server), KEY)).expect("provider");
@@ -405,8 +405,8 @@ fn the_token_floor_uses_the_serving_output() {
 
 #[tokio::test]
 async fn a_credential_shaped_request_id_is_dropped() {
-    // Daybreak repro-02: a key that is also a valid request ID.
-    let key = "req_DaybreakLeak4242";
+    // Reviewer repro-02: a key that is also a valid request ID.
+    let key = "req_ReviewerLeak4242";
     let body = json!({"type": "error", "error": {"type": "authentication_error",
                       "message": "body text is withheld"}, "request_id": key});
     let server = FakeHttp::start([Reply::json(401, &body)]).await;
@@ -434,7 +434,7 @@ async fn a_credential_shaped_request_id_is_dropped() {
     assert_eq!(server.requests()[0].header("x-api-key"), Some(key));
     let journal = std::fs::read_to_string(&path).expect("journal");
     assert!(!journal.contains(key));
-    assert!(!journal.contains("DaybreakLeak"));
+    assert!(!journal.contains("ReviewerLeak"));
 }
 
 async fn complete_once(server: &FakeHttp, key: &str) -> Result<ModelResponse, ProviderError> {
@@ -480,7 +480,7 @@ async fn a_key_spelled_like_an_error_type_is_not_quoted() {
 
 #[tokio::test]
 async fn a_key_completed_by_fixed_wording_empties_the_message() {
-    // Daybreak r2-repro-02, at the 20-byte floor: the key is the end of the
+    // Reviewer r2-repro-02, at the 20-byte floor: the key is the end of the
     // allowlisted type plus the formatter's comma. Neither field holds it,
     // and the body does not either; only the finished message does.
     let key = "uthentication_error,";
@@ -591,7 +591,7 @@ fn final_text() -> Reply {
 
 #[tokio::test]
 async fn an_opaque_number_beyond_64_bits_is_refused() {
-    // Daybreak repro-03: a 30-digit integer would come back as a float.
+    // Reviewer repro-03: a 30-digit integer would come back as a float.
     let server = FakeHttp::start([
         raw(opaque_number_body("123456789012345678901234567890")),
         final_text(),
@@ -686,7 +686,7 @@ async fn a_u64_max_tool_argument_echoes_exactly() {
 
 #[tokio::test]
 async fn an_error_envelope_with_content_is_refused() {
-    // Daybreak repro-04.
+    // Reviewer repro-04.
     let body = json!({
         "type": "error",
         "error": {"type": "api_error", "message": "not a message"},
@@ -835,7 +835,7 @@ fn strict_schemas_strip_only_enforced_bounds() {
 fn unsupported_constructs_are_refused_with_their_path() {
     let object = |properties: Value| json!({"type": "object", "additionalProperties": false, "properties": properties});
     for (schema, expected) in [
-        // Daybreak r2-repro-04's custom bound.
+        // Reviewer r2-repro-04's custom bound.
         (
             object(json!({"n": {"type": "integer", "multipleOf": 2}})),
             "input_schema.properties.n.multipleOf is not supported in strict mode",
@@ -960,7 +960,7 @@ async fn strict_requests_keep_a_stable_prefix() {
 
 #[tokio::test]
 async fn a_tool_use_stop_without_calls_is_refused() {
-    // Daybreak r2-repro-03.
+    // Reviewer r2-repro-03.
     let body = message(
         &json!([{"type": "text", "text": "accepted mismatch"}]),
         "tool_use",
@@ -1120,7 +1120,7 @@ fn served_by_fallback(iterations: &Value) -> Value {
 #[test]
 fn fallback_message_comes_once_and_last() {
     let order = "usage iterations must be message attempts then one fallback_message";
-    // Daybreak r3-repro-01: the fallback first, a message after it.
+    // Reviewer r3-repro-01: the fallback first, a message after it.
     let reversed = served_by_fallback(&json!([fallback_entry(5, 1), declined_entry(5, 1)]));
     assert_eq!(invalid(&reversed), order);
     let twice = served_by_fallback(&json!([fallback_entry(5, 1), fallback_entry(5, 1)]));
@@ -1161,7 +1161,7 @@ fn fallback_message_comes_once_and_last() {
 
 #[tokio::test]
 async fn a_metadata_only_final_fallback_refusal_is_a_refusal() {
-    // Daybreak r3-repro-02: the declined primary spent a token, the final
+    // Reviewer r3-repro-02: the declined primary spent a token, the final
     // fallback declined before output, and content is only the boundary.
     let mut body = json!({
         "id": "msg_r3_02",
@@ -1211,7 +1211,7 @@ fn strict_enums_and_consts_must_be_scalars() {
         json!({"type": "object", "additionalProperties": false,
                "properties": {"choice": property}})
     };
-    // Daybreak r3-repro-03's complex enum.
+    // Reviewer r3-repro-03's complex enum.
     assert_eq!(
         strict_input_schema(&object(json!({"enum": [{"branch": "one"}]}))).expect_err("object"),
         "input_schema.properties.choice.enum[0] is not a scalar"
@@ -1261,7 +1261,7 @@ fn served(model: &str, content: &Value, usage: &Value) -> Value {
 
 #[tokio::test]
 async fn fallbacks_on_require_iterations() {
-    // Daybreak r4-repro-01: a fallback boundary and another serving model,
+    // Reviewer r4-repro-01: a fallback boundary and another serving model,
     // but no per-attempt record.
     let content = json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"),
                          {"type": "text", "text": "ok"}]);
@@ -1361,7 +1361,7 @@ async fn fallbacks_off_allows_top_level_usage_and_refuses_fallback_signs() {
 fn fallback_blocks_must_match_the_usage() {
     let mismatch = "fallback blocks do not match the usage iterations";
     let answer = json!({"type": "text", "text": "ok"});
-    // Daybreak r4-repro-02: a fallback boundary, but the usage and the
+    // Reviewer r4-repro-02: a fallback boundary, but the usage and the
     // top-level model say the requested model served.
     let unserved = served(
         "claude-opus-5-5",
@@ -1441,7 +1441,7 @@ fn every_handoff_needs_its_declined_attempt() {
     let hop = || json!([fallback_block("claude-opus-5-5", "claude-opus-4-8"), answer]);
     let iterations =
         |entries: Value| json!({"input_tokens": 5, "output_tokens": 1, "iterations": entries});
-    // Daybreak r5-repro-01: a handoff block with only the terminal entry.
+    // Reviewer r5-repro-01: a handoff block with only the terminal entry.
     let terminal_only = served(
         "claude-opus-4-8",
         &hop(),
@@ -1546,7 +1546,7 @@ fn every_handoff_needs_its_declined_attempt() {
 
 #[tokio::test]
 async fn a_terminal_only_fallback_cannot_complete_a_session() {
-    // Daybreak r5-repro-01 end to end, under budgets the declined attempt
+    // Reviewer r5-repro-01 end to end, under budgets the declined attempt
     // could have exceeded.
     let body = served(
         "claude-opus-4-8",
@@ -1574,7 +1574,7 @@ async fn a_terminal_only_fallback_cannot_complete_a_session() {
 
 #[tokio::test]
 async fn content_before_the_fallback_boundary_is_refused() {
-    // Daybreak r5-repro-02: the declined model's tool call ahead of the
+    // Reviewer r5-repro-02: the declined model's tool call ahead of the
     // boundary would otherwise run under the fallback's identity.
     let call = json!({"type": "tool_use", "id": "toolu_pre", "name": "write_file",
                       "input": {"path": "a.txt", "content": "primary"}});
@@ -1693,7 +1693,7 @@ async fn an_unmarked_model_switch_is_refused_with_nothing_run() {
     let switched = "response model differs from the requested model without a fallback";
     let call = json!([{"type": "tool_use", "id": "toolu_alt", "name": "write_file",
                        "input": {"path": "a.txt", "content": "alternate"}}]);
-    // Daybreak r6-repro-01, fallbacks off: top-level usage only.
+    // Reviewer r6-repro-01, fallbacks off: top-level usage only.
     let mut off = message(
         &call,
         "tool_use",
