@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "rename-function",
+  "description": "Rename a shell function across a small project without touching look-alike names, other files or the changelog.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

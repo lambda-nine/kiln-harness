@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "ledger-triage",
+  "description": "Fix three reported bugs in an existing awk ledger program and find the unreported ones by checking the code against its manual.",
+  "check_timeout_secs": 120,
+  "session_timeout_secs": 1500,
+  "max_steps": 60,
+  "max_tool_calls": 120
+}

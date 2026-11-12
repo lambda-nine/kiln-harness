@@ -1,0 +1,14 @@
+# Build output and editor files.
+/target/
+*.o
+*~
+.DS_Store
+
+# Logs, except the audit trail.
+logs/
+*.log
+!audit.log
+
+# Generated docs, but keep the index.
+docs/api/*
+!docs/api/index.html

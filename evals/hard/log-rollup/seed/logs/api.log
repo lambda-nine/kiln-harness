@@ -1,0 +1,9 @@
+2026-03-14T09:05:12Z INFO request served path=/health
+2026-03-14T09:17:40Z WARN slow request path=/search ms=1840
+2026-03-14T09:59:59Z ERROR upstream timeout
+2026-03-14T10:00:00Z INFO request served path=/
+2026-03-14T10:12:03+01:00 DEBUG cache warm
+info lost line from a crash
+2026-03-14T10:30:00Z INFO
+
+2026-03-14T11:02:00-02:00 ERROR payment provider returned 502

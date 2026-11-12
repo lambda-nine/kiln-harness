@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "ini-merge",
+  "description": "Merge layered INI files: case-insensitive names, unset markers, first-appearance order and exact errors.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

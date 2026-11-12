@@ -1,0 +1,5 @@
+# Count down, then print a factorial.
+: countdown begin dup . 1 - dup not until drop ;
+: fact dup 1 > if dup 1 - fact * then ;
+5 countdown ." liftoff" cr
+." 6! =" 32 emit 6 fact . ." (factorial)" cr

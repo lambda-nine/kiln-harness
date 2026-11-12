@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "build-order",
+  "description": "Order build targets so dependencies come first, choosing the smallest ready name each time; detect cycles and syntax errors.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

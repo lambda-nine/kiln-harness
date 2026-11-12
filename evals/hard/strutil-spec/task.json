@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "strutil-spec",
+  "description": "Make a shell string library match its written spec when its tests catch only half of the bugs.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

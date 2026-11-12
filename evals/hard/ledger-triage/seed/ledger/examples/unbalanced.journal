@@ -1,0 +1,8 @@
+2026-03-01 Opening balance
+    Assets:Bank:Checking  $500.00
+    Equity:Opening
+
+2026-03-03 Hardware store
+    Expenses:Tools      $25.00
+    Expenses:Paint      $14.99
+    Assets:Bank:Checking  $-39.00

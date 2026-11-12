@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "orders-report",
+  "description": "Produce a sales report by following written rules exactly, over stale notes that contradict them.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

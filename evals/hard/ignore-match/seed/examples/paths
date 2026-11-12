@@ -1,0 +1,16 @@
+src/main.c
+src/main.o
+src/util.c~
+target/
+target/debug/app
+crates/x/target/app
+.DS_Store
+web/.DS_Store
+logs/today.txt
+app.log
+audit.log
+sub/audit.log
+docs/api/index.html
+docs/api/search.html
+docs/api/
+docs/guide.md

@@ -1,0 +1,10 @@
+# Build graph for the demo project.
+app: lib-net lib-ui config.h
+lib-net: libc
+lib-ui:  lib-gfx	libc
+lib-gfx: libc
+	# indented comment
+test: app fixtures
+lib-ui: icons
+
+config.h:

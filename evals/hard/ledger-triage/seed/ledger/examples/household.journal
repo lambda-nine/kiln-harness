@@ -1,0 +1,40 @@
+; Household accounts, first quarter.
+
+2026-01-01 Opening balances
+    Assets:Bank:Checking   $3,200.00
+    Assets:Bank:Savings   $12,000.00
+    Assets:Cash              $150.00
+    Equity:Opening
+
+2026-01-02 Landlord
+    Expenses:Rent          $1,450.00
+    Assets:Bank:Checking
+
+2026-01-05 Employer
+    Assets:Bank:Checking   $4,812.33
+    Income:Salary
+
+2026-01-09 Corner market
+    Expenses:Food             $86.17
+    Assets:Cash              $-40.00
+    Liabilities:Card
+
+2026-01-20 Card payment
+    Liabilities:Card          $46.17
+    Assets:Bank:Checking
+
+2026-02-02 Landlord
+    Expenses:Rent          $1,450.00
+    Assets:Bank:Checking
+
+2026-02-05 Employer
+    Assets:Bank:Checking   $4,812.33
+    Income:Salary
+
+2026-02-14 Bistro
+    Expenses:Eating Out       $63.40  ; dinner
+    Liabilities:Card
+
+2026-02-28 Transfer to savings
+    Assets:Bank:Savings    $2,000.00
+    Assets:Bank:Checking

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "csv-colsum",
+  "description": "Sum one column of an RFC 4180 CSV file: quoting, CRLF, embedded newlines and exact error codes.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

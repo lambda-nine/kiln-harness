@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "stak-interp",
+  "description": "Implement an interpreter for a small stack language from a long written spec: control flow, early-binding definitions, static and runtime errors.",
+  "check_timeout_secs": 120,
+  "session_timeout_secs": 1500,
+  "max_steps": 60,
+  "max_tool_calls": 120
+}

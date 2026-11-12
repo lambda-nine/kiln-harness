@@ -1,0 +1,10 @@
+id,region,"product, name",units,price_cents,notes
+1001,north,"Widget, large",12,1999,
+1002,south,Gadget,7,550,"rush order"
+1003,"east",Widget,-2,1999,"customer said ""send it back"""
+1004,west,"Gizmo
+deluxe",5,12000,two-line product name
+1005,north,Gadget,,550,count missing
+1006,south,"Thing, small",+3,25,
+1007,east,"Widget, large","4",1999,quoted number
+1008,west,Gizmo,10,12000,"note with, comma"

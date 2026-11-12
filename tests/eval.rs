@@ -297,9 +297,10 @@ fn the_starter_suite_loads() {
     }
 }
 
-/// A starter task's seed copied to a host directory, with `/workspace` in
-/// its check and solution rewritten to that directory, so both scripts can
-/// run under the host's `/bin/sh` as they would in the sandbox.
+/// A task's seed copied to a host directory, with `/workspace` in its check
+/// and solution rewritten to that directory, so both scripts can run under
+/// the host's `/bin/sh` as they would in the sandbox. `suite` is the suite's
+/// directory relative to the crate, such as `evals/tasks` or `evals/hard`.
 struct HostTask {
     _dir: tempfile::TempDir,
     workspace: PathBuf,
@@ -307,10 +308,8 @@ struct HostTask {
     solution: String,
 }
 
-fn host_task(id: &str) -> HostTask {
-    let task = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("evals/tasks")
-        .join(id);
+fn host_task(suite: &str, id: &str) -> HostTask {
+    let task = Path::new(env!("CARGO_MANIFEST_DIR")).join(suite).join(id);
     let dir = common::private_tempdir().expect("tempdir");
     let workspace = dir.path().join("workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -366,13 +365,146 @@ fn each_starter_check_fails_bare_and_passes_after_its_solution_on_the_host() {
     {
         let id = entry.expect("entry").file_name();
         let id = id.to_str().expect("utf-8");
-        let task = host_task(id);
+        let task = host_task("evals/tasks", id);
         assert!(!host_sh(&task.check), "{id}: the bare seed passed");
         assert!(host_sh(&task.solution), "{id}: the solution failed");
         assert!(host_sh(&task.check), "{id}: the solved check failed");
         tested += 1;
     }
     assert_eq!(tested, 8);
+}
+
+const HARD_TASKS: [&str; 12] = [
+    "build-order",
+    "csv-colsum",
+    "ignore-match",
+    "ini-merge",
+    "ledger-triage",
+    "log-rollup",
+    "orders-report",
+    "patch-apply",
+    "rename-function",
+    "semver-sort",
+    "stak-interp",
+    "strutil-spec",
+];
+
+/// The round-two hard tasks, which need more overlays than the first eight.
+const HARD_TASKS_ROUND_TWO: [&str; 4] = [
+    "ignore-match",
+    "ledger-triage",
+    "patch-apply",
+    "stak-interp",
+];
+
+#[test]
+fn the_hard_suite_loads() {
+    let tasks = load_tasks(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/hard"),
+        &[],
+        &eval::selftest_config(),
+    )
+    .expect("the hard suite loads");
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        HARD_TASKS
+    );
+    for task in &tasks {
+        let script = String::from_utf8(task.check.script.clone()).expect("UTF-8");
+        assert!(
+            script.starts_with("cd /workspace || exit 2\n"),
+            "{}",
+            task.id
+        );
+    }
+}
+
+#[test]
+fn each_hard_check_fails_bare_and_passes_after_its_solution_on_the_host() {
+    let mut tested = 0;
+    for entry in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/hard"))
+        .expect("read the suite")
+    {
+        let id = entry.expect("entry").file_name();
+        let id = id.to_str().expect("utf-8");
+        let task = host_task("evals/hard", id);
+        assert!(!host_sh(&task.check), "{id}: the bare seed passed");
+        assert!(host_sh(&task.solution), "{id}: the solution failed");
+        assert!(host_sh(&task.check), "{id}: the solved check failed");
+        tested += 1;
+    }
+    assert_eq!(tested, 12);
+}
+
+/// Each directory under `tests/fixtures/eval-hard/<id>/` is an overlay: its
+/// files, relative to `/workspace`, are written over the task's seed before
+/// the check runs. A `fail-*` overlay is a plausible wrong answer, wrong in
+/// one way, that the check must refuse; a `pass-*` overlay is a correct
+/// answer written differently from the reference solution, which it must
+/// accept.
+#[test]
+fn hard_task_overlays_fail_or_pass_as_named() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval-hard");
+    let mut ids = std::fs::read_dir(&fixtures)
+        .expect("read the overlays")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8")
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, HARD_TASKS, "one overlay directory per hard task");
+    for id in &ids {
+        let mut overlays = std::fs::read_dir(fixtures.join(id))
+            .expect("read the task's overlays")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        overlays.sort();
+        let (mut fails, mut passes) = (0, 0);
+        for overlay in &overlays {
+            let name = overlay
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf-8");
+            let task = host_task("evals/hard", id);
+            for file in walk(overlay) {
+                let relative = file.strip_prefix(overlay).expect("under the overlay");
+                write(
+                    &task.workspace.join(relative),
+                    &std::fs::read(&file).expect("read"),
+                );
+            }
+            if name.starts_with("fail-") {
+                assert!(!host_sh(&task.check), "{id}/{name} passed the check");
+                fails += 1;
+            } else if name.starts_with("pass-") {
+                assert!(host_sh(&task.check), "{id}/{name} failed the check");
+                passes += 1;
+            } else {
+                panic!("{id}/{name}: an overlay is named fail-* or pass-*");
+            }
+        }
+        let round_two = HARD_TASKS_ROUND_TWO.contains(&id.as_str());
+        let min_fails = if round_two { 4 } else { 3 };
+        assert!(
+            fails >= min_fails,
+            "{id}: {fails} fail-* overlays, want at least {min_fails}"
+        );
+        if round_two
+            || matches!(
+                id.as_str(),
+                "semver-sort" | "csv-colsum" | "build-order" | "log-rollup" | "ini-merge"
+            )
+        {
+            assert!(passes >= 1, "{id}: no pass-* overlay");
+        }
+    }
 }
 
 #[test]
@@ -383,11 +515,11 @@ fn fix_off_by_one_refuses_a_lookup_and_an_answer_without_its_loop() {
     // Right for every N, but not the loop the prompt asks to keep.
     let closed_form = "#!/bin/sh\necho $(($1 * ($1 + 1) / 2))\n";
     for (name, script) in [("lookup", lookup), ("closed form", closed_form)] {
-        let task = host_task("fix-off-by-one");
+        let task = host_task("evals/tasks", "fix-off-by-one");
         write(&task.workspace.join("sum.sh"), script.as_bytes());
         assert!(!host_sh(&task.check), "{name} passed the check");
     }
-    let task = host_task("fix-off-by-one");
+    let task = host_task("evals/tasks", "fix-off-by-one");
     assert!(!host_sh(&task.check), "the bare seed passed");
     assert!(host_sh(&task.solution), "the solution failed");
     assert!(
@@ -404,7 +536,7 @@ fn fix_off_by_one_accepts_every_posix_loop_form() {
     let until = "#!/bin/sh\nn=$1\ntotal=0\ni=1\nuntil [ \"$i\" -gt \"$n\" ]; do\n  total=$((total + i))\n  i=$((i + 1))\ndone\necho \"$total\"\n";
     let bare_while = "#!/bin/sh\nn=$1\ntotal=0\ni=1\nwhile\n  [ \"$i\" -le \"$n\" ]\ndo\n  total=$((total + i))\n  i=$((i + 1))\ndone\necho \"$total\"\n";
     for (name, script) in [("until", until), ("while alone on its line", bare_while)] {
-        let task = host_task("fix-off-by-one");
+        let task = host_task("evals/tasks", "fix-off-by-one");
         write(&task.workspace.join("sum.sh"), script.as_bytes());
         assert!(host_sh(&task.check), "the {name} repair failed the check");
     }
@@ -1990,6 +2122,7 @@ fn result(
         input_tokens: tokens.0,
         output_tokens: tokens.1,
         cache_read_tokens: None,
+        cache_write_tokens: None,
         wall_ms: u64::from(steps) * 1000,
         replay: None,
         error: None,

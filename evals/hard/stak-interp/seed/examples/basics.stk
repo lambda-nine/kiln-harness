@@ -1,0 +1,5 @@
+# Arithmetic and the stack words.
+." sum:" 32 emit 7 5 + . ." and product:" 32 emit 7 5 * . ." done" cr
+." quotients:" 32 emit 17 5 / . -17 5 / . 17 5 mod . -17 5 mod . ." end" cr
+." stack:" 32 emit 1 2 3 rot . . . 4 5 swap . . 6 7 over . . . ." end" cr
+." compare:" 32 emit 3 4 < . 3 4 > . 4 4 = . 0 not . ." end" cr

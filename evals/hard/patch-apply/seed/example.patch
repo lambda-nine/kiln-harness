@@ -1,0 +1,46 @@
+Add a -v flag and move the default port to 8080.
+
+diff --git a/src/config.h b/src/config.h
+index 3f2a1c4..9c1b7e2 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -4,2 +4,2 @@
+-#define DEFAULT_PORT 8000
++#define DEFAULT_PORT 8080
+ #define DEFAULT_ROOT "."
+diff --git a/src/server.c b/src/server.c
+index 77d0e5a..b41c2f9 100644
+--- a/src/server.c	2026-11-02 09:14:55.000000000 +0000
++++ b/src/server.c	2026-11-02 09:20:13.000000000 +0000
+@@ -7,2 +7,3 @@
+ static int port = DEFAULT_PORT;
+ static const char *root = DEFAULT_ROOT;
++static int verbose = 0;
+@@ -11,3 +12,3 @@ static void usage(const char *name)
+ {
+-	fprintf(stderr, "usage: %s [-p port] [-d dir]\n", name);
++	fprintf(stderr, "usage: %s [-v] [-p port] [-d dir]\n", name);
+ 	exit(2);
+@@ -31,3 +32,5 @@ int main(int argc, char **argv)
+ 		} else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+ 			root = argv[++i];
++		} else if (strcmp(argv[i], "-v") == 0) {
++			verbose = 1;
+ 		} else {
+@@ -38,3 +41,4 @@
+ 	}
+-	printf("serving %s on port %d\n", root, port);
++	if (verbose)
++		printf("serving %s on port %d\n", root, port);
+ 	return 0;
+diff --git a/docs/USAGE.md b/docs/USAGE.md
+new file mode 100644
+index 0000000..d5e8a01
+--- /dev/null
++++ b/docs/USAGE.md
+@@ -0,0 +1,5 @@
++tinyhttp usage
++
++  -v       print the address before serving
++  -p PORT  listen on PORT (default 8080)
++  -d DIR   serve files from DIR (default .)

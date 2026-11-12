@@ -493,6 +493,9 @@ pub struct RunResult {
     /// Of `input_tokens`, those read from a prompt cache, when any were.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<u64>,
+    /// Of `input_tokens`, those written to a prompt cache, when any were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
     pub wall_ms: u64,
     /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`; `None`
     /// without `--replay` or for a run that did not complete.
@@ -1313,6 +1316,8 @@ where
         output_tokens: usage.output_tokens,
         cache_read_tokens: (usage.cache_read_input_tokens > 0)
             .then_some(usage.cache_read_input_tokens),
+        cache_write_tokens: (usage.cache_creation_input_tokens > 0)
+            .then_some(usage.cache_creation_input_tokens),
         wall_ms,
         replay: None,
         error: outcome.as_ref().err().map(ToString::to_string),

@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "semver-sort",
+  "description": "Sort versions by SemVer 2.0.0 precedence with full validation, arbitrary-length numbers and a stable order.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

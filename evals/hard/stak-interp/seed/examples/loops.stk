@@ -1,0 +1,15 @@
+# Loops.
+
+# sum-to: replaces n with 1 + 2 + ... + n
+: sum-to 0 swap begin dup while swap over + swap 1 - repeat drop ;
+." sum to 10:" 32 emit 10 sum-to . ." ok" cr
+
+# The squares of 1 to 5.
+1 begin dup dup * . 1 + dup 6 = until drop ." are squares" cr
+
+# A small table.
+1 begin dup 4 < while
+  1 begin dup 4 < while over over * . 1 + repeat drop
+  ." |" cr
+  1 +
+repeat drop

@@ -1,0 +1,6 @@
+2026-03-14T23:30:00-01:00 INFO nightly rollover
+2026-03-15T00:10:00+00:00 WARN rollover late
+2026-03-14T23:59:59Z INFO last of the day
+2026-03-14T22:00:00 INFO no zone
+2026-03-14T22:00:00Z NOTICE unknown level
+2026-03-15T01:00:00+01:00 ERROR backup check failed

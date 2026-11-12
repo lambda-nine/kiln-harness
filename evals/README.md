@@ -55,8 +55,9 @@ anything runs, even when `--task` picks a few, and every error names its task.
 2. Write `check.sh` to start with `cd /workspace || exit 2`, and make it
    strict: compare exact bytes where you can (`cmp -s - file <<'END'`), and
    check that files the task must not change still hash the same
-   (`sha256sum`). The sandbox is Alpine with busybox, no network, and
-   `/workspace` is the only writable path, so do not write anywhere else.
+   (`sha256sum`). The sandbox is Alpine with busybox and no network.
+   `/workspace` is the task's working tree; `/tmp` is writable scratch
+   (`mktemp -d` works) that the check does not read.
    Redirect stdin from `/dev/null` when the check runs a script the agent
    wrote, since the check itself arrives on stdin.
 3. Make sure the bare seed fails the check and `solution.sh` makes it pass.
@@ -99,6 +100,21 @@ cargo run --locked -- eval run --provider openai-compat \
   --trials 3 --replay --label "baseline" --out evals-out/qwen-baseline
 ```
 
+`--out` is checked against the effective user running the command. Symlinks
+in its existing part are resolved first. Every ancestor directory, from `/`
+down, must be owned by root or that user, and may be group- or
+world-writable only if it has the sticky bit (as `/tmp` has). The stricter
+rule is for the immediate parent of `--out`: it must be owned by the
+effective user and must not be group- or world-writable, sticky or not.
+Missing parents are created with mode 0700, which satisfies this, and `--out`
+itself is created new. So use a private parent and a child that does not
+exist yet, such as `PRIVATE_DIR/out` where `PRIVATE_DIR` is mode 0700; a
+sticky shared directory such as `/tmp` works only as an ancestor
+(`/tmp/PRIVATE_DIR/out`), not as the parent (`/tmp/out`). Under `sudo`, where
+the effective user is root, a path inside another user's home directory is
+refused; use a root-owned private directory instead, such as one made by
+`sudo mktemp -d`.
+
 Runs are sequential, one sandbox at a time, tasks in ID order and trials 1 to
 N. Each run writes `OUT/runs/<id>/<trial>/audit.jsonl` and `journal.jsonl`
 (and, with `--replay`, `replay-audit.jsonl` and `replay-journal.jsonl`), and
@@ -115,7 +131,7 @@ appends one line to `OUT/results.jsonl`:
 by the session deadline) or `null` when the check did not run, because the
 session did not end in an accepted final answer. `input_tokens` counts all
 input, cached included; `cache_read_tokens` appears when some was read from a
-prompt cache. `replay` is `matched`, `diverged_turn:<n>`, `diverged_check`,
+prompt cache, and `cache_write_tokens` when some was written to one. `replay` is `matched`, `diverged_turn:<n>`, `diverged_check`,
 `failed`, or `null` without `--replay` or for a run that did not complete.
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
@@ -153,6 +169,60 @@ every other line identical), `fix-failing-test` (fix a library so an
 unchanged test passes) and `dedupe` (remove duplicate lines in place, in
 order).
 
+## The hard suite
+
+`evals/hard` holds twelve harder tasks in the same format, for telling
+configurations apart once the starter suite passes. All of them use the
+default system prompt. The first eight below give a session 900 seconds, 40
+steps and 80 tool calls, with a 60-second check. The last four are larger
+(an existing program to investigate, or a long written spec whose rules
+interact) and give a session 1500 seconds, 60 steps and 120 tool calls, with
+a 120-second check that runs at least 15 hidden cases. The "write a script"
+tasks state a full contract, in the prompt or in a seeded document, and
+their checks run the script on many inputs that are not in the seed or the
+prompt, covering every rule the contract states; a check prints at most one
+short line, such as `case 3`, naming the first failing case.
+
+- `semver-sort`: sort versions by SemVer 2.0.0 precedence, with validation,
+  numbers too long for floating point and a stable order.
+- `csv-colsum`: sum one column of an RFC 4180 file, with quoted fields,
+  CRLF, embedded newlines and exact exit codes.
+- `build-order`: order build targets so dependencies come first, taking the
+  smallest ready name each time, and report cycles and syntax errors.
+- `strutil-spec`: make a shell string library match its written spec when
+  its tests catch only two of its four bugs.
+- `log-rollup`: count log levels per UTC hour across files, with offsets,
+  calendar validation and malformed-line counting.
+- `rename-function`: rename a shell function across a project without
+  touching look-alike names or the changelog.
+- `ini-merge`: merge layered INI files, with case-insensitive names, unset
+  markers and first-appearance order.
+- `orders-report`: produce a sales report by its written rules, over older
+  notes that contradict two of them.
+- `ledger-triage`: fix the three reported bugs in an existing awk ledger
+  program, and find the two unreported ones by reading the code against its
+  manual.
+- `stak-interp`: write an interpreter for a small stack language from its
+  spec: control flow, early-binding definitions, static and runtime errors
+  with line numbers, and a 200,000-iteration loop within 10 seconds.
+- `ignore-match`: decide which paths an ignore-rules file ignores, with
+  anchoring, `**`, classes, directory-only rules, last-match negation and
+  excluded ancestors.
+- `patch-apply`: apply a unified diff all or nothing, with an offset search
+  whose result carries to later hunks, missing-newline markers, CRLF lines,
+  creation and deletion.
+
+Run it with `--tasks evals/hard`, for example
+`cargo run --locked -- eval run --tasks evals/hard ... --out DIR`, and
+self-test it with `eval selftest --tasks evals/hard`. The starter suite stays
+the smoke tier and the default.
+
+Every hard check and solution is POSIX `sh` and POSIX `awk`, so the tests run
+them on the host too. `tests/fixtures/eval-hard/<id>/` holds overlays for each
+task: `fail-*` directories are plausible wrong answers the check must refuse,
+and `pass-*` directories correct answers written differently from the
+reference solution, which it must accept.
+
 ## Honest limits
 
 - The check runs in the sandbox the agent used. A model that tampers with the
@@ -168,4 +238,6 @@ order).
   small difference.
 - Replay answers every model request from the journal, so a replay divergence
   isolates nondeterminism in the environment (kilnd, the sandbox, timing), not
-  model quality.
+  model quality. For example, seed files carry the time they were written, so a
+  recorded `ls -l` of the workspace diverges when the replay runs in a later
+  minute.

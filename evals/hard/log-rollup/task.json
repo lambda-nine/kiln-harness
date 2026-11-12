@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "log-rollup",
+  "description": "Roll up log levels per UTC hour across files, with time-zone offsets, calendar validation and malformed-line counting.",
+  "check_timeout_secs": 60,
+  "session_timeout_secs": 900,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}
