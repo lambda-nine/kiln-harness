@@ -9,8 +9,8 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{
-    ApiError, CancelReason, CapturedOutput, Execution, ExecutionState, ExpiryReason, SandboxApi,
-    SandboxExec, UnusableReason,
+    ApiError, ApiLimits, CancelReason, CapturedOutput, EnvVar, Execution, ExecutionState,
+    ExpiryReason, SandboxApi, SandboxExec, execution_start_raced, sandbox_unusable_refusal,
 };
 use crate::audit::{ContentSummary, OutputEvidence};
 use crate::engine::{CheckOutcome, SeedFile, TaskCheck};
@@ -18,6 +18,136 @@ use crate::journal::SessionLimits;
 use crate::provider::{ToolCall, ToolDefinition};
 
 const WORKSPACE: &str = "/workspace";
+
+/// The environment every execution gets over kiln's defaults, in order.
+/// The output goes to a model, so no colour or other escape codes
+/// (`TERM=dumb`, `NO_COLOR=1`) and no pager waiting on a terminal
+/// (`PAGER=cat`). `HOME` stays `/root` on purpose: the root filesystem is
+/// read-only, and a writable `HOME` would put dotfiles in `/workspace` and
+/// its diff. These are constants, never from the model, a task, the CLI or
+/// the host environment, because kilnd stores and hashes env values.
+const EXEC_ENV: [(&str, &str); 3] = [("TERM", "dumb"), ("NO_COLOR", "1"), ("PAGER", "cat")];
+
+/// Where every execution of a session runs and which env overrides it
+/// gets. The journal records it in `session_started`, so replay runs a
+/// recording's executions as they ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecContext {
+    /// Before kilnd's exec options: no cwd (kilnd's `/`) and no overrides.
+    /// Only replay of a journal recorded without `exec_context` uses it.
+    Legacy,
+    /// `/workspace` with [`EXEC_ENV`]. Every live session uses it.
+    WorkspaceV1,
+}
+
+impl ExecContext {
+    /// The `session_started.exec_context` value; `None` for
+    /// [`ExecContext::Legacy`], which journals omit.
+    #[must_use]
+    pub(crate) fn journal_name(self) -> Option<&'static str> {
+        match self {
+            Self::Legacy => None,
+            Self::WorkspaceV1 => Some("workspace_v1"),
+        }
+    }
+
+    /// The context a recorded `exec_context` names: absent is legacy, and
+    /// any value but `workspace_v1` is unknown (`None`).
+    #[must_use]
+    pub(crate) fn from_journal(name: Option<&str>) -> Option<Self> {
+        match name {
+            None => Some(Self::Legacy),
+            Some("workspace_v1") => Some(Self::WorkspaceV1),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether executions send cwd and env, which needs `FEATURE_EXEC_CWD`,
+    /// `FEATURE_EXEC_ENV` and room for them in the advertised limits.
+    #[must_use]
+    pub(crate) fn sends_exec_options(self) -> bool {
+        self == Self::WorkspaceV1
+    }
+
+    /// The `ExecRequest.cwd` every execution sends; empty is kilnd's `/`.
+    #[must_use]
+    pub(crate) fn cwd(self) -> &'static str {
+        match self {
+            Self::Legacy => "",
+            Self::WorkspaceV1 => WORKSPACE,
+        }
+    }
+
+    /// The `ExecRequest.env` every execution sends, in order.
+    #[must_use]
+    pub(crate) fn env(self) -> Vec<EnvVar> {
+        match self {
+            Self::Legacy => Vec::new(),
+            Self::WorkspaceV1 => EXEC_ENV
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether kilnd recorded exactly this context for `execution`.
+    #[must_use]
+    pub(crate) fn ran_as_sent(self, execution: &Execution) -> bool {
+        execution.ran_with(self.cwd(), &self.env())
+    }
+}
+
+/// The problem, if any, with running [`ExecContext::WorkspaceV1`] under
+/// `limits`: the first advertised exec limit too small for `/workspace` or
+/// the fixed overrides. Zero is too small, since a daemon fills these
+/// limits whenever it lists the features.
+#[must_use]
+pub(crate) fn exec_limits_problem(limits: &ApiLimits) -> Option<String> {
+    let env = ExecContext::WorkspaceV1.env();
+    let needed = |bytes: usize| u32::try_from(bytes).unwrap_or(u32::MAX);
+    let checks = [
+        (
+            "max_cwd_bytes",
+            limits.max_cwd_bytes,
+            needed(WORKSPACE.len()),
+        ),
+        ("max_env_entries", limits.max_env_entries, needed(env.len())),
+        (
+            "max_env_name_bytes",
+            limits.max_env_name_bytes,
+            needed(env.iter().map(|var| var.name.len()).max().unwrap_or(0)),
+        ),
+        (
+            "max_env_value_bytes",
+            limits.max_env_value_bytes,
+            needed(env.iter().map(|var| var.value.len()).max().unwrap_or(0)),
+        ),
+        (
+            "max_env_total_bytes",
+            limits.max_env_total_bytes,
+            needed(
+                env.iter()
+                    .map(|var| var.name.len() + var.value.len() + 2)
+                    .sum(),
+            ),
+        ),
+    ];
+    checks
+        .into_iter()
+        .find(|(_, advertised, needed)| advertised < needed)
+        .map(|(name, advertised, needed)| {
+            format!("kilnd advertised {name} {advertised}; kiln-harness needs at least {needed}")
+        })
+}
+
+/// The message a session ends with when kilnd's record of an execution
+/// does not show the cwd and env overrides the harness sent.
+pub const EXEC_CONTEXT_MISMATCH: &str =
+    "kilnd ran an execution with a different cwd or env than requested";
+
 /// The name a call to an unregistered tool is recorded and shown under.
 pub const UNKNOWN_TOOL: &str = "unknown";
 
@@ -120,22 +250,26 @@ impl ToolRegistry {
     /// create was sent: the first activity anchor, on the early side.
     /// `typed_reasons` says whether the daemon lists typed refusal reasons;
     /// only then does a tool call end on a refusal proving the sandbox gone.
+    /// Every execution runs in `exec_context`.
     ///
     /// # Errors
     ///
     /// Returns an error if kilnd cannot execute or settle the bounded manifest.
-    pub async fn start_session<'a, A: SandboxApi>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn start_session<'a, A: SandboxApi>(
         &'a self,
         api: &'a A,
         sandbox_id: String,
         session_deadline: Instant,
         typed_reasons: bool,
+        exec_context: ExecContext,
         ready_at: Instant,
         seed: &[SeedFile],
     ) -> Result<(ToolSession<'a, A>, Option<SeedEvidence>, BaselineEvidence), ToolError> {
         let mut session = ToolSession {
             api,
             sandbox_id,
+            exec_context,
             limits: &self.limits,
             baseline: BTreeSet::new(),
             typed_reasons,
@@ -206,6 +340,8 @@ pub const CHECK_OUTPUT_BYTES: usize = 4 << 10;
 pub struct ToolSession<'a, A: SandboxApi> {
     api: &'a A,
     sandbox_id: String,
+    /// The cwd and env every execution sends, and kilnd must report.
+    exec_context: ExecContext,
     limits: &'a ToolLimits,
     baseline: BTreeSet<String>,
     typed_reasons: bool,
@@ -249,6 +385,9 @@ pub struct RecoveredExecutionEvidence {
     /// No `GetSandbox` read succeeded in the whole window, so nothing is
     /// known about what kilnd assigned.
     pub unreadable: bool,
+    /// The first recovered execution whose recorded cwd or env overrides
+    /// differ from what the session sends.
+    pub mismatched: Option<String>,
 }
 
 impl RecoveredExecutionEvidence {
@@ -256,6 +395,9 @@ impl RecoveredExecutionEvidence {
     /// unusable, exactly as for a directly returned one.
     #[must_use]
     pub fn stop(&self) -> Option<ToolStop> {
+        if self.mismatched.is_some() {
+            return Some(ToolStop::Unusable(EXEC_CONTEXT_MISMATCH.to_string()));
+        }
         if let Some(id) = &self.unsettled {
             return Some(ToolStop::Unusable(format!(
                 "execution {id} did not settle after its response was lost"
@@ -444,6 +586,11 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         activity.1 = activity.1.saturating_add(1);
     }
 
+    /// The cwd and env every execution of this session sends.
+    pub(crate) fn exec_context(&self) -> ExecContext {
+        self.exec_context
+    }
+
     fn unusable(&self) -> Option<ToolStop> {
         self.unusable
             .lock()
@@ -457,8 +604,15 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> RecoveredExecutionEvidence {
-        let recovered =
-            recover_execution_evidence(self.api, &self.sandbox_id, known, deadline, cancel).await;
+        let recovered = recover_execution_evidence_in(
+            self.api,
+            &self.sandbox_id,
+            self.exec_context,
+            known,
+            deadline,
+            cancel,
+        )
+        .await;
         // A settled recovered row is an execution kilnd admitted and
         // finished, so it is activity; one that left the sandbox unusable,
         // or never settled, refuses any later Exec.
@@ -862,32 +1016,50 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         // cgroup and publish its terminal row. If settlement exceeds the wall
         // budget, dropping the RPC requests cancellation and session cleanup
         // deletes the sandbox through a separate bounded lifecycle path.
-        let command_timeout = wall_timeout
-            .saturating_sub(Duration::from_millis(250))
-            .max(Duration::from_millis(1));
-        let sent = Instant::now();
-        *self
-            .last_exec_sent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sent);
-        let result = timeout_at(
-            rpc_deadline,
-            self.api.exec(SandboxExec {
-                sandbox_id: self.sandbox_id.clone(),
-                argv,
-                stdin,
-                timeout: command_timeout,
-            }),
-        )
-        .await;
-        let execution = match result {
-            Err(_) => return Err(ToolError::Deadline),
-            Ok(Err(error)) => {
-                return Err(ToolError::Api(
-                    self.settle_not_ready(error, rpc_deadline).await,
-                ));
+        let command_timeout = |budget: Duration| {
+            budget
+                .saturating_sub(Duration::from_millis(250))
+                .max(Duration::from_millis(1))
+        };
+        let mut request = SandboxExec {
+            sandbox_id: self.sandbox_id.clone(),
+            argv,
+            stdin,
+            timeout: command_timeout(wall_timeout),
+            cwd: self.exec_context.cwd().to_string(),
+            env: self.exec_context.env(),
+        };
+        let mut raced = false;
+        let (execution, sent) = loop {
+            let sent = Instant::now();
+            *self
+                .last_exec_sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sent);
+            match timeout_at(rpc_deadline, self.api.exec(request.clone())).await {
+                Err(_) => return Err(ToolError::Deadline),
+                // kilnd recorded nothing and the sandbox is READY again: send
+                // the same request once more, within what is left of the
+                // same budget.
+                Ok(Err(error)) if !raced && execution_start_raced(&error, self.typed_reasons) => {
+                    raced = true;
+                    let left = rpc_deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(ToolError::Deadline);
+                    }
+                    request.timeout = command_timeout(left);
+                }
+                // A second race is an ordinary, recoverable failure: the
+                // reason is dropped so nothing reads it as a terminal one.
+                Ok(Err(error)) if execution_start_raced(&error, self.typed_reasons) => {
+                    return Err(ToolError::Api(ApiError {
+                        reason: None,
+                        ..error
+                    }));
+                }
+                Ok(Err(error)) => return Err(ToolError::Api(error)),
+                Ok(Ok(execution)) => break (execution, sent),
             }
-            Ok(Ok(execution)) => execution,
         };
         // A returned execution proves kilnd saw activity after the request
         // was sent, so the send time is the anchor, on the early side; while
@@ -896,6 +1068,20 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         // otherwise the last known activity stands, so the next boundary
         // renews at once if a renew is overdue.
         self.record_activity(sent);
+        // The command ran, but not as sent, for example on an older daemon
+        // that ignored the options after a reconnect: keep its ID as
+        // evidence, never its output, and stop at this call.
+        if !self.exec_context.ran_as_sent(&execution) {
+            let stop = ToolStop::Unusable(EXEC_CONTEXT_MISMATCH.to_string());
+            self.unusable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(stop.clone());
+            return Err(ToolError::Unusable {
+                stop,
+                execution_ids: vec![execution.id],
+            });
+        }
         if execution.sandbox_reusable == Some(false) {
             let mut unusable = self
                 .unusable
@@ -1182,6 +1368,23 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             Err(ToolError::Deadline) => {
                 return Err(failed(evidence, "the session deadline expired".to_string()));
             }
+            // It ran, but not as sent: its ID is evidence.
+            Err(ToolError::Unusable {
+                stop,
+                execution_ids,
+            }) => {
+                evidence.execution_ids.extend(execution_ids);
+                return Err(failed(
+                    evidence,
+                    format!("the sandbox is no longer usable ({stop:?})"),
+                ));
+            }
+            Err(ToolError::Api(error)) if sandbox_unusable_refusal(&error, self.typed_reasons) => {
+                return Err(failed(
+                    evidence,
+                    format!("the sandbox is no longer usable ({error})"),
+                ));
+            }
             Err(error) => return Err(failed(evidence, error.to_string())),
         };
         evidence.execution_ids.push(execution.id.clone());
@@ -1216,6 +1419,23 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         {
             Ok(execution) => execution,
             Err(ToolError::Deadline) => return CheckRun::error("deadline"),
+            // It ran, but not as sent: an error verdict that keeps its ID
+            // and none of its output.
+            Err(ToolError::Unusable {
+                stop,
+                execution_ids,
+            }) => {
+                return CheckRun {
+                    execution_id: execution_ids.into_iter().next(),
+                    ..CheckRun::error(match stop {
+                        ToolStop::Unusable(message) => message,
+                        other => format!("{other:?}"),
+                    })
+                };
+            }
+            Err(ToolError::Api(error)) if sandbox_unusable_refusal(&error, self.typed_reasons) => {
+                return CheckRun::error(format!("{UNUSABLE_SANDBOX}: {error}"));
+            }
             Err(error) => return CheckRun::error(error.to_string()),
         };
         let outcome = match (execution.state, execution.exit_code) {
@@ -1241,25 +1461,6 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             stderr_evidence: evidence(&execution.stderr),
         }
     }
-
-    /// kilnd also sends `sandbox_not_ready` for a READY sandbox when an
-    /// Exec lost a race with its own row insert, and says to retry. Ask once,
-    /// within the call's deadline: only a sandbox that reads READY turns the
-    /// refusal into an ordinary, recoverable error (its reason is dropped,
-    /// its message kept). Anything else, a lookup failure included, stays
-    /// terminal.
-    async fn settle_not_ready(&self, error: ApiError, deadline: Instant) -> ApiError {
-        if UnusableReason::of(&error, self.typed_reasons) != Some(UnusableReason::NotReady) {
-            return error;
-        }
-        match timeout_at(deadline, self.api.sandbox_ready(&self.sandbox_id)).await {
-            Ok(Ok(true)) => ApiError {
-                reason: None,
-                ..error
-            },
-            _ => error,
-        }
-    }
 }
 
 fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun {
@@ -1274,7 +1475,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stop: ExpiryReason::of(&error, typed_reasons)
                 .map(ToolStop::Expired)
                 .or_else(|| {
-                    UnusableReason::of(&error, typed_reasons).map(|_| ToolStop::unusable())
+                    sandbox_unusable_refusal(&error, typed_reasons).then(ToolStop::unusable)
                 }),
         },
         ToolError::Manifest {
@@ -1309,7 +1510,14 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             execution_ids,
         } => ToolRun {
             ok: false,
-            result: json!({"ok": false, "error": kind, "message": UNUSABLE_SANDBOX}),
+            result: json!({
+                "ok": false,
+                "error": kind,
+                "message": match &stop {
+                    ToolStop::Unusable(message) => message.as_str(),
+                    _ => UNUSABLE_SANDBOX,
+                },
+            }),
             execution_ids,
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
@@ -1411,10 +1619,36 @@ fn unknown_evidence() -> OutputEvidence {
 /// pass, on every pass while no new row is known, and then every fourth
 /// pass; between those only the unsettled IDs are read. The last pass starts
 /// `min(100 ms, window / 4)` before the deadline, so its reads have that
-/// long to answer, and reads both.
+/// long to answer, and reads both. Every recovered row must show a live
+/// session's context, `/workspace` and the fixed env overrides; any other
+/// row is reported as mismatched. This helper is for live sessions only: a
+/// replay of a journal recorded before the exec context ran with an empty
+/// cwd and no overrides, and [`Harness::replay`](crate::engine::Harness::replay)
+/// recovers its rows against that context itself.
 pub async fn recover_execution_evidence<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
+    known: &BTreeSet<String>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> RecoveredExecutionEvidence {
+    recover_execution_evidence_in(
+        api,
+        sandbox_id,
+        ExecContext::WorkspaceV1,
+        known,
+        deadline,
+        cancel,
+    )
+    .await
+}
+
+/// [`recover_execution_evidence`] for a session in `exec_context`: every
+/// recovered row must show it.
+pub(crate) async fn recover_execution_evidence_in<A: SandboxApi>(
+    api: &A,
+    sandbox_id: &str,
+    exec_context: ExecContext,
     known: &BTreeSet<String>,
     deadline: Instant,
     cancel: &CancellationToken,
@@ -1423,17 +1657,18 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
     // what kilnd assigned; a cancellation arriving during it returns at
     // once, and the caller's Canceled stop wins.
     if cancel.is_cancelled() {
-        return recover_until(api, sandbox_id, known, deadline).await;
+        return recover_until(api, sandbox_id, exec_context, known, deadline).await;
     }
     tokio::select! {
         () = cancel.cancelled() => RecoveredExecutionEvidence::empty(),
-        recovered = recover_until(api, sandbox_id, known, deadline) => recovered,
+        recovered = recover_until(api, sandbox_id, exec_context, known, deadline) => recovered,
     }
 }
 
 async fn recover_until<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
+    exec_context: ExecContext,
     known: &BTreeSet<String>,
     deadline: Instant,
 ) -> RecoveredExecutionEvidence {
@@ -1470,7 +1705,7 @@ async fn recover_until<A: SandboxApi>(
             // failed: with nothing found and the last read lost, nothing is
             // known.
             let unreadable = !listed || (rows.is_empty() && last && last_read == Some(false));
-            let mut recovered = aggregate_recovered(rows);
+            let mut recovered = aggregate_recovered(rows, exec_context);
             recovered.unreadable = unreadable && !settled;
             return recovered;
         }
@@ -1522,13 +1757,24 @@ impl RecoveredExecutionEvidence {
             cancel_reason: None,
             unsettled: None,
             unreadable: false,
+            mismatched: None,
         }
     }
 }
 
-fn aggregate_recovered(rows: Vec<Execution>) -> RecoveredExecutionEvidence {
+fn aggregate_recovered(
+    rows: Vec<Execution>,
+    exec_context: ExecContext,
+) -> RecoveredExecutionEvidence {
     let mut recovered = RecoveredExecutionEvidence::empty();
     for execution in rows {
+        // Every execution of this sandbox is this session's, so each must
+        // show what the session sends, settled or not.
+        if !exec_context.ran_as_sent(&execution) {
+            recovered
+                .mismatched
+                .get_or_insert_with(|| execution.id.clone());
+        }
         if !is_terminal(&execution) {
             recovered
                 .unsettled

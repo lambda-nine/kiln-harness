@@ -1379,11 +1379,10 @@ async fn replay_run<A: SandboxApi + Clone>(
         return Ok(("failed".to_string(), false));
     };
     let expected = provider.recorded_final_answer().map(str::to_string);
-    let task = provider.task();
     let config = provider.replay_config(base.clone());
     let (audit, journal, _) = open_outputs(dir, "replay-audit.jsonl", "replay-journal.jsonl")?;
     let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
-    let result = harness.run(&task, cancel.clone()).await;
+    let result = harness.replay(cancel.clone()).await;
     let replay = harness.provider();
     let status = if let Some(turn) = replay.diverged_at() {
         format!("diverged_turn:{turn}")

@@ -32,13 +32,15 @@ struct Stub {
     /// Health answers this many calls, then never answers again.
     health_answers: u32,
     /// Advertise expiry, typed reasons, idempotent create and request-ID
-    /// release.
+    /// release beside the exec options, which every stub lists.
     current: bool,
     /// Record the first create, then lose its response: `UNAVAILABLE`.
     lose_first_create: bool,
     /// Every create and delete request as it arrived on the wire.
     create_requests: Arc<std::sync::Mutex<Vec<pb::CreateSandboxRequest>>>,
     delete_requests: Arc<std::sync::Mutex<Vec<pb::DeleteSandboxRequest>>>,
+    /// Every Exec request as it arrived on the wire.
+    exec_requests: Arc<std::sync::Mutex<Vec<pb::ExecRequest>>>,
     /// Report every non-baseline Exec as canceled by a sandbox deletion that
     /// left the sandbox unusable.
     deleted_during_exec: bool,
@@ -65,6 +67,18 @@ fn sandbox(state: pb::SandboxState) -> pb::Sandbox {
     }
 }
 
+/// kilnd 0c79944's default exec-option bounds, on the wire.
+fn stub_exec_limits() -> pb::ApiLimits {
+    pb::ApiLimits {
+        max_cwd_bytes: 4096,
+        max_env_entries: 64,
+        max_env_name_bytes: 128,
+        max_env_value_bytes: 4096,
+        max_env_total_bytes: 32_768,
+        ..pb::ApiLimits::default()
+    }
+}
+
 fn settled() -> pb::Output {
     pb::Output {
         total_bytes_known: true,
@@ -81,21 +95,35 @@ impl KilndService for Stub {
         if self.health_calls.fetch_add(1, Ordering::SeqCst) >= self.health_answers {
             std::future::pending::<()>().await;
         }
-        let runtime_capabilities = self.current.then(|| pb::RuntimeCapabilities {
-            features: vec![
-                pb::Feature::SandboxExpiry as i32,
-                pb::Feature::TypedReasons as i32,
-                pb::Feature::IdempotentCreate as i32,
-                pb::Feature::RequestIdRelease as i32,
-            ],
-            limits: Some(pb::ApiLimits {
-                min_sandbox_lifetime_ms: 10_000,
-                max_sandbox_lifetime_ms: 7 * 86_400_000,
-                min_sandbox_idle_ms: 10_000,
-                max_sandbox_idle_ms: 86_400_000,
-                ..pb::ApiLimits::default()
-            }),
-            ..pb::RuntimeCapabilities::default()
+        // Every kilnd the harness accepts lists the exec options.
+        let exec_options = [pb::Feature::ExecCwd as i32, pb::Feature::ExecEnv as i32];
+        let exec_limits = stub_exec_limits();
+        let runtime_capabilities = Some(if self.current {
+            pb::RuntimeCapabilities {
+                features: [
+                    pb::Feature::SandboxExpiry as i32,
+                    pb::Feature::TypedReasons as i32,
+                    pb::Feature::IdempotentCreate as i32,
+                    pb::Feature::RequestIdRelease as i32,
+                ]
+                .into_iter()
+                .chain(exec_options)
+                .collect(),
+                limits: Some(pb::ApiLimits {
+                    min_sandbox_lifetime_ms: 10_000,
+                    max_sandbox_lifetime_ms: 7 * 86_400_000,
+                    min_sandbox_idle_ms: 10_000,
+                    max_sandbox_idle_ms: 86_400_000,
+                    ..exec_limits
+                }),
+                ..pb::RuntimeCapabilities::default()
+            }
+        } else {
+            pb::RuntimeCapabilities {
+                features: exec_options.to_vec(),
+                limits: Some(exec_limits),
+                ..pb::RuntimeCapabilities::default()
+            }
         });
         Ok(Response::new(pb::HealthResponse {
             status: pb::health_response::Status::Serving as i32,
@@ -147,13 +175,21 @@ impl KilndService for Stub {
         request: Request<pb::ExecRequest>,
     ) -> Result<Response<pb::ExecResponse>, Status> {
         let number = self.execs.fetch_add(1, Ordering::SeqCst) + 1;
+        self.exec_requests
+            .lock()
+            .expect("exec requests")
+            .push(request.get_ref().clone());
         let baseline = request
             .get_ref()
             .argv
             .first()
             .is_some_and(|arg| arg == "/usr/bin/find");
+        let (cwd, env_names, env_sha256) = common::pb_recorded_context(request.get_ref());
         let mut execution = pb::Execution {
             id: format!("ex-{number:016x}"),
+            cwd,
+            env_names,
+            env_sha256,
             sandbox_id: "sb-0000000000000001".to_string(),
             state: pb::ExecutionState::Exited as i32,
             exit_code: Some(0),
@@ -190,6 +226,17 @@ impl KilndService for Stub {
         Ok(Response::new(pb::ExecResponse {
             execution: Some(execution),
         }))
+    }
+
+    type ExecStreamStream =
+        tonic::codegen::tokio_stream::Empty<Result<pb::ExecStreamResponse, Status>>;
+
+    /// The harness never streams.
+    async fn exec_stream(
+        &self,
+        _request: Request<pb::ExecStreamRequest>,
+    ) -> Result<Response<Self::ExecStreamStream>, Status> {
+        Err(Status::unimplemented("test stub"))
     }
 
     async fn delete_sandbox(
@@ -678,6 +725,61 @@ fn exit_within(mut child: Child, limit: Duration) -> Option<std::process::Output
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+#[test]
+fn the_cli_replays_a_legacy_journal_with_no_cwd_or_env() {
+    // M3B-10: `kiln-harness replay` must go through `Harness::replay`, so a
+    // journal recorded before the exec context runs as it ran: kilnd's `/`
+    // and no overrides, journaled without `exec_context`. Routing it through
+    // the public `run` would send /workspace and the overrides instead.
+    let temp = common::private_tempdir().expect("tempdir");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        ..Stub::default()
+    };
+    let exec_requests = Arc::clone(&stub.exec_requests);
+    let servers = Servers::start(temp.path(), stub, Vec::new());
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/journal-demo-golden.jsonl");
+    let journal = temp.path().join("out/replay.jsonl");
+    let child = Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+        .arg("--socket")
+        .arg(&servers.socket)
+        .arg("replay")
+        .arg("--from")
+        .arg(&golden)
+        .arg("--audit")
+        .arg(temp.path().join("out/replay-audit.jsonl"))
+        .arg("--journal")
+        .arg(&journal)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the CLI");
+    // The stub's outputs differ from the recording, so the replay may
+    // diverge; only what it sent matters here.
+    let output = exit_within(child, Duration::from_secs(30)).expect("the replay ends");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let requests = exec_requests.lock().expect("exec requests").clone();
+    let tools = requests
+        .iter()
+        .filter(|request| {
+            request
+                .argv
+                .first()
+                .is_none_or(|arg| arg != "/usr/bin/find")
+        })
+        .count();
+    assert!(tools > 0, "no tool Exec reached kilnd: {stderr}");
+    for request in &requests {
+        assert_eq!(request.cwd, "", "{:?}", request.argv);
+        assert!(request.env.is_empty(), "{:?}", request.argv);
+    }
+    let first = std::fs::read_to_string(&journal).expect("the replay journal");
+    let first = first.lines().next().expect("a session start");
+    assert!(first.contains("\"session_started\""), "{first}");
+    assert!(!first.contains("exec_context"), "{first}");
 }
 
 #[test]

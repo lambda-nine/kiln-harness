@@ -24,7 +24,7 @@ struct MissingExecutionApi {
 }
 
 fn running() -> Execution {
-    Execution {
+    common::in_workspace(Execution {
         id: "ex-0000000000000001".to_string(),
         state: ExecutionState::Unknown,
         exit_code: None,
@@ -33,7 +33,10 @@ fn running() -> Execution {
         stderr: CapturedOutput::default(),
         sandbox_reusable: None,
         cancel_reason: None,
-    }
+        cwd: String::new(),
+        env_names: Vec::new(),
+        env_sha256: String::new(),
+    })
 }
 
 #[async_trait]
@@ -70,10 +73,6 @@ impl SandboxApi for MissingExecutionApi {
     async fn get_execution(&self, _execution_id: &str) -> Result<Execution, ApiError> {
         self.execution_reads.fetch_add(1, Ordering::SeqCst);
         Err(ApiError::new(Code::NotFound, "execution not found"))
-    }
-
-    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
-        unreachable!("recovery reads no sandbox state")
     }
 
     async fn final_check(
@@ -160,10 +159,6 @@ impl SandboxApi for UnreadableApi {
         unreachable!("no row to follow")
     }
 
-    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
-        unreachable!("recovery reads no sandbox state")
-    }
-
     async fn final_check(
         &self,
         _sandbox_id: &str,
@@ -219,7 +214,7 @@ struct LateTerminalRow {
 
 impl LateTerminalRow {
     fn row() -> Execution {
-        Execution {
+        common::in_workspace(Execution {
             id: "ex-0000000000000002".to_string(),
             state: ExecutionState::Canceled,
             exit_code: None,
@@ -228,7 +223,10 @@ impl LateTerminalRow {
             stderr: CapturedOutput::default(),
             sandbox_reusable: Some(false),
             cancel_reason: Some(kiln_harness::api::CancelReason::DaemonShutdown),
-        }
+            cwd: String::new(),
+            env_names: Vec::new(),
+            env_sha256: String::new(),
+        })
     }
 }
 
@@ -268,10 +266,6 @@ impl SandboxApi for LateTerminalRow {
 
     async fn get_execution(&self, _execution_id: &str) -> Result<Execution, ApiError> {
         Ok(Self::row())
-    }
-
-    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
-        unreachable!("recovery reads no sandbox state")
     }
 
     async fn final_check(
@@ -356,10 +350,6 @@ impl SandboxApi for HangsAtTheEnd {
 
     async fn get_execution(&self, _execution_id: &str) -> Result<Execution, ApiError> {
         unreachable!("no row to follow")
-    }
-
-    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
-        unreachable!("recovery reads no sandbox state")
     }
 
     async fn final_check(
@@ -460,10 +450,6 @@ impl SandboxApi for LatePublishedRow {
             Some(row) if row.id == execution_id => Ok(row),
             _ => self.inner.get_execution(execution_id).await,
         }
-    }
-
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
-        self.inner.sandbox_ready(sandbox_id).await
     }
 
     async fn final_check(

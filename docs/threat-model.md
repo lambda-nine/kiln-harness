@@ -18,6 +18,21 @@ it is not a hostile multi-tenant boundary.
   filesystem state, or runs a host shell.
 - Every session requests network none. The harness itself talks to the model
   endpoint from the host; the sandbox never gets a network or a credential.
+- Every execution's environment overrides are three fixed constants
+  (`TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`), never taken from the model, a
+  task, the CLI or the host environment, because kilnd stores and hashes
+  exec env values. kiln applies them over its own fixed `HOME=/root`,
+  `PATH` and `TERM=xterm`, so the effective environment is `HOME`, `PATH`,
+  `TERM=dumb`, `NO_COLOR` and `PAGER`. The working directory is the
+  constant `/workspace`. kilnd's record of every execution, returned,
+  recovered or first seen by the final check, must show that cwd and the
+  sorted override names and digest;
+  one that does not (an older daemon that ignored the options after a
+  reconnect, say) ends the session at that call with its execution ID kept
+  and its output withheld. A daemon whose advertised exec limits cannot fit
+  them is refused at discovery. Only `Harness::replay` of a journal
+  recorded before this context sends no cwd and no env, as it ran; the
+  public `Harness::run` always sends them.
 - Typed JSON arguments reject unknown fields. File helpers accept only
   `/workspace` paths, relative or with the `/workspace/` prefix stripped
   once, and refuse every other absolute path and any `.` or `..` component; `exec` remains a deliberately general sandbox
@@ -48,10 +63,12 @@ it is not a hostile multi-tenant boundary.
   reason proves one, and otherwise as an error, with no further execution
   or model call. Recovery takes only terminal rows as evidence, following
   a RUNNING row until it settles, and a row that never settles within the
-  recovery window ends the session too. A typed lost, quarantined or
-  failed refusal ends it the same way, and so does `sandbox_not_ready`
-  unless one lookup shows the sandbox READY (kilnd's retryable insert
-  race). The CLI's only Health call before a session is
+  recovery window ends the session too. A typed lost, quarantined, failed
+  or not-ready refusal ends it the same way, with no further lookup, and
+  so does an Exec refused because the backend or the sandbox's runtime
+  cannot apply the exec working directory or environment. Only a typed
+  `execution_start_raced`, where kilnd says nothing ran, is sent again,
+  once, within the same call's budget. The CLI's only Health call before a session is
   the engine's, bounded by the session deadline and cancellation; the one
   after it is bounded by the lifecycle window and only warns. Feature
   names are the only daemon-supplied strings `session_opened` records, and

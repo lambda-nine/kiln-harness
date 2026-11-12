@@ -215,6 +215,24 @@ rest of it. After the session the CLI checks Health once more, within the
 lifecycle window and at most 10 seconds, and only warns on stderr if kilnd
 does not answer or is not serving; it never changes the exit status.
 
+kiln-harness requires `EXEC_CWD` and `EXEC_ENV`, because every execution
+sends a working directory and an environment (see the tool mapping). A
+serving daemon that lists either one without the other, or neither, ends
+the session at discovery with an `Api` error (`FAILED_PRECONDITION`,
+"kilnd does not list exec_cwd and exec_env; ..."), before the audit's
+`session_opened` and before any create, so nothing exists or is recorded.
+There is no fallback for an older daemon, so the system prompt has one
+wording. The same check reads the exec limits kilnd fills while it lists
+the features (`ApiLimits.max_cwd_bytes`, `max_env_entries`,
+`max_env_name_bytes`, `max_env_value_bytes`, `max_env_total_bytes`) and
+refuses, with a one-line `FAILED_PRECONDITION` naming the limit, any that
+cannot fit what every execution sends. The needs are computed from the
+constants: `/workspace` (10 bytes), three entries, the longest name
+(`NO_COLOR`, 8) and value (`dumb`, 4), and 31 bytes counting each entry as
+name + value + 2. Zero, or no limits at all, is too small. A replay of a
+legacy journal (see the journal) sends neither option, so it needs neither
+the features nor the limits.
+
 The advertised limits must be coherent before anything is created: for
 lifetime and idle each, a nonzero maximum is at least the minimum, and a
 nonzero default lies within `[min, max]`. Otherwise the session fails with
@@ -240,6 +258,24 @@ otherwise behaves exactly as without one. Two classifications use it:
   feature named, is a definite create rejection: kilnd refuses it before
   any row or backend call. `UNIMPLEMENTED` without one, with an empty
   feature, or with any other reason, stays ambiguous.
+- On an Exec, `UNIMPLEMENTED` `backend_unsupported:exec_cwd` or
+  `:exec_env`, or `FAILED_PRECONDITION` `sandbox_unsupported:exec_cwd` or
+  `:exec_env`, means the backend or the sandbox's runtime cannot apply the
+  working directory or environment every execution sends. Nothing ran,
+  and no later call could succeed, so it is classified with the
+  `UnusableReason`s by one function (`api::sandbox_unusable_refusal`) at
+  every Exec boundary: a tool call that hits one ends the session as
+  sandbox-unusable once its result is journaled; the baseline ends it the
+  same way rather than as `ToolSetup`; seeding fails `Seed` with "the
+  sandbox is no longer usable"; and the check gives an `error` verdict
+  whose reason starts "execution left the sandbox unusable".
+- On an Exec, `FAILED_PRECONDITION` `execution_start_raced` means the
+  sandbox changed state while kilnd recorded the execution and is `READY`
+  again; nothing ran. The harness sends the same request once more, within
+  the same wall budget (the command timeout recomputed from the time left,
+  less 250 ms, at least 1 ms; with nothing left the call is a deadline). A
+  second race is returned as an ordinary, recoverable `kilnd_error` with
+  its reason dropped, so the session goes on.
 
 A successful Exec RPC does not mean the sandbox survived. kilnd says so in
 `Execution.sandbox_reusable`, and the adapter keeps it with the execution's
@@ -288,7 +324,8 @@ usable, in every session. It is bounded by the session deadline and the
 lifecycle window, and canceled with the session. The sandbox must be
 READY, and, from a daemon that reports execution usability (one that lists
 sandbox expiry), every recent execution the session never saw must be
-terminal and reusable. A row that left the sandbox unusable ends the
+terminal and reusable; from any daemon, a finished reusable one must also
+show the session's cwd and env overrides (see the tool mapping). A row that left the sandbox unusable ends the
 session with its mapped stop, as a returned one would; a row still
 running, or a sandbox not READY, ends it as `Api` `FAILED_PRECONDITION`,
 "sandbox was not usable when the session finished", or as `SandboxExpired`
@@ -311,15 +348,11 @@ An Exec refused with `FAILED_PRECONDITION` and a typed `sandbox_failed`,
 the same thing: this session's sandbox, which was ready, cannot take
 another call. The model-visible result is still the `kilnd_error` it was,
 journaled first; then the session ends with the same `Api` error. A renew
-refused with one of these reasons is terminal too, never retried. One
-exception: kilnd also sends `sandbox_not_ready`, saying to retry, when an
-Exec lost a race with its own row insert on a READY sandbox. So on an Exec
-refused `sandbox_not_ready` the harness reads the sandbox once, within the
-call's deadline; only a sandbox that reads READY turns the refusal into an
-ordinary, recoverable `kilnd_error`, and anything else, a failed lookup
-included, stays terminal. `sandbox_failed`, `sandbox_lost` and
-`sandbox_quarantined` are terminal unconditionally, and so is any of the
-four on a renew. The expiry and deletion tokens still map to
+refused with one of these reasons is terminal too, never retried. All four
+are terminal unconditionally, on an Exec as on a renew, with no
+`GetSandbox` read: kilnd sends `sandbox_not_ready` only for a sandbox that
+is not ready, and the race it once also covered now has its own reason,
+`execution_start_raced`, above. The expiry and deletion tokens still map to
 `SandboxExpired`, and without typed reasons nothing changes.
 
 ## Sandbox expiry and the renew heartbeat
@@ -819,10 +852,47 @@ File paths may be relative (`notes.txt`) or start with `/workspace/`
 stripped exactly once, and the rest must have no empty, `.` or `..`
 component and no leading `/`. `/workspace` alone names the workspace, which
 only `list_dir` accepts. Any other absolute path, including `/workspacefoo`,
-`//workspace/x`, and `/workspace/../x`, is `invalid_path`. Executions start
-in `/`, so the default system prompt tells the model to give `exec`
-absolute paths; when kilnd's exec working directory ships, the harness will
-run executions in `/workspace` instead.
+`//workspace/x`, and `/workspace/../x`, is `invalid_path`.
+
+Every execution, a model's `exec`, the file tools, the workspace manifest,
+seeding and the task check, starts in `/workspace` (`ExecRequest.cwd`), so
+the default system prompt tells the model that relative paths refer to
+workspace files. Each also sends the same fixed environment
+(`ExecRequest.env`), in this order, over kiln's defaults:
+
+- `TERM=dumb` and `NO_COLOR=1`: no colour or other escape codes in output a
+  model reads;
+- `PAGER=cat`: no pager waiting on a terminal.
+
+`HOME` stays kiln's `/root` on purpose: the root filesystem is read-only,
+and a writable `HOME` would put dotfiles in `/workspace` and its diff. The
+three are constants in `src/tools.rs`, with no flag or config, and nothing
+from the model, a task or the host environment reaches them. They are
+overrides: the effective environment is kiln's `HOME=/root` and `PATH`
+with `TERM=dumb`, `NO_COLOR=1` and `PAGER=cat`. The values are neither
+journaled nor audited; the journal names the context once, as
+`session_started.exec_context`, and `session_opened` records the feature
+list.
+
+kilnd records what each execution ran with (`Execution.cwd`, `env_names`
+sorted by name bytes, and `env_sha256`, its digest over
+`"kilnd.v1.exec-env.1"`, a zero byte, then each override sorted by name as
+u32be length, name, u32be length, value), and the adapter keeps all three.
+Every execution `run` returns, and every row recovered as evidence after a
+lost response (from `GetSandbox` or `GetExecution`, settled or not), must
+show exactly the session's cwd, names and digest. An older daemon reached
+after a transparent reconnect ignores the unknown request fields and runs
+in `/` with no overrides, and its record says so. On a mismatch the
+command has run, so its execution ID is kept as evidence, but its output
+is never returned: the call ends with `kilnd_error` and the message "kilnd
+ran an execution with a different cwd or env than requested", and the
+session ends through the sandbox-unusable stop (`FAILED_PRECONDITION`,
+same message). At seeding it is a `Seed` failure, at the baseline the
+session ends before any model call, and at the check it is an `error`
+verdict that keeps the execution ID and none of the output. A finished,
+reusable row the session never saw, first seen by the final check, must
+show the same, from any daemon; otherwise the session does not complete
+and ends with the same `FAILED_PRECONDITION` message.
 
 No model string is interpolated into a host command. Fixed helper programs and
 validated model values are separate sandbox argv entries. A model can request
@@ -900,7 +970,17 @@ For a task with a seed or a check it also records `seed` (each file's path
 and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
 replay is self-contained. Both are omitted when absent, so a journal without
 them is byte-identical to one written before they existed, and the schema
-stays 1. `check_completed` holds the check's outcome, its execution ID and at
+stays 1. `exec_context` names where every execution ran: new sessions
+always write `"exec_context":"workspace_v1"` (`/workspace` and the fixed
+overrides). Absent means the legacy context, no cwd and no env, exactly
+what the harness sent before it existed, so older journals stay
+byte-identical and load; the grammar refuses any other value. Replay runs
+in the recorded context: `Harness::replay` runs a `ReplayProvider`'s task
+in the context its journal recorded, through a crate-private entry point
+that the public `Harness::run` also uses with `workspace_v1`, so no caller
+can run a live session in the legacy context. A legacy journal
+replays with cwd `""` and env `[]`, so its tools behave as recorded, and
+expects kilnd's metadata to be empty too. `check_completed` holds the check's outcome, its execution ID and at
 most 4 KiB of each output stream, after the final `model_responded` and
 before `session_ended`.
 
@@ -1042,7 +1122,7 @@ cannot fit is refused before create. The largest recordable tool timeout,
 10 minutes, needs 902 seconds. Since the model side is fixed, a divergence means kilnd returned
 different tool results than during the recording.
 
-Replay rebuilds the whole task from `session_started`, seed and check
+Replay rebuilds the whole task from `session_started`, seed, check and exec context
 included, seeds the fresh sandbox the same way, and reruns the check after
 the replayed final answer. `Provider::check_completed` hands the result to
 `ReplayProvider`, which compares it with the recorded `check_completed`:

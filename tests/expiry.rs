@@ -3,7 +3,7 @@
 //! run on paused time, so their minutes take no wall time.
 mod common;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -170,7 +170,8 @@ async fn an_old_daemon_gets_no_expiry_and_no_renews() {
     let events = audit_events(&harness);
     assert!(matches!(
         events[0],
-        AuditEvent::SessionOpened { features, .. } if features.is_empty()
+        AuditEvent::SessionOpened { features, .. }
+            if features == &["exec_cwd".to_string(), "exec_env".to_string()]
     ));
     assert!(matches!(
         events[1],
@@ -213,7 +214,12 @@ async fn expiry_is_sent_and_recorded_when_listed() {
     assert!(matches!(
         events[0],
         AuditEvent::SessionOpened { features, .. }
-            if features == &["sandbox_expiry".to_string(), "typed_reasons".to_string()]
+            if features == &[
+                "sandbox_expiry".to_string(),
+                "typed_reasons".to_string(),
+                "exec_cwd".to_string(),
+                "exec_env".to_string(),
+            ]
     ));
     assert!(matches!(
         events[1],
@@ -342,6 +348,36 @@ async fn a_daemon_that_is_not_serving_is_refused_before_create() {
     );
     assert!(api.state().creates.is_empty());
     assert!(harness.audit().records.is_empty());
+}
+
+#[tokio::test]
+async fn a_daemon_without_both_exec_options_is_refused_before_create() {
+    for missing in [
+        vec![Feature::ExecCwd],
+        vec![Feature::ExecEnv],
+        vec![Feature::ExecCwd, Feature::ExecEnv],
+    ] {
+        let api = FakeApi::with_expiry();
+        for feature in &missing {
+            api.state().features.remove(feature);
+        }
+        let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+        let error = run(&mut harness).await.expect_err("refused");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message.contains("exec_cwd and exec_env")),
+            "{missing:?}: {error}"
+        );
+        // Nothing was created or recorded, as for a daemon not serving.
+        let state = api.state();
+        assert_eq!(state.health_calls, 1, "{missing:?}");
+        assert!(state.create_requests.is_empty(), "{missing:?}");
+        assert!(state.execs.is_empty(), "{missing:?}");
+        drop(state);
+        assert!(harness.audit().records.is_empty(), "{missing:?}");
+        assert!(harness.journal().records.is_empty(), "{missing:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -549,7 +585,7 @@ async fn an_expired_sandbox_ends_the_session_at_its_next_tool_call() {
 #[tokio::test]
 async fn without_typed_reasons_an_expiry_refusal_is_only_a_tool_error() {
     let api = FakeApi::with_expiry();
-    api.state().features = BTreeSet::from([Feature::SandboxExpiry]);
+    api.state().features.remove(&Feature::TypedReasons);
     let provider = Script::new(
         Duration::ZERO,
         [exec_call(), ModelResponse::final_text("done")],
@@ -687,6 +723,7 @@ fn common_session_started() -> JournalEvent {
         limits: HarnessConfig::default().limits(),
         seed: Vec::new(),
         check: None,
+        exec_context: None,
     }
 }
 
@@ -1044,7 +1081,9 @@ async fn a_failed_exec_rpc_is_not_activity() {
 #[tokio::test]
 async fn a_typed_non_ready_exec_refusal_ends_the_session() {
     // R2-03: lost, quarantined, failed or not ready: the sandbox cannot run
-    // another call in this session.
+    // another call in this session. kilnd sends sandbox_not_ready only for
+    // a sandbox that is not ready, so even it is terminal at once: the
+    // sandbox here would read READY, and nothing reads it.
     for token in [
         "sandbox_lost",
         "sandbox_quarantined",
@@ -1057,9 +1096,6 @@ async fn a_typed_non_ready_exec_refusal_ends_the_session() {
             token,
             &format!("{token}: sandbox sb-0000000000000001 is not ready"),
         ));
-        // A not-ready refusal is terminal when the sandbox does not read
-        // READY; the other three are terminal even when it does.
-        api.state().not_ready = token == "sandbox_not_ready";
         let provider = Script::new(
             Duration::ZERO,
             [exec_call(), ModelResponse::final_text("done")],
@@ -1083,11 +1119,14 @@ async fn a_typed_non_ready_exec_refusal_ends_the_session() {
             .expect("tool_executed");
         assert_eq!(result["error"], "kilnd_error", "{token}");
         assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+        // No readiness lookup: the fake has none to answer, and the final
+        // check never runs.
+        assert_eq!(api.state().final_checks, 0, "{token}");
     }
 
     // Without typed reasons the refusal stays an ordinary tool error.
     let api = FakeApi::with_expiry();
-    api.state().features = BTreeSet::from([Feature::SandboxExpiry]);
+    api.state().features.remove(&Feature::TypedReasons);
     api.state().tool_exec_error = Some(api_error_with_reason(
         Code::FailedPrecondition,
         "sandbox_lost",
@@ -1375,10 +1414,6 @@ impl kiln_harness::api::SandboxApi for NotifyingApi {
         self.inner.get_execution(execution_id).await
     }
 
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, kiln_harness::api::ApiError> {
-        self.inner.sandbox_ready(sandbox_id).await
-    }
-
     async fn final_check(
         &self,
         sandbox_id: &str,
@@ -1545,16 +1580,438 @@ async fn a_recovered_row_is_evidence_only_once_it_settles() {
 }
 
 #[tokio::test]
-async fn a_not_ready_race_on_a_ready_sandbox_is_recoverable() {
-    // kilnd answers sandbox_not_ready, "retry", when an Exec lost a race
-    // with its own row insert on a READY sandbox. One lookup tells them
-    // apart: READY returns an ordinary tool error and the loop continues.
+async fn an_unsupported_exec_option_ends_the_session() {
+    // The backend or the sandbox's runtime cannot apply the working
+    // directory or environment every execution sends: nothing ran, and no
+    // later call could succeed either.
+    for (code, token) in [
+        (Code::Unimplemented, "backend_unsupported:exec_cwd"),
+        (Code::Unimplemented, "backend_unsupported:exec_env"),
+        (Code::FailedPrecondition, "sandbox_unsupported:exec_cwd"),
+        (Code::FailedPrecondition, "sandbox_unsupported:exec_env"),
+    ] {
+        let api = FakeApi::with_expiry();
+        api.state().tool_exec_error = Some(api_error_with_reason(
+            code,
+            token,
+            &format!("{token}: the sandbox cannot apply it"),
+        ));
+        let provider = Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        );
+        let mut harness = session(&api, provider, short_lifecycle_config());
+        let error = run(&mut harness).await.expect_err("sandbox unusable");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message == "execution left the sandbox unusable"),
+            "{token}: {error}"
+        );
+        assert_eq!(harness.provider().calls, 1, "{token}");
+        assert_eq!(tool_results(&harness)[0]["error"], "kilnd_error", "{token}");
+        assert_eq!(finished(&harness), ("failed".to_string(), true, 0));
+    }
+
+    // Another feature, the right token under the wrong code, or no typed
+    // reasons: an ordinary tool error, and the loop goes on.
+    for (code, token, typed) in [
+        (Code::Unimplemented, "backend_unsupported:exec_stream", true),
+        (
+            Code::FailedPrecondition,
+            "sandbox_unsupported:exec_stream",
+            true,
+        ),
+        (
+            Code::FailedPrecondition,
+            "backend_unsupported:exec_cwd",
+            true,
+        ),
+        (Code::Unimplemented, "sandbox_unsupported:exec_env", true),
+        (Code::Unimplemented, "backend_unsupported:exec_cwd", false),
+        (
+            Code::FailedPrecondition,
+            "sandbox_unsupported:exec_env",
+            false,
+        ),
+    ] {
+        let api = FakeApi::with_expiry();
+        if !typed {
+            api.state().features.remove(&Feature::TypedReasons);
+        }
+        api.state().tool_exec_error = Some(api_error_with_reason(code, token, token));
+        let provider = Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        );
+        let mut harness = session(&api, provider, short_lifecycle_config());
+        let outcome = run(&mut harness)
+            .await
+            .unwrap_or_else(|error| panic!("{token} {typed}: {error}"));
+        assert_eq!(outcome.steps, 2, "{token} {typed}");
+    }
+}
+
+fn wrong_cwd(row: &mut kiln_harness::api::Execution) {
+    row.cwd = "/".to_string();
+}
+
+fn missing_names(row: &mut kiln_harness::api::Execution) {
+    row.env_names.clear();
+}
+
+fn wrong_sha(row: &mut kiln_harness::api::Execution) {
+    row.env_sha256 = "0".repeat(64);
+}
+
+fn assert_mismatch_stop<P: Provider>(name: &str, harness: &TestHarness<P>, error: &HarnessError) {
+    assert!(
+        matches!(error, HarnessError::Api(error)
+            if error.code == Code::FailedPrecondition
+                && error.message == kiln_harness::tools::EXEC_CONTEXT_MISMATCH),
+        "{name}: {error}"
+    );
+    assert_eq!(finished(harness), ("failed".to_string(), true, 0), "{name}");
+}
+
+#[tokio::test]
+async fn an_execution_not_run_as_sent_ends_the_session_at_that_call() {
+    let tampers: [(&str, common::Tamper); 3] = [
+        ("wrong cwd", wrong_cwd),
+        ("missing names", missing_names),
+        ("wrong sha", wrong_sha),
+    ];
+    for (name, tamper) in tampers {
+        let api = FakeApi::with_expiry();
+        // Exec 1 is the baseline; 2 is the tool's.
+        api.state().tamper_exec = Some((2, tamper));
+        let provider = Script::new(
+            Duration::ZERO,
+            [exec_call(), ModelResponse::final_text("done")],
+        );
+        let mut harness = session(&api, provider, short_lifecycle_config());
+        let error = run(&mut harness).await.expect_err("not as sent");
+        assert_mismatch_stop(name, &harness, &error);
+        assert_eq!(
+            harness.provider().calls,
+            1,
+            "{name}: the model is not asked again"
+        );
+        // The execution is evidence; its output never reaches the model.
+        let row = api.state().executions[1].id.clone();
+        let (ok, result, execution_ids) = journal_events(&harness)
+            .into_iter()
+            .find_map(|event| match event {
+                JournalEvent::ToolExecuted {
+                    ok,
+                    result,
+                    execution_ids,
+                    ..
+                } => Some((*ok, result.clone(), execution_ids.clone())),
+                _ => None,
+            })
+            .expect("tool_executed");
+        assert!(!ok, "{name}");
+        assert_eq!(execution_ids, [row], "{name}");
+        assert_eq!(
+            result,
+            json!({
+                "ok": false,
+                "error": "kilnd_error",
+                "message": kiln_harness::tools::EXEC_CONTEXT_MISMATCH,
+            }),
+            "{name}"
+        );
+    }
+
+    // Matching metadata, the fake's default, is a normal session.
     let api = FakeApi::with_expiry();
-    api.state().tool_exec_error = Some(api_error_with_reason(
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    run(&mut harness).await.expect("as sent");
+    assert_eq!(tool_results(&harness)[0]["ok"], true);
+}
+
+#[tokio::test]
+async fn a_recovered_execution_not_run_as_sent_ends_the_session() {
+    // The tool's row is recorded with a wrong digest and its response lost:
+    // recovery finds it, and the session stops as for a returned one.
+    let api = FakeApi::with_expiry();
+    api.state().tamper_exec = Some((2, wrong_sha));
+    api.state().lose_exec_response = Some(2);
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("not as sent");
+    assert_mismatch_stop("recovered", &harness, &error);
+    assert_eq!(harness.provider().calls, 1);
+    let row = api.state().executions[1].id.clone();
+    let execution_ids = journal_events(&harness)
+        .into_iter()
+        .find_map(|event| match event {
+            JournalEvent::ToolExecuted { execution_ids, .. } => Some(execution_ids.clone()),
+            _ => None,
+        })
+        .expect("tool_executed");
+    assert_eq!(execution_ids, [row]);
+}
+
+#[tokio::test]
+async fn a_baseline_not_run_as_sent_ends_the_session_before_any_model_call() {
+    let api = FakeApi::with_expiry();
+    api.state().tamper_exec = Some((1, wrong_cwd));
+    let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("not as sent");
+    assert_mismatch_stop("baseline", &harness, &error);
+    let baseline = audit_events(&harness)
+        .into_iter()
+        .find_map(|event| match event {
+            AuditEvent::WorkspaceBaseline {
+                ok, execution_ids, ..
+            } => Some((*ok, execution_ids.clone())),
+            _ => None,
+        })
+        .expect("workspace_baseline");
+    assert_eq!(baseline, (false, vec!["ex-0000000000000001".to_string()]));
+    assert!(
+        !journal_events(&harness)
+            .into_iter()
+            .any(|event| matches!(event, JournalEvent::ModelRequested { .. }))
+    );
+}
+
+#[tokio::test]
+async fn an_unsupported_exec_option_at_the_baseline_ends_the_session_unusable() {
+    // M3B-04: the same classification as at a tool, not ToolSetup.
+    for (code, token) in [
+        (Code::Unimplemented, "backend_unsupported:exec_cwd"),
+        (Code::FailedPrecondition, "sandbox_unsupported:exec_env"),
+    ] {
+        let api = FakeApi::with_expiry();
+        api.state().baseline_exec_error = Some(api_error_with_reason(code, token, token));
+        let mut harness = session(&api, ScriptedProvider::demo(), short_lifecycle_config());
+        let error = run(&mut harness).await.expect_err("unusable");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message == "execution left the sandbox unusable"),
+            "{token}: {error}"
+        );
+        assert_eq!(
+            finished(&harness),
+            ("failed".to_string(), true, 0),
+            "{token}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exec_limits_too_small_for_the_fixed_context_are_refused_before_create() {
+    // /workspace is 10 bytes; three overrides; NO_COLOR is the longest name
+    // (8) and dumb the longest value (4); 10 + 11 + 10 = 31 bytes in all.
+    let needed = ApiLimits {
+        max_cwd_bytes: 10,
+        max_env_entries: 3,
+        max_env_name_bytes: 8,
+        max_env_value_bytes: 4,
+        max_env_total_bytes: 31,
+        ..kilnd_limits()
+    };
+    let one_below: [(&str, ApiLimits); 5] = [
+        (
+            "max_cwd_bytes",
+            ApiLimits {
+                max_cwd_bytes: 9,
+                ..needed
+            },
+        ),
+        (
+            "max_env_entries",
+            ApiLimits {
+                max_env_entries: 2,
+                ..needed
+            },
+        ),
+        (
+            "max_env_name_bytes",
+            ApiLimits {
+                max_env_name_bytes: 7,
+                ..needed
+            },
+        ),
+        (
+            "max_env_value_bytes",
+            ApiLimits {
+                max_env_value_bytes: 3,
+                ..needed
+            },
+        ),
+        (
+            "max_env_total_bytes",
+            ApiLimits {
+                max_env_total_bytes: 30,
+                ..needed
+            },
+        ),
+    ];
+    for (name, limits) in one_below {
+        let api = FakeApi::with_expiry();
+        api.state().limits = Some(limits);
+        let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+        let error = run(&mut harness).await.expect_err("refused");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message.contains(name)
+                    && !error.message.contains('\n')),
+            "{name}: {error}"
+        );
+        assert!(api.state().create_requests.is_empty(), "{name}");
+        assert!(harness.audit().records.is_empty(), "{name}");
+        assert!(harness.journal().records.is_empty(), "{name}");
+    }
+
+    // No limits at all reads as zero: too small.
+    let api = FakeApi::with_expiry();
+    api.state().limits = None;
+    let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+    let error = run(&mut harness).await.expect_err("refused");
+    assert!(
+        matches!(&error, HarnessError::Api(error) if error.message.contains("max_cwd_bytes")),
+        "{error}"
+    );
+    assert!(api.state().create_requests.is_empty());
+
+    // Exactly what is needed is enough.
+    let api = FakeApi::with_expiry();
+    api.state().limits = Some(needed);
+    let mut harness = session(&api, ScriptedProvider::demo(), HarnessConfig::default());
+    run(&mut harness).await.expect("demo completes");
+}
+
+fn raced() -> kiln_harness::api::ApiError {
+    api_error_with_reason(
         Code::FailedPrecondition,
-        "sandbox_not_ready",
-        "sandbox_not_ready: execution insert lost a race; retry",
-    ));
+        "execution_start_raced",
+        "execution_start_raced: the sandbox changed state; retry",
+    )
+}
+
+/// Every `wc` Exec the fake received: the tool's, retries included.
+fn tool_execs(api: &FakeApi) -> Vec<kiln_harness::api::SandboxExec> {
+    api.state()
+        .execs
+        .iter()
+        .filter(|exec| exec.argv[0] == "/usr/bin/wc")
+        .cloned()
+        .collect()
+}
+
+fn tool_results<P: Provider>(harness: &TestHarness<P>) -> Vec<Value> {
+    journal_events(harness)
+        .into_iter()
+        .filter_map(|event| match event {
+            JournalEvent::ToolExecuted { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_execution_start_race_is_sent_once_more() {
+    // kilnd recorded nothing and the sandbox is READY again: the same
+    // request goes again, and its answer is the tool's result.
+    let api = FakeApi::with_expiry();
+    api.state().exec_refusals = VecDeque::from([raced()]);
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let outcome = run(&mut harness).await.expect("the session completes");
+    assert_eq!(outcome.steps, 2);
+
+    let sent = tool_execs(&api);
+    assert_eq!(sent.len(), 2, "exactly one retry");
+    let same = |exec: &kiln_harness::api::SandboxExec| {
+        (
+            exec.argv.clone(),
+            exec.stdin.clone(),
+            exec.cwd.clone(),
+            exec.env.clone(),
+        )
+    };
+    assert_eq!(same(&sent[0]), same(&sent[1]));
+    assert!(sent[1].timeout <= sent[0].timeout);
+    let retried = api
+        .state()
+        .executions
+        .last()
+        .expect("the retry's row")
+        .id
+        .clone();
+    let executed = journal_events(&harness)
+        .into_iter()
+        .find_map(|event| match event {
+            JournalEvent::ToolExecuted {
+                ok, execution_ids, ..
+            } => Some((*ok, execution_ids.clone())),
+            _ => None,
+        })
+        .expect("tool_executed");
+    assert_eq!(executed, (true, vec![retried]));
+    assert_eq!(tool_results(&harness)[0]["exit_code"], 0);
+    assert_eq!(finished(&harness), ("completed".to_string(), true, 0));
+}
+
+#[tokio::test]
+async fn a_second_execution_start_race_is_an_ordinary_tool_error() {
+    let api = FakeApi::with_expiry();
+    api.state().exec_refusals = VecDeque::from([raced(), raced()]);
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let outcome = run(&mut harness)
+        .await
+        .expect("the sandbox is still usable and the loop continues");
+    assert_eq!(outcome.steps, 2);
+    assert_eq!(tool_execs(&api).len(), 2, "no third attempt");
+    let result = &tool_results(&harness)[0];
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"], "kilnd_error");
+    assert_eq!(finished(&harness), ("completed".to_string(), true, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_execution_start_race_with_no_time_left_is_a_deadline() {
+    // The race is answered as the tool's whole wall budget runs out: there
+    // is no time for a second attempt, so the call ends as a deadline.
+    let api = FakeApi::with_expiry();
+    api.state().exec_refusals = VecDeque::from([raced()]);
+    api.state().tool_exec_delay = kiln_harness::tools::ToolLimits::default().timeout;
+    let provider = Script::new(
+        Duration::ZERO,
+        [exec_call(), ModelResponse::final_text("done")],
+    );
+    let mut harness = session(&api, provider, short_lifecycle_config());
+    let error = run(&mut harness).await.expect_err("deadline");
+    assert!(matches!(error, HarnessError::Deadline), "{error}");
+    assert_eq!(tool_execs(&api).len(), 1);
+    assert_eq!(harness.provider().calls, 1);
+}
+
+#[tokio::test]
+async fn an_execution_start_race_is_retried_only_with_typed_reasons() {
+    let api = FakeApi::with_expiry();
+    api.state().features.remove(&Feature::TypedReasons);
+    api.state().exec_refusals = VecDeque::from([raced()]);
     let provider = Script::new(
         Duration::ZERO,
         [exec_call(), ModelResponse::final_text("done")],
@@ -1562,14 +2019,8 @@ async fn a_not_ready_race_on_a_ready_sandbox_is_recoverable() {
     let mut harness = session(&api, provider, short_lifecycle_config());
     let outcome = run(&mut harness).await.expect("the loop continues");
     assert_eq!(outcome.steps, 2);
-    let result = journal_events(&harness)
-        .into_iter()
-        .find_map(|event| match event {
-            JournalEvent::ToolExecuted { result, .. } => Some(result.clone()),
-            _ => None,
-        })
-        .expect("tool_executed");
-    assert_eq!(result["error"], "kilnd_error");
+    assert_eq!(tool_execs(&api).len(), 1, "not retried");
+    assert_eq!(tool_results(&harness)[0]["error"], "kilnd_error");
 }
 
 #[tokio::test]
@@ -1969,10 +2420,6 @@ impl kiln_harness::api::SandboxApi for SlowRefusedHead {
         self.inner.get_execution(execution_id).await
     }
 
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, kiln_harness::api::ApiError> {
-        self.inner.sandbox_ready(sandbox_id).await
-    }
-
     async fn final_check(
         &self,
         sandbox_id: &str,
@@ -2110,7 +2557,7 @@ fn missed_row(
     state: kiln_harness::api::ExecutionState,
     reusable: Option<bool>,
 ) -> kiln_harness::api::Execution {
-    kiln_harness::api::Execution {
+    common::in_workspace(kiln_harness::api::Execution {
         id: "ex-00000000000000ff".to_string(),
         state,
         exit_code: None,
@@ -2119,7 +2566,69 @@ fn missed_row(
         stderr: common::captured(Vec::new()),
         sandbox_reusable: reusable,
         cancel_reason: Some(kiln_harness::api::CancelReason::SandboxDeleted),
+        cwd: String::new(),
+        env_names: Vec::new(),
+        env_sha256: String::new(),
+    })
+}
+
+#[tokio::test]
+async fn a_final_only_execution_not_run_as_sent_is_refused() {
+    // M3B-06: a finished, reusable row the session never saw, seen first by
+    // the final check, ran in `/`. The session does not complete.
+    for daemon in ["with expiry", "without expiry"] {
+        let api = if daemon == "with expiry" {
+            FakeApi::with_expiry()
+        } else {
+            FakeApi::default()
+        };
+        let mut row = missed_row(kiln_harness::api::ExecutionState::Exited, Some(true));
+        row.exit_code = Some(0);
+        row.cancel_reason = None;
+        row.cwd = "/".to_string();
+        api.state().final_rows = vec![row];
+        let mut harness = session(
+            &api,
+            ScriptedProvider::new([ModelResponse::final_text("done")]),
+            short_lifecycle_config(),
+        );
+        let error = run(&mut harness).await.expect_err("not as sent");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == Code::FailedPrecondition
+                    && error.message == kiln_harness::tools::EXEC_CONTEXT_MISMATCH),
+            "{daemon}: {error}"
+        );
+        assert_eq!(
+            final_check_event(&harness),
+            Some(("ready".to_string(), 1, false)),
+            "{daemon}"
+        );
+        assert_eq!(
+            finished(&harness),
+            ("failed".to_string(), true, 0),
+            "{daemon}"
+        );
     }
+
+    // The same row as sent is accepted, as before.
+    let api = FakeApi::with_expiry();
+    let mut row = missed_row(kiln_harness::api::ExecutionState::Exited, Some(true));
+    row.exit_code = Some(0);
+    row.cancel_reason = None;
+    api.state().final_rows = vec![row];
+    let mut harness = session(
+        &api,
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
+        short_lifecycle_config(),
+    );
+    run(&mut harness)
+        .await
+        .expect("a matching final-only row is fine");
+    assert_eq!(
+        final_check_event(&harness),
+        Some(("ready".to_string(), 1, true))
+    );
 }
 
 fn final_check_event<P: Provider>(harness: &TestHarness<P>) -> Option<(String, usize, bool)> {
@@ -2306,10 +2815,6 @@ impl kiln_harness::api::SandboxApi for DelayedThenHangingRenew {
         execution_id: &str,
     ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
         self.inner.get_execution(execution_id).await
-    }
-
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, kiln_harness::api::ApiError> {
-        self.inner.sandbox_ready(sandbox_id).await
     }
 
     async fn final_check(

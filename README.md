@@ -66,13 +66,21 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 
 ## Pinned control plane
 
-- kiln, tested: `00d61c546db7aa67ad283d10c2ca6165ca5f8166`. The integration
+- kiln, tested: `87359079834c38371c9296d2e4610e1ac182ca61`. The integration
   run requires exactly this kiln.
-- kiln, minimum: `e48f0e785ad484d0b2947897f6d48d0756059d7e`, the oldest kiln
-  with every feature this kilnd requires (persistent-exec v1 and
-  persistent-create certainty). For reference only; nothing enforces it.
-- kilnd API and runtime semantics: `4baf98636d7510c45b308d979e0c85d39373118f`
-  (parent `dcecf5417810c67173ed4ee3c1a6b961e8774e9e`)
+- kiln, minimum: `5cada841edd0bbe112550816fad221dfb1db6a47`, the first kiln
+  with exec options (capability bit `0x20`); without them kilnd lists neither
+  `FEATURE_EXEC_CWD` nor `FEATURE_EXEC_ENV`, and kiln-harness refuses the
+  session. For reference only; nothing enforces it.
+- kilnd API and runtime semantics: `0c79944842e306ead803a2644fdf43de62db472d`
+  (parent `eb646251634beca28d97b0405b04c22580520a7f`)
+- kilnd must list `FEATURE_EXEC_CWD` and `FEATURE_EXEC_ENV`, with exec limits
+  that fit `/workspace` and the overrides: every execution runs in
+  `/workspace` with three fixed env overrides (`TERM=dumb`, `NO_COLOR=1`,
+  `PAGER=cat`) over kiln's fixed `HOME`, `PATH` and `TERM`. A daemon that
+  lists either feature without the other, or neither, or advertises limits
+  too small for them, is refused at discovery, before anything is created.
+  Replaying a journal recorded before then needs neither.
 
 The compatible `kilnd.v1` protobuf schema is vendored under `proto/` so this
 repository builds against the reviewed API even if a sibling checkout is on a

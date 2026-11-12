@@ -39,8 +39,21 @@ impl KilndService for GatedKilnd {
             let _ = self.health_entered.send(());
             self.release_health.notified().await;
         }
+        // The exec options every kilnd the harness accepts lists.
         Ok(Response::new(pb::HealthResponse {
             status: pb::health_response::Status::Serving as i32,
+            runtime_capabilities: Some(pb::RuntimeCapabilities {
+                features: vec![pb::Feature::ExecCwd as i32, pb::Feature::ExecEnv as i32],
+                limits: Some(pb::ApiLimits {
+                    max_cwd_bytes: 4096,
+                    max_env_entries: 64,
+                    max_env_name_bytes: 128,
+                    max_env_value_bytes: 4096,
+                    max_env_total_bytes: 32_768,
+                    ..pb::ApiLimits::default()
+                }),
+                ..pb::RuntimeCapabilities::default()
+            }),
             ..pb::HealthResponse::default()
         }))
     }
@@ -77,6 +90,17 @@ impl KilndService for GatedKilnd {
         &self,
         _request: Request<pb::ExecRequest>,
     ) -> Result<Response<pb::ExecResponse>, Status> {
+        Err(Status::unimplemented("test stub"))
+    }
+
+    type ExecStreamStream =
+        tonic::codegen::tokio_stream::Empty<Result<pb::ExecStreamResponse, Status>>;
+
+    /// The harness never streams.
+    async fn exec_stream(
+        &self,
+        _request: Request<pb::ExecStreamRequest>,
+    ) -> Result<Response<Self::ExecStreamStream>, Status> {
         Err(Status::unimplemented("test stub"))
     }
 

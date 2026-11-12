@@ -6,6 +6,42 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- kilnd API milestone 3b (kilnd `0c79944`, whose `kilnd.v1` schema is now
+  vendored, ExecStream messages included; the harness does not stream).
+  Every execution (a model's `exec`, the file tools, the workspace
+  manifest, seeding and the task check) sends `cwd` `/workspace` and three
+  fixed env overrides, `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, over kiln's
+  fixed `HOME=/root`, `PATH` and `TERM`. `SandboxExec` gains `cwd` and `env`
+  (`api::EnvVar`). A session refuses a daemon that does not list both
+  `FEATURE_EXEC_CWD` and `FEATURE_EXEC_ENV`, or whose `max_cwd_bytes`,
+  `max_env_entries`, `max_env_name_bytes`, `max_env_value_bytes` or
+  `max_env_total_bytes` (now kept in `ApiLimits`) cannot fit them
+  (`FAILED_PRECONDITION`, before anything is created or recorded). The
+  default system prompt says commands run in `/workspace` and relative
+  paths refer to workspace files. A typed `execution_start_raced` Exec
+  refusal is sent again once within the same budget, and a second one is an
+  ordinary tool error. `sandbox_not_ready` from an Exec is now terminal with
+  no `GetSandbox` lookup, and `SandboxApi::sandbox_ready` is removed. A typed
+  `backend_unsupported:exec_cwd`/`:exec_env` or
+  `sandbox_unsupported:exec_cwd`/`:exec_env` refusal ends the session as
+  sandbox-unusable, at seeding, the baseline, a tool or the check alike
+  (`api::sandbox_unusable_refusal`). `Execution` gains `cwd`, `env_names`
+  and `env_sha256`; every returned or recovered execution, and every
+  finished reusable row first seen by the final check, must show what
+  was sent (`api::env_sha256` is kilnd's digest), and one that does not ends
+  the session ("kilnd ran an execution with a different cwd or env than
+  requested") with its ID kept and its output withheld. The journal keeps
+  schema 1: `session_started` gains `exec_context`, always `workspace_v1`
+  for new sessions; absent, as in every older journal, means the legacy
+  context (no cwd, no env), so old journals are byte-identical. The new
+  `Harness::replay` runs a `ReplayProvider`'s recorded task in its recorded
+  context, so legacy journals replay as they ran; the public `Harness::run`
+  always uses `workspace_v1`, and the context type is crate-private.
+  `ToolRegistry::start_session` is now crate-private. The `run` and
+  `replay` CLI paths and the eval runner use `Harness::replay` for
+  replays. No audit schema change.
+- The tested kiln pin moves to `8735907`, which `scripts/integration-vm.sh`
+  requires, and the minimum to `5cada84`, the first kiln with exec options.
 - An eval suite. `SessionTask` gains an optional `seed` (files written into
   `/workspace` with the `write_file` Exec before the baseline; a failure is
   `HarnessError::Seed`) and `check` (a script run once as `/bin/sh -s` after

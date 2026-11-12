@@ -943,10 +943,6 @@ impl SandboxApi for Hooked {
         self.inner.get_execution(execution_id).await
     }
 
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
-        self.inner.sandbox_ready(sandbox_id).await
-    }
-
     async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError> {
         self.inner.final_check(sandbox_id).await
     }
@@ -1149,8 +1145,13 @@ impl SandboxApi for Replaced {
             running_executions: 0,
             reservations: NodeReservations::default(),
             capabilities: Capabilities {
-                features: BTreeSet::from([Feature::IdempotentCreate, Feature::RequestIdRelease]),
-                limits: None,
+                features: BTreeSet::from([
+                    Feature::IdempotentCreate,
+                    Feature::RequestIdRelease,
+                    Feature::ExecCwd,
+                    Feature::ExecEnv,
+                ]),
+                limits: Some(common::exec_limits()),
             },
         })
     }
@@ -1209,10 +1210,6 @@ impl SandboxApi for Replaced {
     }
 
     async fn get_execution(&self, _execution_id: &str) -> Result<Execution, ApiError> {
-        unreachable!("the empty echo stops the session before work")
-    }
-
-    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
         unreachable!("the empty echo stops the session before work")
     }
 

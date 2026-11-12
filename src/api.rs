@@ -157,6 +157,19 @@ pub struct SandboxExec {
     pub argv: Vec<String>,
     pub stdin: Vec<u8>,
     pub timeout: Duration,
+    /// The working directory, absolute; empty is kilnd's default, `/`.
+    /// Needs [`Feature::ExecCwd`].
+    pub cwd: String,
+    /// Environment overrides, each name once. kilnd stores and hashes the
+    /// values, so this never carries a secret. Needs [`Feature::ExecEnv`].
+    pub env: Vec<EnvVar>,
+}
+
+/// One environment variable of an Exec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +203,14 @@ pub struct Execution {
     pub sandbox_reusable: Option<bool>,
     /// Why a `Canceled` execution was canceled, when kilnd says.
     pub cancel_reason: Option<CancelReason>,
+    /// The working directory kilnd recorded, as it was sent; empty when
+    /// none was.
+    pub cwd: String,
+    /// The names of the effective env overrides, sorted by name bytes.
+    pub env_names: Vec<String>,
+    /// kilnd's [`env_sha256`] of the effective overrides; empty when there
+    /// are none.
+    pub env_sha256: String,
 }
 
 /// What one `GetSandbox` says about whether the sandbox stayed usable.
@@ -234,6 +255,54 @@ impl Execution {
     pub fn succeeded(&self) -> bool {
         self.state == ExecutionState::Exited && self.exit_code == Some(0)
     }
+
+    /// Whether kilnd recorded exactly this working directory and these env
+    /// overrides for the execution. The harness sends no sandbox default
+    /// env, so the effective overrides are the ones the Exec sent.
+    #[must_use]
+    pub fn ran_with(&self, cwd: &str, env: &[EnvVar]) -> bool {
+        self.cwd == cwd && self.env_names == env_names(env) && self.env_sha256 == env_sha256(env)
+    }
+}
+
+/// The env names kilnd records for an execution: sorted by name bytes, no
+/// values.
+#[must_use]
+pub fn env_names(env: &[EnvVar]) -> Vec<String> {
+    let mut names: Vec<String> = env.iter().map(|var| var.name.clone()).collect();
+    names.sort_unstable();
+    names
+}
+
+/// `Execution.env_sha256` for these overrides: lowercase hex SHA-256 over
+/// `"kilnd.v1.exec-env.1"`, one zero byte, then each entry sorted by name
+/// bytes as u32be length, name, u32be length, value. Empty for no entries.
+#[must_use]
+pub fn env_sha256(env: &[EnvVar]) -> String {
+    use sha2::{Digest as _, Sha256};
+    if env.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<&EnvVar> = env.iter().collect();
+    sorted.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    let mut hash = Sha256::new();
+    hash.update(b"kilnd.v1.exec-env.1");
+    hash.update([0]);
+    // kilnd bounds names to 128 and values to 4096 bytes, far under u32.
+    let length = |bytes: &str| u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_be_bytes();
+    for var in sorted {
+        hash.update(length(&var.name));
+        hash.update(var.name.as_bytes());
+        hash.update(length(&var.value));
+        hash.update(var.value.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -302,7 +371,9 @@ impl Feature {
     }
 }
 
-/// The daemon's expiry bounds. Each `max_*` of 0 means no cap.
+/// The daemon's expiry bounds, where each `max_*` of 0 means no cap, and
+/// its exec-option bounds, which kilnd fills only while it lists the
+/// feature (zero otherwise).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApiLimits {
     pub min_sandbox_lifetime_ms: u64,
@@ -312,6 +383,14 @@ pub struct ApiLimits {
     pub min_sandbox_idle_ms: u64,
     pub max_sandbox_idle_ms: u64,
     pub default_sandbox_idle_ms: u64,
+    /// Longest `ExecRequest.cwd` (`FEATURE_EXEC_CWD`).
+    pub max_cwd_bytes: u32,
+    /// Most `ExecRequest.env` entries (`FEATURE_EXEC_ENV`).
+    pub max_env_entries: u32,
+    pub max_env_name_bytes: u32,
+    pub max_env_value_bytes: u32,
+    /// Most bytes of the env, each entry counted as name + value + 2.
+    pub max_env_total_bytes: u32,
 }
 
 /// What a daemon supports. An older daemon reports no features and no
@@ -516,6 +595,56 @@ pub fn backend_unsupported_feature(error: &ApiError, typed_reasons: bool) -> Opt
         })
 }
 
+/// The exec option a typed `sandbox_unsupported:<option>` refusal names:
+/// the sandbox's runtime did not prove `exec_cwd` or `exec_env`, and
+/// nothing ran. Like every reason, read only when the daemon lists typed
+/// reasons.
+#[must_use]
+pub fn sandbox_unsupported_exec_option(error: &ApiError, typed_reasons: bool) -> Option<&str> {
+    if error.code != tonic::Code::FailedPrecondition {
+        return None;
+    }
+    error
+        .typed_reason(typed_reasons)?
+        .strip_prefix("sandbox_unsupported:")
+        .filter(|option| EXEC_OPTIONS.contains(option))
+}
+
+/// The exec options a typed unsupported refusal can name.
+const EXEC_OPTIONS: [&str; 2] = ["exec_cwd", "exec_env"];
+
+/// Whether kilnd refused an Exec because its backend or the sandbox's
+/// runtime cannot apply the working directory or environment the harness
+/// sends: typed `backend_unsupported:exec_cwd`/`:exec_env` or
+/// `sandbox_unsupported:exec_cwd`/`:exec_env`. Nothing ran, and no later
+/// Exec can succeed either.
+#[must_use]
+pub fn exec_option_unsupported(error: &ApiError, typed_reasons: bool) -> bool {
+    backend_unsupported_feature(error, typed_reasons)
+        .is_some_and(|feature| EXEC_OPTIONS.contains(&feature))
+        || sandbox_unsupported_exec_option(error, typed_reasons).is_some()
+}
+
+/// Whether an Exec refusal proves this session's sandbox cannot take
+/// another execution, though it was not expired or deleted: an
+/// [`UnusableReason`] or an unsupported exec option. Every boundary that
+/// sends an Exec (seeding, the baseline, tools and the check) classifies
+/// refusals with this one function.
+#[must_use]
+pub fn sandbox_unusable_refusal(error: &ApiError, typed_reasons: bool) -> bool {
+    UnusableReason::of(error, typed_reasons).is_some()
+        || exec_option_unsupported(error, typed_reasons)
+}
+
+/// Whether an Exec refusal is kilnd's `execution_start_raced`: the sandbox
+/// changed state while the execution was being recorded and is `READY`
+/// again. Nothing ran, so the same request may be sent again.
+#[must_use]
+pub fn execution_start_raced(error: &ApiError, typed_reasons: bool) -> bool {
+    error.code == tonic::Code::FailedPrecondition
+        && error.typed_reason(typed_reasons) == Some("execution_start_raced")
+}
+
 impl std::fmt::Display for ExpiryReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
@@ -546,8 +675,6 @@ pub trait SandboxApi: Send + Sync {
     async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError>;
     /// Read one execution, as `GetExecution` reports it now.
     async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError>;
-    /// Whether the sandbox is `READY` now, by `GetSandbox`.
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError>;
     /// The sandbox's state and recent executions, in one `GetSandbox`, for
     /// the check that gates a completed session.
     async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError>;
@@ -664,7 +791,30 @@ fn create_request_to_proto(request: SandboxRequest) -> pb::CreateSandboxRequest 
             idle_timeout_ms: policy.idle_timeout_ms,
         }),
         request_id: request.request_id.unwrap_or_default(),
+        // The harness sets no sandbox-wide env: each Exec sends its own.
+        default_env: Vec::new(),
     }
+}
+
+/// The wire form of an Exec.
+fn exec_request_to_proto(request: SandboxExec) -> Result<pb::ExecRequest, ApiError> {
+    let timeout_ms = u32::try_from(request.timeout.as_millis())
+        .map_err(|_| ApiError::local("execution timeout exceeds kilnd uint32 limit"))?;
+    Ok(pb::ExecRequest {
+        sandbox_id: request.sandbox_id,
+        argv: request.argv,
+        stdin: request.stdin,
+        timeout_ms,
+        cwd: request.cwd,
+        env: request
+            .env
+            .into_iter()
+            .map(|var| pb::EnvVar {
+                name: var.name,
+                value: var.value,
+            })
+            .collect(),
+    })
 }
 
 fn capabilities_from_proto(capabilities: Option<pb::RuntimeCapabilities>) -> Capabilities {
@@ -684,6 +834,11 @@ fn capabilities_from_proto(capabilities: Option<pb::RuntimeCapabilities>) -> Cap
             min_sandbox_idle_ms: limits.min_sandbox_idle_ms,
             max_sandbox_idle_ms: limits.max_sandbox_idle_ms,
             default_sandbox_idle_ms: limits.default_sandbox_idle_ms,
+            max_cwd_bytes: limits.max_cwd_bytes,
+            max_env_entries: limits.max_env_entries,
+            max_env_name_bytes: limits.max_env_name_bytes,
+            max_env_value_bytes: limits.max_env_value_bytes,
+            max_env_total_bytes: limits.max_env_total_bytes,
         }),
     }
 }
@@ -731,17 +886,10 @@ impl SandboxApi for TonicKilnd {
     }
 
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
-        let timeout_ms = u32::try_from(request.timeout.as_millis())
-            .map_err(|_| ApiError::local("execution timeout exceeds kilnd uint32 limit"))?;
         let response = self
             .client
             .clone()
-            .exec(pb::ExecRequest {
-                sandbox_id: request.sandbox_id,
-                argv: request.argv,
-                stdin: request.stdin,
-                timeout_ms,
-            })
+            .exec(exec_request_to_proto(request)?)
             .await
             .map_err(ApiError::from)?
             .into_inner();
@@ -811,10 +959,6 @@ impl SandboxApi for TonicKilnd {
             .execution
             .map(execution_from_proto)
             .ok_or_else(|| ApiError::local("response omitted execution"))
-    }
-
-    async fn sandbox_ready(&self, sandbox_id: &str) -> Result<bool, ApiError> {
-        Ok(self.final_check(sandbox_id).await?.ready)
     }
 
     async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError> {
@@ -931,6 +1075,9 @@ fn execution_from_proto(execution: pb::Execution) -> Execution {
         stderr: output(execution.stderr),
         sandbox_reusable: execution.sandbox_reusable,
         cancel_reason: CancelReason::from_proto(execution.cancel_reason),
+        cwd: execution.cwd,
+        env_names: execution.env_names,
+        env_sha256: execution.env_sha256,
     }
 }
 
@@ -1211,5 +1358,145 @@ mod status_contract_test {
         for _ in 0..4 {
             assert_eq!(forward.clone().encode_to_vec(), encoded);
         }
+    }
+
+    #[test]
+    fn an_exec_maps_its_cwd_and_env_in_order() {
+        use super::{EnvVar, SandboxExec, exec_request_to_proto};
+        use std::time::Duration;
+
+        let var = |name: &str, value: &str| EnvVar {
+            name: name.to_string(),
+            value: value.to_string(),
+        };
+        let request = exec_request_to_proto(SandboxExec {
+            sandbox_id: "sb-1".to_string(),
+            argv: vec!["/bin/true".to_string()],
+            stdin: b"in".to_vec(),
+            timeout: Duration::from_millis(4_750),
+            cwd: "/workspace".to_string(),
+            env: vec![var("TERM", "dumb"), var("A", ""), var("PAGER", "cat")],
+        })
+        .expect("maps");
+        assert_eq!(request.sandbox_id, "sb-1");
+        assert_eq!(request.argv, ["/bin/true"]);
+        assert_eq!(request.stdin, b"in");
+        assert_eq!(request.timeout_ms, 4_750);
+        assert_eq!(request.cwd, "/workspace");
+        let env: Vec<_> = request
+            .env
+            .iter()
+            .map(|var| (var.name.as_str(), var.value.as_str()))
+            .collect();
+        assert_eq!(env, [("TERM", "dumb"), ("A", ""), ("PAGER", "cat")]);
+
+        let too_long = exec_request_to_proto(SandboxExec {
+            sandbox_id: "sb-1".to_string(),
+            argv: Vec::new(),
+            stdin: Vec::new(),
+            timeout: Duration::from_millis(u64::from(u32::MAX) + 1),
+            cwd: String::new(),
+            env: Vec::new(),
+        })
+        .expect_err("over uint32");
+        assert_eq!(too_long.code, tonic::Code::Unknown);
+    }
+
+    #[test]
+    fn exec_option_and_race_reasons_need_their_code_and_typed_reasons() {
+        use super::{execution_start_raced, sandbox_unsupported_exec_option};
+        let error = |code, reason: &str| ApiError {
+            code,
+            message: reason.to_string(),
+            reason: Some(reason.to_string()),
+        };
+        let raced = error(tonic::Code::FailedPrecondition, "execution_start_raced");
+        assert!(execution_start_raced(&raced, true));
+        assert!(!execution_start_raced(&raced, false));
+        assert!(!execution_start_raced(
+            &error(tonic::Code::Aborted, "execution_start_raced"),
+            true
+        ));
+        assert!(!execution_start_raced(
+            &error(tonic::Code::FailedPrecondition, "sandbox_not_ready"),
+            true
+        ));
+        // A race is not a readiness refusal.
+        assert_eq!(super::UnusableReason::of(&raced, true), None);
+
+        for option in ["exec_cwd", "exec_env"] {
+            let refusal = error(
+                tonic::Code::FailedPrecondition,
+                &format!("sandbox_unsupported:{option}"),
+            );
+            assert_eq!(
+                sandbox_unsupported_exec_option(&refusal, true),
+                Some(option)
+            );
+            assert_eq!(sandbox_unsupported_exec_option(&refusal, false), None);
+            let refusal = error(
+                tonic::Code::Unimplemented,
+                &format!("sandbox_unsupported:{option}"),
+            );
+            assert_eq!(sandbox_unsupported_exec_option(&refusal, true), None);
+        }
+        for other in ["sandbox_unsupported:exec_stream", "sandbox_unsupported:"] {
+            let refusal = error(tonic::Code::FailedPrecondition, other);
+            assert_eq!(
+                sandbox_unsupported_exec_option(&refusal, true),
+                None,
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_digests_match_kilnds_goldens() {
+        use super::{EnvVar, env_names, env_sha256};
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        // kilnd 0c79944 crates/kilnd/src/exec_env.rs, from Python's hashlib.
+        assert_eq!(env_sha256(&[]), "");
+        assert_eq!(
+            env_sha256(&env(&[("A", "1")])),
+            "2603f468ba3210c56637236b3bb4fa2c637b59c2bc4cab419908ebdeddf1938f"
+        );
+        assert_eq!(
+            env_sha256(&env(&[("A", ""), ("B", "2")])),
+            "c91d8149e5b845070bef2ab16f824e9cd307c6029b35347aa70412b8bea9de46"
+        );
+        assert_eq!(
+            env_sha256(&env(&[("B", "2"), ("A", "")])),
+            env_sha256(&env(&[("A", ""), ("B", "2")]))
+        );
+        assert_ne!(
+            env_sha256(&env(&[("A", "B1")])),
+            env_sha256(&env(&[("AB", "1")]))
+        );
+        // The harness's fixed overrides, computed the same way in hashlib.
+        assert_eq!(
+            env_sha256(&env(&[
+                ("TERM", "dumb"),
+                ("NO_COLOR", "1"),
+                ("PAGER", "cat")
+            ])),
+            "2c496a2607f307502ab39276323adc62b701d61fc618bb3b82f23cdbeb4af041"
+        );
+        assert_eq!(env_names(&env(&[("b", "x"), ("A", "y")])), ["A", "b"]);
+        assert_eq!(
+            env_names(&env(&[
+                ("TERM", "dumb"),
+                ("NO_COLOR", "1"),
+                ("PAGER", "cat")
+            ])),
+            ["NO_COLOR", "PAGER", "TERM"]
+        );
     }
 }

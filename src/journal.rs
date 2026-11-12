@@ -56,6 +56,12 @@ pub enum JournalEvent {
         /// The task's check, script included. Never model-visible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         check: Option<RecordedCheck>,
+        /// Where every execution ran: `workspace_v1` is `/workspace` with
+        /// the fixed env overrides. Absent is the legacy context, no cwd
+        /// and no env, so journals recorded before it are byte-identical
+        /// and replay as they ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_context: Option<String>,
     },
     SandboxReady {
         sandbox_id: String,
@@ -972,11 +978,18 @@ impl Grammar {
                 limits,
                 seed,
                 check,
+                exec_context,
                 ..
             } = event
             else {
                 return Err(JournalError::MissingSessionStarted { sequence });
             };
+            if crate::tools::ExecContext::from_journal(exec_context.as_deref()).is_none() {
+                return Err(JournalError::Grammar {
+                    sequence,
+                    reason: "unknown exec_context".to_string(),
+                });
+            }
             if *schema != JOURNAL_SCHEMA {
                 return Err(JournalError::UnsupportedSchema {
                     found: *schema,

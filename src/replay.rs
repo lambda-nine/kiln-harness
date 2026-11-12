@@ -10,14 +10,19 @@ use std::collections::VecDeque;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::engine::{CheckOutcome, SessionTask};
+use crate::api::SandboxApi;
+use crate::audit::AuditSink;
+use crate::engine::{CheckOutcome, Harness, HarnessError, SessionOutcome, SessionTask};
+use crate::journal::JournalSink;
 use crate::journal::{
     Grammar, JournalEvent, LoadedJournal, RecordedSeedFile, SessionLimits, request_sha256,
 };
 use crate::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo, ToolCall,
 };
+use crate::tools::ExecContext;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ReplayError {
@@ -52,6 +57,9 @@ struct RecordedTurn {
 pub struct ReplayProvider {
     info: ProviderInfo,
     task: SessionTask,
+    /// Where the recording's executions ran; [`Harness::replay`] runs
+    /// them there again.
+    exec_context: ExecContext,
     limits: SessionLimits,
     /// The idle timeout the recorded session sent kilnd, if it used expiry.
     sandbox_idle_ms: Option<u64>,
@@ -105,6 +113,7 @@ impl ReplayProvider {
             limits,
             seed,
             check,
+            exec_context,
             ..
         }) = records.next().map(|record| &record.event)
         else {
@@ -129,6 +138,7 @@ impl ReplayProvider {
                 seed,
                 check,
             },
+            exec_context: recorded_exec_context(exec_context.as_deref())?,
             limits: *limits,
             sandbox_idle_ms: None,
             turns: VecDeque::new(),
@@ -196,7 +206,8 @@ impl ReplayProvider {
         Ok(replay)
     }
 
-    /// The recorded system prompt and task.
+    /// The recorded system prompt and task. Run it with [`Harness::replay`],
+    /// which also restores the recorded execution context.
     #[must_use]
     pub fn task(&self) -> SessionTask {
         self.task.clone()
@@ -356,5 +367,35 @@ impl Provider for ReplayProvider {
                 format!("recording ends before turn {} was answered", request.turn),
             )),
         }
+    }
+}
+
+/// The recorded execution context; the grammar has already refused an
+/// unknown one, and a forged record that bypassed it is refused here.
+fn recorded_exec_context(name: Option<&str>) -> Result<ExecContext, ReplayError> {
+    ExecContext::from_journal(name).ok_or(ReplayError::InvalidTask)
+}
+
+impl<A, S, J> Harness<A, ReplayProvider, S, J>
+where
+    A: SandboxApi,
+    S: AuditSink,
+    J: JournalSink,
+{
+    /// Replay the recording: its task, in the execution context it was
+    /// recorded in. A journal written before `exec_context` existed runs
+    /// with no cwd and no env, as it ran, and needs neither exec option;
+    /// every other one runs as [`Harness::run`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Harness::run`].
+    pub async fn replay(
+        &mut self,
+        cancel: CancellationToken,
+    ) -> Result<SessionOutcome, HarnessError> {
+        let task = self.provider().task();
+        let exec_context = self.provider().exec_context;
+        self.run_in_context(&task, exec_context, cancel).await
     }
 }

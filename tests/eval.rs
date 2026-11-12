@@ -1004,6 +1004,76 @@ async fn a_failed_seed_write_fails_the_session_before_any_model_call() {
     );
 }
 
+#[tokio::test]
+async fn every_execution_runs_in_the_workspace_with_the_fixed_env() {
+    // Seeding, the baseline, each tool, the diff's manifest and the check:
+    // the same working directory and environment, from constants.
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let task = SessionTask {
+        check: Some(TaskCheck {
+            script: b"test -f out.txt\n".to_vec(),
+            timeout: Duration::from_secs(10),
+        }),
+        ..seeded_task()
+    };
+    let calls = [
+        ToolCall::new("call-1", "exec", json!({"argv": ["/usr/bin/wc", "a.txt"]})),
+        ToolCall::new("call-2", "read_file", json!({"path": "a.txt"})),
+        ToolCall::new(
+            "call-3",
+            "write_file",
+            json!({"path": "out.txt", "content": "done\n"}),
+        ),
+        ToolCall::new("call-4", "list_dir", json!({"path": "."})),
+        ToolCall::new("call-5", "workspace_diff", json!({})),
+    ];
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new([
+            ModelResponse::tool_use(calls),
+            ModelResponse::final_text("done"),
+        ]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config(),
+    );
+    let outcome = harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("completes");
+    assert_eq!(outcome.check, Some(CheckOutcome::Passed));
+
+    let state = api.state();
+    let programs = state
+        .execs
+        .iter()
+        .map(|exec| exec.argv[0].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for program in [
+        "/bin/dd",
+        "/bin/mkdir",
+        "/usr/bin/find",
+        "/usr/bin/wc",
+        "/bin/stat",
+        "/usr/bin/head",
+        "/bin/ls",
+        "/bin/sh",
+    ] {
+        assert!(programs.contains(program), "{program} ran: {programs:?}");
+    }
+    let env = [("TERM", "dumb"), ("NO_COLOR", "1"), ("PAGER", "cat")]
+        .map(|(name, value)| kiln_harness::api::EnvVar {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+        .to_vec();
+    for exec in &state.execs {
+        assert_eq!(exec.cwd, "/workspace", "{:?}", exec.argv);
+        assert_eq!(exec.env, env, "{:?}", exec.argv);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The check
 
@@ -1574,6 +1644,211 @@ async fn the_model_works_until_the_deadline_less_the_check_window() {
     assert!(started.elapsed() >= Duration::from_millis(3400));
 }
 
+#[tokio::test]
+async fn a_check_or_seed_not_run_as_sent_fails_as_an_unusable_sandbox_does() {
+    // The check: an error verdict that keeps the execution ID and none of
+    // its output; the work outcome is unchanged.
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(fixed_handler(ShAnswer {
+        stdout: b"must not be kept".to_vec(),
+        ..ShAnswer::exit(0)
+    }));
+    // 1 is the baseline, 2 the write, 3 the check.
+    api.state().tamper_exec = Some((3, |row| row.env_sha256 = "0".repeat(64)));
+    let task = checked_task("test -f out.txt\n", Duration::from_secs(10));
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new([write_out(), ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config(),
+    );
+    let outcome = harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the work completed");
+    assert_eq!(
+        outcome.check,
+        Some(CheckOutcome::Error {
+            reason: kiln_harness::tools::EXEC_CONTEXT_MISMATCH.to_string()
+        })
+    );
+    let row = api.state().executions[2].id.clone();
+    let recorded = harness
+        .journal()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::CheckCompleted {
+                execution_id,
+                stdout,
+                ..
+            } => Some((execution_id.clone(), stdout.clone())),
+            _ => None,
+        })
+        .expect("check_completed");
+    assert_eq!(recorded, (Some(row), String::new()));
+
+    // Seeding: a seed failure, as for an execution that left the sandbox
+    // unusable.
+    let api = FakeApi::default();
+    api.state().tamper_exec = Some((1, |row| row.cwd = "/".to_string()));
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config(),
+    );
+    let error = harness
+        .run(&seeded_task(), CancellationToken::new())
+        .await
+        .expect_err("seeding fails");
+    assert!(
+        matches!(&error, HarnessError::Seed(message)
+            if message.contains("no longer usable")
+                && message.contains(kiln_harness::tools::EXEC_CONTEXT_MISMATCH)),
+        "{error}"
+    );
+    assert_eq!(api.state().execs.len(), 1, "nothing after it");
+}
+
+#[tokio::test]
+async fn unusable_refusals_at_seeding_share_the_tools_classification() {
+    // M3B-08: a typed refusal of a seed Exec that proves the sandbox
+    // unusable, new or existing, is a Seed failure saying so; nothing more
+    // is sent, the model is never asked, and cleanup runs.
+    for (code, token) in [
+        (tonic::Code::Unimplemented, "backend_unsupported:exec_env"),
+        (tonic::Code::FailedPrecondition, "sandbox_lost"),
+    ] {
+        let api = FakeApi::default();
+        api.state()
+            .features
+            .insert(kiln_harness::api::Feature::TypedReasons);
+        api.state().tool_exec_error = Some(common::api_error_with_reason(code, token, token));
+        let seen = Seen::default();
+        let provider = Observing::new(&api, &seen, vec![ModelResponse::final_text("done")]);
+        let mut harness = Harness::new(
+            api.clone(),
+            provider,
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config(),
+        );
+        let error = harness
+            .run(&seeded_task(), CancellationToken::new())
+            .await
+            .expect_err("seeding fails");
+        assert!(
+            matches!(&error, HarnessError::Seed(message)
+                if message.contains("the sandbox is no longer usable") && message.contains(token)),
+            "{token}: {error}"
+        );
+        let state = api.state();
+        assert_eq!(
+            state.execs.len(),
+            1,
+            "{token}: no later seed Exec or baseline"
+        );
+        assert_eq!(state.execs[0].argv[0], "/bin/dd", "{token}");
+        assert_eq!(
+            state.deleted,
+            ["sb-0000000000000001"],
+            "{token}: cleaned up"
+        );
+        drop(state);
+        assert!(
+            seen.requests.lock().expect("lock").is_empty(),
+            "{token}: no model call"
+        );
+        assert!(
+            !harness
+                .journal()
+                .records
+                .iter()
+                .any(|record| matches!(record.event, JournalEvent::ModelRequested { .. })),
+            "{token}"
+        );
+        let finished = harness
+            .audit()
+            .records
+            .iter()
+            .find_map(|record| match &record.event {
+                AuditEvent::SessionFinished {
+                    sandbox_deleted, ..
+                } => Some(*sandbox_deleted),
+                _ => None,
+            });
+        assert_eq!(finished, Some(true), "{token}");
+    }
+}
+
+#[tokio::test]
+async fn unusable_refusals_at_the_check_share_the_tools_classification() {
+    // M3B-04: an unsupported exec option is classified like a lost sandbox.
+    for (code, token) in [
+        (tonic::Code::Unimplemented, "backend_unsupported:exec_env"),
+        (
+            tonic::Code::FailedPrecondition,
+            "sandbox_unsupported:exec_cwd",
+        ),
+        (tonic::Code::FailedPrecondition, "sandbox_lost"),
+    ] {
+        let api = FakeApi::default();
+        api.state()
+            .features
+            .insert(kiln_harness::api::Feature::TypedReasons);
+        api.state().sh_error = Some(common::api_error_with_reason(code, token, token));
+        let task = checked_task("test -f out.txt\n", Duration::from_secs(10));
+        let mut harness = Harness::new(
+            api.clone(),
+            ScriptedProvider::new([write_out(), ModelResponse::final_text("done")]),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config(),
+        );
+        let outcome = harness
+            .run(&task, CancellationToken::new())
+            .await
+            .expect("the work completed");
+        let Some(CheckOutcome::Error { reason }) = &outcome.check else {
+            panic!("{token}: {:?}", outcome.check);
+        };
+        assert!(
+            reason.starts_with("execution left the sandbox unusable: ") && reason.contains(token),
+            "{token}: {reason}"
+        );
+    }
+
+    // Another refusal is an error verdict with its own message.
+    let api = FakeApi::default();
+    api.state()
+        .features
+        .insert(kiln_harness::api::Feature::TypedReasons);
+    api.state().sh_error = Some(common::api_error_with_reason(
+        tonic::Code::Unimplemented,
+        "backend_unsupported:exec_stream",
+        "backend_unsupported:exec_stream",
+    ));
+    let task = checked_task("test -f out.txt\n", Duration::from_secs(10));
+    let mut harness = Harness::new(
+        api,
+        ScriptedProvider::new([write_out(), ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config(),
+    );
+    let outcome = harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the work completed");
+    let Some(CheckOutcome::Error { reason }) = &outcome.check else {
+        panic!("{:?}", outcome.check);
+    };
+    assert!(!reason.contains("unusable"), "{reason}");
+}
+
 // ---------------------------------------------------------------------------
 // Replay
 
@@ -1708,7 +1983,8 @@ fn a_journal_without_seed_or_check_is_byte_identical_to_before() {
 #[tokio::test]
 async fn todays_demo_journal_matches_the_golden_one() {
     // The golden journal predates truncation recovery: with it off, and no
-    // recovery, the journal is byte-identical to before.
+    // recovery, the journal is byte-identical to before but for the
+    // execution context.
     let mut harness = Harness::new(
         FakeApi::default(),
         ScriptedProvider::demo(),
@@ -1731,6 +2007,11 @@ async fn todays_demo_journal_matches_the_golden_one() {
             let mut event = record.event.clone();
             if let JournalEvent::ModelResponded { latency_ms, .. } = &mut event {
                 *latency_ms = 0;
+            }
+            // The golden journal also predates the execution context, today
+            // always recorded; without it the rest is unchanged.
+            if let JournalEvent::SessionStarted { exec_context, .. } = &mut event {
+                assert_eq!(exec_context.take().as_deref(), Some("workspace_v1"));
             }
             event
         })

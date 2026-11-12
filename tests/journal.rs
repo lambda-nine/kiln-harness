@@ -471,6 +471,7 @@ fn unsupported_schema_is_rejected() {
             limits: HarnessConfig::default().limits(),
             seed: Vec::new(),
             check: None,
+            exec_context: None,
         },
     };
     let temp = common::private_tempdir().expect("temp dir");
@@ -672,6 +673,180 @@ async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
             .collect::<Vec<_>>()
     };
     assert_eq!(hashes(&harness.journal().records), hashes(&journal.records));
+}
+
+#[tokio::test]
+async fn a_new_journal_records_its_exec_context_and_replays_in_it() {
+    let temp = common::private_tempdir().expect("temp dir");
+    let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
+    assert!(lines(&path)[0].contains(r#""exec_context":"workspace_v1""#));
+    let journal = read_journal(&path).expect("journal verifies");
+    let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    let config = provider.replay_config(short_lifecycle_config());
+    let api = FakeApi::default();
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    harness
+        .replay(CancellationToken::new())
+        .await
+        .expect("replay reproduces");
+    assert_eq!(harness.provider().diverged_at(), None);
+    let env = common::workspace_env();
+    let state = api.state();
+    assert!(!state.execs.is_empty());
+    for exec in &state.execs {
+        assert_eq!((exec.cwd.as_str(), &exec.env), ("/workspace", &env));
+    }
+}
+
+/// The checked-in journal recorded before the exec context existed.
+fn legacy_golden() -> LoadedJournal {
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/journal-demo-golden.jsonl");
+    assert!(!lines(&golden)[0].contains("exec_context"));
+    read_journal(&golden).expect("the old journal still verifies")
+}
+
+#[tokio::test]
+async fn a_legacy_journal_replays_with_no_cwd_or_env() {
+    // Recorded before the exec context existed: kilnd's `/` and no
+    // overrides, so its tools behave as recorded. Nothing new is sent, so
+    // even a daemon without the exec options can replay it.
+    let journal = legacy_golden();
+    for features_listed in [true, false] {
+        let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+        let config = provider.replay_config(short_lifecycle_config());
+        let api = FakeApi::default();
+        if !features_listed {
+            api.state().features.clear();
+            api.state().limits = None;
+        }
+        let mut harness = Harness::new(
+            api.clone(),
+            provider,
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            config,
+        );
+        harness
+            .replay(CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("listed {features_listed}: {error}"));
+        assert_eq!(harness.provider().diverged_at(), None);
+        assert!(harness.provider().exhausted());
+        let state = api.state();
+        assert!(!state.execs.is_empty());
+        for exec in &state.execs {
+            assert_eq!(exec.cwd, "", "{:?}", exec.argv);
+            assert!(exec.env.is_empty(), "{:?}", exec.argv);
+        }
+        drop(state);
+        // The replay records the same legacy context: no field.
+        let JournalEvent::SessionStarted { exec_context, .. } = &harness.journal().records[0].event
+        else {
+            panic!("session start");
+        };
+        assert_eq!(*exec_context, None);
+    }
+}
+
+#[tokio::test]
+async fn the_public_run_is_always_a_live_workspace_session() {
+    // M3B-07: only `Harness::replay` can run a legacy context. The public
+    // `run`, even given a legacy recording's own task and provider, sends
+    // /workspace and the overrides, journals workspace_v1, and still needs
+    // the exec options.
+    let journal = legacy_golden();
+    let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    let task = provider.task();
+    let api = FakeApi::default();
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the demo runs live");
+    let env = common::workspace_env();
+    {
+        let state = api.state();
+        assert!(!state.execs.is_empty());
+        for exec in &state.execs {
+            assert_eq!((exec.cwd.as_str(), &exec.env), ("/workspace", &env));
+        }
+    }
+    let JournalEvent::SessionStarted { exec_context, .. } = &harness.journal().records[0].event
+    else {
+        panic!("session start");
+    };
+    assert_eq!(exec_context.as_deref(), Some("workspace_v1"));
+
+    // A daemon without the exec options is refused before anything exists,
+    // for the legacy recording's task as for any other.
+    for task in [
+        ReplayProvider::from_journal(&journal)
+            .expect("replayable")
+            .task(),
+        SessionTask::demo(),
+    ] {
+        let api = FakeApi::default();
+        api.state().features.clear();
+        api.state().limits = None;
+        let mut harness = Harness::new(
+            api.clone(),
+            ReplayProvider::from_journal(&journal).expect("replayable"),
+            MemoryAudit::default(),
+            MemoryJournal::default(),
+            short_lifecycle_config(),
+        );
+        let error = harness
+            .run(&task, CancellationToken::new())
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == tonic::Code::FailedPrecondition
+                    && error.message.contains("exec_cwd and exec_env")),
+            "{error}"
+        );
+        assert!(api.state().create_requests.is_empty());
+        assert!(harness.journal().records.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_replay_still_checks_that_kilnd_ran_it_as_sent() {
+    // The expected metadata is the legacy one: a daemon that reports a cwd
+    // for a legacy execution did not run it as sent.
+    let provider = ReplayProvider::from_journal(&legacy_golden()).expect("replayable");
+    let config = provider.replay_config(short_lifecycle_config());
+    let api = FakeApi::default();
+    api.state().tamper_exec = Some((1, |row| row.cwd = "/workspace".to_string()));
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let error = harness
+        .replay(CancellationToken::new())
+        .await
+        .expect_err("the baseline did not run as sent");
+    assert!(
+        matches!(&error, HarnessError::Api(error)
+            if error.message == kiln_harness::tools::EXEC_CONTEXT_MISMATCH),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1613,6 +1788,7 @@ fn discarding_an_unwritten_output_removes_its_new_directories() {
                 limits: HarnessConfig::default().limits(),
                 seed: Vec::new(),
                 check: None,
+                exec_context: None,
             },
         )
         .expect("first record");

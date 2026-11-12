@@ -115,6 +115,7 @@ fn started() -> JournalEvent {
         limits: HarnessConfig::default().limits(),
         seed: Vec::new(),
         check: None,
+        exec_context: None,
     }
 }
 

@@ -52,9 +52,6 @@ impl fmt::Debug for SecretString {
     }
 }
 
-// TODO(kilnd M3): once kilnd's exec working directory ships, set it to
-// /workspace for every execution and change the sentence about working
-// directory / below.
 /// The system prompt `run` uses when no `--system-file` is given. `{...}`
 /// placeholders are filled from the session's tool limits by
 /// [`default_system_prompt`], so the model is told the limits that apply.
@@ -73,9 +70,9 @@ UTF-8 text.
 - list_dir: list entry names in a directory under /workspace.
 - workspace_diff: list files added or removed since the session started.
 
-Commands run with working directory /, so refer to workspace files by \
-absolute path, for example [\"/bin/sh\", \"/workspace/fib.sh\"]; the file \
-tools accept fib.sh or /workspace/fib.sh.
+Commands run with working directory /workspace, so relative paths refer to \
+workspace files, for example [\"/bin/sh\", \"fib.sh\"]; the file tools accept \
+fib.sh or /workspace/fib.sh.
 
 Every result is JSON and at most {result_kib} KiB; longer output is truncated. \
 Use the tools to carry out the task. When it is done, answer in plain text \
@@ -124,7 +121,7 @@ mod tests {
         assert!(prompt.contains("64 KiB"), "{prompt}");
         assert!(prompt.contains("128 KiB"), "{prompt}");
         assert!(!prompt.contains('{'), "{prompt}");
-        assert!(prompt.contains("working directory /"), "{prompt}");
+        assert!(prompt.contains("working directory /workspace"), "{prompt}");
         assert!(
             prompt.contains("report only what tool results showed"),
             "{prompt}"

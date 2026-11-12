@@ -3,9 +3,9 @@ set -eu
 
 # The kiln pins in README.md's "Pinned control plane" section; keep both
 # equal to it. The installed kiln must be a clean build of TESTED_KILN.
-# MINIMUM_KILN, the oldest kiln kilnd accepts, is documentation only.
-TESTED_KILN=00d61c546db7aa67ad283d10c2ca6165ca5f8166
-MINIMUM_KILN=e48f0e785ad484d0b2947897f6d48d0756059d7e
+# MINIMUM_KILN, the first kiln with exec options, is documentation only.
+TESTED_KILN=87359079834c38371c9296d2e4610e1ac182ca61
+MINIMUM_KILN=5cada841edd0bbe112550816fad221dfb1db6a47
 
 # The Linux ACL tests skip without these tools; this run must not. Install
 # nothing here: package changes on the shared VM go through its owner.
@@ -96,6 +96,13 @@ print(matches[-1] if matches else "")
 test -n "$test_bin"
 sudo env KILND_INTEGRATION=1 "$test_bin" \
     --exact scripted_provider_through_installed_kilnd_leaves_no_api_residue \
+    --nocapture
+
+assert_clean
+
+# Tools run in /workspace with the fixed env, and kilnd's rows show it.
+sudo env KILND_INTEGRATION=1 "$test_bin" \
+    --exact tools_run_in_the_workspace_with_the_fixed_env_through_installed_kilnd \
     --nocapture
 
 assert_clean

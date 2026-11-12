@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::{
     ApiError, ApiLimits, Capabilities, Execution, ExecutionState, ExpiryPolicy, ExpiryReason,
     Feature, FinalCheck, Sandbox, SandboxApi, SandboxRequest, SandboxState, UnusableReason,
-    backend_unsupported_feature, request_id_is_valid,
+    backend_unsupported_feature, request_id_is_valid, sandbox_unusable_refusal,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::journal::{
@@ -26,8 +26,9 @@ use crate::provider::{
     ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::{
-    CheckRun, ToolError, ToolLimits, ToolRegistry, ToolRun, ToolSession, ToolStop,
-    UNUSABLE_SANDBOX, recover_execution_evidence, sanitize_call_bounded, unusable_stop,
+    CheckRun, EXEC_CONTEXT_MISMATCH, ExecContext, ToolError, ToolLimits, ToolRegistry, ToolRun,
+    ToolSession, ToolStop, UNUSABLE_SANDBOX, exec_limits_problem, recover_execution_evidence_in,
+    sanitize_call_bounded, unusable_stop,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -477,16 +478,31 @@ where
         &self.provider
     }
 
-    /// Run one session and wait until its sandbox has been deleted.
+    /// Run one session and wait until its sandbox has been deleted. Every
+    /// execution runs in `/workspace` with the fixed env overrides; only
+    /// [`Harness::replay`] runs a recording in the context it recorded.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid tasks or budgets, provider, budget, audit,
     /// journal, kilnd, deadline, cancellation, or cleanup failures.
-    #[allow(clippy::too_many_lines)]
     pub async fn run(
         &mut self,
         task: &SessionTask,
+        cancel: CancellationToken,
+    ) -> Result<SessionOutcome, HarnessError> {
+        self.run_in_context(task, ExecContext::WorkspaceV1, cancel)
+            .await
+    }
+
+    /// [`Harness::run`] with every execution in `exec_context`. Only replay
+    /// calls it with anything but [`ExecContext::WorkspaceV1`], with the
+    /// context its journal recorded.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn run_in_context(
+        &mut self,
+        task: &SessionTask,
+        exec_context: ExecContext,
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
         validate_config(&self.config)?;
@@ -520,6 +536,27 @@ where
                 Err(_) => return Err(HarnessError::Deadline),
             },
         };
+        // Every live execution runs in /workspace with a fixed environment,
+        // so a daemon whose backend has not proven both options, or whose
+        // limits leave no room for them, cannot serve the session. A legacy
+        // replay sends neither and needs neither. Nothing exists or is
+        // recorded yet.
+        if exec_context.sends_exec_options() {
+            if !(capabilities.supports(Feature::ExecCwd) && capabilities.supports(Feature::ExecEnv))
+            {
+                return Err(HarnessError::Api(ApiError::new(
+                    tonic::Code::FailedPrecondition,
+                    "kilnd does not list exec_cwd and exec_env; kiln-harness needs a kilnd whose \
+                     backend proves both",
+                )));
+            }
+            if let Some(problem) = exec_limits_problem(&capabilities.limits.unwrap_or_default()) {
+                return Err(HarnessError::Api(ApiError::new(
+                    tonic::Code::FailedPrecondition,
+                    problem,
+                )));
+            }
+        }
         let expiry = expiry_policy(&self.config, &capabilities)?;
         let typed_reasons = capabilities.supports(Feature::TypedReasons);
         // Keyed only when a serving daemon lists idempotent create: an older
@@ -565,6 +602,7 @@ where
                 limits: self.config.limits(),
                 seed: task.seed.iter().map(RecordedSeedFile::new).collect(),
                 check: task.check.as_ref().map(RecordedCheck::new),
+                exec_context: exec_context.journal_name().map(str::to_string),
             },
         );
         if let Err(error) = started {
@@ -700,6 +738,7 @@ where
                         sandbox_id.clone(),
                         deadline,
                         typed_reasons,
+                        exec_context,
                         create_sent,
                         &task.seed,
                     ) => {
@@ -714,9 +753,10 @@ where
                     let recovery_deadline = recovery_deadline(self.config.lifecycle_timeout);
                     // Already canceled: recover on a token of its own, within
                     // its short window.
-                    let execution_ids = recover_execution_evidence(
+                    let execution_ids = recover_execution_evidence_in(
                         &self.api,
                         &sandbox_id,
+                        exec_context,
                         &BTreeSet::new(),
                         recovery_deadline,
                         &CancellationToken::new(),
@@ -744,9 +784,10 @@ where
                     let mut recovered_stop = None;
                     if execution_ids.is_empty() {
                         let recovery_deadline = recovery_deadline(self.config.lifecycle_timeout);
-                        let recovered = recover_execution_evidence(
+                        let recovered = recover_execution_evidence_in(
                             &self.api,
                             &sandbox_id,
+                            exec_context,
                             &BTreeSet::new(),
                             recovery_deadline,
                             &cancel,
@@ -777,7 +818,7 @@ where
                             if let Some(reason) = ExpiryReason::of(api_error, typed_reasons) {
                                 return Err(HarnessError::SandboxExpired { reason });
                             }
-                            if UnusableReason::of(api_error, typed_reasons).is_some() {
+                            if sandbox_unusable_refusal(api_error, typed_reasons) {
                                 return Err(stop_error(ToolStop::Unusable(
                                     UNUSABLE_SANDBOX.to_string(),
                                 )));
@@ -1454,7 +1495,8 @@ where
 /// The final check's verdict. With a daemon that reports execution
 /// usability (one that supports expiry), an execution the session never saw
 /// must have finished and left the sandbox reusable; with an older one only
-/// the sandbox's state is checked.
+/// the sandbox's state is checked. Either way, a finished one must show the
+/// session's cwd and env overrides.
 fn judge_final_check<A: SandboxApi>(
     check: &FinalCheck,
     unknown: &[&Execution],
@@ -1473,6 +1515,18 @@ fn judge_final_check<A: SandboxApi>(
             .find(|row| row.state != ExecutionState::Unknown && row.sandbox_reusable == Some(false))
     {
         return Err(stop_error(unusable_stop(row.cancel_reason)));
+    }
+    // A settled row the session never saw must also have run as every
+    // execution of the session is sent.
+    let exec_context = context.tools.exec_context();
+    if unknown.iter().any(|row| {
+        row.state != ExecutionState::Unknown
+            && row.sandbox_reusable != Some(false)
+            && !exec_context.ran_as_sent(row)
+    }) {
+        return Err(stop_error(ToolStop::Unusable(
+            EXEC_CONTEXT_MISMATCH.to_string(),
+        )));
     }
     if !check.ready {
         return Err(check

@@ -666,14 +666,13 @@ async fn replay(
             from.display(),
         );
     };
-    let task = provider.task();
     let config = provider.replay_config(HarnessConfig::default());
 
     let (audit, journal) = open_sinks(Some(&source), audit_path, journal_path)?;
     let api = connect(socket).await?;
     let lifecycle = config.lifecycle_timeout;
     let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
-    let result = harness.run(&task, interrupt()).await;
+    let result = harness.replay(interrupt()).await;
     warn_if_unhealthy(&api, lifecycle).await;
     println!("journal: {}", journal_path.display());
     match result {

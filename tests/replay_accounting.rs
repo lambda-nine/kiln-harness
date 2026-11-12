@@ -59,6 +59,7 @@ impl Fixture {
                 limits: HarnessConfig::default().limits(),
                 seed: Vec::new(),
                 check: None,
+                exec_context: None,
             },
             JournalEvent::SandboxReady {
                 sandbox_id: "sb-1".to_string(),

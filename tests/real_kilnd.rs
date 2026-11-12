@@ -7,10 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use kiln_harness::api::{ExpiryPolicy, Feature, SandboxApi, SandboxRequest, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{Harness, HarnessConfig, SessionTask};
-use kiln_harness::journal::{JsonlJournal, read_journal};
-use kiln_harness::provider::ScriptedProvider;
+use kiln_harness::journal::{JournalEvent, JsonlJournal, read_journal};
+use kiln_harness::provider::{ModelResponse, ScriptedProvider, ToolCall};
 use kiln_harness::replay::ReplayProvider;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -30,9 +30,12 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         "integration baseline is not empty"
     );
     assert_eq!(before.running_executions, 0);
-    // kilnd 4baf986 lists expiry, typed reasons, idempotent create and
+    // kilnd 0c79944 lists expiry, typed reasons, idempotent create and
     // request-ID release, so the harness sends an expiry and a request ID,
-    // reads reason trailers, and releases the key at cleanup.
+    // reads reason trailers, and releases the key at cleanup. Its backend
+    // proves exec cwd and env, which every session needs.
+    assert!(before.capabilities.supports(Feature::ExecCwd));
+    assert!(before.capabilities.supports(Feature::ExecEnv));
     assert!(before.capabilities.supports(Feature::SandboxExpiry));
     assert!(before.capabilities.supports(Feature::TypedReasons));
     assert!(before.capabilities.supports(Feature::IdempotentCreate));
@@ -80,7 +83,6 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     let recorded = read_journal(&journal_path).expect("journal verifies");
     assert!(recorded.complete);
     let provider = ReplayProvider::from_journal(&recorded).expect("replayable journal");
-    let task = provider.task();
     let config = provider.replay_config(HarnessConfig::default());
     let mut replay = Harness::new(
         api.clone(),
@@ -90,7 +92,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
         config,
     );
     let replayed = replay
-        .run(&task, CancellationToken::new())
+        .replay(CancellationToken::new())
         .await
         .expect("replay reproduces against installed kilnd");
     assert_eq!(replay.provider().diverged_at(), None);
@@ -101,6 +103,81 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
 
     let after = api.health().await.expect("health after");
     assert!(after.serving, "kilnd unhealthy: {}", after.detail);
+    assert_eq!(after.active_sandboxes, 0);
+    assert_eq!(after.running_executions, 0);
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
+}
+
+#[tokio::test]
+async fn tools_run_in_the_workspace_with_the_fixed_env_through_installed_kilnd() {
+    if std::env::var_os("KILND_INTEGRATION").is_none() {
+        return;
+    }
+    let socket = std::env::var_os("KILND_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/kilnd/kilnd.sock"), PathBuf::from);
+    let api = TonicKilnd::connect(socket)
+        .await
+        .expect("connect to installed kilnd");
+    let before = api.health().await.expect("health before");
+    assert!(before.serving, "kilnd unhealthy: {}", before.detail);
+    assert_eq!(before.active_sandboxes, 0);
+    let sandboxes_before = non_deleted_ids(&api).await;
+
+    // A relative write_file path and a relative read from the shell both
+    // resolve under /workspace; the shell sees kiln's HOME and the three
+    // overrides, with TERM replacing kiln's xterm.
+    let probe =
+        "pwd; printf '%s|%s|%s|%s\\n' \"$TERM\" \"$NO_COLOR\" \"$PAGER\" \"$HOME\"; cat probe.txt";
+    let provider = ScriptedProvider::new([
+        ModelResponse::tool_use([ToolCall::new(
+            "call-1",
+            "write_file",
+            json!({"path": "probe.txt", "content": "relative\n"}),
+        )]),
+        ModelResponse::tool_use([ToolCall::new(
+            "call-2",
+            "exec",
+            json!({"argv": ["/bin/sh", "-c", probe]}),
+        )]),
+        ModelResponse::final_text("probed"),
+    ]);
+    let temp = common::private_tempdir().expect("temporary directory");
+    let journal_path = temp.path().join("probe-journal.jsonl");
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        JsonlAudit::open(&temp.path().join("probe-audit.jsonl")).expect("open audit"),
+        JsonlJournal::open(&journal_path).expect("open journal"),
+        HarnessConfig::default(),
+    );
+    // Completion also means every returned execution row showed the cwd,
+    // env names and env digest the harness sent.
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("the probe session completes");
+
+    let recorded = read_journal(&journal_path).expect("journal verifies");
+    assert!(recorded.complete);
+    let JournalEvent::SessionStarted { exec_context, .. } = &recorded.records[0].event else {
+        panic!("session start");
+    };
+    assert_eq!(exec_context.as_deref(), Some("workspace_v1"));
+    let stdout = recorded
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::ToolExecuted { call, result, .. } if call.tool == "exec" => result
+                .get("stdout")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .expect("the exec result");
+    assert_eq!(stdout, "/workspace\ndumb|1|cat|/root\nrelative\n");
+
+    let after = api.health().await.expect("health after");
     assert_eq!(after.active_sandboxes, 0);
     assert_eq!(after.running_executions, 0);
     assert_eq!(after.reservations, before.reservations);

@@ -41,6 +41,7 @@ fn started() -> JournalEvent {
         limits: HarnessConfig::default().limits(),
         seed: Vec::new(),
         check: None,
+        exec_context: None,
     }
 }
 
@@ -998,6 +999,23 @@ fn recorded_tasks_must_be_ones_the_engine_accepts() {
     *system = at.clone();
     *task = at;
     write_all(&events).expect("a task at the limit is valid");
+}
+
+#[test]
+fn the_exec_context_is_absent_or_workspace_v1() {
+    let with_context = |value: Option<&str>| {
+        let mut events = valid();
+        let JournalEvent::SessionStarted { exec_context, .. } = &mut events[0] else {
+            panic!("session start");
+        };
+        *exec_context = value.map(str::to_string);
+        events
+    };
+    assert_accepted("legacy, no exec_context", with_context(None));
+    assert_accepted("workspace_v1", with_context(Some("workspace_v1")));
+    for value in ["workspace_v2", "", "WORKSPACE_V1", "legacy"] {
+        assert_rejected_because(value, with_context(Some(value)), "unknown exec_context");
+    }
 }
 
 /// The valid session with a recorded seed and check, and the check's

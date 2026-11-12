@@ -10,17 +10,39 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiln_harness::api::{
-    ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Deleted, Execution,
+    ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Deleted, EnvVar, Execution,
     ExecutionState, ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health, NodeReservations,
-    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState,
+    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState, env_names, env_sha256,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FakeApi {
     pub state: Arc<Mutex<FakeState>>,
 }
+
+/// A fake of the oldest kilnd the harness accepts: it lists only the exec
+/// options every session needs, with kilnd's default bounds for them.
+impl Default for FakeApi {
+    fn default() -> Self {
+        let api = Self {
+            state: Arc::default(),
+        };
+        api.state().features = exec_options();
+        api.state().limits = Some(exec_limits());
+        api
+    }
+}
+
+/// The exec options the harness requires of every daemon.
+pub fn exec_options() -> BTreeSet<Feature> {
+    BTreeSet::from([Feature::ExecCwd, Feature::ExecEnv])
+}
+
+/// Changes a recorded execution row, as a daemon that did not run it as
+/// sent would report it.
+pub type Tamper = fn(&mut Execution);
 
 /// One scripted `RenewSandbox` answer.
 pub enum RenewScript {
@@ -150,7 +172,7 @@ pub struct FakeState {
     /// Record the created row this long after the request, independently of
     /// the RPC.
     pub create_record_delay: Duration,
-    /// What Health lists; empty, like a daemon that predates discovery.
+    /// What Health lists; `FakeApi::default` lists the exec options.
     pub features: BTreeSet<Feature>,
     pub limits: Option<ApiLimits>,
     pub not_serving: bool,
@@ -170,9 +192,19 @@ pub struct FakeState {
     /// Every non-baseline Exec is refused with this error after
     /// `tool_exec_delay`, before admission: no execution row is recorded.
     pub tool_exec_error: Option<ApiError>,
+    /// Each non-baseline Exec takes the next of these, while any are left,
+    /// and is refused with it like `tool_exec_error`.
+    pub exec_refusals: VecDeque<ApiError>,
+    /// Every baseline (`find`) Exec is refused with this error, before
+    /// admission: no execution row is recorded.
+    pub baseline_exec_error: Option<ApiError>,
     /// The Nth Exec (from 1) records its execution row, then its response
     /// is lost: the RPC fails `UNAVAILABLE`.
     pub lose_exec_response: Option<usize>,
+    /// The Nth Exec's (from 1, the baseline included) row, as returned and
+    /// as recovery reads it, is changed by this, as by a daemon that did
+    /// not run it as sent.
+    pub tamper_exec: Option<(usize, Tamper)>,
     /// The Nth Exec (from 1) is published RUNNING and its response lost;
     /// the row turns terminal only after this many `GetExecution` reads
     /// (`u32::MAX`: never).
@@ -207,13 +239,15 @@ impl FakeApi {
         self.state.lock().expect("fake state lock")
     }
 
-    /// A fake of kilnd 853dee2: sandbox expiry and typed reasons with its
-    /// default bounds.
+    /// A fake of kilnd 853dee2's expiry and typed reasons, with its default
+    /// bounds, beside the exec options.
     pub fn with_expiry() -> Self {
         let api = Self::default();
         {
             let mut state = api.state();
-            state.features = BTreeSet::from([Feature::SandboxExpiry, Feature::TypedReasons]);
+            state
+                .features
+                .extend([Feature::SandboxExpiry, Feature::TypedReasons]);
             state.limits = Some(kilnd_limits());
         }
         api
@@ -238,7 +272,15 @@ impl FakeApi {
     fn pre_admission_refusal(&self, request: &SandboxExec) -> Option<(ApiError, Duration)> {
         let mut state = self.state();
         let baseline = request.argv.first().map(String::as_str) == Some("/usr/bin/find");
-        let error = state.tool_exec_error.clone().filter(|_| !baseline)?;
+        if baseline {
+            let error = state.baseline_exec_error.clone()?;
+            state.execs.push(request.clone());
+            return Some((error, Duration::ZERO));
+        }
+        let error = state
+            .exec_refusals
+            .pop_front()
+            .or_else(|| state.tool_exec_error.clone())?;
         state.execs.push(request.clone());
         Some((error, state.tool_exec_delay))
     }
@@ -249,7 +291,8 @@ impl FakeApi {
     }
 }
 
-/// kilnd 853dee2's default expiry bounds.
+/// kilnd 853dee2's default expiry bounds, with kilnd 0c79944's default
+/// exec-option bounds.
 pub fn kilnd_limits() -> ApiLimits {
     ApiLimits {
         min_sandbox_lifetime_ms: 10_000,
@@ -258,7 +301,68 @@ pub fn kilnd_limits() -> ApiLimits {
         min_sandbox_idle_ms: 10_000,
         max_sandbox_idle_ms: 86_400_000,
         default_sandbox_idle_ms: 0,
+        ..exec_limits()
     }
+}
+
+/// kilnd 0c79944's default exec-option bounds, which it advertises while
+/// it lists the exec options; no expiry bounds.
+pub fn exec_limits() -> ApiLimits {
+    ApiLimits {
+        max_cwd_bytes: 4096,
+        max_env_entries: 64,
+        max_env_name_bytes: 128,
+        max_env_value_bytes: 4096,
+        max_env_total_bytes: 32_768,
+        ..ApiLimits::default()
+    }
+}
+
+/// What kilnd records for an execution of `request`: its cwd as sent, the
+/// env names sorted, and their digest.
+pub fn recorded_context(request: &SandboxExec) -> (String, Vec<String>, String) {
+    (
+        request.cwd.clone(),
+        env_names(&request.env),
+        env_sha256(&request.env),
+    )
+}
+
+/// The env overrides every live execution sends, in order.
+pub fn workspace_env() -> Vec<EnvVar> {
+    [("TERM", "dumb"), ("NO_COLOR", "1"), ("PAGER", "cat")]
+        .map(|(name, value)| EnvVar {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+        .to_vec()
+}
+
+/// `execution` as kilnd records it for an Exec of a live session, which
+/// sends `/workspace` and the fixed overrides.
+pub fn in_workspace(execution: Execution) -> Execution {
+    let env = workspace_env();
+    Execution {
+        cwd: "/workspace".to_string(),
+        env_names: env_names(&env),
+        env_sha256: env_sha256(&env),
+        ..execution
+    }
+}
+
+/// The same record for a wire request, as a stub kilnd returns it.
+pub fn pb_recorded_context(
+    request: &kiln_harness::pb::ExecRequest,
+) -> (String, Vec<String>, String) {
+    let env: Vec<EnvVar> = request
+        .env
+        .iter()
+        .map(|var| EnvVar {
+            name: var.name.clone(),
+            value: var.value.clone(),
+        })
+        .collect();
+    (request.cwd.clone(), env_names(&env), env_sha256(&env))
 }
 
 /// The refusal kilnd sends for a sandbox that is gone.
@@ -519,6 +623,7 @@ impl SandboxApi for FakeApi {
                 Some("/bin/big-output") => (0, vec![b'x'; 100 << 10], Vec::new()),
                 _ => (127, Vec::new(), b"unsupported fake command".to_vec()),
             };
+            let (cwd, env_names, env_sha256) = recorded_context(&request);
             let mut execution = Execution {
                 id,
                 state: ExecutionState::Exited,
@@ -529,10 +634,18 @@ impl SandboxApi for FakeApi {
                 // An older daemon does not say; a current one does.
                 sandbox_reusable: (!state.features.is_empty()).then_some(true),
                 cancel_reason: None,
+                cwd,
+                env_names,
+                env_sha256,
             };
             if let Some((exec_state, exec_code)) = sh_state {
                 execution.state = exec_state;
                 execution.exit_code = exec_code;
+            }
+            if let Some((number, tamper)) = state.tamper_exec
+                && number == state.execs.len()
+            {
+                tamper(&mut execution);
             }
             leave_unusable_if_scripted(&mut state, &mut execution);
             state.executions.push(execution.clone());
@@ -661,15 +774,6 @@ impl SandboxApi for FakeApi {
             .find(|row| row.id == execution_id)
             .cloned()
             .ok_or_else(|| api_error(Code::NotFound, "no such execution"))
-    }
-
-    async fn sandbox_ready(&self, _sandbox_id: &str) -> Result<bool, ApiError> {
-        let state = self.state();
-        Ok(
-            state.expired.is_none()
-                && !state.not_ready
-                && state.creates.len() > state.deleted.len(),
-        )
     }
 
     async fn final_check(&self, _sandbox_id: &str) -> Result<FinalCheck, ApiError> {
