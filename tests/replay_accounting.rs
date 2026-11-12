@@ -99,6 +99,7 @@ fn ended(outcome: &str, final_answer: Option<&str>) -> JournalEvent {
         tool_calls: 0,
         usage: Usage::default(),
         sandbox_deleted: true,
+        truncation_recoveries: 0,
     }
 }
 

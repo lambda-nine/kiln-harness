@@ -853,6 +853,7 @@ fn distinct_config() -> HarnessConfig {
         max_total_input_tokens: 5555,
         max_total_output_tokens: 666,
         max_total_model_output_bytes: 7777,
+        max_truncation_recoveries: 5,
         tool_limits: ToolLimits {
             timeout: Duration::from_millis(1234),
             max_argv_bytes: 101,

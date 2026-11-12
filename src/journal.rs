@@ -19,7 +19,7 @@ use thiserror::Error;
 use std::os::unix::fs::MetadataExt;
 
 use crate::engine::{
-    CheckOutcome, MAX_SEED_FILES, SeedFile, TaskCheck, check_problem, seed_problem,
+    CheckOutcome, MAX_SEED_FILES, SeedFile, TaskCheck, check_problem, seed_problem, truncation_note,
 };
 pub use crate::outputs::DirectoryProblem;
 use crate::outputs::{Existing, OutputError, Rollback, describe_unsafe};
@@ -112,7 +112,17 @@ pub enum JournalEvent {
         tool_calls: u32,
         usage: Usage,
         sandbox_deleted: bool,
+        /// Truncated responses the engine discarded and went on from.
+        /// Absent from journals written before recovery existed, and
+        /// skipped when 0, so those journals are byte-identical to before.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        truncation_recoveries: u32,
     },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// A seeded file as the journal records it.
@@ -258,6 +268,11 @@ pub struct SessionLimits {
     /// with the engine's default.
     #[serde(default = "default_max_total_model_output_bytes")]
     pub max_total_model_output_bytes: u64,
+    /// Absent from journals written before truncation recovery existed;
+    /// they load with 0, their meaning then: a truncated response is
+    /// fatal. Skipped when 0, so such journals stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_truncation_recoveries: u32,
     pub max_model_arguments_bytes: usize,
     pub max_final_answer_bytes: usize,
     pub tool_limits: RecordedToolLimits,
@@ -796,16 +811,23 @@ fn check_expiry(
 /// - `model_requested` turns run 1, 2, … and each is answered by exactly one
 ///   `model_responded` or `model_failed` for that turn before the next
 ///   request. Nothing but `session_ended` follows a failure or a response
-///   without tool calls.
+///   without tool calls, except a discarded one (below).
 /// - After a response with n tool calls, up to n `tool_executed` records
 ///   follow for that turn with indexes 1, 2, … and the response's call IDs
 ///   in order. Fewer than n only when the session then ends.
+/// - A response the engine discards at its output limit (a `max_tokens`
+///   stop within the budgets and the recorded recovery limit) is followed
+///   only by the next `model_requested`, whose history ends with the
+///   truncation note instead of the response, or by a `session_ended` that
+///   is not completed work: failed work when it was on the last allowed
+///   step.
 /// - `session_ended` matches what came before: its tool-call count, last
-///   turn, and usage sum; `completed` work needs a final response without
+///   turn, usage sum, and truncation recoveries; `completed` work needs a final response without
 ///   tool calls whose text is the final answer; a completed outcome needs
 ///   confirmed deletion; `cleanup_failed` means deletion was not confirmed;
-///   and a request may be left unanswered only when the work did not
-///   complete.
+///   a request may be left unanswered only when the work did not
+///   complete; and `create_failed` only before `sandbox_ready` and any
+///   request.
 /// - A recorded seed and check pass the engine's rules under the recorded
 ///   limits. `check_completed` appears only when a check was recorded, at
 ///   most once, right after an accepted final answer, and completed work
@@ -822,6 +844,7 @@ pub struct Grammar {
     tool_calls: u32,
     usage: Usage,
     output_bytes: u64,
+    truncation_recoveries: u32,
     check: CheckState,
 }
 
@@ -863,45 +886,71 @@ struct RespondedTurn {
     /// Echoed into the history exactly as recorded, as the engine does.
     provider_content: Option<ProviderContent>,
     results: Vec<ToolResult>,
-    /// Whether the engine would go on from this response: run its calls, or
-    /// accept it as the final answer. See [`engine_accepts`].
-    accepted: bool,
+    /// What the engine does with this response. See [`engine_accepts`].
+    disposition: Disposition,
 }
 
-/// Mirror of the engine's checks on one response, in the engine's order.
-/// A refused response is still journaled (the engine records it before
-/// refusing it), but nothing may follow from it except `session_ended`.
+/// What the engine does with one response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// It runs the response's calls, or takes it as the final answer.
+    Accepted,
+    /// It discards the response, cut off at its output limit, appends the
+    /// truncation note, and requests the next turn.
+    Recovered,
+    /// It ends the session.
+    Refused,
+}
+
+/// Mirror of the engine's checks on one response, in the engine's order:
+/// the budgets, then truncation recovery, then the rest. A refused response
+/// is still journaled (the engine records it before refusing it), but
+/// nothing may follow from it except `session_ended`. `recoveries` is the
+/// number of responses recovered from before this one.
 fn engine_accepts(
     response: &ModelResponse,
     usage_after: Usage,
     output_bytes_after: u64,
+    recoveries: u32,
     limits: &SessionLimits,
-) -> bool {
+) -> Disposition {
     use crate::provider::StopReason;
     let within_budget = response.usage.output_tokens
         <= u64::from(limits.max_output_tokens_per_request)
         && usage_after.total_input_tokens() <= limits.max_total_input_tokens
         && usage_after.output_tokens <= limits.max_total_output_tokens
         && output_bytes_after <= limits.max_total_model_output_bytes;
-    if !within_budget
-        || matches!(
-            response.stop_reason,
-            StopReason::MaxTokens | StopReason::Refusal
-        )
-        || (response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty())
+    if !within_budget {
+        return Disposition::Refused;
+    }
+    if response.stop_reason == StopReason::MaxTokens
+        && recoveries < limits.max_truncation_recoveries
     {
-        return false;
+        return Disposition::Recovered;
+    }
+    if matches!(
+        response.stop_reason,
+        StopReason::MaxTokens | StopReason::ContextExceeded | StopReason::Refusal
+    ) || (response.stop_reason == StopReason::ToolUse && response.tool_calls.is_empty())
+    {
+        return Disposition::Refused;
     }
     let text_bytes = response.text.as_ref().map_or(0, String::len);
-    if response.tool_calls.is_empty() {
-        return text_bytes > 0 && text_bytes <= limits.max_final_answer_bytes;
+    let accepted = if response.tool_calls.is_empty() {
+        text_bytes > 0 && text_bytes <= limits.max_final_answer_bytes
+    } else {
+        let mut call_ids = std::collections::BTreeSet::new();
+        response.tool_calls.len() <= limits.max_tool_calls_per_turn as usize
+            && response.tool_calls.iter().all(|call| {
+                crate::engine::call_id_is_valid(&call.call_id) && call_ids.insert(&call.call_id)
+            })
+            && text_bytes <= limits.max_final_answer_bytes
+    };
+    if accepted {
+        Disposition::Accepted
+    } else {
+        Disposition::Refused
     }
-    let mut call_ids = std::collections::BTreeSet::new();
-    response.tool_calls.len() <= limits.max_tool_calls_per_turn as usize
-        && response.tool_calls.iter().all(|call| {
-            crate::engine::call_id_is_valid(&call.call_id) && call_ids.insert(&call.call_id)
-        })
-        && text_bytes <= limits.max_final_answer_bytes
 }
 
 impl Grammar {
@@ -1007,38 +1056,7 @@ impl Grammar {
                 turn,
                 request_sha256,
                 message_count,
-            } => {
-                if !self.sandbox_ready {
-                    return Err("model_requested before sandbox_ready");
-                }
-                if self.pending.is_some() {
-                    return Err("model_requested before the previous turn was answered");
-                }
-                if self.turn_failed {
-                    return Err("model_requested after model_failed");
-                }
-                if let Some(last) = &self.last_response {
-                    if !last.accepted {
-                        return Err("model_requested after a response the engine refuses");
-                    }
-                    if last.calls.is_empty() {
-                        return Err("model_requested after a final response");
-                    }
-                    if last.results.len() != last.calls.len() {
-                        return Err("model_requested before every tool call of the turn ran");
-                    }
-                }
-                if Some(*turn) != self.last_turn.checked_add(1) {
-                    return Err("model_requested turns must run 1, 2, ...");
-                }
-                let max_steps = self.context.as_ref().map_or(0, |ctx| ctx.limits.max_steps);
-                if *turn > max_steps {
-                    return Err("model_requested beyond max_steps");
-                }
-                self.check_request(*turn, request_sha256, *message_count)?;
-                self.last_turn = *turn;
-                self.pending = Some(*turn);
-            }
+            } => self.model_requested(*turn, request_sha256, *message_count)?,
             JournalEvent::ModelResponded { turn, response, .. } => {
                 if self.pending != Some(*turn) {
                     return Err("model_responded without a matching request");
@@ -1054,17 +1072,25 @@ impl Grammar {
                     .collect();
                 let usage_after = self.usage + response.usage;
                 let output_bytes_after = self.output_bytes.saturating_add(response.output_bytes());
-                let accepted =
-                    engine_accepts(response, usage_after, output_bytes_after, &context.limits);
+                let disposition = engine_accepts(
+                    response,
+                    usage_after,
+                    output_bytes_after,
+                    self.truncation_recoveries,
+                    &context.limits,
+                );
                 self.usage = usage_after;
                 self.output_bytes = output_bytes_after;
+                if disposition == Disposition::Recovered {
+                    self.truncation_recoveries += 1;
+                }
                 self.last_response = Some(RespondedTurn {
                     turn: *turn,
                     text: response.text.clone(),
                     calls,
                     provider_content: response.provider_content.clone(),
                     results: Vec::new(),
-                    accepted,
+                    disposition,
                 });
             }
             JournalEvent::ModelFailed { turn, .. } => {
@@ -1095,6 +1121,52 @@ impl Grammar {
         Ok(())
     }
 
+    /// Check one `model_requested` against the turns before it.
+    fn model_requested(
+        &mut self,
+        turn: u32,
+        request_sha256: &str,
+        message_count: usize,
+    ) -> Result<(), &'static str> {
+        if !self.sandbox_ready {
+            return Err("model_requested before sandbox_ready");
+        }
+        if self.pending.is_some() {
+            return Err("model_requested before the previous turn was answered");
+        }
+        if self.turn_failed {
+            return Err("model_requested after model_failed");
+        }
+        if let Some(last) = &self.last_response {
+            match last.disposition {
+                Disposition::Refused => {
+                    return Err("model_requested after a response the engine refuses");
+                }
+                // Nothing of a discarded response ran or stays.
+                Disposition::Recovered => {}
+                Disposition::Accepted => {
+                    if last.calls.is_empty() {
+                        return Err("model_requested after a final response");
+                    }
+                    if last.results.len() != last.calls.len() {
+                        return Err("model_requested before every tool call of the turn ran");
+                    }
+                }
+            }
+        }
+        if Some(turn) != self.last_turn.checked_add(1) {
+            return Err("model_requested turns must run 1, 2, ...");
+        }
+        let max_steps = self.context.as_ref().map_or(0, |ctx| ctx.limits.max_steps);
+        if turn > max_steps {
+            return Err("model_requested beyond max_steps");
+        }
+        self.check_request(turn, request_sha256, message_count)?;
+        self.last_turn = turn;
+        self.pending = Some(turn);
+        Ok(())
+    }
+
     /// The check runs once, only for a session that recorded one, and only
     /// after an accepted final answer in the last turn.
     fn check_completed(&mut self) -> Result<(), &'static str> {
@@ -1104,7 +1176,9 @@ impl Grammar {
             CheckState::Recorded => {}
         }
         let final_answer = self.last_response.as_ref().is_some_and(|last| {
-            last.turn == self.last_turn && last.calls.is_empty() && last.accepted
+            last.turn == self.last_turn
+                && last.calls.is_empty()
+                && last.disposition == Disposition::Accepted
         });
         if self.pending.is_some() || self.turn_failed || !final_answer {
             return Err("check_completed needs an accepted final answer in the last turn");
@@ -1138,8 +1212,14 @@ impl Grammar {
         if self.turn_failed || last.turn != turn {
             return Err("tool_executed for a turn other than the last response");
         }
-        if !last.accepted {
-            return Err("tool_executed after a response the engine refuses");
+        match last.disposition {
+            Disposition::Accepted => {}
+            Disposition::Recovered => {
+                return Err("tool_executed after a response the engine discards");
+            }
+            Disposition::Refused => {
+                return Err("tool_executed after a response the engine refuses");
+            }
         }
         let limits = self.context.as_ref().ok_or("no session context")?.limits;
         if index > limits.max_tool_calls_per_turn {
@@ -1167,9 +1247,11 @@ impl Grammar {
         Ok(())
     }
 
-    /// Extend the rebuilt history with the last tool turn, as the engine does
-    /// before its next request, and require the recorded message count and
-    /// request hash to match it. On failure the history is left unchanged.
+    /// Extend the rebuilt history with the last tool turn, or with the
+    /// truncation note after a discarded response, as the engine does before
+    /// its next request, and require the recorded message count and request
+    /// hash to match it. On failure the history and the last response are
+    /// left exactly as they were.
     fn check_request(
         &mut self,
         turn: u32,
@@ -1177,6 +1259,23 @@ impl Grammar {
         message_count: usize,
     ) -> Result<(), &'static str> {
         let context = self.context.as_mut().ok_or("no session context")?;
+        if self
+            .last_response
+            .as_ref()
+            .is_some_and(|last| last.disposition == Disposition::Recovered)
+        {
+            // The discarded response stays in place until the check passes.
+            context.messages.push(Message::User {
+                text: truncation_note(context.limits.max_output_tokens_per_request),
+            });
+            let reason = Self::request_mismatch(context, turn, recorded_sha256, message_count);
+            if let Some(reason) = reason {
+                context.messages.pop();
+                return Err(reason);
+            }
+            self.last_response = None;
+            return Ok(());
+        }
         // Move the last tool turn into the history; it is rebuilt from the
         // history only if the check fails.
         let extended = self.last_response.take().map(|last| {
@@ -1190,20 +1289,7 @@ impl Grammar {
             });
             last.turn
         });
-        let reason = if context.messages.len() == message_count {
-            let expected = request_sha256(&ModelRequest {
-                session_id: "",
-                turn,
-                system: &context.system,
-                tools: &context.tools,
-                messages: &context.messages,
-                max_output_tokens: context.limits.max_output_tokens_per_request,
-            });
-            (expected != recorded_sha256)
-                .then_some("model_requested hash differs from the rebuilt request")
-        } else {
-            Some("model_requested message_count differs from the rebuilt history")
-        };
+        let reason = Self::request_mismatch(context, turn, recorded_sha256, message_count);
         let Some(reason) = reason else {
             return Ok(());
         };
@@ -1226,11 +1312,33 @@ impl Grammar {
                     calls: tool_calls,
                     provider_content,
                     results,
-                    accepted: true,
+                    disposition: Disposition::Accepted,
                 });
             }
         }
         Err(reason)
+    }
+
+    /// Why the rebuilt history does not match a recorded request, if not.
+    fn request_mismatch(
+        context: &SessionContext,
+        turn: u32,
+        recorded_sha256: &str,
+        message_count: usize,
+    ) -> Option<&'static str> {
+        if context.messages.len() != message_count {
+            return Some("model_requested message_count differs from the rebuilt history");
+        }
+        let expected = request_sha256(&ModelRequest {
+            session_id: "",
+            turn,
+            system: &context.system,
+            tools: &context.tools,
+            messages: &context.messages,
+            max_output_tokens: context.limits.max_output_tokens_per_request,
+        });
+        (expected != recorded_sha256)
+            .then_some("model_requested hash differs from the rebuilt request")
     }
 
     /// Check `session_ended` against everything fed before it.
@@ -1243,6 +1351,7 @@ impl Grammar {
             tool_calls,
             usage,
             sandbox_deleted,
+            truncation_recoveries,
         } = event
         else {
             return Err("not a session_ended record");
@@ -1268,6 +1377,26 @@ impl Grammar {
         if *usage != self.usage {
             return Err("usage differs from the sum of responses");
         }
+        if *truncation_recoveries != self.truncation_recoveries {
+            return Err("truncation_recoveries differs from the discarded responses");
+        }
+        // The engine ends create_failed only before it journals sandbox_ready; a
+        // sandbox that exists but was never accepted as READY does not count.
+        if work_outcome == "create_failed" && (self.sandbox_ready || self.last_turn > 0) {
+            return Err("create_failed after sandbox_ready or a model request");
+        }
+        // A recovery on the last allowed step leaves the loop at once, with
+        // the step budget (or a failed audit) as the only way out.
+        let max_steps = self.context.as_ref().map_or(0, |ctx| ctx.limits.max_steps);
+        let recovered_last_step = self.pending.is_none()
+            && self.last_response.as_ref().is_some_and(|last| {
+                last.disposition == Disposition::Recovered
+                    && last.turn == self.last_turn
+                    && last.turn == max_steps
+            });
+        if recovered_last_step && work_outcome != "failed" {
+            return Err("a recovery on the last step ends only as failed work");
+        }
         if work_outcome == "completed" {
             let final_response = self
                 .last_response
@@ -1276,8 +1405,14 @@ impl Grammar {
             if self.pending.is_some() || self.turn_failed || final_response.is_none() {
                 return Err("completed work needs a final response in the last turn");
             }
-            if final_response.is_some_and(|last| !last.accepted) {
-                return Err("completed after a response the engine refuses");
+            match final_response.map(|last| last.disposition) {
+                Some(Disposition::Recovered) => {
+                    return Err("completed after a response the engine discards");
+                }
+                Some(Disposition::Refused) => {
+                    return Err("completed after a response the engine refuses");
+                }
+                Some(Disposition::Accepted) | None => {}
             }
             if final_answer.is_none()
                 || final_response.and_then(|last| last.text.as_ref()) != final_answer.as_ref()

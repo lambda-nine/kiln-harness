@@ -29,6 +29,11 @@
 //! - One turn's tool results are one user message of `tool_result` blocks,
 //!   in order: the result's compact JSON as `content`, and `is_error` unless
 //!   the result says `"ok": true`.
+//! - A user turn right after tool results or another user turn (the
+//!   engine's truncation note) joins that user message as a trailing
+//!   `{"type": "text"}` block, after any `tool_result` blocks; a string
+//!   `content` becomes an array of text blocks first. Every other request
+//!   is unchanged.
 //!
 //! Tools come first, then the system prompt, then the messages, all
 //! serialized deterministically, so each request's rendered prompt starts
@@ -58,7 +63,8 @@
 //! |---|---|
 //! | `end_turn`, `stop_sequence` | `EndTurn`; `InvalidResponse` with `tool_use` blocks |
 //! | `tool_use` | `ToolUse`; `InvalidResponse` without `tool_use` blocks |
-//! | `max_tokens`, `model_context_window_exceeded` | `MaxTokens` |
+//! | `max_tokens` | `MaxTokens` |
+//! | `model_context_window_exceeded` | `ContextExceeded` |
 //! | `refusal` | `Refusal` |
 //! | `pause_turn` | `InvalidResponse`: it needs server tools, never sent |
 //! | missing or anything else | `InvalidResponse` |
@@ -66,8 +72,10 @@
 //! The adapter never produces [`StopReason::Other`], so nothing it does not
 //! understand ends a session as a final answer. With client tools only, a
 //! `tool_use` stop and `tool_use` blocks come together, and a mismatch is
-//! refused rather than normalized; a `max_tokens` or `refusal` turn may
-//! still hold blocks, and the engine refuses it as truncated or refused.
+//! refused rather than normalized; a `max_tokens`,
+//! `model_context_window_exceeded` or `refusal` turn may still hold blocks:
+//! the engine discards a truncated turn (within its recovery limit) and
+//! refuses the others.
 //!
 //! Opaque content must echo value for value, and `serde_json` holds only
 //! 64-bit integers exactly: a float, or an integer outside `i64` and `u64`,
@@ -570,9 +578,76 @@ pub fn request_body(
     config: &AnthropicConfig,
     request: &ModelRequest<'_>,
 ) -> Result<Value, ProviderError> {
-    let mut messages = Vec::with_capacity(request.messages.len());
-    for message in request.messages {
+    let messages = messages(request.messages);
+    let mut body = Map::new();
+    body.insert("model".to_string(), json!(config.model));
+    body.insert("max_tokens".to_string(), json!(request.max_output_tokens));
+    if !request.system.is_empty() {
+        body.insert("system".to_string(), json!(request.system));
+    }
+    body.insert("messages".to_string(), Value::Array(messages));
+    if !request.tools.is_empty() {
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| {
+                let mut entry = Map::new();
+                entry.insert("name".to_string(), json!(tool.name));
+                entry.insert("description".to_string(), json!(tool.description));
+                if config.strict_tools {
+                    // The canonical schema stays in ToolDefinition; the
+                    // typed tools still enforce every limit it states.
+                    let schema = strict_input_schema(&tool.input_schema).map_err(|problem| {
+                        ProviderError::new(
+                            ProviderErrorKind::Rejected,
+                            format!("tool {} cannot be strict: {problem}", tool.name),
+                        )
+                    })?;
+                    entry.insert("input_schema".to_string(), schema);
+                    entry.insert("strict".to_string(), json!(true));
+                } else {
+                    entry.insert("input_schema".to_string(), tool.input_schema.clone());
+                }
+                Ok(Value::Object(entry))
+            })
+            .collect::<Result<Vec<_>, ProviderError>>()?;
+        body.insert("tools".to_string(), Value::Array(tools));
+        body.insert("tool_choice".to_string(), json!({"type": "auto"}));
+    }
+    body.insert(
+        "output_config".to_string(),
+        json!({"effort": config.effort.as_str()}),
+    );
+    // Automatic caching: the breakpoint goes on the last cacheable block.
+    body.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
+    if config.fallbacks {
+        body.insert("fallbacks".to_string(), json!("default"));
+    }
+    Ok(Value::Object(body))
+}
+
+/// The `messages` array for `history`, in order. See the module docs.
+fn messages(history: &[Message]) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::with_capacity(history.len());
+    // Whether the last message pushed is user-role: a user turn or tool
+    // results. The API wants roles to alternate, so a user turn right after
+    // one joins it as a trailing text block.
+    let mut after_user = false;
+    for message in history {
+        let user_role = matches!(message, Message::User { .. } | Message::ToolResults { .. });
         match message {
+            Message::User { text } if after_user => {
+                let block = json!({"type": "text", "text": text});
+                if let Some(content) = messages.last_mut().and_then(|last| last.get_mut("content"))
+                {
+                    if let Value::String(earlier) = content {
+                        *content = json!([{"type": "text", "text": earlier}]);
+                    }
+                    if let Value::Array(blocks) = content {
+                        blocks.push(block);
+                    }
+                }
+            }
             Message::User { text } => messages.push(json!({"role": "user", "content": text})),
             Message::Assistant {
                 provider_content: Some(content),
@@ -622,52 +697,9 @@ pub fn request_body(
                 messages.push(json!({"role": "user", "content": content}));
             }
         }
+        after_user = user_role;
     }
-    let mut body = Map::new();
-    body.insert("model".to_string(), json!(config.model));
-    body.insert("max_tokens".to_string(), json!(request.max_output_tokens));
-    if !request.system.is_empty() {
-        body.insert("system".to_string(), json!(request.system));
-    }
-    body.insert("messages".to_string(), Value::Array(messages));
-    if !request.tools.is_empty() {
-        let tools = request
-            .tools
-            .iter()
-            .map(|tool| {
-                let mut entry = Map::new();
-                entry.insert("name".to_string(), json!(tool.name));
-                entry.insert("description".to_string(), json!(tool.description));
-                if config.strict_tools {
-                    // The canonical schema stays in ToolDefinition; the
-                    // typed tools still enforce every limit it states.
-                    let schema = strict_input_schema(&tool.input_schema).map_err(|problem| {
-                        ProviderError::new(
-                            ProviderErrorKind::Rejected,
-                            format!("tool {} cannot be strict: {problem}", tool.name),
-                        )
-                    })?;
-                    entry.insert("input_schema".to_string(), schema);
-                    entry.insert("strict".to_string(), json!(true));
-                } else {
-                    entry.insert("input_schema".to_string(), tool.input_schema.clone());
-                }
-                Ok(Value::Object(entry))
-            })
-            .collect::<Result<Vec<_>, ProviderError>>()?;
-        body.insert("tools".to_string(), Value::Array(tools));
-        body.insert("tool_choice".to_string(), json!({"type": "auto"}));
-    }
-    body.insert(
-        "output_config".to_string(),
-        json!({"effort": config.effort.as_str()}),
-    );
-    // Automatic caching: the breakpoint goes on the last cacheable block.
-    body.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
-    if config.fallbacks {
-        body.insert("fallbacks".to_string(), json!("default"));
-    }
-    Ok(Value::Object(body))
+    messages
 }
 
 /// Schema keywords sent unchanged in strict mode.
@@ -887,7 +919,8 @@ fn parse_response_quoting(
     // server tools; nothing unknown is taken as a final answer. With client
     // tools only, a tool_use stop and tool_use blocks come together: either
     // without the other is a malformed response, not something to normalize.
-    // A truncated or refused turn may hold blocks; the engine refuses it.
+    // A truncated or refused turn may hold blocks; the engine discards or
+    // refuses it.
     let calls = !tool_calls.is_empty();
     let stop_reason = match value.get("stop_reason").and_then(Value::as_str) {
         Some("tool_use") if calls => StopReason::ToolUse,
@@ -896,7 +929,8 @@ fn parse_response_quoting(
             return Err(invalid("tool_use blocks without a tool_use stop"));
         }
         Some("end_turn" | "stop_sequence") => StopReason::EndTurn,
-        Some("max_tokens" | "model_context_window_exceeded") => StopReason::MaxTokens,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("model_context_window_exceeded") => StopReason::ContextExceeded,
         Some("refusal") => StopReason::Refusal,
         Some("pause_turn") => {
             return Err(invalid(

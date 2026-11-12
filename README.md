@@ -191,8 +191,12 @@ the hard ceilings in `docs/architecture.md` still apply. The sandbox expiry
 flags are described above. Reasoning tokens
 count toward the output budgets: a thinking model such as Qwen3 can spend
 thousands of hidden tokens per turn before it answers, and with too small a
-cap the turn is truncated and the session fails. Lower `--max-output-tokens`
-only for models that do not think. `--temperature`
+cap the turn is truncated. A truncated turn is discarded unexecuted and the
+model is told to keep its reasoning short; `--max-truncation-recoveries`
+(default 2, at most 16, 0 to make truncation fatal) bounds how often that
+happens per session, each one using a step, and the next truncation then
+fails the session. A response that fills the model's context window always
+fails it. Lower `--max-output-tokens` only for models that do not think. `--temperature`
 (default 0) and `--seed` are forwarded. Output matches `demo`. The audit
 defaults to `audit/run.jsonl` and the journal to
 `journal/run-<unix_ms>.jsonl`, which `replay` reruns without the model

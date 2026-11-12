@@ -1574,12 +1574,16 @@ async fn truncated_refused_and_empty_responses_fail_closed_and_clean_up() {
     for (name, response, expected) in cases {
         let api = FakeApi::default();
         let observer = api.clone();
+        // Without recoveries, as before they existed.
         let mut harness = Harness::new(
             api,
             ScriptedProvider::new([response]),
             MemoryAudit::default(),
             MemoryJournal::default(),
-            short_lifecycle_config(),
+            HarnessConfig {
+                max_truncation_recoveries: 0,
+                ..short_lifecycle_config()
+            },
         );
 
         let error = harness

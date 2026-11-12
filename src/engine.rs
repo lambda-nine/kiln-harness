@@ -46,6 +46,8 @@ pub const MAX_TOTAL_TOKENS: u64 = 1_000_000_000;
 /// Ceiling for the cumulative model-output byte budget.
 pub const MAX_TOTAL_MODEL_OUTPUT_BYTES: u64 = 256 << 20;
 pub const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
+/// Ceiling for [`HarnessConfig::max_truncation_recoveries`].
+pub const MAX_TRUNCATION_RECOVERIES: u32 = 16;
 /// Largest accepted system prompt or task prompt.
 pub const MAX_TASK_TEXT_BYTES: usize = 64 << 10;
 /// Bounds for [`HarnessConfig::sandbox_idle_timeout`].
@@ -221,6 +223,10 @@ pub struct HarnessConfig {
     /// [`ModelResponse::output_bytes`]) per session. Bounded locally, so
     /// a session stays bounded even when reported token usage is wrong.
     pub max_total_model_output_bytes: u64,
+    /// Responses stopped at `max_output_tokens_per_request` that the
+    /// session may discard and go on from, in total, not per streak. Each
+    /// uses a step. 0 makes every such stop fatal.
+    pub max_truncation_recoveries: u32,
     pub tool_limits: ToolLimits,
     /// How long kilnd may leave the sandbox idle before reclaiming it, when
     /// the daemon supports expiry. A heartbeat renews it during provider
@@ -246,6 +252,7 @@ impl Default for HarnessConfig {
             max_total_input_tokens: 2_000_000,
             max_total_output_tokens: 200_000,
             max_total_model_output_bytes: 8 << 20,
+            max_truncation_recoveries: 2,
             tool_limits: ToolLimits::default(),
             sandbox_idle_timeout: Duration::from_secs(120),
             sandbox_lifetime_margin: Duration::from_secs(60),
@@ -267,6 +274,7 @@ impl HarnessConfig {
             max_total_input_tokens: self.max_total_input_tokens,
             max_total_output_tokens: self.max_total_output_tokens,
             max_total_model_output_bytes: self.max_total_model_output_bytes,
+            max_truncation_recoveries: self.max_truncation_recoveries,
             max_model_arguments_bytes: self.max_model_arguments_bytes,
             max_final_answer_bytes: self.max_final_answer_bytes,
             tool_limits: RecordedToolLimits {
@@ -323,6 +331,7 @@ impl HarnessConfig {
         self.max_total_input_tokens = limits.max_total_input_tokens;
         self.max_total_output_tokens = limits.max_total_output_tokens;
         self.max_total_model_output_bytes = limits.max_total_model_output_bytes;
+        self.max_truncation_recoveries = limits.max_truncation_recoveries;
         self.max_model_arguments_bytes = limits.max_model_arguments_bytes;
         self.max_final_answer_bytes = limits.max_final_answer_bytes;
         let tools = &limits.tool_limits;
@@ -348,6 +357,8 @@ pub struct SessionOutcome {
     pub usage: Usage,
     /// Successful `RenewSandbox` heartbeats during provider calls.
     pub renews: u32,
+    /// Truncated responses discarded and recovered from.
+    pub truncation_recoveries: u32,
     /// The task check's result, when the task has one.
     pub check: Option<CheckOutcome>,
 }
@@ -385,6 +396,8 @@ pub enum HarnessError {
     OutputBytesBudget(u64),
     #[error("model output was truncated at its token limit")]
     ModelTruncated,
+    #[error("model context window was exceeded")]
+    ContextExceeded,
     #[error("model refused the request")]
     ModelRefused,
     #[error("invalid model tool call: {0}")]
@@ -419,6 +432,7 @@ struct Progress {
     usage: Usage,
     output_bytes: u64,
     renews: u32,
+    truncation_recoveries: u32,
     /// Transient renew failures in a row, across provider calls, and when
     /// the last one happened.
     renew_failures: u32,
@@ -1068,6 +1082,25 @@ where
         progress.output_bytes = progress
             .output_bytes
             .saturating_add(response.output_bytes());
+        let over_tokens = response.usage.output_tokens
+            > u64::from(config.max_output_tokens_per_request)
+            || progress.usage.total_input_tokens() > config.max_total_input_tokens
+            || progress.usage.output_tokens > config.max_total_output_tokens;
+        // Reported usage is trusted only for cost; size is bounded here
+        // whatever the endpoint reports.
+        let over_bytes = progress.output_bytes > config.max_total_model_output_bytes;
+        // Whether this response is discarded and recovered from depends only
+        // on the journaled response and the limits, and a budget wins over
+        // it. The grammar counts it at model_responded, so it is counted
+        // here, before any fallible audit append, and session_ended agrees
+        // whatever fails next.
+        let recovering = !over_tokens
+            && !over_bytes
+            && response.stop_reason == StopReason::MaxTokens
+            && progress.truncation_recoveries < config.max_truncation_recoveries;
+        if recovering {
+            progress.truncation_recoveries += 1;
+        }
         audit.append(
             session_id,
             Some(sandbox_id),
@@ -1083,15 +1116,10 @@ where
                     .and_then(|content| content.model.clone()),
             },
         )?;
-        if response.usage.output_tokens > u64::from(config.max_output_tokens_per_request)
-            || progress.usage.total_input_tokens() > config.max_total_input_tokens
-            || progress.usage.output_tokens > config.max_total_output_tokens
-        {
+        if over_tokens {
             return Err(HarnessError::TokenBudget);
         }
-        // Reported usage is trusted only for cost; size is bounded here
-        // whatever the endpoint reports.
-        if progress.output_bytes > config.max_total_model_output_bytes {
+        if over_bytes {
             return Err(HarnessError::OutputBytesBudget(
                 config.max_total_model_output_bytes,
             ));
@@ -1104,6 +1132,36 @@ where
             ..
         } = response;
 
+        // A response cut off at its output limit is discarded whole, within
+        // the session's recovery allowance: its arguments may be cut off,
+        // and a truncated thinking block cannot be echoed back. None of its
+        // calls run; the model is told instead, and the step is used.
+        match stop_reason {
+            // Already counted above.
+            StopReason::MaxTokens if recovering => {
+                audit.append(
+                    session_id,
+                    Some(sandbox_id),
+                    AuditEvent::ModelTurn {
+                        turn,
+                        action: "truncated_turn_discarded".to_string(),
+                        audit_call_id: None,
+                        tool: None,
+                        arguments: None,
+                    },
+                )?;
+                messages.push(Message::User {
+                    text: truncation_note(config.max_output_tokens_per_request),
+                });
+                continue;
+            }
+            StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
+            // Retrying re-sends the whole context, so it cannot succeed.
+            StopReason::ContextExceeded => return Err(HarnessError::ContextExceeded),
+            StopReason::EndTurn | StopReason::ToolUse | StopReason::Refusal | StopReason::Other => {
+            }
+        }
+
         if tool_calls.is_empty() {
             let outcome = final_answer(audit, context, progress, turn, stop_reason, text)?;
             final_check(audit, context, &known_execution_ids).await?;
@@ -1113,6 +1171,7 @@ where
         // Tool arguments may be cut off, and a refusal must not run tools.
         match stop_reason {
             StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
+            StopReason::ContextExceeded => return Err(HarnessError::ContextExceeded),
             StopReason::Refusal => return Err(HarnessError::ModelRefused),
             StopReason::EndTurn | StopReason::ToolUse | StopReason::Other => {}
         }
@@ -1444,6 +1503,7 @@ where
 {
     match stop_reason {
         StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
+        StopReason::ContextExceeded => return Err(HarnessError::ContextExceeded),
         StopReason::Refusal => return Err(HarnessError::ModelRefused),
         // A provider protocol fault, never a final answer.
         StopReason::ToolUse => {
@@ -1494,8 +1554,20 @@ where
         tool_calls: progress.tool_calls,
         usage: progress.usage,
         renews: progress.renews,
+        truncation_recoveries: progress.truncation_recoveries,
         check: None,
     })
+}
+
+/// The user message that replaces a response discarded at its output
+/// limit. Shared with the journal grammar, which rebuilds the same history.
+#[must_use]
+pub fn truncation_note(max_output_tokens: u32) -> String {
+    format!(
+        "Your previous response reached the {max_output_tokens}-token output limit before it \
+         finished, so it was discarded and none of its tool calls ran. Keep your reasoning \
+         short: make the next tool call now, or give your final answer."
+    )
 }
 
 /// How long response-loss recovery may run after a tool call: the
@@ -1835,6 +1907,7 @@ impl Terminal {
             tool_calls: progress.tool_calls,
             usage: progress.usage,
             sandbox_deleted: self.sandbox_deleted,
+            truncation_recoveries: progress.truncation_recoveries,
         }
     }
 }
@@ -2009,6 +2082,7 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         && config.max_total_input_tokens <= MAX_TOTAL_TOKENS
         && config.max_total_output_tokens <= MAX_TOTAL_TOKENS
         && config.max_total_model_output_bytes <= MAX_TOTAL_MODEL_OUTPUT_BYTES
+        && config.max_truncation_recoveries <= MAX_TRUNCATION_RECOVERIES
         && tools.max_manifest_entries <= MAX_MANIFEST_ENTRIES
         && byte_limits.iter().all(|limit| *limit <= MAX_BYTE_LIMIT)
         && config.sandbox_idle_timeout <= MAX_SANDBOX_IDLE_TIMEOUT

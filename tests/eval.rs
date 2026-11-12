@@ -1707,12 +1707,17 @@ fn a_journal_without_seed_or_check_is_byte_identical_to_before() {
 
 #[tokio::test]
 async fn todays_demo_journal_matches_the_golden_one() {
+    // The golden journal predates truncation recovery: with it off, and no
+    // recovery, the journal is byte-identical to before.
     let mut harness = Harness::new(
         FakeApi::default(),
         ScriptedProvider::demo(),
         MemoryAudit::default(),
         MemoryJournal::default(),
-        HarnessConfig::default(),
+        HarnessConfig {
+            max_truncation_recoveries: 0,
+            ..HarnessConfig::default()
+        },
     );
     harness
         .run(&SessionTask::demo(), CancellationToken::new())
@@ -1930,6 +1935,74 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[tokio::test]
+async fn results_carry_truncation_recoveries_and_replay_them() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = two_tasks(&temp.path().join("tasks"));
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let seen = Seen::default();
+    let truncated = ModelResponse {
+        text: None,
+        tool_calls: Vec::new(),
+        stop_reason: kiln_harness::provider::StopReason::MaxTokens,
+        usage: kiln_harness::provider::Usage::default(),
+        provider_content: None,
+    };
+    let mut runs = 0;
+    let out = temp.path().join("out");
+    // alpha recovers once and passes; beta answers at once and fails.
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &options(&out, 1, true),
+        || {
+            runs += 1;
+            let responses = if runs == 1 {
+                vec![
+                    truncated.clone(),
+                    write_out(),
+                    ModelResponse::final_text("done"),
+                ]
+            } else {
+                vec![ModelResponse::final_text("done")]
+            };
+            Ok(Observing::new(&api, &seen, responses))
+        },
+        &CancellationToken::new(),
+        &mut |_| {},
+    )
+    .await
+    .expect("the suite runs");
+    let results = read_lines(&out.join("results.jsonl"));
+    assert_eq!(results, summary.results);
+    assert_eq!(results[0].truncation_recoveries, 1);
+    assert_eq!(results[0].steps, 3);
+    assert_eq!(results[0].check.as_deref(), Some("passed"));
+    assert_eq!(results[0].replay.as_deref(), Some("matched"));
+    assert_eq!(results[1].truncation_recoveries, 0);
+    // Always written, 0 included.
+    let text = std::fs::read_to_string(out.join("results.jsonl")).expect("results");
+    let lines = text.lines().collect::<Vec<_>>();
+    assert!(
+        lines[0].contains("\"truncation_recoveries\":1"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("\"truncation_recoveries\":0"),
+        "{}",
+        lines[1]
+    );
+    // A line written before the field existed still reads, as 0.
+    let mut old: Value = serde_json::from_str(lines[0]).expect("line");
+    old.as_object_mut()
+        .expect("object")
+        .remove("truncation_recoveries");
+    let old: RunResult = serde_json::from_value(old).expect("old line");
+    assert_eq!(old.truncation_recoveries, 0);
+}
+
+#[tokio::test]
 async fn replay_in_the_runner_matches_or_diverges_at_the_check() {
     let temp = common::private_tempdir().expect("tempdir");
     let tasks = two_tasks(&temp.path().join("tasks"));
@@ -2124,6 +2197,7 @@ fn result(
         cache_read_tokens: None,
         cache_write_tokens: None,
         wall_ms: u64::from(steps) * 1000,
+        truncation_recoveries: 0,
         replay: None,
         error: None,
     }

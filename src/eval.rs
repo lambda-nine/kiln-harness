@@ -497,6 +497,9 @@ pub struct RunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
     pub wall_ms: u64,
+    /// Truncated responses the session discarded and went on from.
+    #[serde(default)]
+    pub truncation_recoveries: u32,
     /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`; `None`
     /// without `--replay` or for a run that did not complete.
     pub replay: Option<String>,
@@ -1070,6 +1073,7 @@ struct Recorded {
     tool_calls: u32,
     usage: crate::provider::Usage,
     check: Option<CheckOutcome>,
+    truncation_recoveries: u32,
 }
 
 fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
@@ -1081,11 +1085,21 @@ fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
         .records
         .first()
         .map(|record| record.session_id.clone());
+    // A verified journal requests another turn after a `max_tokens` stop
+    // only when the engine discarded it, so recoveries can be counted
+    // without `session_ended`; its own count wins when it is there.
+    let mut truncated = false;
     for record in &journal.records {
         match &record.event {
-            JournalEvent::ModelRequested { turn, .. } => recorded.steps = *turn,
+            JournalEvent::ModelRequested { turn, .. } => {
+                recorded.steps = *turn;
+                if std::mem::take(&mut truncated) {
+                    recorded.truncation_recoveries += 1;
+                }
+            }
             JournalEvent::ModelResponded { response, .. } => {
                 recorded.usage = recorded.usage + response.usage;
+                truncated = response.stop_reason == crate::provider::StopReason::MaxTokens;
             }
             JournalEvent::ToolExecuted { .. } => recorded.tool_calls += 1,
             JournalEvent::CheckCompleted { outcome, .. } => {
@@ -1094,8 +1108,12 @@ fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
             JournalEvent::SessionEnded {
                 outcome,
                 work_outcome,
+                truncation_recoveries,
                 ..
-            } => recorded.outcome = Some((outcome.clone(), work_outcome.clone())),
+            } => {
+                recorded.outcome = Some((outcome.clone(), work_outcome.clone()));
+                recorded.truncation_recoveries = *truncation_recoveries;
+            }
             _ => {}
         }
     }
@@ -1319,6 +1337,7 @@ where
         cache_write_tokens: (usage.cache_creation_input_tokens > 0)
             .then_some(usage.cache_creation_input_tokens),
         wall_ms,
+        truncation_recoveries: recorded.truncation_recoveries,
         replay: None,
         error: outcome.as_ref().err().map(ToString::to_string),
     };

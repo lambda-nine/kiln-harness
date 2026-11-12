@@ -120,7 +120,11 @@ pub enum Message {
 pub enum StopReason {
     EndTurn,
     ToolUse,
+    /// The response reached its own output-token limit.
     MaxTokens,
+    /// The request and response together filled the model's context
+    /// window. Retrying re-sends the whole context, so it never recovers.
+    ContextExceeded,
     Refusal,
     Other,
 }

@@ -170,6 +170,7 @@ impl Ended {
             tool_calls: self.tool_calls,
             usage: self.usage,
             sandbox_deleted: self.sandbox_deleted,
+            truncation_recoveries: 0,
         }
     }
 }
@@ -747,6 +748,7 @@ fn forge_tool_after(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
         tool_calls: tool_calls + 1,
         usage,
         sandbox_deleted: true,
+        truncation_recoveries: 0,
     });
     events
 }
@@ -758,6 +760,7 @@ fn forge_completion(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
         tool_calls,
         steps,
         usage,
+        truncation_recoveries,
         ..
     }) = events.pop()
     else {
@@ -774,6 +777,7 @@ fn forge_completion(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
         tool_calls,
         usage,
         sandbox_deleted: true,
+        truncation_recoveries,
     });
     events
 }
@@ -803,7 +807,10 @@ async fn engine_refusals_verify_and_forged_continuations_do_not() {
                 stop_reason: StopReason::MaxTokens,
                 ..ModelResponse::tool_use([diff("a")])
             }],
-            short(),
+            HarnessConfig {
+                max_truncation_recoveries: 0,
+                ..short()
+            },
         ),
         (
             "invalid call ID",
@@ -863,7 +870,10 @@ async fn engine_refusals_verify_and_forged_continuations_do_not() {
                 stop_reason: StopReason::MaxTokens,
                 ..ModelResponse::final_text("half")
             }],
-            short(),
+            HarnessConfig {
+                max_truncation_recoveries: 0,
+                ..short()
+            },
         ),
         (
             "tool_use stop with no tool calls",
@@ -948,6 +958,7 @@ async fn engine_refusals_verify_and_forged_continuations_do_not() {
         tool_calls: tool_calls + 1,
         usage,
         sandbox_deleted: true,
+        truncation_recoveries: 0,
     });
     assert_rejected_because("past the call budget", over_calls, "beyond max_tool_calls");
 }

@@ -12,8 +12,8 @@ use kiln_harness::engine::{
     CheckOutcome, Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST,
     MAX_SANDBOX_IDLE_TIMEOUT, MAX_SANDBOX_LIFETIME_MARGIN, MAX_SESSION_TIMEOUT, MAX_STEPS,
     MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
-    MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, MIN_SANDBOX_IDLE_TIMEOUT,
-    MIN_SANDBOX_LIFETIME_MARGIN, SessionOutcome, SessionTask,
+    MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, MAX_TRUNCATION_RECOVERIES,
+    MIN_SANDBOX_IDLE_TIMEOUT, MIN_SANDBOX_LIFETIME_MARGIN, SessionOutcome, SessionTask,
 };
 use kiln_harness::eval;
 use kiln_harness::files::read_regular_file;
@@ -158,6 +158,11 @@ struct ModelArgs {
     /// Output tokens per model request, hidden reasoning included.
     #[arg(long, default_value_t = 16_384)]
     max_output_tokens: u32,
+    /// Responses cut off at --max-output-tokens that the session discards
+    /// and goes on from, 0 to 16 per session; each uses a step. 0 makes
+    /// every such response fatal.
+    #[arg(long, default_value_t = 2)]
+    max_truncation_recoveries: u32,
     /// Input tokens per session, cached input included.
     #[arg(long, default_value_t = 2_000_000)]
     max_total_input_tokens: u64,
@@ -430,6 +435,9 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         args.max_output_tokens,
         MAX_OUTPUT_TOKENS_PER_REQUEST,
     )?;
+    if args.max_truncation_recoveries > MAX_TRUNCATION_RECOVERIES {
+        bail!("--max-truncation-recoveries must be between 0 and {MAX_TRUNCATION_RECOVERIES}");
+    }
     check_limit(
         "--max-total-input-tokens",
         args.max_total_input_tokens,
@@ -463,6 +471,7 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         max_tool_calls_per_turn: args.max_tool_calls_per_turn,
         session_timeout: Duration::from_secs(args.session_timeout_secs),
         max_output_tokens_per_request: args.max_output_tokens,
+        max_truncation_recoveries: args.max_truncation_recoveries,
         max_total_input_tokens: args.max_total_input_tokens,
         max_total_output_tokens: args.max_total_output_tokens,
         max_total_model_output_bytes: args.max_total_output_bytes,
@@ -1140,6 +1149,51 @@ mod tests {
         assert_eq!(base_url_host(&args).as_deref(), Some("api.anthropic.com"));
         let args = model_args("openai-compat", Some("not a url"));
         assert_eq!(base_url_host(&args), None);
+    }
+
+    #[test]
+    fn truncation_recoveries_default_to_two_and_reach_the_engine() {
+        let defaults = model_args("anthropic", None);
+        assert_eq!(defaults.max_truncation_recoveries, 2);
+        assert_eq!(
+            model_config(&defaults)
+                .expect("config")
+                .max_truncation_recoveries,
+            2
+        );
+        let parse = |command: &str, value: &str| {
+            let mut argv = vec!["kiln-harness", command];
+            if command == "eval" {
+                argv.extend(["run", "--out", "out"]);
+            } else {
+                argv.extend(["--prompt", "x"]);
+            }
+            argv.extend([
+                "--provider",
+                "anthropic",
+                "--max-truncation-recoveries",
+                value,
+            ]);
+            match Cli::parse_from(argv).command {
+                Command::Run(run) => run.model,
+                Command::Eval {
+                    command: EvalCommand::Run(run),
+                } => run.model,
+                _ => panic!("parsed as run or eval run"),
+            }
+        };
+        for command in ["run", "eval"] {
+            for value in [0, 5, MAX_TRUNCATION_RECOVERIES] {
+                let config = model_config(&parse(command, &value.to_string())).expect("valid");
+                assert_eq!(config.max_truncation_recoveries, value, "{command}");
+                assert_eq!(config.limits().max_truncation_recoveries, value);
+            }
+            let error = model_config(&parse(command, "17")).expect_err("over the ceiling");
+            assert_eq!(
+                error.to_string(),
+                "--max-truncation-recoveries must be between 0 and 16"
+            );
+        }
     }
 
     #[test]

@@ -187,6 +187,15 @@ fn budgets_over_their_ceilings_are_refused() {
             .output();
         refused(dir, &output, &format!("{flag} must be between {range}"));
     }
+    let output = Run::new(dir)
+        .arg("--prompt", "hi")
+        .arg("--max-truncation-recoveries", "17")
+        .output();
+    refused(
+        dir,
+        &output,
+        "--max-truncation-recoveries must be between 0 and 16",
+    );
     for (flag, value) in [("--temperature", "2.5"), ("--model", "")] {
         let output = Run::new(dir)
             .arg("--prompt", "hi")

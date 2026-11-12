@@ -415,6 +415,154 @@ fn thinking_and_two_tool_calls_keep_their_blocks() {
 }
 
 #[test]
+fn the_truncation_note_joins_the_user_message_before_it() {
+    let config = config("https://api.anthropic.com");
+    let note = kiln_harness::engine::truncation_note(16_384);
+    let blocks = json!([
+        thinking(""),
+        tool_use("toolu_01A", "list_dir", &json!({"path": "."}))
+    ]);
+    let prompt = Message::User {
+        text: "Make a file.".to_string(),
+    };
+    let tool_turn = [
+        Message::Assistant {
+            text: None,
+            tool_calls: vec![ToolCall::new("toolu_01A", "list_dir", json!({"path": "."}))],
+            provider_content: Some(anthropic_content(blocks.clone())),
+        },
+        Message::ToolResults {
+            results: vec![ToolResult {
+                call_id: "toolu_01A".to_string(),
+                tool: "list_dir".to_string(),
+                result: json!({"ok": true}),
+            }],
+        },
+    ];
+    let body = |messages: &[Message]| {
+        request_body(
+            &config,
+            &ModelRequest {
+                session_id: "hs-test",
+                turn: 2,
+                system: "",
+                tools: &[],
+                messages,
+                max_output_tokens: 16_384,
+            },
+        )
+        .expect("body")["messages"]
+            .clone()
+    };
+    let user_note = Message::User { text: note.clone() };
+
+    // After tool results: a text block after the tool_result blocks.
+    let mut after_tools = vec![prompt.clone()];
+    after_tools.extend(tool_turn.iter().cloned());
+    let without = body(&after_tools);
+    after_tools.push(user_note.clone());
+    let with = body(&after_tools);
+    assert_eq!(
+        with,
+        json!([
+            {"role": "user", "content": "Make a file."},
+            {"role": "assistant", "content": blocks},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01A",
+                 "content": "{\"ok\":true}", "is_error": false},
+                {"type": "text", "text": note}
+            ]}
+        ])
+    );
+    // Everything before the note is byte-identical to the request without it.
+    let encode = |value: &Value| serde_json::to_string(value).expect("encode");
+    assert_eq!(encode(&with[0]), encode(&without[0]));
+    assert_eq!(encode(&with[1]), encode(&without[1]));
+    assert_eq!(
+        encode(&with[2]["content"][0]),
+        encode(&without[2]["content"][0])
+    );
+
+    // After the initial prompt: one user message of two text blocks.
+    assert_eq!(
+        body(&[prompt.clone(), user_note.clone()]),
+        json!([{"role": "user", "content": [
+            {"type": "text", "text": "Make a file."},
+            {"type": "text", "text": note}
+        ]}])
+    );
+    // After an earlier note, the prompt's message keeps growing.
+    assert_eq!(
+        body(&[prompt.clone(), user_note.clone(), user_note.clone()])[0]["content"]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+    // A user turn after an assistant turn is its own message, as before.
+    let messages = body(&[prompt, tool_turn[0].clone(), user_note]);
+    assert_eq!(messages.as_array().map(Vec::len), Some(3));
+    assert_eq!(messages[2], json!({"role": "user", "content": note}));
+}
+
+#[tokio::test]
+async fn a_live_truncated_turn_is_not_echoed_and_the_note_is_sent() {
+    let server = FakeHttp::start(vec![
+        ok(&json!([thinking("all of it")]), "max_tokens"),
+        ok(&json!([text("done")]), "end_turn"),
+    ])
+    .await;
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider(config(&base(&server))),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+    let outcome = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("recovers");
+    assert_eq!(outcome.final_answer, "done");
+    assert_eq!(outcome.truncation_recoveries, 1);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let second: Value = serde_json::from_slice(&requests[1].body).expect("JSON");
+    let note = kiln_harness::engine::truncation_note(
+        kiln_harness::engine::HarnessConfig::default().max_output_tokens_per_request,
+    );
+    assert_eq!(
+        second["messages"],
+        json!([{"role": "user", "content": [
+            {"type": "text", "text": SessionTask::demo().prompt},
+            {"type": "text", "text": note}
+        ]}])
+    );
+    assert!(!String::from_utf8_lossy(&requests[1].body).contains(SIGNATURE));
+}
+
+#[tokio::test]
+async fn an_exceeded_context_window_ends_the_session() {
+    let server = FakeHttp::start(vec![ok(
+        &json!([text("x")]),
+        "model_context_window_exceeded",
+    )])
+    .await;
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        provider(config(&base(&server))),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        short_lifecycle_config(),
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("fatal");
+    assert!(matches!(error, HarnessError::ContextExceeded), "{error}");
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
 fn stop_reasons_map() {
     let call = json!([tool_use("toolu_1", "list_dir", &json!({}))]);
     let say = json!([text("x")]);
@@ -423,7 +571,11 @@ fn stop_reasons_map() {
         (&say, "end_turn", StopReason::EndTurn),
         (&say, "stop_sequence", StopReason::EndTurn),
         (&say, "max_tokens", StopReason::MaxTokens),
-        (&say, "model_context_window_exceeded", StopReason::MaxTokens),
+        (
+            &say,
+            "model_context_window_exceeded",
+            StopReason::ContextExceeded,
+        ),
     ] {
         assert_eq!(parsed(content, stop).stop_reason, expected, "{stop}");
     }

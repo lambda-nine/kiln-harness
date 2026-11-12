@@ -193,8 +193,12 @@ it is not a hostile multi-tenant boundary.
 - Every response is bounded before it reaches kilnd: per-turn and per-session
   call budgets, per-request and cumulative token budgets (cached input
   included), argument and
-  assistant-text byte limits, and fail-closed handling of truncated or refused
-  turns. Malformed or repeated provider call IDs fail the session; unregistered
+  assistant-text byte limits, and fail-closed handling of refused turns. A
+  turn truncated at its output limit is discarded unexecuted (none of its
+  calls run, and none of its content reaches the history or the audit),
+  within a bounded number of recoveries per session (default 2, at most 16),
+  after which truncation fails the session; a turn that fills the context
+  window always does. Malformed or repeated provider call IDs fail the session; unregistered
   tool names only produce a model-visible `unknown_tool` result. Configured and
   recorded limits are capped by fixed ceilings before any sandbox exists.
 

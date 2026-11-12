@@ -479,10 +479,35 @@ journals and request hashes from providers without it are byte-identical
 to before. The audit's `model_responded` carries the served model as
 `served_model` when there is one.
 
-A response without tool calls is the final answer. `max_tokens` ends with
-`ModelTruncated`, `refusal` with `ModelRefused`, and empty text with
-`InvalidModelCall`. A response with tool calls is checked as a whole before
-any call runs: `max_tokens` (arguments may be cut off) and `refusal` end the
+After the budgets, the stop reason is checked, whatever the response holds.
+A `max_tokens` stop, the response cut off at `max_output_tokens_per_request`,
+is recovered from while the session has recoveries left
+(`max_truncation_recoveries`, default 2 and at most 16, counted per session,
+not per streak; 0 makes it fatal). Recovery discards the whole response:
+its text, tool calls and provider content never enter the history, and
+none of its calls run, since arguments may be cut off and a truncated
+thinking block cannot be echoed back. The engine audits a
+`truncated_turn_discarded` model turn without content, appends one user
+message from `truncation_note`:
+
+> Your previous response reached the N-token output limit before it
+> finished, so it was discarded and none of its tool calls ran. Keep your
+> reasoning short: make the next tool call now, or give your final answer.
+
+with N the per-request limit, and goes on to the next turn. A recovery uses
+a step, so `max_steps` still bounds the session, and one on the last step
+ends it with `StepBudget`. The budgets come first and count the truncated
+output: a response over one ends the session with that budget's error,
+never a recovery. Once the recoveries are used up, `max_tokens` ends the
+session with `ModelTruncated`. A `context_exceeded` stop, the request and
+response filling the model's context window, ends it with
+`ContextExceeded` and is never recovered: a retry re-sends the whole
+context. `SessionOutcome` and `session_ended` report
+`truncation_recoveries`.
+
+A response without tool calls is then the final answer. `refusal` ends with
+`ModelRefused`, and empty text with `InvalidModelCall`. A response with tool
+calls is checked as a whole before any call runs: `refusal` ends the
 session, as does more than the per-turn call budget. Provider call IDs must
 each match the existing character rule and be unique within the turn; a bad
 ID is a provider protocol fault and fails the session. Assistant text beside
@@ -627,7 +652,13 @@ the sanitized arguments are not an object. A turn's tool results are one
 user message of `tool_result` blocks, in order, each with the result's
 compact JSON and `is_error` unless the result says `"ok": true`; splitting
 them across messages would teach the model to stop calling tools in
-parallel. Blocks are held as JSON values, so the echo is value-for-value:
+parallel. A user turn right after tool results or another user turn, which
+only the engine's truncation note makes, joins that user message as a
+trailing `{"type": "text"}` block, after the `tool_result` blocks; a string
+`content` becomes an array of text blocks first. The API wants roles to
+alternate, and every request without a note is byte-identical to before.
+The openai-compat adapter sends the note as its own user message, which
+that API accepts after tool messages. Blocks are held as JSON values, so the echo is value-for-value:
 strings are exact, object keys come out in the journal's canonical sorted
 order, and numbers are exact because a response whose opaque content holds
 one serde_json cannot hold exactly (a float, or an integer outside 64 bits)
@@ -646,12 +677,12 @@ opaque content. A `tool_use` must have an `id` that passes the engine's
 call-ID rule (the echoed block keeps it, so it cannot be replaced by a
 positional ID), a name of at most 256 bytes, and an object `input`;
 otherwise the response is `InvalidResponse`. `end_turn` and `stop_sequence`
-are `end_turn`, `tool_use` is `tool_use`, `max_tokens` and
-`model_context_window_exceeded` are `max_tokens`, and `refusal` is
+are `end_turn`, `tool_use` is `tool_use`, `max_tokens` is `max_tokens`,
+`model_context_window_exceeded` is `context_exceeded`, and `refusal` is
 `refusal`. Since only client tools are sent, a `tool_use` stop must come
 with at least one `tool_use` block and `end_turn` or `stop_sequence` with
 none; either mismatch is `InvalidResponse`, not normalized. A truncated or
-refused turn may still hold blocks, and the engine refuses it. Provider
+refused turn may still hold blocks; the engine discards or refuses it. Provider
 neutrally, the engine and the grammar treat a `tool_use` stop with no tool
 calls as a protocol fault (`InvalidModelCall`), never a final answer; an
 openai-compat `finish_reason: "tool_calls"` with no calls ends that way. `pause_turn` is `InvalidResponse`:
@@ -811,11 +842,15 @@ cancellation. kilnd independently bounds retained output and owns execution
 cleanup. Configured lifecycle windows are rejected above 60 seconds so
 deadline construction cannot overflow after a sandbox exists.
 
+Both `HarnessConfig` and `run` allow two truncation recoveries per session
+by default (`--max-truncation-recoveries`).
+
 Every configuration, including limits loaded from a journal, must also stay
 under hard ceilings: 1,000 steps, 10,000 tool calls and 64 per turn, a 6-hour
 session, a 10-minute tool timeout, 16 MiB for each byte limit, 1,000,000
 output tokens per request, 1,000,000,000 tokens for each cumulative
-budget, and 256 MiB of model output per session.
+budget, 256 MiB of model output per session, and 16 truncation recoveries
+per session (0 is allowed).
 
 ## Audit
 
@@ -854,8 +889,13 @@ session ID, one event, and `prev_sha256`: the SHA-256 of the previous record's
 exact line bytes (64 zeros for the first). Events are `session_started`,
 `sandbox_ready`, `model_requested`, `model_responded`, `model_failed`,
 `tool_executed`, `check_completed`, and `session_ended`. `session_started` records every
-model-visible limit (steps, calls, timeouts, token budgets, argument and
-final-answer bounds, and all tool limits); lifecycle windows are not recorded.
+model-visible limit (steps, calls, timeouts, token budgets, truncation
+recoveries, argument and final-answer bounds, and all tool limits);
+lifecycle windows are not recorded. `max_truncation_recoveries` in the
+limits and `truncation_recoveries` in `session_ended` are omitted when 0,
+and a journal without them loads with 0, the meaning journals written
+before recovery existed had: truncation is fatal. So those journals, and
+any session with recovery off, stay byte-identical.
 For a task with a seed or a check it also records `seed` (each file's path
 and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
 replay is self-contained. Both are omitted when absent, so a journal without
@@ -905,7 +945,8 @@ must pass the engine's task checks and the recorded limits its hard ceilings.
 `sandbox_ready` appears at most once, before any request, and a request needs
 it. Requests run turn 1, 2, … and each is answered by exactly one
 `model_responded` or `model_failed` before the next; nothing but
-`session_ended` follows a failure or a response without tool calls. After a
+`session_ended` follows a failure or a response without tool calls, except
+a discarded one (below). After a
 response with n calls, up to n `tool_executed` records follow with indexes 1,
 2, …, and each call must equal the response's call after the shared
 `sanitize_call` (unregistered names become `unknown`, oversized arguments the
@@ -915,11 +956,15 @@ as the engine does, and every `model_requested` must carry that history's
 message count and request hash, so every result that fed a later request is
 bound to its record. Results of a final tool turn feed no later request; only
 replay checks those. `session_ended` must agree with the records: its tool-call
-count, last turn, and usage sum. Work outcome `completed` needs a final
+count, last turn, usage sum, and truncation recoveries. Work outcome `completed` needs a final
 response in the last turn whose text is the final answer, the outcome
 `completed` needs confirmed deletion, `cleanup_failed` is required exactly when
-deletion was not confirmed, and a request may stay unanswered only if the work
-did not complete.
+deletion was not confirmed, a request may stay unanswered only if the work
+did not complete, and work outcome `create_failed` is allowed only before
+`sandbox_ready` and any request, since the engine writes it only before it
+has accepted a READY create response and journaled `sandbox_ready`. A create
+that made a sandbox but lost its response still ends `create_failed`; label
+recovery deletes that sandbox.
 
 A recorded seed and check must pass the engine's own rules under the
 recorded limits (valid base64 included). `check_completed` is allowed only
@@ -930,13 +975,31 @@ final answer in the last turn, and with neither output stream longer than
 
 The grammar also applies the engine's acceptance rules with the recorded
 limits. Requests stop at `max_steps`, and tool records at `max_tool_calls` in
-total and `max_tool_calls_per_turn` in a turn. A response the engine refuses (a
-token budget, the per-request output cap, or the model-output byte budget
-exceeded, a `max_tokens` or
-`refusal` stop, invalid or repeated call IDs, too many calls, or text over its
-byte bound) may be recorded, because the engine records it before refusing it,
-but nothing but `session_ended` may follow it and it cannot complete the
-session.
+total and `max_tool_calls_per_turn` in a turn. Each response gets the
+engine's disposition, in the engine's order: accepted, recovered, or
+refused. A response the engine refuses (a token budget, the per-request
+output cap, or the model-output byte budget exceeded, a `max_tokens` stop
+with no recoveries left, a `context_exceeded` or `refusal` stop, invalid or
+repeated call IDs, too many calls, or text over its byte bound) may be
+recorded, because the engine records it before refusing it, but nothing but
+`session_ended` may follow it and it cannot complete the session. A
+response is recovered when it is within the budgets, its stop is
+`max_tokens`, and the grammar's own count of earlier recoveries is below
+the recorded limit. After it, the next `model_requested` is allowed, and its
+history must end with the truncation note in place of the response and
+tool results; a request that fails that check leaves the note out and the
+recovered response in place again. No `tool_executed` or `check_completed`
+may follow a recovered response, and neither may a `session_ended` with
+completed work or a final answer. Before the last step, the failure endings
+(cancellation, the deadline, a failure, or cleanup) may follow it, as after
+a tool turn. On the last allowed step the engine leaves the loop at once
+with the step budget, so the work outcome must be `failed`; the outcome may
+still be `cleanup_failed` when deletion was not confirmed.
+
+The engine decides whether a response is recovered right after journaling
+it, from the response and the limits alone, and counts it before any audit
+append that could fail, so its `session_ended` count always agrees with the
+grammar's.
 
 `request_sha256` hashes the versioned layout `{"v", "system", "tools",
 "messages", "max_output_tokens"}` encoded by serde_json. The session ID is
@@ -995,8 +1058,10 @@ existing `--out`, reads kilnd's Health once for the manifest's feature list,
 then creates `--out` with mode 0700 through the same descriptor walk as the
 journal. Runs are sequential, one sandbox at a time, tasks in ID order and
 trials 1 to N, each with a fresh provider. Each run's results line is built
-from its journal (session ID, outcome, steps, tool calls, usage, check) and
-appended to `results.jsonl` before the next run starts. With `--replay`, a
+from its journal (session ID, outcome, steps, tool calls, usage, check,
+truncation recoveries) and appended to `results.jsonl` before the next run
+starts. `truncation_recoveries` is always written, and a line without it
+reads as 0. With `--replay`, a
 completed run is replayed against a fresh sandbox right after it. The suite
 fails closed: after a run or replay whose sandbox deletion was not confirmed
 (`cleanup_failed`, `Cleanup` or `CreateUncertain`), or replay outputs that
