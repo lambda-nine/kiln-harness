@@ -38,4 +38,4 @@ app
 test
 ```
 
-Leave `deps.txt` unchanged. Commands you run start in `/`, so use absolute paths or `cd /workspace` first.
+Leave `deps.txt` unchanged. Commands you run start in `/workspace`.

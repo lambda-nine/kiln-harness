@@ -15,4 +15,4 @@ Rename the shell function `get_cfg` to `config_get` throughout the project:
 
 When you are done, `sh tests/run.sh`, run from `/workspace`, must still pass.
 
-Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `grep`, `find` and so on); there is no network. Commands you run start in `/`, so use absolute paths or `cd /workspace` first, for example `sh -c 'cd /workspace && sh tests/run.sh'`.
+Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `grep`, `find` and so on); there is no network. Commands you run start in `/workspace`, so `sh tests/run.sh` runs the tests.

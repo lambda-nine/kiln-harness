@@ -27,4 +27,4 @@ Check the data records in order and stop at the first problem:
 
 Within one record, a wrong field count is reported before a bad value.
 
-For example, `sh /workspace/colsum.sh /workspace/sales.csv units` prints `39`. Leave `sales.csv` unchanged. Commands you run start in `/`, so use absolute paths or `cd /workspace` first.
+For example, `sh /workspace/colsum.sh /workspace/sales.csv units` prints `39`. Leave `sales.csv` unchanged. Commands you run start in `/workspace`.

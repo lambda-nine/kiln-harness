@@ -15,4 +15,4 @@ Rules:
 - The program must stay POSIX `sh` and POSIX `awk`, run as `sh /workspace/ledger/bin/ledger COMMAND FILE [PREFIX]` from any directory.
 - When you are done, `sh /workspace/ledger/tests/run.sh` must still pass.
 
-Use only the standard tools available here; there is no network. Commands you run start in `/`, so use absolute paths.
+Use only the standard tools available here; there is no network. Commands you run start in `/workspace`.

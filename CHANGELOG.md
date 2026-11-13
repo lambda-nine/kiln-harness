@@ -6,6 +6,11 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Eval prompts match the execution context: the 13 task prompts that said
+  commands start in `/` (every `evals/hard` task and `fix-failing-test`) now
+  say they start in `/workspace`, with examples that use relative paths.
+  Checks, seeds and solutions are unchanged, but results from these prompts
+  are not directly comparable with runs made before this change.
 - kilnd API milestone 4: the model's `exec` runs through `ExecStream`. Every
   live session uses a third execution context, `workspace_stream_v1`
   (`/workspace` and the fixed env, as `workspace_v1`), journaled in

@@ -18,4 +18,4 @@ Rules:
 - Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `grep`, `tr` and so on). There is no network.
 - Speed matters: section 9 of the document sets a time limit for long loops.
 
-Commands you run start in `/`, so use absolute paths, for example `sh /workspace/stak.sh /workspace/examples/loops.stk`.
+Commands you run start in `/workspace`, so `sh stak.sh examples/loops.stk` runs an example.

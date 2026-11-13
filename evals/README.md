@@ -61,8 +61,8 @@ anything runs, even when `--task` picks a few, and every error names its task.
    Redirect stdin from `/dev/null` when the check runs a script the agent
    wrote, since the check itself arrives on stdin.
 3. Make sure the bare seed fails the check and `solution.sh` makes it pass.
-   Commands run from `/`, so the solution uses absolute paths or
-   `cd /workspace`.
+   Commands, `solution.sh` included, start in `/workspace`; say so in
+   `prompt.md` when the task depends on it.
 4. Prove it against kilnd with `eval selftest --task <id>`.
 
 ## Self-test

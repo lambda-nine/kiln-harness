@@ -53,4 +53,4 @@ password=
 endpoint=/metrics
 ```
 
-Leave `base.ini` and `prod.ini` unchanged. Commands you run start in `/`, so use absolute paths or `cd /workspace` first.
+Leave `base.ini` and `prod.ini` unchanged. Commands you run start in `/workspace`.

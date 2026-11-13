@@ -12,4 +12,4 @@ Rules:
 - Keep the six function names and their arguments. The library must stay POSIX `sh` that works when sourced with `. lib/strutil.sh`.
 - When you are done, `sh tests/test_strutil.sh` run from `/workspace` must pass.
 
-Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `tr`, `grep` and so on); there is no network. Commands you run start in `/`, so run the tests as `sh -c 'cd /workspace && sh tests/test_strutil.sh'`.
+Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `tr`, `grep` and so on); there is no network. Commands you run start in `/workspace`, so `sh tests/test_strutil.sh` runs the tests.

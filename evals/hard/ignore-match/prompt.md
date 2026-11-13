@@ -21,4 +21,4 @@ Rules:
 - Do not change, add or remove anything under `docs/` or `examples/`.
 - Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `grep` and so on). Do not use `git` or any other program that implements ignore rules for you; there is no network.
 
-Commands you run start in `/`, so use absolute paths.
+Commands you run start in `/workspace`.

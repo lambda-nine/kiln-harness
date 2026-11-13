@@ -1,1 +1,1 @@
-`/workspace/test.sh` tests the `slugify` function in `/workspace/lib.sh`, and it fails. Fix `lib.sh` so that `sh test.sh`, run from `/workspace`, passes. Do not edit `test.sh`. Note that commands you run start in `/`, so run the test as `sh -c 'cd /workspace && sh test.sh'`.
+`/workspace/test.sh` tests the `slugify` function in `/workspace/lib.sh`, and it fails. Fix `lib.sh` so that `sh test.sh`, run from `/workspace`, passes. Do not edit `test.sh`. Commands you run start in `/workspace`, so `sh test.sh` runs the test.

@@ -14,4 +14,4 @@ and exit with status 0, having changed the default port in `src/config.h` to 808
 
 The check runs many patches that are not in the workspace, each against a fresh copy of the tree, so you may change `/workspace/tree` while you test. Do not change `docs/` or `example.patch`.
 
-Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `cmp`, `mktemp` and so on). Do not use `patch`, `git` or any other program that applies diffs for you; there is no network. Commands you run start in `/`, so use absolute paths.
+Use only POSIX `sh` and the standard tools available here (`awk`, `sed`, `cmp`, `mktemp` and so on). Do not use `patch`, `git` or any other program that applies diffs for you; there is no network. Commands you run start in `/workspace`.

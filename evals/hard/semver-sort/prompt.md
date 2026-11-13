@@ -28,4 +28,4 @@ For example, `1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-alpha.beta < 1.0.0-beta < 1.0.
 - If any line is invalid: print nothing on standard output, print exactly one line `invalid version on line N: TEXT` on standard error for the first invalid line (N counts from 1, TEXT is the line as given), and exit 2.
 - Otherwise exit 0.
 
-`/workspace/examples.txt` is a sample input, and `/workspace/examples.sorted.txt` is its correct output. Commands you run start in `/`, so use absolute paths or `cd /workspace` first.
+`/workspace/examples.txt` is a sample input, and `/workspace/examples.sorted.txt` is its correct output. Commands you run start in `/workspace`.

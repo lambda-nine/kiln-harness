@@ -36,4 +36,4 @@ For example, `sh /workspace/rollup.sh /workspace/logs` must print:
 malformed=5
 ```
 
-Leave `/workspace/logs` unchanged. Commands you run start in `/`, so use absolute paths or `cd /workspace` first.
+Leave `/workspace/logs` unchanged. Commands you run start in `/workspace`.
