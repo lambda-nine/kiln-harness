@@ -3799,34 +3799,40 @@ fn timed_tasks(root: &Path, timed: &[(&str, Option<u64>)], base: &HarnessConfig)
     load_tasks(root, &[], base).expect("loads")
 }
 
-fn session_timeouts(tasks: &[EvalTask]) -> Vec<Option<u64>> {
-    tasks
-        .iter()
-        .map(|task| task.session_timeout.map(|timeout| timeout.as_secs()))
-        .collect()
-}
-
 #[test]
-fn max_run_secs_caps_each_tasks_session_timeout() {
+fn max_run_secs_caps_each_runs_session_timeout() {
     let temp = common::private_tempdir().expect("tempdir");
     let base = config();
     let timed = [("a", Some(1500)), ("b", Some(300)), ("c", None)];
-    let original = timed_tasks(&temp.path().join("tasks"), &timed, &base);
+    let tasks = timed_tasks(&temp.path().join("tasks"), &timed, &base);
     assert_eq!(base.session_timeout, Duration::from_secs(30));
+    let run_timeouts = |base: &HarnessConfig, cap: Option<u64>| {
+        tasks
+            .iter()
+            .map(|task| task.run_config(base, cap).session_timeout.as_secs())
+            .collect::<Vec<_>>()
+    };
 
-    let mut tasks = original.clone();
-    eval::cap_run_time(&mut tasks, &base, None).expect("no cap");
-    assert_eq!(tasks, original, "unset changes nothing");
-
-    eval::cap_run_time(&mut tasks, &base, Some(600)).expect("caps");
-    assert_eq!(session_timeouts(&tasks), [Some(600), Some(300), Some(30)]);
-    for (capped, task) in tasks.iter().zip(&original) {
+    assert_eq!(
+        run_timeouts(&base, None),
+        [1500, 300, 30],
+        "unset changes nothing"
+    );
+    for task in &tasks {
         assert_eq!(
-            EvalTask {
-                session_timeout: task.session_timeout,
-                ..capped.clone()
-            },
-            *task,
+            task.run_config(&base, None).limits(),
+            task.config(&base).limits()
+        );
+    }
+    assert_eq!(run_timeouts(&base, Some(600)), [600, 300, 30]);
+    for task in &tasks {
+        assert_eq!(
+            HarnessConfig {
+                session_timeout: task.config(&base).session_timeout,
+                ..task.run_config(&base, Some(600))
+            }
+            .limits(),
+            task.config(&base).limits(),
             "only the session timeout changes"
         );
     }
@@ -3837,40 +3843,57 @@ fn max_run_secs_caps_each_tasks_session_timeout() {
         session_timeout: Duration::from_secs(1200),
         ..config()
     };
-    let mut tasks = original.clone();
-    eval::cap_run_time(&mut tasks, &long_base, Some(600)).expect("caps");
-    assert_eq!(session_timeouts(&tasks), [Some(600), Some(300), Some(600)]);
+    assert_eq!(run_timeouts(&long_base, Some(600)), [600, 300, 600]);
 }
 
 #[test]
 fn max_run_secs_out_of_range_or_under_a_check_window_is_refused() {
     let temp = common::private_tempdir().expect("tempdir");
     let base = config();
-    let original = timed_tasks(
+    let tasks = timed_tasks(
         &temp.path().join("tasks"),
         &[("a", Some(1500)), ("b", None)],
         &base,
     );
+    eval::check_run_cap(&tasks, &base, None).expect("unset passes");
     for refused in [0, 6 * 60 * 60 + 1] {
-        let mut tasks = original.clone();
-        let error = eval::cap_run_time(&mut tasks, &base, Some(refused)).expect_err("refused");
+        let error = eval::check_run_cap(&tasks, &base, Some(refused)).expect_err("refused");
         assert!(matches!(error, EvalError::Options(_)), "{error}");
         assert_eq!(
             error.to_string(),
             "--max-run-secs must be between 1 and 21600"
         );
-        assert_eq!(tasks, original);
     }
     // Each task's check timeout is 10 s, so the cap must be at least 20.
-    let mut tasks = original.clone();
-    let error = eval::cap_run_time(&mut tasks, &base, Some(19)).expect_err("refused");
+    let error = eval::check_run_cap(&tasks, &base, Some(19)).expect_err("refused");
     assert_eq!(
         error.to_string(),
         "--max-run-secs 19 is less than twice task a's check timeout of 10 s"
     );
-    assert_eq!(tasks, original, "an error leaves every task unchanged");
-    eval::cap_run_time(&mut tasks, &base, Some(20)).expect("exactly twice is allowed");
-    assert_eq!(session_timeouts(&tasks), [Some(20), Some(20)]);
+    eval::check_run_cap(&tasks, &base, Some(20)).expect("exactly twice is allowed");
+}
+
+#[tokio::test]
+async fn run_suite_refuses_a_max_run_secs_under_a_check_window_before_any_output() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = timed_tasks(&temp.path().join("tasks"), &[("a", Some(1500))], &config());
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    let error = eval::run_suite(
+        &api,
+        &tasks,
+        &SuiteOptions {
+            max_run_secs: Some(19),
+            ..options(&out, 1, false)
+        },
+        || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect_err("refused");
+    assert!(matches!(error, EvalError::Options(_)), "{error}");
+    assert!(!out.exists(), "nothing was written");
 }
 
 #[test]
@@ -4002,11 +4025,43 @@ async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
     assert_eq!(rows, ["a", "b", "c"]);
 }
 
+#[tokio::test]
+async fn a_cap_that_ties_every_task_still_starts_the_longest_budgets_first() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = timed_tasks(
+        &temp.path().join("tasks"),
+        &[("a", Some(300)), ("b", Some(1500)), ("c", Some(900))],
+        &config(),
+    );
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let mut progress = Vec::new();
+    // 200 s caps every task, so all three run under the same limit.
+    eval::run_suite(
+        &api,
+        &tasks,
+        &SuiteOptions {
+            max_run_secs: Some(200),
+            ..options(&out, 1, false)
+        },
+        || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
+        &CancellationToken::new(),
+        &mut |result| {
+            progress.push(result.task.clone());
+            Ok(())
+        },
+    )
+    .await
+    .expect("the suite runs");
+    assert_eq!(progress, ["b", "c", "a"]);
+    assert_eq!(read_manifest(&out).max_run_secs, Some(200));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_capped_run_ends_at_the_deadline_and_fails() {
     let temp = common::private_tempdir().expect("tempdir");
-    let mut tasks = timed_tasks(&temp.path().join("tasks"), &[("a", Some(1500))], &config());
-    eval::cap_run_time(&mut tasks, &config(), Some(20)).expect("caps");
+    let tasks = timed_tasks(&temp.path().join("tasks"), &[("a", Some(1500))], &config());
     let out = temp.path().join("out");
     let api = FakeApi::default();
     api.state().sh_handler = Some(out_txt_handler());

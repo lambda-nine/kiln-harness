@@ -144,6 +144,17 @@ impl EvalTask {
         config
     }
 
+    /// [`EvalTask::config`] with its session timeout capped at `max_run_secs`
+    /// seconds (`--max-run-secs`), as one run of the task uses it.
+    #[must_use]
+    pub fn run_config(&self, base: &HarnessConfig, max_run_secs: Option<u64>) -> HarnessConfig {
+        let mut config = self.config(base);
+        if let Some(cap) = max_run_secs {
+            config.session_timeout = config.session_timeout.min(Duration::from_secs(cap));
+        }
+        config
+    }
+
     /// The session this task runs under `config`: its prompt, its system
     /// prompt or the default one for `config`'s tool limits, its seed and
     /// its check.
@@ -1017,8 +1028,9 @@ pub struct SuiteOptions {
     pub trials: u32,
     /// Runs at a time, 1 to [`MAX_CONCURRENCY`].
     pub concurrency: u32,
-    /// --max-run-secs, recorded in the manifest; the cap itself is already
-    /// in each task's session timeout.
+    /// `--max-run-secs`: each run's session timeout is capped at this many
+    /// seconds, and the manifest records it. Launch order still uses each
+    /// task's own budget.
     pub max_run_secs: Option<u64>,
     pub replay: bool,
     pub label: Option<String>,
@@ -1057,17 +1069,17 @@ pub fn validate_concurrency(concurrency: u32) -> Result<(), EvalError> {
     }
 }
 
-/// Cap every task's session timeout at `cap` seconds (`--max-run-secs`):
-/// each becomes the smaller of `cap` and its own, or `base`'s when it has
-/// none. `None` changes nothing.
+/// Check `--max-run-secs` against every task: it must be 1 to
+/// [`MAX_SESSION_TIMEOUT`] seconds, and each task's capped session timeout
+/// (see [`EvalTask::run_config`]) must still be at least twice its check
+/// timeout. `None` always passes.
 ///
 /// # Errors
 ///
-/// [`EvalError::Options`] when `cap` is 0 or above [`MAX_SESSION_TIMEOUT`],
-/// or is less than twice a task's check timeout (naming the task); the
-/// tasks are then unchanged.
-pub fn cap_run_time(
-    tasks: &mut [EvalTask],
+/// [`EvalError::Options`] naming the flag, and the task when a check
+/// window is the problem.
+pub fn check_run_cap(
+    tasks: &[EvalTask],
     base: &HarnessConfig,
     cap: Option<u64>,
 ) -> Result<(), EvalError> {
@@ -1080,25 +1092,15 @@ pub fn cap_run_time(
             MAX_SESSION_TIMEOUT.as_secs()
         )));
     }
-    let limit = Duration::from_secs(cap);
-    // Every task is checked before any is changed.
-    let capped = tasks
-        .iter()
-        .map(|task| {
-            let capped = task.config(base).session_timeout.min(limit);
-            if task.check.timeout.saturating_mul(2) > capped {
-                Err(EvalError::Options(format!(
-                    "--max-run-secs {cap} is less than twice task {}'s check timeout of {} s",
-                    task.id,
-                    task.check.timeout.as_secs()
-                )))
-            } else {
-                Ok(capped)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for (task, capped) in tasks.iter_mut().zip(capped) {
-        task.session_timeout = Some(capped);
+    for task in tasks {
+        let capped = task.run_config(base, Some(cap)).session_timeout;
+        if task.check.timeout.saturating_mul(2) > capped {
+            return Err(EvalError::Options(format!(
+                "--max-run-secs {cap} is less than twice task {}'s check timeout of {} s",
+                task.id,
+                task.check.timeout.as_secs()
+            )));
+        }
     }
     Ok(())
 }
@@ -1290,6 +1292,7 @@ where
     F: FnMut() -> Result<P, String>,
 {
     options.validate()?;
+    check_run_cap(tasks, &options.base_config, options.max_run_secs)?;
     refuse_existing_out(&options.out)?;
     let window = options.base_config.lifecycle_timeout;
     let features = match tokio::time::timeout(window, api.health()).await {
@@ -1310,7 +1313,9 @@ where
     // Every stop cancels this token, never the caller's, so the runs in
     // flight stop and clean up while the suite tells the stops apart.
     let runs_cancel = cancel.child_token();
-    // Longest budget first; the sort is stable, so ties keep task order.
+    // Longest budget first, by each task's own session timeout before
+    // `--max-run-secs`, so a cap that ties every task still starts the
+    // likely-long ones first; the sort is stable, so ties keep task order.
     // `index` stays the task's place in `tasks`, which orders the results.
     let mut order: Vec<usize> = (0..tasks.len()).collect();
     order.sort_by_key(|&index| {
@@ -1570,7 +1575,7 @@ where
     A: SandboxApi + Clone,
     P: Provider,
 {
-    let config = task.config(&options.base_config);
+    let config = task.run_config(&options.base_config, options.max_run_secs);
     let session = task.session(&config);
     let (audit, journal, journal_path) = open_outputs(dir, "audit.jsonl", "journal.jsonl")?;
     let started = Instant::now();

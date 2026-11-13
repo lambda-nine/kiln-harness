@@ -1067,11 +1067,11 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
     let config = model_config(&args.model)?;
     eval::validate_trials_and_label(args.trials, args.label.as_deref())?;
     eval::validate_concurrency(args.concurrency)?;
-    let mut tasks = eval::load_tasks(&args.tasks, &args.only, &config)?;
+    let tasks = eval::load_tasks(&args.tasks, &args.only, &config)?;
     if tasks.is_empty() {
         bail!("{} holds no tasks", args.tasks.display());
     }
-    eval::cap_run_time(&mut tasks, &config, args.max_run_secs)?;
+    eval::check_run_cap(&tasks, &config, args.max_run_secs)?;
     let provider = build_provider(&args.model)?.info();
     eval::refuse_existing_out(&args.out)?;
     let api = connect(socket).await?;

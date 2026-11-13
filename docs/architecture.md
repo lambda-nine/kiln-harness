@@ -1306,9 +1306,11 @@ journal. Runs start longest session timeout first (ties in task ID order),
 trials 1 to N, each with a fresh provider and its own sandbox, up to
 `--concurrency` (1 to 8, default 1) at once, all polled within the suite's
 own task, so the runs most likely to be long are not left until last.
-`--max-run-secs N` caps every task's session timeout at N seconds before
-anything runs (the smaller of N and the task's own, or the command line's),
-and is refused when it is under twice any task's check timeout; a run that
+`--max-run-secs N` caps each run's session timeout at N seconds (the
+smaller of N and the task's own, or the command line's), is checked against
+every task before anything runs and refused when it is under twice any
+task's check timeout, and leaves the launch order on each task's own
+timeout, so a cap that ties every task still starts the long ones first; a run that
 reaches it ends at the session deadline and fails, and the cap is part of
 the journal's recorded limits, so a replay runs under it too. Each running
 run holds its own kilnd connection: kilnd caps every connection's HTTP/2

@@ -121,8 +121,8 @@ Runs start longest session timeout first (ties in task ID order) and
 trials 1 to N, up to `--concurrency` at once, each with its own sandbox and
 its own kilnd connection; a new run starts as soon as one ends.
 `--max-run-secs` makes each run's session timeout the smaller of N and the
-task's own (or `--session-timeout-secs`); it must be at least twice every
-task's check timeout, and a run that reaches it ends at the session deadline
+task's own (or `--session-timeout-secs`) without changing the start order;
+it must be at least twice every task's check timeout, and a run that reaches it ends at the session deadline
 and fails. The report notes the cap, and `eval compare` says when two
 reports differ in it. Lines in `results.jsonl` are in completion
 order, while the report lists tasks and trials in order. Each run holds at

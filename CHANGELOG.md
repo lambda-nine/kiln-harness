@@ -11,8 +11,8 @@ change the CLI or audit format.
   whose `task.json` sets a longer one; it is refused before anything runs
   when it is under twice any task's check timeout. A run that reaches it
   ends at the session deadline and fails. Runs now start longest session
-  timeout first (ties in task order, trials 1 to N), so long runs no longer
-  start last; the report still lists tasks in order. `manifest.json` and
+  timeout first (ties in task order, trials 1 to N), using each task's own
+  timeout even under the cap, so long runs no longer start last; the report still lists tasks in order. `manifest.json` and
   `report.json` gain `max_run_secs` (absent when unset and in older files),
   `report.md` prints the longest run allowed, and `eval compare` notes when
   two reports differ in it.
