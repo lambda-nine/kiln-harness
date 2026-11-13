@@ -1080,6 +1080,10 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
         trials: args.trials,
         concurrency: args.concurrency,
         max_run_secs: args.max_run_secs,
+        effort: match args.model.provider {
+            ProviderKind::Anthropic => Some(args.model.effort.unwrap_or_default().to_string()),
+            ProviderKind::OpenAiCompat => None,
+        },
         replay: args.replay,
         label: args.label.clone(),
         base_config: config,

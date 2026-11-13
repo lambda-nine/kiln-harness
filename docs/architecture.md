@@ -1323,8 +1323,11 @@ per-user stream cap. Each run's results line is built from its journal
 (session ID, outcome, steps, tool calls, usage, check, truncation
 recoveries) and appended to `results.jsonl` as soon as the run ends, in
 completion order; the summary and reports are in task and trial order, and
-the manifest and report record `concurrency` (a file without it reads as 1)
-and `max_run_secs` (absent when unset).
+the manifest and report record `concurrency` (a file without it reads as 1),
+`max_run_secs` (absent when unset), `effort` (the reasoning effort sent;
+absent for providers without one) and `max_output_tokens` (the output limit
+per response), the last two absent in older files; `eval compare` notes a
+difference in either only when both reports recorded it.
 `truncation_recoveries` is always written, and a line without it reads as 0.
 With `--replay`, a completed run is replayed against a fresh sandbox right
 after it, on the same connection. The suite fails closed: a run or replay

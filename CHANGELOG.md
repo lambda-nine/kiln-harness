@@ -6,6 +6,11 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `manifest.json` and `report.json` record `effort` (the reasoning effort
+  sent, `--provider anthropic` only) and `max_output_tokens` (the output
+  limit per response), `report.md` prints both, and `eval compare` notes
+  when two reports differ in either. Both are absent in older files, and an
+  unrecorded value is not reported as a difference.
 - `eval run --max-run-secs N` (1 to 21600) caps every run's session timeout
   at N seconds, sandbox creation and the check included, even for tasks
   whose `task.json` sets a longer one; it is refused before anything runs

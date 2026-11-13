@@ -551,6 +551,14 @@ pub struct Manifest {
     /// `--max-run-secs`; missing when unset and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_secs: Option<u64>,
+    /// The reasoning effort sent (`--effort`); missing for providers
+    /// without one and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The output token limit per model response (`--max-output-tokens`);
+    /// missing in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     pub replay: bool,
     pub started_unix_ms: u64,
     pub ended_unix_ms: u64,
@@ -664,6 +672,12 @@ pub struct Report {
     /// `--max-run-secs`; missing when unset and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_secs: Option<u64>,
+    /// As in [`Manifest::effort`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// As in [`Manifest::max_output_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     pub stopped: Option<String>,
     pub tasks: Vec<TaskReport>,
     pub overall: OverallReport,
@@ -753,6 +767,8 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         trials: manifest.trials,
         concurrency: manifest.concurrency,
         max_run_secs: manifest.max_run_secs,
+        effort: manifest.effort.clone(),
+        max_output_tokens: manifest.max_output_tokens,
         stopped: manifest.stopped.clone(),
         overall: OverallReport {
             tasks: u32::try_from(tasks.len()).unwrap_or(u32::MAX),
@@ -815,6 +831,12 @@ pub fn report_markdown(report: &Report) -> String {
     let _ = writeln!(text, "- Runs at a time: {}", report.concurrency);
     if let Some(secs) = report.max_run_secs {
         let _ = writeln!(text, "- Longest run allowed: {secs} s");
+    }
+    if let Some(effort) = &report.effort {
+        let _ = writeln!(text, "- Effort: {}", cell(effort));
+    }
+    if let Some(tokens) = report.max_output_tokens {
+        let _ = writeln!(text, "- Output limit per response: {tokens} tokens");
     }
     if let Some(stopped) = &report.stopped {
         let _ = writeln!(text, "- Stopped early: {}", cell(stopped));
@@ -977,6 +999,13 @@ pub fn compare(base: &Report, new: &Report) -> String {
         number(total_tokens(new)),
         delta(total_tokens(base), total_tokens(new), 1.0, ""),
     );
+    write_setting_notes(&mut text, base, new);
+    text
+}
+
+/// The notes [`compare`] ends with: one per run setting the two reports
+/// differ in, since those make their numbers not directly comparable.
+fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
     if base.concurrency != new.concurrency {
         let _ = writeln!(
             text,
@@ -995,7 +1024,28 @@ pub fn compare(base: &Report, new: &Report) -> String {
             secs(new.max_run_secs)
         );
     }
-    text
+    // Reports written before these were recorded carry neither, and an
+    // unknown setting is not a known difference.
+    if let (Some(base_effort), Some(new_effort)) = (&base.effort, &new.effort)
+        && base_effort != new_effort
+    {
+        let _ = writeln!(
+            text,
+            "\nEffort differs ({} → {}); pass rates, tokens and wall times are not directly \
+             comparable.",
+            cell(base_effort),
+            cell(new_effort)
+        );
+    }
+    if let (Some(base_tokens), Some(new_tokens)) = (base.max_output_tokens, new.max_output_tokens)
+        && base_tokens != new_tokens
+    {
+        let _ = writeln!(
+            text,
+            "\nOutput limit per response differs ({base_tokens} → {new_tokens} tokens); pass \
+             rates and tokens are not directly comparable."
+        );
+    }
 }
 
 /// Read a `report.json` written by [`run_suite`].
@@ -1032,6 +1082,9 @@ pub struct SuiteOptions {
     /// seconds, and the manifest records it. Launch order still uses each
     /// task's own budget.
     pub max_run_secs: Option<u64>,
+    /// The provider's reasoning effort, for the manifest; `None` for a
+    /// provider without one.
+    pub effort: Option<String>,
     pub replay: bool,
     pub label: Option<String>,
     /// The run limits before each task's overrides.
@@ -1436,6 +1489,8 @@ where
         trials: options.trials,
         concurrency: options.concurrency,
         max_run_secs: options.max_run_secs,
+        effort: options.effort.clone(),
+        max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
         replay: options.replay,
         started_unix_ms,
         ended_unix_ms: unix_ms(),

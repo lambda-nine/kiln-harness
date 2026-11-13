@@ -2047,6 +2047,7 @@ fn options(out: &Path, trials: u32, replay: bool) -> SuiteOptions {
         trials,
         concurrency: 1,
         max_run_secs: None,
+        effort: None,
         replay,
         label: Some("test | run".to_string()),
         base_config: config(),
@@ -3255,6 +3256,8 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         trials,
         concurrency: 1,
         max_run_secs: None,
+        effort: None,
+        max_output_tokens: None,
         replay: true,
         started_unix_ms: 1,
         ended_unix_ms: 2,
@@ -3962,6 +3965,82 @@ fn max_run_secs_reaches_the_manifest_report_and_comparison() {
     }
 }
 
+#[test]
+fn effort_and_output_limit_reach_the_manifest_report_and_comparison() {
+    let mut low = manifest(&["a"], 1);
+    low.effort = Some("low".to_string());
+    low.max_output_tokens = Some(64_000);
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let older = eval::report(&runs, &manifest(&["a"], 1));
+    let new = eval::report(&runs, &low);
+    assert_eq!(
+        (new.effort.as_deref(), new.max_output_tokens),
+        (Some("low"), Some(64_000))
+    );
+
+    let json = serde_json::to_value(&low).expect("manifest JSON");
+    assert_eq!(
+        (&json["effort"], &json["max_output_tokens"]),
+        (&json!("low"), &json!(64_000))
+    );
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, low);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    assert_eq!(
+        (&json["effort"], &json["max_output_tokens"]),
+        (&json!("low"), &json!(64_000))
+    );
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+
+    // Unset, and in files written before the fields existed: no keys.
+    let unset = serde_json::to_value(&older).expect("report JSON");
+    for key in ["effort", "max_output_tokens"] {
+        assert!(unset.get(key).is_none(), "{unset}");
+    }
+    let parsed: Report = serde_json::from_value(unset).expect("an older report parses");
+    assert_eq!((parsed.effort, parsed.max_output_tokens), (None, None));
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown.contains("- Effort: low\n- Output limit per response: 64000 tokens\n"),
+        "{markdown}"
+    );
+    let markdown = eval::report_markdown(&older);
+    assert!(
+        !markdown.contains("Effort") && !markdown.contains("Output limit"),
+        "{markdown}"
+    );
+
+    let mut high = new.clone();
+    high.effort = Some("high".to_string());
+    high.max_output_tokens = Some(16_384);
+    let differing = eval::compare(&high, &new);
+    assert!(
+        differing.ends_with(
+            ").\n\nEffort differs (high → low); pass rates, tokens and wall times are not \
+             directly comparable.\n\nOutput limit per response differs (16384 → 64000 tokens); \
+             pass rates and tokens are not directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    // An older report recorded neither: unknown is not a difference.
+    for same in [
+        eval::compare(&new, &new),
+        eval::compare(&older, &new),
+        eval::compare(&new, &older),
+    ] {
+        assert!(
+            !same.contains("Effort") && !same.contains("Output limit"),
+            "{same}"
+        );
+    }
+    // A hostile effort string stays inside its line.
+    let mut odd = new.clone();
+    odd.effort = Some("x|y\nz".to_string());
+    assert!(eval::report_markdown(&odd).contains("- Effort: x\\|y z\n"));
+}
+
 #[tokio::test]
 async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
     let temp = common::private_tempdir().expect("tempdir");
@@ -4015,6 +4094,13 @@ async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
     assert_eq!(report_tasks, ["a", "b", "c"]);
     assert_eq!(read_manifest(&out).tasks, ["a", "b", "c"]);
     assert_eq!(read_manifest(&out).max_run_secs, None);
+    // The suite records the output limit it ran with, and the effort it
+    // was given (none for this provider).
+    assert_eq!(
+        read_manifest(&out).max_output_tokens,
+        Some(config().max_output_tokens_per_request)
+    );
+    assert_eq!(read_manifest(&out).effort, None);
     let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
     let rows = markdown
         .lines()
