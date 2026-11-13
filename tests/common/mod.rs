@@ -11,8 +11,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use kiln_harness::api::{
     ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Deleted, EnvVar, Execution,
-    ExecutionState, ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health, NodeReservations,
-    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState, env_names, env_sha256,
+    ExecutionMode, ExecutionState, ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health,
+    LiveDelivery, LiveStream, NodeReservations, Sandbox, SandboxApi, SandboxExec, SandboxRequest,
+    SandboxState, StreamObserver, StreamedExec, env_names, env_sha256,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
@@ -22,22 +23,65 @@ pub struct FakeApi {
     pub state: Arc<Mutex<FakeState>>,
 }
 
-/// A fake of the oldest kilnd the harness accepts: it lists only the exec
-/// options every session needs, with kilnd's default bounds for them.
+/// A fake of the oldest kilnd a live session accepts: it lists only the
+/// exec options and exec streaming, with kilnd's default bounds for them.
 impl Default for FakeApi {
     fn default() -> Self {
         let api = Self {
             state: Arc::default(),
         };
-        api.state().features = exec_options();
+        api.state().features = live_features();
         api.state().limits = Some(exec_limits());
         api
     }
 }
 
-/// The exec options the harness requires of every daemon.
+/// The exec options every session that sends a cwd and env needs.
 pub fn exec_options() -> BTreeSet<Feature> {
     BTreeSet::from([Feature::ExecCwd, Feature::ExecEnv])
+}
+
+/// What a live session needs of every daemon: the exec options and exec
+/// streaming.
+pub fn live_features() -> BTreeSet<Feature> {
+    let mut features = exec_options();
+    features.insert(Feature::ExecStream);
+    features
+}
+
+/// One scripted `ExecStream` event after `ExecStarted`.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Bytes of a stream at an offset.
+    Chunk(LiveStream, u64, Vec<u8>),
+    /// Bytes from an offset not delivered, and whether the count is exact.
+    Gap(LiveStream, u64, u64, bool),
+    /// The command runs on this long, quiet, before the next event.
+    Sleep(Duration),
+}
+
+/// How a scripted `ExecStream` ends.
+#[derive(Debug, Clone, Default)]
+pub enum StreamEnd {
+    /// `ExecFinished` with the recorded row.
+    #[default]
+    Finished,
+    /// The stream breaks after its events.
+    Broken(ApiError),
+    /// The row is recorded, then the stream breaks before `ExecStarted`.
+    BrokenBeforeStarted(ApiError),
+    /// After its events, kilnd breaks the stream's rules, as the adapter
+    /// reports it: `Broken` with an `INTERNAL` error, flagged a violation.
+    Violation,
+}
+
+/// One `ExecStream` answer, taken in order, one per stream that kilnd
+/// admits. `events: None` sends the row's retained stdout and stderr as one
+/// chunk each.
+#[derive(Debug, Clone, Default)]
+pub struct StreamScript {
+    pub events: Option<Vec<StreamEvent>>,
+    pub end: StreamEnd,
 }
 
 /// Changes a recorded execution row, as a daemon that did not run it as
@@ -215,6 +259,8 @@ pub struct FakeState {
     /// that was not a race.
     pub not_ready: bool,
     pub get_execution_calls: u32,
+    /// The execution each `GetExecution` asked for, in order.
+    pub get_execution_ids: Vec<String>,
     /// The final check: how often it ran, an error to answer it with, and
     /// rows only it sees, as executions recovery missed.
     pub final_checks: u32,
@@ -232,6 +278,17 @@ pub struct FakeState {
     pub fail_dd_from: Option<usize>,
     /// `dd` executions so far.
     pub dd_count: usize,
+    /// Every `ExecStream` request, refused ones included; each is also in
+    /// `execs`, so every other entry there was a unary Exec.
+    pub streams: Vec<SandboxExec>,
+    /// Streams the client dropped before `ExecFinished`.
+    pub streams_dropped: u32,
+    /// How each admitted stream goes; the default once these run out.
+    pub stream_script: VecDeque<StreamScript>,
+    /// A dropped stream's row stays RUNNING for this many `GetExecution`
+    /// reads (`u32::MAX`: for ever) before it settles; `None` settles it at
+    /// once.
+    pub stopped_settles_after: Option<u32>,
 }
 
 impl FakeApi {
@@ -285,6 +342,250 @@ impl FakeApi {
         Some((error, state.tool_exec_delay))
     }
 
+    /// Record an `Exec` or `ExecStream` request as kilnd would: refused before
+    /// admission, or a row with its output, how long its answer takes, and
+    /// whether that answer is lost.
+    #[allow(clippy::too_many_lines)]
+    async fn record_exec(
+        &self,
+        request: SandboxExec,
+        mode: ExecutionMode,
+    ) -> Result<(Execution, Duration, bool), ApiError> {
+        let sh_refusal = {
+            let mut state = self.state();
+            if request.argv.first().map(String::as_str) == Some("/bin/sh") {
+                state
+                    .sh_error
+                    .clone()
+                    .map(|error| (error, state.sh_delay))
+                    .inspect(|_| state.execs.push(request.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((error, delay)) = sh_refusal {
+            tokio::time::sleep(delay).await;
+            return Err(error);
+        }
+        let refusal = self.pre_admission_refusal(&request);
+        if let Some((error, delay)) = refusal {
+            // Refused before admission: no execution row and no activity.
+            tokio::time::sleep(delay).await;
+            return Err(error);
+        }
+        let recorded = {
+            let mut state = self.state();
+            if let Some(reason) = state.expired {
+                return Err(expired_error(reason));
+            }
+            state.next_execution += 1;
+            let id = format!("ex-{:016x}", state.next_execution);
+            state.execs.push(request.clone());
+            let argv = &request.argv;
+            let mut sh_state = None;
+            let (exit_code, stdout, stderr) = match argv.first().map(String::as_str) {
+                Some("/bin/sh") => {
+                    let handler = state.sh_handler.clone();
+                    match handler {
+                        Some(handler) => {
+                            let answer = handler(&request.stdin, &mut state.files);
+                            sh_state = Some((answer.state, answer.exit_code));
+                            (answer.exit_code.unwrap_or(0), answer.stdout, answer.stderr)
+                        }
+                        None => (127, Vec::new(), b"no sh handler".to_vec()),
+                    }
+                }
+                Some("/bin/mkdir") => (0, Vec::new(), Vec::new()),
+                Some("/usr/bin/find") => {
+                    if state.fail_baseline && state.execs.len() == 1 {
+                        (1, Vec::new(), b"find failed".to_vec())
+                    } else {
+                        let mut output = Vec::new();
+                        for path in state.files.keys() {
+                            output.extend_from_slice(path.as_bytes());
+                            output.push(0);
+                        }
+                        (0, output, Vec::new())
+                    }
+                }
+                Some("/bin/dd") => {
+                    state.dd_count += 1;
+                    let path = argv
+                        .iter()
+                        .find_map(|arg| arg.strip_prefix("of="))
+                        .expect("dd output path")
+                        .to_string();
+                    if state
+                        .fail_dd_from
+                        .is_some_and(|from| state.dd_count >= from)
+                    {
+                        (1, Vec::new(), b"dd: write error".to_vec())
+                    } else {
+                        state.files.insert(path, request.stdin.clone());
+                        (0, Vec::new(), Vec::new())
+                    }
+                }
+                Some("/bin/stat") => {
+                    let path = argv.last().expect("stat path");
+                    match state.files.get(path) {
+                        Some(bytes) => (0, format!("{}\n", bytes.len()).into_bytes(), Vec::new()),
+                        None => (1, Vec::new(), b"not found".to_vec()),
+                    }
+                }
+                Some("/usr/bin/head") => {
+                    let limit = argv[2].parse::<usize>().expect("head limit");
+                    let path = argv.last().expect("head path");
+                    let stored = state.read_override.as_ref().or(state.files.get(path));
+                    match stored {
+                        Some(bytes) => (0, bytes[..bytes.len().min(limit)].to_vec(), Vec::new()),
+                        None => (1, Vec::new(), b"not found".to_vec()),
+                    }
+                }
+                Some("/bin/ls") => {
+                    let names: BTreeSet<_> = state
+                        .files
+                        .keys()
+                        .filter_map(|path| path.strip_prefix("/workspace/"))
+                        .collect();
+                    let listing = names.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+                    (0, listing.into_bytes(), Vec::new())
+                }
+                Some("/usr/bin/wc") => {
+                    let path = argv.last().expect("wc path");
+                    let size = state.files.get(path).map_or(0, Vec::len);
+                    (0, format!("{size} {path}\n").into_bytes(), Vec::new())
+                }
+                Some("/bin/big-output") => (0, vec![b'x'; 100 << 10], Vec::new()),
+                _ => (127, Vec::new(), b"unsupported fake command".to_vec()),
+            };
+            let (cwd, env_names, env_sha256) = recorded_context(&request);
+            let mut execution = Execution {
+                id,
+                state: ExecutionState::Exited,
+                exit_code: Some(exit_code),
+                failure_reason: String::new(),
+                stdout: captured(stdout),
+                stderr: captured(stderr),
+                // An older daemon does not say; a current one does.
+                sandbox_reusable: (!state.features.is_empty()).then_some(true),
+                cancel_reason: None,
+                cwd,
+                env_names,
+                env_sha256,
+                mode,
+            };
+            if let Some((exec_state, exec_code)) = sh_state {
+                execution.state = exec_state;
+                execution.exit_code = exec_code;
+            }
+            if let Some((number, tamper)) = state.tamper_exec
+                && number == state.execs.len()
+            {
+                tamper(&mut execution);
+            }
+            leave_unusable_if_scripted(&mut state, &mut execution);
+            state.executions.push(execution.clone());
+            let delay = if argv.first().map(String::as_str) == Some("/usr/bin/find") {
+                state.baseline_exec_delay
+            } else if argv.first().map(String::as_str) == Some("/bin/sh") {
+                state.sh_delay
+            } else {
+                state.tool_exec_delay
+            };
+            let mut lost = state.lose_exec_response == Some(state.execs.len());
+            lost |= publish_running_if_scripted(&mut state, &execution);
+            (execution, delay, lost)
+        };
+        Ok(recorded)
+    }
+
+    /// kilnd under `--output-storage full` keeps a prefix of whatever a
+    /// command wrote, so a scripted stream's output shows in its row: a
+    /// stream with live bytes where the row has none gets them (the chunks'
+    /// bytes, or a placeholder for gaps alone) and observes at least as many
+    /// as the stream shows. A scripted tamper of this Exec then applies
+    /// again, so it still has the last word.
+    fn retain_live_output(&self, execution: &mut Execution, events: &[StreamEvent]) {
+        let mut state = self.state();
+        for stream in [LiveStream::Stdout, LiveStream::Stderr] {
+            let mut data = Vec::new();
+            let mut end = 0u64;
+            for event in events {
+                match event {
+                    StreamEvent::Chunk(at, offset, bytes) if *at == stream => {
+                        if data.len() < 1 << 20 {
+                            data.extend_from_slice(bytes);
+                        }
+                        end = end.max(offset.saturating_add(bytes.len() as u64));
+                    }
+                    StreamEvent::Gap(at, offset, dropped, _) if *at == stream => {
+                        end = end.max(offset.saturating_add(*dropped));
+                    }
+                    _ => {}
+                }
+            }
+            let output = match stream {
+                LiveStream::Stdout => &mut execution.stdout,
+                LiveStream::Stderr => &mut execution.stderr,
+            };
+            if end == 0 || !output.data.is_empty() {
+                continue;
+            }
+            if data.is_empty() {
+                data = b"x".to_vec();
+            }
+            data.truncate(1 << 20);
+            output.observed_bytes = output.observed_bytes.max(end);
+            output.truncated = (data.len() as u64) < output.observed_bytes;
+            output.data = data;
+        }
+        if let Some((number, tamper)) = state.tamper_exec
+            && number == state.execs.len()
+        {
+            tamper(execution);
+        }
+        if let Some(row) = state
+            .executions
+            .iter_mut()
+            .find(|row| row.id == execution.id)
+        {
+            *row = execution.clone();
+        }
+    }
+
+    /// A dropped stream cancels its execution: the row becomes CANCELED for
+    /// a client disconnect, still reusable, at once or after
+    /// `stopped_settles_after` reads.
+    fn drop_stream(&self, execution: &Execution) {
+        let mut state = self.state();
+        state.streams_dropped += 1;
+        let stopped = Execution {
+            state: ExecutionState::Canceled,
+            exit_code: None,
+            failure_reason: "client disconnected".to_string(),
+            cancel_reason: Some(CancelReason::ClientDisconnected),
+            ..execution.clone()
+        };
+        let settles_after = state.stopped_settles_after;
+        let Some(row) = state
+            .executions
+            .iter_mut()
+            .find(|row| row.id == execution.id)
+        else {
+            return;
+        };
+        match settles_after {
+            None => *row = stopped,
+            Some(reads) => {
+                *row = Execution {
+                    state: ExecutionState::Unknown,
+                    ..stopped.clone()
+                };
+                state.pending_terminal = Some((stopped, reads));
+            }
+        }
+    }
+
     /// Expire the sandbox now, as kilnd's sweeper would.
     pub fn expire(&self, reason: &'static str) {
         self.state().expired = Some(reason);
@@ -306,7 +607,8 @@ pub fn kilnd_limits() -> ApiLimits {
 }
 
 /// kilnd 0c79944's default exec-option bounds, which it advertises while
-/// it lists the exec options; no expiry bounds.
+/// it lists the exec options, and kilnd 2562a53's default stream timeouts
+/// (30 minutes by default, 2 hours at most); no expiry bounds.
 pub fn exec_limits() -> ApiLimits {
     ApiLimits {
         max_cwd_bytes: 4096,
@@ -314,6 +616,8 @@ pub fn exec_limits() -> ApiLimits {
         max_env_name_bytes: 128,
         max_env_value_bytes: 4096,
         max_env_total_bytes: 32_768,
+        default_stream_timeout_ms: 1_800_000,
+        max_stream_timeout_ms: 7_200_000,
         ..ApiLimits::default()
     }
 }
@@ -514,152 +818,8 @@ impl SandboxApi for FakeApi {
         Ok(sandbox)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
-        let sh_refusal = {
-            let mut state = self.state();
-            if request.argv.first().map(String::as_str) == Some("/bin/sh") {
-                state
-                    .sh_error
-                    .clone()
-                    .map(|error| (error, state.sh_delay))
-                    .inspect(|_| state.execs.push(request.clone()))
-            } else {
-                None
-            }
-        };
-        if let Some((error, delay)) = sh_refusal {
-            tokio::time::sleep(delay).await;
-            return Err(error);
-        }
-        let refusal = self.pre_admission_refusal(&request);
-        if let Some((error, delay)) = refusal {
-            // Refused before admission: no execution row and no activity.
-            tokio::time::sleep(delay).await;
-            return Err(error);
-        }
-        let (execution, delay, lost) = {
-            let mut state = self.state();
-            if let Some(reason) = state.expired {
-                return Err(expired_error(reason));
-            }
-            state.next_execution += 1;
-            let id = format!("ex-{:016x}", state.next_execution);
-            state.execs.push(request.clone());
-            let argv = &request.argv;
-            let mut sh_state = None;
-            let (exit_code, stdout, stderr) = match argv.first().map(String::as_str) {
-                Some("/bin/sh") => {
-                    let handler = state.sh_handler.clone();
-                    match handler {
-                        Some(handler) => {
-                            let answer = handler(&request.stdin, &mut state.files);
-                            sh_state = Some((answer.state, answer.exit_code));
-                            (answer.exit_code.unwrap_or(0), answer.stdout, answer.stderr)
-                        }
-                        None => (127, Vec::new(), b"no sh handler".to_vec()),
-                    }
-                }
-                Some("/bin/mkdir") => (0, Vec::new(), Vec::new()),
-                Some("/usr/bin/find") => {
-                    if state.fail_baseline && state.execs.len() == 1 {
-                        (1, Vec::new(), b"find failed".to_vec())
-                    } else {
-                        let mut output = Vec::new();
-                        for path in state.files.keys() {
-                            output.extend_from_slice(path.as_bytes());
-                            output.push(0);
-                        }
-                        (0, output, Vec::new())
-                    }
-                }
-                Some("/bin/dd") => {
-                    state.dd_count += 1;
-                    let path = argv
-                        .iter()
-                        .find_map(|arg| arg.strip_prefix("of="))
-                        .expect("dd output path")
-                        .to_string();
-                    if state
-                        .fail_dd_from
-                        .is_some_and(|from| state.dd_count >= from)
-                    {
-                        (1, Vec::new(), b"dd: write error".to_vec())
-                    } else {
-                        state.files.insert(path, request.stdin.clone());
-                        (0, Vec::new(), Vec::new())
-                    }
-                }
-                Some("/bin/stat") => {
-                    let path = argv.last().expect("stat path");
-                    match state.files.get(path) {
-                        Some(bytes) => (0, format!("{}\n", bytes.len()).into_bytes(), Vec::new()),
-                        None => (1, Vec::new(), b"not found".to_vec()),
-                    }
-                }
-                Some("/usr/bin/head") => {
-                    let limit = argv[2].parse::<usize>().expect("head limit");
-                    let path = argv.last().expect("head path");
-                    let stored = state.read_override.as_ref().or(state.files.get(path));
-                    match stored {
-                        Some(bytes) => (0, bytes[..bytes.len().min(limit)].to_vec(), Vec::new()),
-                        None => (1, Vec::new(), b"not found".to_vec()),
-                    }
-                }
-                Some("/bin/ls") => {
-                    let names: BTreeSet<_> = state
-                        .files
-                        .keys()
-                        .filter_map(|path| path.strip_prefix("/workspace/"))
-                        .collect();
-                    let listing = names.into_iter().collect::<Vec<_>>().join("\n") + "\n";
-                    (0, listing.into_bytes(), Vec::new())
-                }
-                Some("/usr/bin/wc") => {
-                    let path = argv.last().expect("wc path");
-                    let size = state.files.get(path).map_or(0, Vec::len);
-                    (0, format!("{size} {path}\n").into_bytes(), Vec::new())
-                }
-                Some("/bin/big-output") => (0, vec![b'x'; 100 << 10], Vec::new()),
-                _ => (127, Vec::new(), b"unsupported fake command".to_vec()),
-            };
-            let (cwd, env_names, env_sha256) = recorded_context(&request);
-            let mut execution = Execution {
-                id,
-                state: ExecutionState::Exited,
-                exit_code: Some(exit_code),
-                failure_reason: String::new(),
-                stdout: captured(stdout),
-                stderr: captured(stderr),
-                // An older daemon does not say; a current one does.
-                sandbox_reusable: (!state.features.is_empty()).then_some(true),
-                cancel_reason: None,
-                cwd,
-                env_names,
-                env_sha256,
-            };
-            if let Some((exec_state, exec_code)) = sh_state {
-                execution.state = exec_state;
-                execution.exit_code = exec_code;
-            }
-            if let Some((number, tamper)) = state.tamper_exec
-                && number == state.execs.len()
-            {
-                tamper(&mut execution);
-            }
-            leave_unusable_if_scripted(&mut state, &mut execution);
-            state.executions.push(execution.clone());
-            let delay = if argv.first().map(String::as_str) == Some("/usr/bin/find") {
-                state.baseline_exec_delay
-            } else if argv.first().map(String::as_str) == Some("/bin/sh") {
-                state.sh_delay
-            } else {
-                state.tool_exec_delay
-            };
-            let mut lost = state.lose_exec_response == Some(state.execs.len());
-            lost |= publish_running_if_scripted(&mut state, &execution);
-            (execution, delay, lost)
-        };
+        let (execution, delay, lost) = self.record_exec(request, ExecutionMode::Unary).await?;
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -667,6 +827,89 @@ impl SandboxApi for FakeApi {
             return Err(api_error(Code::Unavailable, "exec response lost"));
         }
         Ok(execution)
+    }
+
+    async fn exec_stream(
+        &self,
+        request: SandboxExec,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
+        self.state().streams.push(request.clone());
+        let (mut execution, delay, lost) = self.record_exec(request, ExecutionMode::Stream).await?;
+        let script = self.state().stream_script.pop_front().unwrap_or_default();
+        if let Some(events) = &script.events {
+            self.retain_live_output(&mut execution, events);
+        }
+        let id = execution.id.clone();
+        if let StreamEnd::BrokenBeforeStarted(error) = script.end {
+            tokio::time::sleep(delay).await;
+            return Ok(StreamedExec::Broken {
+                execution_id: None,
+                error,
+                protocol_violation: false,
+            });
+        }
+        observer.started(&id);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if lost {
+            return Ok(StreamedExec::Broken {
+                execution_id: Some(id),
+                error: api_error(Code::Unavailable, "exec response lost"),
+                protocol_violation: false,
+            });
+        }
+        let events = script.events.unwrap_or_else(|| output_events(&execution));
+        let mut delivery = [LiveDelivery {
+            dropped_bytes_known: true,
+            ..LiveDelivery::default()
+        }; 2];
+        for event in events {
+            let flow = match event {
+                StreamEvent::Chunk(stream, offset, data) => {
+                    delivery[stream as usize].delivered_bytes += data.len() as u64;
+                    observer.chunk(stream, offset, &data)
+                }
+                StreamEvent::Gap(stream, offset, dropped, known) => {
+                    delivery[stream as usize].dropped_bytes += dropped;
+                    delivery[stream as usize].dropped_bytes_known &= known;
+                    observer.gap(stream, offset, dropped, known)
+                }
+                StreamEvent::Sleep(duration) => {
+                    tokio::time::sleep(duration).await;
+                    std::ops::ControlFlow::Continue(())
+                }
+            };
+            if flow.is_break() {
+                self.drop_stream(&execution);
+                return Ok(StreamedExec::Stopped { execution_id: id });
+            }
+        }
+        match script.end {
+            StreamEnd::Broken(error) => Ok(StreamedExec::Broken {
+                execution_id: Some(id),
+                error,
+                protocol_violation: false,
+            }),
+            StreamEnd::Violation => {
+                // The adapter drops the stream at a violation: kilnd cancels.
+                self.drop_stream(&execution);
+                Ok(StreamedExec::Broken {
+                    execution_id: Some(id),
+                    error: api_error(
+                        Code::Internal,
+                        "ExecStream messages were not numbered in order",
+                    ),
+                    protocol_violation: true,
+                })
+            }
+            StreamEnd::Finished | StreamEnd::BrokenBeforeStarted(_) => Ok(StreamedExec::Finished {
+                execution,
+                stdout: delivery[0],
+                stderr: delivery[1],
+            }),
+        }
     }
 
     async fn delete(
@@ -752,6 +995,7 @@ impl SandboxApi for FakeApi {
     async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError> {
         let mut state = self.state();
         state.get_execution_calls += 1;
+        state.get_execution_ids.push(execution_id.to_string());
         if let Some((terminal, reads)) = state.pending_terminal.take() {
             if terminal.id == execution_id && reads != u32::MAX && reads <= 1 {
                 if let Some(row) = state
@@ -802,7 +1046,18 @@ impl SandboxApi for FakeApi {
         if state.recent_unavailable {
             return Err(api_error(Code::Unavailable, "listing failed"));
         }
-        Ok(state.executions.iter().rev().cloned().collect())
+        // As kilnd's `GetSandbox`: recent rows leave output data out.
+        Ok(state
+            .executions
+            .iter()
+            .rev()
+            .map(|row| {
+                let mut row = row.clone();
+                row.stdout.data.clear();
+                row.stderr.data.clear();
+                row
+            })
+            .collect())
     }
 
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
@@ -980,4 +1235,148 @@ pub fn dir_all_with_mode(path: &std::path::Path, mode: u32) {
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
             .expect("set directory mode");
     }
+}
+
+/// The default stream of a row: its retained stdout, then stderr, each as
+/// one chunk at offset 0.
+pub fn output_events(execution: &Execution) -> Vec<StreamEvent> {
+    [
+        (LiveStream::Stdout, &execution.stdout.data),
+        (LiveStream::Stderr, &execution.stderr.data),
+    ]
+    .into_iter()
+    .filter(|(_, data)| !data.is_empty())
+    .map(|(stream, data)| StreamEvent::Chunk(stream, 0, data.clone()))
+    .collect()
+}
+
+/// An `ExecStream` answer made from a unary answer, for wrappers whose
+/// `exec` decides the outcome: a refusal stays one, and an execution is
+/// streamed as its output and finished, recorded as streamed.
+pub fn stream_from_exec(
+    result: Result<Execution, ApiError>,
+    observer: &mut (dyn StreamObserver + Send),
+) -> Result<StreamedExec, ApiError> {
+    let execution = Execution {
+        mode: ExecutionMode::Stream,
+        ..result?
+    };
+    observer.started(&execution.id);
+    for event in output_events(&execution) {
+        if let StreamEvent::Chunk(stream, offset, data) = event
+            && observer.chunk(stream, offset, &data).is_break()
+        {
+            return Ok(StreamedExec::Stopped {
+                execution_id: execution.id,
+            });
+        }
+    }
+    let delivered = |data: &[u8]| LiveDelivery {
+        delivered_bytes: data.len() as u64,
+        dropped_bytes: 0,
+        dropped_bytes_known: true,
+    };
+    Ok(StreamedExec::Finished {
+        stdout: delivered(&execution.stdout.data),
+        stderr: delivered(&execution.stderr.data),
+        execution,
+    })
+}
+
+/// A provider that also hashes each request as a session in an earlier
+/// execution context would have sent it: the same request with the tools as
+/// a session that does not stream describes them, whose `exec` description
+/// does not state the output cutoff.
+pub struct Unstreamed<P> {
+    pub inner: P,
+    /// Per request: its hash, and its hash with the earlier tools.
+    pub hashes: Vec<(String, String)>,
+    tools: Vec<kiln_harness::provider::ToolDefinition>,
+}
+
+impl<P> Unstreamed<P> {
+    pub fn new(inner: P) -> Self {
+        Self {
+            inner,
+            hashes: Vec::new(),
+            tools: kiln_harness::tools::ToolRegistry::new(HarnessConfig::default().tool_limits)
+                .definitions()
+                .to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl<P: kiln_harness::provider::Provider> kiln_harness::provider::Provider for Unstreamed<P> {
+    fn info(&self) -> kiln_harness::provider::ProviderInfo {
+        self.inner.info()
+    }
+
+    async fn complete(
+        &mut self,
+        request: kiln_harness::provider::ModelRequest<'_>,
+    ) -> Result<kiln_harness::provider::ModelResponse, kiln_harness::provider::ProviderError> {
+        let earlier = kiln_harness::provider::ModelRequest {
+            tools: &self.tools,
+            ..request
+        };
+        self.hashes.push((
+            kiln_harness::journal::request_sha256(&request),
+            kiln_harness::journal::request_sha256(&earlier),
+        ));
+        self.inner.complete(request).await
+    }
+
+    fn tool_completed(
+        &mut self,
+        turn: u32,
+        index: u32,
+        call: &kiln_harness::provider::ToolCall,
+        ok: bool,
+        result: &serde_json::Value,
+    ) -> Result<(), kiln_harness::provider::ProviderError> {
+        self.inner.tool_completed(turn, index, call, ok, result)
+    }
+
+    fn check_completed(&mut self, outcome: &kiln_harness::engine::CheckOutcome) {
+        self.inner.check_completed(outcome);
+    }
+}
+
+/// A live recording made through [`Unstreamed`] with `hashes`, as the same
+/// session recorded in the earlier execution context `context` (`None` for
+/// legacy): that context, the earlier tool definitions, and each request's
+/// hash with them. Every tool result stays as recorded.
+pub fn recorded_in(
+    records: &[kiln_harness::journal::JournalRecord],
+    context: Option<&str>,
+    hashes: &[(String, String)],
+) -> Vec<kiln_harness::journal::JournalRecord> {
+    use kiln_harness::journal::JournalEvent;
+    let tools = kiln_harness::tools::ToolRegistry::new(HarnessConfig::default().tool_limits)
+        .definitions()
+        .to_vec();
+    let mut hashes = hashes.iter();
+    let mut records = records.to_vec();
+    for record in &mut records {
+        match &mut record.event {
+            JournalEvent::SessionStarted {
+                exec_context,
+                tools: recorded,
+                ..
+            } => {
+                assert_eq!(exec_context.as_deref(), Some("workspace_stream_v1"));
+                *exec_context = context.map(str::to_string);
+                recorded.clone_from(&tools);
+            }
+            JournalEvent::ModelRequested { request_sha256, .. } => {
+                let (live, earlier) = hashes.next().expect("a hash per request");
+                assert_eq!(request_sha256, live);
+                request_sha256.clone_from(earlier);
+            }
+            _ => {}
+        }
+    }
+    assert!(hashes.next().is_none(), "a request per hash");
+    records
 }

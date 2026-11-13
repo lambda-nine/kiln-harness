@@ -549,9 +549,14 @@ fn ended_after(
 }
 
 fn request_with(turn: u32, messages: &[Message], max_output_tokens: u32) -> String {
-    let tools = kiln_harness::tools::ToolRegistry::new(HarnessConfig::default().tool_limits)
+    // A live session streams its model's commands, and its `exec`
+    // description says so.
+    let mut tools = kiln_harness::tools::ToolRegistry::new(HarnessConfig::default().tool_limits)
         .definitions()
         .to_vec();
+    tools[0]
+        .description
+        .push_str(kiln_harness::tools::EXEC_STREAM_DESCRIPTION);
     request_sha256(&ModelRequest {
         session_id: "",
         turn,

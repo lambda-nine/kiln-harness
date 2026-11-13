@@ -26,6 +26,7 @@ use kiln_harness::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, ToolCall,
 };
 use kiln_harness::replay::ReplayProvider;
+use kiln_harness::tools::{EXEC_STREAM_DESCRIPTION, ToolRegistry};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -1828,8 +1829,8 @@ async fn unusable_refusals_at_the_check_share_the_tools_classification() {
         .insert(kiln_harness::api::Feature::TypedReasons);
     api.state().sh_error = Some(common::api_error_with_reason(
         tonic::Code::Unimplemented,
-        "backend_unsupported:exec_stream",
-        "backend_unsupported:exec_stream",
+        "backend_unsupported:sandbox_expiry",
+        "backend_unsupported:sandbox_expiry",
     ));
     let task = checked_task("test -f out.txt\n", Duration::from_secs(10));
     let mut harness = Harness::new(
@@ -1984,10 +1985,11 @@ fn a_journal_without_seed_or_check_is_byte_identical_to_before() {
 async fn todays_demo_journal_matches_the_golden_one() {
     // The golden journal predates truncation recovery: with it off, and no
     // recovery, the journal is byte-identical to before but for the
-    // execution context.
+    // execution context and the streaming `exec` description, with the
+    // request hashes that include it.
     let mut harness = Harness::new(
         FakeApi::default(),
-        ScriptedProvider::demo(),
+        common::Unstreamed::new(ScriptedProvider::demo()),
         MemoryAudit::default(),
         MemoryJournal::default(),
         HarnessConfig {
@@ -1999,19 +2001,28 @@ async fn todays_demo_journal_matches_the_golden_one() {
         .run(&SessionTask::demo(), CancellationToken::new())
         .await
         .expect("demo");
-    let events = harness
-        .journal()
-        .records
-        .iter()
+    let registry = ToolRegistry::new(HarnessConfig::default().tool_limits);
+    let JournalEvent::SessionStarted { tools, .. } = &harness.journal().records[0].event else {
+        panic!("session start");
+    };
+    // Only the streaming `exec` description differs: it states the cutoff.
+    assert_eq!(
+        tools[0].description,
+        format!(
+            "{}{EXEC_STREAM_DESCRIPTION}",
+            registry.definitions()[0].description
+        )
+    );
+    assert_eq!(tools[1..], registry.definitions()[1..]);
+    // The golden journal also predates the execution context, today always
+    // recorded; recorded without it, and without streaming, the rest is
+    // unchanged.
+    let events = common::recorded_in(&harness.journal().records, None, &harness.provider().hashes)
+        .into_iter()
         .map(|record| {
-            let mut event = record.event.clone();
+            let mut event = record.event;
             if let JournalEvent::ModelResponded { latency_ms, .. } = &mut event {
                 *latency_ms = 0;
-            }
-            // The golden journal also predates the execution context, today
-            // always recorded; without it the rest is unchanged.
-            if let JournalEvent::SessionStarted { exec_context, .. } = &mut event {
-                assert_eq!(exec_context.take().as_deref(), Some("workspace_v1"));
             }
             event
         })

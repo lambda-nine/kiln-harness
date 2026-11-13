@@ -33,6 +33,51 @@ it is not a hostile multi-tenant boundary.
   them is refused at discovery. Only `Harness::replay` of a journal
   recorded before this context sends no cwd and no env, as it ran; the
   public `Harness::run` always sends them.
+- The model's `exec` runs through kilnd's `ExecStream`, and a command is
+  stopped (the harness drops the stream; kilnd SIGKILLs the command's
+  cgroup with no grace period) as soon as its delivered chunks and reported
+  gaps show more than 8 MiB on stdout or stderr, rather than flooding until
+  its timeout. Live bytes may be dropped, so the limit counts reported gaps
+  as well as delivered chunks: offsets, not received bytes. But the harness
+  learns of dropped bytes only from a gap, which kilnd sends before the
+  stream's next chunk or after the command settles: a command whose excess
+  output was dropped live and that then goes quiet is bounded by its
+  timeout instead. The stream's messages are checked (order, a single
+  start, matching IDs, named streams, per-stream offsets that neither
+  overlap nor skip bytes without a gap, nothing after the end, and the
+  final live totals), and a stream that breaks them is dropped before the
+  offending message is used and ends the session as unusable, with the
+  execution ID kept and nothing kilnd sent for that command, its row
+  included, used as a result. A stream that otherwise ends without its
+  result after kilnd started the command is followed to kilnd's row by its
+  ID, and the row is checked as a returned one; one that ends before is treated as a
+  lost response, whose recovery and the final check then apply as before.
+  A streamed row must say it was streamed and hold output wherever kilnd
+  observed some or the live stream delivered some: kilnd must run with
+  `--output-storage full`, since under `metadata` or `none` the stored row
+  has no bytes and results would silently be empty; such a row ends the
+  session, on every path, recovery included. The check is only as good as
+  that evidence: under `none` kilnd stores no byte count either, so a
+  command whose output was all lost live is not caught, and
+  `--output-storage full` stays a requirement, not something the harness
+  can verify. An `INTERRUPTED` row is exempt: kilnd's restart
+  reconciliation keeps no output for a running row under any storage mode,
+  so its empty output proves nothing about retention. There is no unary fallback, so a model cannot get different
+  behaviour by exhausting stream capacity: kilnd allows 8 streams per uid
+  and 16 on the node by default, the harness runs as one uid, and a refused
+  stream is retried within the call's budget and is otherwise an ordinary
+  tool error.
+- Live output reaching the host is untrusted sandbox output. It goes only
+  to an optional host sink, never to the journal, the audit or a result.
+  The sink is fed by a bounded queue and a writer thread of its own, so a
+  sink that blocks (a `--live` pipe nobody reads) never holds up a stream,
+  its cutoff, a cancellation, a deadline or sandbox cleanup; output that
+  does not fit reaches it as a gap.
+  The CLI's `--live` printer shows every byte that is not printable ASCII,
+  a newline or a tab as `\xNN`, so escape sequences, carriage returns,
+  bells, NUL and UTF-8 never reach the operator's terminal raw, and it
+  buffers at most 4 KiB of an unfinished line. The audit's `live` field is
+  byte counts only.
 - Typed JSON arguments reject unknown fields. File helpers accept only
   `/workspace` paths, relative or with the `/workspace/` prefix stripped
   once, and refuse every other absolute path and any `.` or `..` component; `exec` remains a deliberately general sandbox

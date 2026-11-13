@@ -81,6 +81,17 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
   lists either feature without the other, or neither, or advertises limits
   too small for them, is refused at discovery, before anything is created.
   Replaying a journal recorded before then needs neither.
+- kilnd must also list `FEATURE_EXEC_STREAM`, with `max_stream_timeout_ms`
+  at least the tool timeout: the model's `exec` calls run through
+  `ExecStream`, never unary, so their output reaches the host live. A
+  command is stopped as soon as its delivered chunks and reported gaps show
+  more than 8 MiB on stdout or stderr; live output is lossy, so one whose
+  excess output was dropped live and that then goes quiet is bounded by its
+  timeout instead. kilnd must keep its default `--output-storage full`: a
+  streamed row with no output where kilnd or the live stream showed some
+  ends the session, but a command whose output was all lost live cannot be
+  caught that way. A daemon without the feature is refused at discovery.
+  Replaying a journal recorded before streaming needs neither.
 
 The compatible `kilnd.v1` protobuf schema is vendored under `proto/` so this
 repository builds against the reviewed API even if a sibling checkout is on a
@@ -100,6 +111,11 @@ back and lists the workspace in one two-call turn; checks the session file-set
 diff; runs `wc` with literal argv; then answers. The scripted provider verifies
 every result before its next turn. The command prints the journal path, by
 default `journal/demo-<unix_ms>.jsonl`; pass `--journal PATH` to choose one.
+Add `--live` to `demo`, `run` or `replay` to watch the model's commands'
+output on stderr as kilnd streams it, each line prefixed `[call-<turn>-<index>
+out]` or `err]`, with every byte that is not printable ASCII, a newline or a
+tab shown as `\xNN`. It is host-only: nothing it prints is journaled or
+changes a result.
 Journals are never overwritten, and their directory must be owned by the user
 running the harness and writable by no one else. Ctrl-C and wall deadlines stop
 waiting on an active RPC, including sandbox create and the workspace baseline;

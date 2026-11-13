@@ -107,6 +107,13 @@ sudo env KILND_INTEGRATION=1 "$test_bin" \
 
 assert_clean
 
+# The model's exec streams live, and a runaway is cut at the output limit.
+sudo env KILND_INTEGRATION=1 "$test_bin" \
+    --exact model_exec_streams_live_and_cuts_a_runaway_through_installed_kilnd \
+    --nocapture
+
+assert_clean
+
 # The eval self-test proves two starter tasks' checks against kilnd.
 sudo env KILND_INTEGRATION=1 "$test_bin" \
     --exact eval_selftest_proves_two_starter_tasks_against_installed_kilnd \

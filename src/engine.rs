@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,7 @@ use crate::journal::{
     JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedCheck, RecordedSeedFile,
     RecordedToolLimits, SessionLimits, request_sha256,
 };
+use crate::live::{LiveOutput, LivePump};
 use crate::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderError, StopReason, ToolCall,
     ToolDefinition, ToolResult, Usage,
@@ -28,7 +30,7 @@ use crate::provider::{
 use crate::tools::{
     CheckRun, EXEC_CONTEXT_MISMATCH, ExecContext, ToolError, ToolLimits, ToolRegistry, ToolRun,
     ToolSession, ToolStop, UNUSABLE_SANDBOX, exec_limits_problem, recover_execution_evidence_in,
-    sanitize_call_bounded, unusable_stop,
+    sanitize_call_bounded, stream_limits_problem, unusable_stop,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -423,6 +425,9 @@ pub struct Harness<A, P, S, J> {
     journal: J,
     config: HarnessConfig,
     registry: ToolRegistry,
+    /// Where streamed tool output goes on the host, if anywhere: the pump
+    /// in front of the caller's sink.
+    live: Option<Arc<LivePump>>,
 }
 
 /// Counters that every exit path reports in `session_ended`.
@@ -460,7 +465,32 @@ where
             journal,
             config,
             registry,
+            live: None,
         }
+    }
+
+    /// Send the output of the model's streamed `exec` calls to `sink` as it
+    /// arrives. Host-only: the sink is never journaled and never changes a
+    /// result. By default there is none.
+    ///
+    /// The session never waits for `sink`: a bounded queue and a thread of
+    /// its own feed it, and output that does not fit while it is slow
+    /// reaches it as a gap. Call [`Harness::drain_live_output`] before exit
+    /// to let the last of it through.
+    #[must_use]
+    pub fn with_live_output(mut self, sink: Arc<dyn LiveOutput>) -> Self {
+        self.live = Some(LivePump::new(sink));
+        self
+    }
+
+    /// Wait up to `wait` for live output already produced to reach the
+    /// sink; true if it all did, or there is no sink. A `wait` too long to
+    /// be a point in time, such as `Duration::MAX`, waits with no deadline:
+    /// until the sink has taken everything, however long a stuck sink
+    /// takes.
+    #[must_use]
+    pub fn drain_live_output(&self, wait: Duration) -> bool {
+        self.live.as_ref().is_none_or(|pump| pump.drain(wait))
     }
 
     #[must_use]
@@ -479,8 +509,9 @@ where
     }
 
     /// Run one session and wait until its sandbox has been deleted. Every
-    /// execution runs in `/workspace` with the fixed env overrides; only
-    /// [`Harness::replay`] runs a recording in the context it recorded.
+    /// execution runs in `/workspace` with the fixed env overrides, and the
+    /// model's `exec` calls stream; only [`Harness::replay`] runs a
+    /// recording in the context it recorded.
     ///
     /// # Errors
     ///
@@ -491,13 +522,13 @@ where
         task: &SessionTask,
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
-        self.run_in_context(task, ExecContext::WorkspaceV1, cancel)
+        self.run_in_context(task, ExecContext::WorkspaceStreamV1, cancel)
             .await
     }
 
     /// [`Harness::run`] with every execution in `exec_context`. Only replay
-    /// calls it with anything but [`ExecContext::WorkspaceV1`], with the
-    /// context its journal recorded.
+    /// calls it with anything but [`ExecContext::WorkspaceStreamV1`], with
+    /// the context its journal recorded.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn run_in_context(
         &mut self,
@@ -557,6 +588,28 @@ where
                 )));
             }
         }
+        // A streaming session sends the model's commands only through
+        // ExecStream, never unary, so a daemon that cannot stream them for
+        // a whole tool timeout cannot serve it. Replays of earlier contexts
+        // need neither.
+        if exec_context.streams_exec() {
+            if !capabilities.supports(Feature::ExecStream) {
+                return Err(HarnessError::Api(ApiError::new(
+                    tonic::Code::FailedPrecondition,
+                    "kilnd does not list exec_stream; kiln-harness needs a kilnd whose backend \
+                     streams exec output",
+                )));
+            }
+            if let Some(problem) = stream_limits_problem(
+                &capabilities.limits.unwrap_or_default(),
+                self.config.tool_limits.timeout,
+            ) {
+                return Err(HarnessError::Api(ApiError::new(
+                    tonic::Code::FailedPrecondition,
+                    problem,
+                )));
+            }
+        }
         let expiry = expiry_policy(&self.config, &capabilities)?;
         let typed_reasons = capabilities.supports(Feature::TypedReasons);
         // Keyed only when a serving daemon lists idempotent create: an older
@@ -598,7 +651,7 @@ where
                 provider: self.provider.info(),
                 system: task.system.clone(),
                 task: task.prompt.clone(),
-                tools: self.registry.definitions().to_vec(),
+                tools: self.registry.definitions_in(exec_context).to_vec(),
                 limits: self.config.limits(),
                 seed: task.seed.iter().map(RecordedSeedFile::new).collect(),
                 check: task.check.as_ref().map(RecordedCheck::new),
@@ -745,7 +798,7 @@ where
                     Some(started)
                 }
             };
-            let (tools, seeded, baseline) = match started {
+            let (mut tools, seeded, baseline) = match started {
                 Some(Ok(value)) => value,
                 None => {
                     // The dropped baseline RPC asks kilnd to cancel it; record
@@ -760,6 +813,7 @@ where
                         &BTreeSet::new(),
                         recovery_deadline,
                         &CancellationToken::new(),
+                        None,
                     )
                     .await
                     .execution_ids;
@@ -791,6 +845,7 @@ where
                             &BTreeSet::new(),
                             recovery_deadline,
                             &cancel,
+                            None,
                         )
                         .await;
                         recovered_stop = recovered.stop();
@@ -830,7 +885,18 @@ where
                     return Err(HarnessError::ToolSetup(error));
                 }
             };
+            tools.set_live_output(
+                self.live
+                    .clone()
+                    .map(|pump| pump as Arc<dyn LiveOutput>),
+            );
+            // Every execution the setup ran, seeding and the baseline, is
+            // known before the loop: response-loss recovery for a model call
+            // and the final check look only for rows the harness has not
+            // seen, so a seed row is never taken for a model call's.
+            let mut setup_execution_ids = Vec::new();
             if let Some(seeded) = seeded {
+                setup_execution_ids.extend(seeded.execution_ids.iter().cloned());
                 self.audit.append(
                     &session_id,
                     Some(&sandbox_id),
@@ -841,7 +907,7 @@ where
                     },
                 )?;
             }
-            let baseline_execution_ids = baseline.execution_ids.clone();
+            setup_execution_ids.extend(baseline.execution_ids.iter().cloned());
             self.audit.append(
                 &session_id,
                 Some(&sandbox_id),
@@ -866,7 +932,7 @@ where
                 typed_reasons,
                 config: &self.config,
                 task,
-                definitions: self.registry.definitions(),
+                definitions: self.registry.definitions_in(exec_context),
                 tools: &tools,
                 session_id: &session_id,
                 sandbox_id: &sandbox_id,
@@ -879,7 +945,7 @@ where
                 &mut self.journal,
                 &context,
                 &mut progress,
-                baseline_execution_ids,
+                setup_execution_ids,
             )
             .await?;
             // The check runs once, only after a final answer that passed
@@ -1335,10 +1401,12 @@ where
             } else {
                 tokio::select! {
                     () = cancel.cancelled() => ToolRun::interrupted(ToolStop::Canceled),
-                    run = context.tools.execute(
+                    run = context.tools.execute_call(
                         &call.visible.tool,
                         call.visible.arguments.clone(),
                         deadline,
+                        &audit_call_id,
+                        tool_deadline,
                     ) => run,
                 }
             };
@@ -1381,6 +1449,7 @@ where
                     result: result_summary,
                     stdout: run.stdout,
                     stderr: run.stderr,
+                    live: run.live.as_deref().cloned(),
                 },
             )?;
             journal.append(
@@ -2344,6 +2413,7 @@ fn rejected_tool_run(kind: &str) -> ToolRun {
         stdout: empty_output(),
         stderr: empty_output(),
         stop: None,
+        live: None,
     }
     .bounded(64)
 }

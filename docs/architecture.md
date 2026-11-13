@@ -233,6 +233,15 @@ name + value + 2. Zero, or no limits at all, is too small. A replay of a
 legacy journal (see the journal) sends neither option, so it needs neither
 the features nor the limits.
 
+A live session also streams the model's `exec` calls (see
+[Streamed exec](#streamed-exec)), so in the same place, before anything is
+created or recorded, it requires `EXEC_STREAM` and an
+`ApiLimits.max_stream_timeout_ms` of at least the tool timeout in
+milliseconds; missing limits count as zero, as for the exec options. Either
+refusal is an `Api` `FAILED_PRECONDITION` naming `exec_stream`. There is no
+fallback to unary Exec. A replay of a `workspace_v1` or legacy journal
+streams nothing and needs neither.
+
 The advertised limits must be coherent before anything is created: for
 lifetime and idle each, a nonzero maximum is at least the minimum, and a
 nonzero default lies within `[min, max]`. Otherwise the session fails with
@@ -275,7 +284,15 @@ otherwise behaves exactly as without one. Two classifications use it:
   the same wall budget (the command timeout recomputed from the time left,
   less 250 ms, at least 1 ms; with nothing left the call is a deadline). A
   second race is returned as an ordinary, recoverable `kilnd_error` with
-  its reason dropped, so the session goes on.
+  its reason dropped, so the session goes on. The same holds for an
+  `ExecStream`.
+- On an `ExecStream`, `UNIMPLEMENTED` `backend_unsupported:exec_stream`
+  means the backend cannot stream, and a streaming session never falls
+  back to unary, so it is classified unusable by the same
+  `api::sandbox_unusable_refusal`. `RESOURCE_EXHAUSTED` `exec_stream_limit`
+  means every stream permit was taken (kilnd allows 8 per uid and 16 on the
+  node by default, and the harness runs as one uid); kilnd allocated
+  nothing, so the stream is retried (see below).
 
 A successful Exec RPC does not mean the sandbox survived. kilnd says so in
 `Execution.sandbox_reusable`, and the adapter keeps it with the execution's
@@ -301,8 +318,13 @@ nothing is known about what kilnd assigned, and the session ends the same
 way, "execution evidence could not be read after its response was lost";
 a read that succeeded and found nothing keeps the call an ordinary
 failure. A cancellation that arrives during recovery ends it at once, and
-the session ends as canceled; recovery after a cancellation still runs its
-window, to record what kilnd assigned. Settled rows keep their
+the session ends as canceled (or as the call's own deadline, if that came
+first); a streamed call's execution ID already known is kept as unsettled
+evidence rather than dropped. Recovery after a cancellation still runs its
+window, to record what kilnd assigned. "New" means not seen by the
+session: the seed's and the baseline's executions are known before the
+first model call, so recovery, and the final check, never take a setup row
+for a model call's. Settled rows keep their
 `sandbox_reusable` and `cancel_reason`, and one that left the sandbox
 unusable stops the session exactly as a returned one would, during the
 baseline too. A row still not terminal at the deadline fails closed: the
@@ -841,11 +863,17 @@ where it does not, is a later piece.
 
 | Tool | kilnd executions | Validation |
 |---|---:|---|
-| `exec` | 1 | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s |
+| `exec` | 1 (streamed) | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s; stopped past 8 MiB of either output |
 | `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned |
 | `write_file` | 1 | `/workspace` file path; fixed `dd` argv and bounded stdin; at most 64 KiB |
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |
 | `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline |
+
+In a streaming session the `exec` tool's description ends "A command whose
+stdout or stderr passes 8 MiB is stopped.", so the model is told of the
+cutoff whatever system prompt the session brings. Tool definitions are part
+of every model request, which replay compares by hash, so a session in an
+earlier context keeps the definitions it had, without that sentence.
 
 File paths may be relative (`notes.txt`) or start with `/workspace/`
 (`/workspace/notes.txt`), the two forms models produce. The prefix is
@@ -922,6 +950,142 @@ output tokens per request, 1,000,000,000 tokens for each cumulative
 budget, 256 MiB of model output per session, and 16 truncation recoveries
 per session (0 is allowed).
 
+## Streamed exec
+
+There are three execution contexts. `legacy` sends no cwd and no env;
+`workspace_v1` sends `/workspace` and the fixed overrides, every
+execution unary; and `workspace_stream_v1`, which every live session uses,
+is `workspace_v1` except that the model's `exec` tool calls go through
+`ExecStream`. The file tools, seeding, the baseline and diff manifests and
+the task check stay unary in every context: their output is small and
+bounded, and only a model command can run away.
+
+A streamed `exec` keeps everything a unary one does: the refusal on a
+sandbox already unusable, the wall and RPC deadline (dropping the stream at
+the deadline is `ToolStop::Deadline`, and kilnd cancels the command), the
+command timeout less the 250 ms reserve, the send time as the activity
+anchor, the single `execution_start_raced` retry, the cwd and env check, and
+`sandbox_reusable == false` stopping the session after the call. The
+request is the same `ExecRequest`, inside `ExecStreamRequest`.
+
+- **The protocol.** `TonicKilnd::exec_stream` checks every message: `seq`
+  starts at 0 and grows by one, message 0 is `ExecStarted` and no other is,
+  every chunk and gap names stdout or stderr, `ExecFinished` names the
+  started execution, and nothing follows it. Each stream's offsets start at
+  0 and every chunk and gap must start exactly where that stream's previous
+  one ended (kilnd sends an interior gap right before the chunk after it,
+  and tail gaps at the stream's end), with no overflow; `ExecFinished`'s
+  `LiveDelivery` must equal the bytes the stream's chunks carried and its
+  gaps reported. A violation drops the stream before the observer sees the
+  offending message and is `StreamedExec::Broken` with an `INTERNAL` error
+  and `protocol_violation` set; the execution may still have been running,
+  and dropping the stream cancels it. Nothing kilnd sends for that command
+  is trusted, its row included: the tool ends the session as unusable with
+  the fixed message "kilnd broke the ExecStream protocol" and the execution
+  ID, if one arrived, as evidence, without reading the row. With no ID the
+  call has none, so response-loss recovery still looks for the row; the
+  stop stands either way. A transport error, or a stream that just ends
+  without `ExecFinished`, is not a violation. An RPC error before the first message is a refusal, returned
+  as `Err` and classified exactly like a unary Exec error.
+- **The observer.** A harness-internal observer forwards chunks and gaps to
+  the host's live sink, if there is one, and keeps, per stream, the
+  furthest offset seen: `offset + len` of a chunk, `offset + dropped` of a
+  gap. kilnd may drop live bytes, so gaps count: a command cannot hide a
+  flood behind them. As soon as either stream's chunks and gaps show more
+  than `RUNAWAY_OUTPUT_BYTES` (8 MiB) it breaks off, the stream is dropped,
+  and kilnd SIGKILLs the command's cgroup and publishes `CANCELED` /
+  `CLIENT_DISCONNECTED` (or the real outcome if the command had already
+  finished). Live output is lossy, and kilnd reports dropped bytes only in
+  a gap before the stream's next chunk or after the command settles, so a
+  command whose excess output was dropped live and that then goes quiet is
+  bounded by its timeout instead. The observer also writes the started
+  execution's ID and its furthest offsets into the tool session, outside
+  the call's future, so recovery has them even when a cancellation or the
+  call's deadline drops the call.
+- **Finished.** `ExecFinished` carries the stored row, equal to
+  `GetExecution`, and is handled as a unary answer, with two more checks,
+  made by one function for every streamed row, returned or recovered. The
+  row's `mode` must be `STREAM`; anything else is a context mismatch
+  ("kilnd recorded a streamed execution as another mode"), handled as a cwd
+  or env mismatch: the ID is kept, the output withheld, and the session
+  ends. And a row whose stdout or stderr holds no retained data although
+  kilnd observed bytes there, or the live stream delivered or reported
+  some, comes from a kilnd that keeps no output (`--output-storage
+  metadata` or `none`; under `none` kilnd stores no byte count either, so
+  the live stream is the only proof); the result would be silently empty,
+  so the session ends the same way, naming `--output-storage full`. A
+  command whose output was all lost live leaves no such proof, so
+  `--output-storage full` stays a requirement. An `INTERRUPTED` row is
+  exempt from this output check, though not from the others: kilnd's
+  restart reconciliation marks a running row so without its capture,
+  whatever the storage mode, so it is the ordinary `state: interrupted`
+  result whether or not output arrived live first. Unary rows always carry
+  their bytes, so this check is for streamed rows only.
+- **Stopped, or broken after `ExecStarted`.** After the cutoff, or when the
+  stream ends without `ExecFinished`, other than by a protocol violation,
+  once kilnd has started the command,
+  the harness reads the row with `GetExecution`, backing off from 10 ms to
+  200 ms, until it is terminal or the call's whole tool budget ends: the
+  tool timeout plus the response-loss recovery window from the call's
+  start, capped by the work deadline. A terminal row passes every check
+  above and becomes the normal result, the one `ExecFinished` would have
+  carried, plus `"stopped": "output_limit"` after a cutoff; the session goes
+  on if the row says the sandbox is reusable, as kiln's does. So the result
+  does not depend on when within that budget the row settled, and replay
+  reproduces it. A row not read as terminal by then ends the session as
+  unusable with its ID kept as evidence and the fixed message "the
+  command's result could not be read after its stream ended", which names
+  no execution, since the result is model-visible and replay compares it.
+  The call carries its ID, so the engine's response-loss recovery does not
+  run for it.
+- **Broken before `ExecStarted`.** A stream that ends before kilnd named
+  the execution is a lost response: no settled execution, so the engine's
+  response-loss recovery runs for its window. The row, if kilnd made one,
+  is among the sandbox's recent executions, so recovery finds it, as after
+  a lost unary response, but `GetSandbox` leaves output out, so each row it
+  finds is also read with `GetExecution` once terminal and must pass the
+  checks above; one never so read counts as unsettled. When a streamed call
+  is dropped after `ExecStarted` instead, by a cancellation or its
+  deadline, recovery follows the known ID with `GetExecution` alone, never
+  depending on `GetSandbox`; a row never read as terminal is reported
+  unsettled under that ID. A recovered streamed row that fails a check ends
+  the session as a returned one would, with its ID kept and no output.
+- **Capacity.** `exec_stream_limit` is retried with backoff from 50 ms
+  doubling to 1 s, each retry with the command timeout recomputed from what
+  is left, until the RPC deadline. If that passes first, the call is an
+  ordinary, recoverable `kilnd_error` saying kilnd's stream capacity was
+  busy. It is never sent as a unary Exec instead, so a result never depends
+  on contention.
+
+The model-visible result has the unary shape, plus `"stopped":
+"output_limit"` only when the cutoff fired; live-delivery numbers depend on
+timing and stay out of it. The journal's `tool_executed` records that
+result. The audit's `tool_completed` gains `live`, only for a streamed call
+that kilnd started: kilnd's `LiveDelivery` totals from `ExecFinished`, or,
+after a cutoff or a broken stream, the harness's own counts with
+`dropped_bytes_known: false`, and `stopped`. Unary calls omit it, so their
+records are unchanged.
+
+Live output on the host is optional: `Harness::with_live_output` takes a
+`live::LiveOutput` sink, which gets `started`, each chunk and gap, and
+`finished` (also when the call is dropped part-way) under the call's audit
+ID. It is never journaled and never affects a result. The session never
+calls the sink itself: a pump queues each event, and a writer thread of its
+own hands them to the sink in order, so a sink that blocks never holds up a
+stream, its cutoff, a cancellation, a deadline or cleanup. At most 1 MiB of
+chunk data and 4096 chunks and gaps wait; a chunk that does not fit is left
+out and its bytes are added to a gap the sink gets before that stream's
+next chunk, or before `finished`, so every byte it was not shown is still
+reported. `Harness::drain_live_output` waits a bounded time for the queue
+to empty; the CLI gives it 2 s after the session and its cleanup. The CLI's `--live`
+(on `demo`, `run` and `replay`) prints to stderr, one line at a time,
+prefixed `[call-<turn>-<index> out]` or `err]`, buffering at most 4 KiB of
+an unfinished line, and shows every byte that is not printable ASCII, a
+newline or a tab as `\xNN`, so no escape sequence, carriage return or
+UTF-8 from a sandbox reaches the terminal. A gap prints `[<call> out: N
+bytes not shown live]`, with `>= N` when the count is a lower bound. The
+eval runner has no sink.
+
 ## Audit
 
 Each JSONL record has a session-local sequence, timestamp, session ID, sandbox
@@ -971,14 +1135,16 @@ and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
 replay is self-contained. Both are omitted when absent, so a journal without
 them is byte-identical to one written before they existed, and the schema
 stays 1. `exec_context` names where every execution ran: new sessions
-always write `"exec_context":"workspace_v1"` (`/workspace` and the fixed
-overrides). Absent means the legacy context, no cwd and no env, exactly
+always write `"exec_context":"workspace_stream_v1"` (`/workspace` and the
+fixed overrides, the model's `exec` streamed); `workspace_v1` is the same
+with every execution unary, as journals recorded before streaming say. Absent means the legacy context, no cwd and no env, exactly
 what the harness sent before it existed, so older journals stay
 byte-identical and load; the grammar refuses any other value. Replay runs
 in the recorded context: `Harness::replay` runs a `ReplayProvider`'s task
 in the context its journal recorded, through a crate-private entry point
-that the public `Harness::run` also uses with `workspace_v1`, so no caller
-can run a live session in the legacy context. A legacy journal
+that the public `Harness::run` also uses with `workspace_stream_v1`, so no
+caller can run a live session in an earlier context. A `workspace_v1`
+journal replays with every execution unary, and needs no `EXEC_STREAM`. A legacy journal
 replays with cwd `""` and env `[]`, so its tools behave as recorded, and
 expects kilnd's metadata to be empty too. `check_completed` holds the check's outcome, its execution ID and at
 most 4 KiB of each output stream, after the final `model_responded` and

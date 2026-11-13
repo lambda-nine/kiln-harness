@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use common::{CreateScript, DeleteBehavior, FakeApi, HealthScript, api_error};
 use kiln_harness::api::{
     ApiError, Capabilities, Deleted, Execution, Feature, FinalCheck, Health, NodeReservations,
-    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState,
+    Sandbox, SandboxApi, SandboxExec, SandboxRequest, SandboxState, StreamObserver, StreamedExec,
 };
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionOutcome, SessionTask};
@@ -923,6 +923,14 @@ impl SandboxApi for Hooked {
         self.inner.exec(request).await
     }
 
+    async fn exec_stream(
+        &self,
+        request: SandboxExec,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
+        self.inner.exec_stream(request, observer).await
+    }
+
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
         self.inner.recent_executions(sandbox_id).await
     }
@@ -1150,6 +1158,7 @@ impl SandboxApi for Replaced {
                     Feature::RequestIdRelease,
                     Feature::ExecCwd,
                     Feature::ExecEnv,
+                    Feature::ExecStream,
                 ]),
                 limits: Some(common::exec_limits()),
             },
@@ -1187,6 +1196,14 @@ impl SandboxApi for Replaced {
     }
 
     async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("the empty echo stops the session before work")
+    }
+
+    async fn exec_stream(
+        &self,
+        _request: SandboxExec,
+        _observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
         unreachable!("the empty echo stops the session before work")
     }
 

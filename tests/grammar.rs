@@ -1002,7 +1002,7 @@ fn recorded_tasks_must_be_ones_the_engine_accepts() {
 }
 
 #[test]
-fn the_exec_context_is_absent_or_workspace_v1() {
+fn the_exec_context_is_absent_or_a_known_one() {
     let with_context = |value: Option<&str>| {
         let mut events = valid();
         let JournalEvent::SessionStarted { exec_context, .. } = &mut events[0] else {
@@ -1013,7 +1013,18 @@ fn the_exec_context_is_absent_or_workspace_v1() {
     };
     assert_accepted("legacy, no exec_context", with_context(None));
     assert_accepted("workspace_v1", with_context(Some("workspace_v1")));
-    for value in ["workspace_v2", "", "WORKSPACE_V1", "legacy"] {
+    assert_accepted(
+        "workspace_stream_v1",
+        with_context(Some("workspace_stream_v1")),
+    );
+    for value in [
+        "workspace_v2",
+        "",
+        "WORKSPACE_V1",
+        "legacy",
+        "workspace_stream_v2",
+        "workspace_stream",
+    ] {
         assert_rejected_because(value, with_context(Some(value)), "unknown exec_context");
     }
 }

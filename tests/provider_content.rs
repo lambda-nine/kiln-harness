@@ -118,7 +118,6 @@ async fn a_piece_two_journal_replays_unchanged() {
     let replay = ReplayProvider::from_journal(&journal).expect("replayable");
     let mut config = short_lifecycle_config();
     config.apply_limits(&replay.limits());
-    let replay_task = replay.task();
     let api = FakeApi::default();
     let mut harness = Harness::new(
         api.clone(),
@@ -127,8 +126,10 @@ async fn a_piece_two_journal_replays_unchanged() {
         MemoryJournal::default(),
         config,
     );
+    // Replayed in its recorded context: a live run describes the tools as a
+    // streaming session does, which this recording predates.
     let outcome = harness
-        .run(&replay_task, CancellationToken::new())
+        .replay(CancellationToken::new())
         .await
         .expect("replay completes");
     assert_eq!(outcome.final_answer, "a.txt contains hello.");

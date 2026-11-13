@@ -171,7 +171,11 @@ async fn an_old_daemon_gets_no_expiry_and_no_renews() {
     assert!(matches!(
         events[0],
         AuditEvent::SessionOpened { features, .. }
-            if features == &["exec_cwd".to_string(), "exec_env".to_string()]
+            if features == &[
+                "exec_cwd".to_string(),
+                "exec_env".to_string(),
+                "exec_stream".to_string(),
+            ]
     ));
     assert!(matches!(
         events[1],
@@ -219,6 +223,7 @@ async fn expiry_is_sent_and_recorded_when_listed() {
                 "typed_reasons".to_string(),
                 "exec_cwd".to_string(),
                 "exec_env".to_string(),
+                "exec_stream".to_string(),
             ]
     ));
     assert!(matches!(
@@ -1386,6 +1391,14 @@ impl kiln_harness::api::SandboxApi for NotifyingApi {
         self.inner.exec(request).await
     }
 
+    async fn exec_stream(
+        &self,
+        request: kiln_harness::api::SandboxExec,
+        observer: &mut (dyn kiln_harness::api::StreamObserver + Send),
+    ) -> Result<kiln_harness::api::StreamedExec, kiln_harness::api::ApiError> {
+        self.inner.exec_stream(request, observer).await
+    }
+
     async fn recent_executions(
         &self,
         sandbox_id: &str,
@@ -1522,7 +1535,9 @@ async fn a_recovered_row_is_evidence_only_once_it_settles() {
     assert!(api.state().get_execution_calls >= 3);
     assert_eq!(harness.provider().calls, 1);
 
-    // A row that never settles fails closed, and no later Exec runs.
+    // A row that never settles fails closed, and no later Exec runs. The
+    // model's exec streams, and its stream named the execution before it
+    // broke, so the tool itself follows the row for its whole budget.
     let api = FakeApi::with_expiry();
     api.state().running_exec = Some((2, u32::MAX));
     let provider = Script::new(
@@ -1534,8 +1549,7 @@ async fn a_recovered_row_is_evidence_only_once_it_settles() {
     assert!(
         matches!(&error, HarnessError::Api(error)
             if error.code == Code::FailedPrecondition
-                && error.message
-                    == "execution ex-0000000000000002 did not settle after its response was lost"),
+                && error.message == kiln_harness::tools::STREAM_RESULT_UNREADABLE),
         "{error}"
     );
     assert_eq!(harness.provider().calls, 1);
@@ -1616,7 +1630,11 @@ async fn an_unsupported_exec_option_ends_the_session() {
     // Another feature, the right token under the wrong code, or no typed
     // reasons: an ordinary tool error, and the loop goes on.
     for (code, token, typed) in [
-        (Code::Unimplemented, "backend_unsupported:exec_stream", true),
+        (
+            Code::Unimplemented,
+            "backend_unsupported:sandbox_expiry",
+            true,
+        ),
         (
             Code::FailedPrecondition,
             "sandbox_unsupported:exec_stream",
@@ -2394,6 +2412,14 @@ impl kiln_harness::api::SandboxApi for SlowRefusedHead {
         self.inner.exec(request).await
     }
 
+    async fn exec_stream(
+        &self,
+        request: kiln_harness::api::SandboxExec,
+        observer: &mut (dyn kiln_harness::api::StreamObserver + Send),
+    ) -> Result<kiln_harness::api::StreamedExec, kiln_harness::api::ApiError> {
+        self.inner.exec_stream(request, observer).await
+    }
+
     async fn recent_executions(
         &self,
         sandbox_id: &str,
@@ -2569,6 +2595,7 @@ fn missed_row(
         cwd: String::new(),
         env_names: Vec::new(),
         env_sha256: String::new(),
+        mode: kiln_harness::api::ExecutionMode::Unary,
     })
 }
 
@@ -2784,6 +2811,14 @@ impl kiln_harness::api::SandboxApi for DelayedThenHangingRenew {
         request: kiln_harness::api::SandboxExec,
     ) -> Result<kiln_harness::api::Execution, kiln_harness::api::ApiError> {
         self.inner.exec(request).await
+    }
+
+    async fn exec_stream(
+        &self,
+        request: kiln_harness::api::SandboxExec,
+        observer: &mut (dyn kiln_harness::api::StreamObserver + Send),
+    ) -> Result<kiln_harness::api::StreamedExec, kiln_harness::api::ApiError> {
+        self.inner.exec_stream(request, observer).await
     }
 
     async fn recent_executions(

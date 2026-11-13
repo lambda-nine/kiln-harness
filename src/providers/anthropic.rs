@@ -205,7 +205,7 @@ use crate::provider::{
     Message, ModelRequest, ModelResponse, Provider, ProviderContent, ProviderError,
     ProviderErrorKind, ProviderInfo, StopReason, ToolCall, Usage,
 };
-use crate::tools::{ToolLimits, ToolRegistry};
+use crate::tools::{ExecContext, ToolLimits, ToolRegistry};
 
 /// The name recorded in journals and in [`ProviderContent::provider`].
 pub const PROVIDER_NAME: &str = "anthropic";
@@ -462,10 +462,15 @@ impl AnthropicProvider {
         }
         if config.strict_tools {
             // The harness's own tools must survive the strict transform, so
-            // --strict-tools fails here rather than mid-session.
-            for tool in ToolRegistry::new(ToolLimits::default()).definitions() {
-                strict_input_schema(&tool.input_schema)
-                    .map_err(|problem| AnthropicError(format!("tool {}: {problem}", tool.name)))?;
+            // --strict-tools fails here rather than mid-session: as every
+            // execution context describes them.
+            let registry = ToolRegistry::new(ToolLimits::default());
+            for context in [ExecContext::WorkspaceV1, ExecContext::WorkspaceStreamV1] {
+                for tool in registry.definitions_in(context) {
+                    strict_input_schema(&tool.input_schema).map_err(|problem| {
+                        AnthropicError(format!("tool {}: {problem}", tool.name))
+                    })?;
+                }
             }
         }
         let client = config.transport().client().map_err(AnthropicError)?;

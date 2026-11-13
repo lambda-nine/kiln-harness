@@ -679,7 +679,7 @@ async fn replay_reproduces_the_recorded_demo_against_a_fresh_sandbox() {
 async fn a_new_journal_records_its_exec_context_and_replays_in_it() {
     let temp = common::private_tempdir().expect("temp dir");
     let (path, _) = record_demo(temp.path(), "demo.jsonl").await;
-    assert!(lines(&path)[0].contains(r#""exec_context":"workspace_v1""#));
+    assert!(lines(&path)[0].contains(r#""exec_context":"workspace_stream_v1""#));
     let journal = read_journal(&path).expect("journal verifies");
     let provider = ReplayProvider::from_journal(&journal).expect("replayable");
     let config = provider.replay_config(short_lifecycle_config());
@@ -759,8 +759,10 @@ async fn a_legacy_journal_replays_with_no_cwd_or_env() {
 async fn the_public_run_is_always_a_live_workspace_session() {
     // M3B-07: only `Harness::replay` can run a legacy context. The public
     // `run`, even given a legacy recording's own task and provider, sends
-    // /workspace and the overrides, journals workspace_v1, and still needs
-    // the exec options.
+    // /workspace and the overrides, journals workspace_stream_v1, and still
+    // needs the exec options. It also describes `exec` as a streaming
+    // session does, so the legacy recording diverges at its first request,
+    // after the baseline ran.
     let journal = legacy_golden();
     let provider = ReplayProvider::from_journal(&journal).expect("replayable");
     let task = provider.task();
@@ -772,10 +774,16 @@ async fn the_public_run_is_always_a_live_workspace_session() {
         MemoryJournal::default(),
         short_lifecycle_config(),
     );
-    harness
+    let error = harness
         .run(&task, CancellationToken::new())
         .await
-        .expect("the demo runs live");
+        .expect_err("a live session's first request is not the legacy one");
+    assert!(
+        matches!(&error, HarnessError::Provider(error)
+            if error.kind == ProviderErrorKind::ReplayDiverged),
+        "{error}"
+    );
+    assert_eq!(harness.provider().diverged_at(), Some(1));
     let env = common::workspace_env();
     {
         let state = api.state();
@@ -788,7 +796,7 @@ async fn the_public_run_is_always_a_live_workspace_session() {
     else {
         panic!("session start");
     };
-    assert_eq!(exec_context.as_deref(), Some("workspace_v1"));
+    assert_eq!(exec_context.as_deref(), Some("workspace_stream_v1"));
 
     // A daemon without the exec options is refused before anything exists,
     // for the legacy recording's task as for any other.

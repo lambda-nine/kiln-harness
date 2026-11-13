@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kiln_harness::api::{ExpiryPolicy, Feature, SandboxApi, SandboxRequest, TonicKilnd};
+use kiln_harness::api::{
+    ExpiryPolicy, Feature, LiveStream, SandboxApi, SandboxRequest, TonicKilnd,
+};
 use kiln_harness::audit::JsonlAudit;
 use kiln_harness::engine::{Harness, HarnessConfig, SessionTask};
 use kiln_harness::journal::{JournalEvent, JsonlJournal, read_journal};
+use kiln_harness::live::LiveOutput;
 use kiln_harness::provider::{ModelResponse, ScriptedProvider, ToolCall};
 use kiln_harness::replay::ReplayProvider;
 use serde_json::{Value, json};
@@ -36,6 +39,7 @@ async fn scripted_provider_through_installed_kilnd_leaves_no_api_residue() {
     // proves exec cwd and env, which every session needs.
     assert!(before.capabilities.supports(Feature::ExecCwd));
     assert!(before.capabilities.supports(Feature::ExecEnv));
+    assert!(before.capabilities.supports(Feature::ExecStream));
     assert!(before.capabilities.supports(Feature::SandboxExpiry));
     assert!(before.capabilities.supports(Feature::TypedReasons));
     assert!(before.capabilities.supports(Feature::IdempotentCreate));
@@ -163,7 +167,7 @@ async fn tools_run_in_the_workspace_with_the_fixed_env_through_installed_kilnd()
     let JournalEvent::SessionStarted { exec_context, .. } = &recorded.records[0].event else {
         panic!("session start");
     };
-    assert_eq!(exec_context.as_deref(), Some("workspace_v1"));
+    assert_eq!(exec_context.as_deref(), Some("workspace_stream_v1"));
     let stdout = recorded
         .records
         .iter()
@@ -176,6 +180,168 @@ async fn tools_run_in_the_workspace_with_the_fixed_env_through_installed_kilnd()
         })
         .expect("the exec result");
     assert_eq!(stdout, "/workspace\ndumb|1|cat|/root\nrelative\n");
+
+    let after = api.health().await.expect("health after");
+    assert_eq!(after.active_sandboxes, 0);
+    assert_eq!(after.running_executions, 0);
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
+}
+
+/// Every live event of a session, with when it arrived.
+#[derive(Default)]
+struct Timeline {
+    events: std::sync::Mutex<Vec<(Instant, String, String)>>,
+}
+
+impl Timeline {
+    fn push(&self, call_id: &str, event: String) {
+        self.events
+            .lock()
+            .expect("timeline")
+            .push((Instant::now(), call_id.to_string(), event));
+    }
+
+    fn of(&self, call_id: &str) -> Vec<(Instant, String)> {
+        self.events
+            .lock()
+            .expect("timeline")
+            .iter()
+            .filter(|(_, call, _)| call == call_id)
+            .map(|(at, _, event)| (*at, event.clone()))
+            .collect()
+    }
+}
+
+impl LiveOutput for Timeline {
+    fn started(&self, call_id: &str, _execution_id: &str) {
+        self.push(call_id, "started".to_string());
+    }
+
+    fn chunk(&self, call_id: &str, stream: LiveStream, data: &[u8]) {
+        self.push(
+            call_id,
+            format!("{} {}", stream.as_str(), String::from_utf8_lossy(data)),
+        );
+    }
+
+    fn gap(&self, call_id: &str, stream: LiveStream, dropped: u64, known: bool) {
+        self.push(
+            call_id,
+            format!("{} gap {dropped} {known}", stream.as_str()),
+        );
+    }
+
+    fn finished(&self, call_id: &str, stopped: Option<&str>) {
+        self.push(call_id, format!("finished {stopped:?}"));
+    }
+}
+
+/// The model's `exec` streams through installed kilnd: output written a
+/// second apart arrives live, a second apart, before the call finishes; a
+/// runaway is cut at the output limit; and the next exec in the same
+/// sandbox runs normally.
+#[tokio::test]
+async fn model_exec_streams_live_and_cuts_a_runaway_through_installed_kilnd() {
+    if std::env::var_os("KILND_INTEGRATION").is_none() {
+        return;
+    }
+    let socket = std::env::var_os("KILND_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/kilnd/kilnd.sock"), PathBuf::from);
+    let api = TonicKilnd::connect(socket)
+        .await
+        .expect("connect to installed kilnd");
+    let before = api.health().await.expect("health before");
+    assert!(before.serving, "kilnd unhealthy: {}", before.detail);
+    assert!(before.capabilities.supports(Feature::ExecStream));
+    assert_eq!(before.active_sandboxes, 0);
+    let sandboxes_before = non_deleted_ids(&api).await;
+
+    let exec = |id: &str, script: &str| {
+        ModelResponse::tool_use([ToolCall::new(
+            id,
+            "exec",
+            json!({"argv": ["/bin/sh", "-c", script]}),
+        )])
+    };
+    let provider = ScriptedProvider::new([
+        exec("call-1", "echo first; sleep 1; echo second"),
+        exec("call-2", "head -c 9000000 /dev/zero | tr '\\0' x"),
+        exec("call-3", "echo after"),
+        ModelResponse::final_text("streamed"),
+    ]);
+    let temp = common::private_tempdir().expect("temporary directory");
+    let journal_path = temp.path().join("stream-journal.jsonl");
+    let timeline = std::sync::Arc::new(Timeline::default());
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        JsonlAudit::open(&temp.path().join("stream-audit.jsonl")).expect("open audit"),
+        JsonlJournal::open(&journal_path).expect("open journal"),
+        HarnessConfig::default(),
+    )
+    .with_live_output(std::sync::Arc::clone(&timeline) as std::sync::Arc<dyn LiveOutput>);
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("the stream session completes");
+    // The sink is fed by a thread of its own; let it catch up.
+    assert!(harness.drain_live_output(Duration::from_secs(5)));
+
+    // Both lines arrived live, about a second apart, before the end.
+    let first = timeline.of("call-1-1");
+    assert_eq!(
+        first.first().map(|(_, event)| event.as_str()),
+        Some("started")
+    );
+    let at = |text: &str| {
+        first
+            .iter()
+            .find(|(_, event)| event.starts_with("stdout") && event.contains(text))
+            .map_or_else(|| panic!("no live {text:?}: {first:?}"), |(at, _)| *at)
+    };
+    let finished = first
+        .iter()
+        .find(|(_, event)| event.starts_with("finished"))
+        .map(|(at, _)| *at)
+        .expect("finished");
+    assert!(
+        at("second") >= at("first") + Duration::from_millis(500),
+        "{first:?}"
+    );
+    assert!(at("second") <= finished);
+    assert_eq!(
+        first.last().map(|(_, event)| event.as_str()),
+        Some("finished None")
+    );
+
+    let recorded = read_journal(&journal_path).expect("journal verifies");
+    let JournalEvent::SessionStarted { exec_context, .. } = &recorded.records[0].event else {
+        panic!("session start");
+    };
+    assert_eq!(exec_context.as_deref(), Some("workspace_stream_v1"));
+    let results: Vec<Value> = recorded
+        .records
+        .iter()
+        .filter_map(|record| match &record.event {
+            JournalEvent::ToolExecuted { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["stdout"], "first\nsecond\n");
+    assert!(results[0].get("stopped").is_none());
+    // The runaway was cut, whatever state kilnd settled it in.
+    assert_eq!(results[1]["stopped"], "output_limit", "{}", results[1]);
+    assert_eq!(
+        timeline
+            .of("call-2-1")
+            .last()
+            .map(|(_, event)| event.clone()),
+        Some("finished Some(\"output_limit\")".to_string())
+    );
+    assert_eq!(results[2]["ok"], true, "{}", results[2]);
+    assert_eq!(results[2]["stdout"], "after\n");
 
     let after = api.health().await.expect("health after");
     assert_eq!(after.active_sandboxes, 0);

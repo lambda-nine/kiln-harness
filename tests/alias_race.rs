@@ -39,17 +39,24 @@ impl KilndService for GatedKilnd {
             let _ = self.health_entered.send(());
             self.release_health.notified().await;
         }
-        // The exec options every kilnd the harness accepts lists.
+        // The exec options and exec streaming every kilnd a live session
+        // accepts lists.
         Ok(Response::new(pb::HealthResponse {
             status: pb::health_response::Status::Serving as i32,
             runtime_capabilities: Some(pb::RuntimeCapabilities {
-                features: vec![pb::Feature::ExecCwd as i32, pb::Feature::ExecEnv as i32],
+                features: vec![
+                    pb::Feature::ExecCwd as i32,
+                    pb::Feature::ExecEnv as i32,
+                    pb::Feature::ExecStream as i32,
+                ],
                 limits: Some(pb::ApiLimits {
                     max_cwd_bytes: 4096,
                     max_env_entries: 64,
                     max_env_name_bytes: 128,
                     max_env_value_bytes: 4096,
                     max_env_total_bytes: 32_768,
+                    default_stream_timeout_ms: 1_800_000,
+                    max_stream_timeout_ms: 7_200_000,
                     ..pb::ApiLimits::default()
                 }),
                 ..pb::RuntimeCapabilities::default()
@@ -96,7 +103,7 @@ impl KilndService for GatedKilnd {
     type ExecStreamStream =
         tonic::codegen::tokio_stream::Empty<Result<pb::ExecStreamResponse, Status>>;
 
-    /// The harness never streams.
+    /// Nothing gets past create here.
     async fn exec_stream(
         &self,
         _request: Request<pb::ExecStreamRequest>,

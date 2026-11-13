@@ -6,6 +6,61 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- kilnd API milestone 4: the model's `exec` runs through `ExecStream`. Every
+  live session uses a third execution context, `workspace_stream_v1`
+  (`/workspace` and the fixed env, as `workspace_v1`), journaled in
+  `session_started.exec_context`; the file tools, seeding, the baseline
+  manifest and the check stay unary. Discovery also requires
+  `FEATURE_EXEC_STREAM` and `ApiLimits.max_stream_timeout_ms` (now kept in
+  `ApiLimits`, with `default_stream_timeout_ms`) of at least the tool
+  timeout, refusing otherwise with `FAILED_PRECONDITION` before anything is
+  created; there is no unary fallback. Replay keeps the recorded context:
+  `workspace_v1` and legacy journals replay unary, against a daemon with or
+  without streaming, and stay byte-identical. A command is stopped by
+  dropping its stream, which kilnd cancels, as soon as its delivered chunks
+  and reported gaps show more than `tools::RUNAWAY_OUTPUT_BYTES` (8 MiB) on
+  either stream; its final row is read back, the result gains
+  `"stopped": "output_limit"`, and the session goes on. Live output is
+  lossy, so a command whose excess output was dropped live and that then
+  goes quiet is bounded by its timeout instead. A stream that ends without
+  its result after `ExecStarted` is followed to kilnd's row with
+  `GetExecution` within the call's time and recovery window, and gives the
+  result `ExecFinished` would have; a row never read as terminal ends the
+  session with the ID kept and a fixed message. A stream that breaks the
+  protocol ends the session as unusable with a fixed message and the ID, if
+  one arrived, and its row is never used as a result. A stream that breaks
+  before `ExecStarted` is treated as a lost response; recovery after a
+  streamed call follows its started execution by ID even when the call was
+  canceled or hit its deadline, keeps that ID if a cancellation cuts it
+  short, and reads every row it discovers with `GetExecution` and checks it
+  as a returned streamed row. Seed executions are known before the first
+  model call, so recovery never takes a seed row for a model call's. A
+  typed
+  `exec_stream_limit` refusal is retried with backoff (50 ms doubling to
+  1 s) within the call's budget and is otherwise an ordinary tool error; a
+  typed `backend_unsupported:exec_stream` ends the session as
+  sandbox-unusable through `api::sandbox_unusable_refusal`. A streamed row
+  must say it was streamed (`Execution.mode`, new) and must hold output
+  wherever kilnd observed some or the live stream delivered some (kilnd's
+  `--output-storage full`), or the session ends at that call with the
+  execution ID kept and its output withheld; a command whose output was all
+  lost live is not caught this way, and an `INTERRUPTED` row, which kilnd's
+  restart reconciliation leaves without output, is exempt. `SandboxApi::exec_stream` (new, with
+  `StreamObserver`, `StreamedExec`, `LiveStream`, `LiveDelivery`) checks the
+  stream protocol (`seq`, started first, nothing after finished, matching
+  IDs, named streams, per-stream offsets with no overlap or unreported
+  hole, and `ExecFinished`'s live totals). The new `live::LiveOutput` sink
+  receives live bytes on the host (`Harness::with_live_output`) through a
+  bounded queue and a writer thread of its own, so a slow sink never holds
+  up a command, a cancellation or cleanup; bytes that do not fit reach it
+  as a gap, and `Harness::drain_live_output` lets the last of them through
+  (`Duration::MAX` waits with no deadline).
+  `demo`, `run` and `replay` gain `--live`, which prints them to stderr
+  sanitized. The audit's `tool_completed` gains an optional `live`
+  (delivery totals and `stopped`), omitted for unary calls. In a streaming
+  session the `exec` tool's description adds that a command whose stdout or
+  stderr passes 8 MiB is stopped; recordings of earlier contexts keep their
+  tool definitions. Journal schema 1, unchanged shape.
 - kilnd API milestone 3b (kilnd `0c79944`, whose `kilnd.v1` schema is now
   vendored, ExecStream messages included; the harness does not stream).
   Every execution (a model's `exec`, the file tools, the workspace

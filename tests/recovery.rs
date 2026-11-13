@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiln_harness::api::{
-    ApiError, CapturedOutput, Deleted, Execution, ExecutionState, Health, Sandbox, SandboxApi,
-    SandboxExec, SandboxRequest,
+    ApiError, CapturedOutput, Deleted, Execution, ExecutionMode, ExecutionState, Health, Sandbox,
+    SandboxApi, SandboxExec, SandboxRequest, StreamObserver, StreamedExec,
 };
 use kiln_harness::tools::recover_execution_evidence;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,7 @@ fn running() -> Execution {
         cwd: String::new(),
         env_names: Vec::new(),
         env_sha256: String::new(),
+        mode: ExecutionMode::Unary,
     })
 }
 
@@ -50,6 +51,14 @@ impl SandboxApi for MissingExecutionApi {
     }
 
     async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("recovery runs nothing")
+    }
+
+    async fn exec_stream(
+        &self,
+        _request: SandboxExec,
+        _observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
         unreachable!("recovery runs nothing")
     }
 
@@ -132,6 +141,14 @@ impl SandboxApi for UnreadableApi {
     }
 
     async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("recovery runs nothing")
+    }
+
+    async fn exec_stream(
+        &self,
+        _request: SandboxExec,
+        _observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
         unreachable!("recovery runs nothing")
     }
 
@@ -226,6 +243,7 @@ impl LateTerminalRow {
             cwd: String::new(),
             env_names: Vec::new(),
             env_sha256: String::new(),
+            mode: ExecutionMode::Stream,
         })
     }
 }
@@ -241,6 +259,14 @@ impl SandboxApi for LateTerminalRow {
     }
 
     async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("recovery runs nothing")
+    }
+
+    async fn exec_stream(
+        &self,
+        _request: SandboxExec,
+        _observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
         unreachable!("recovery runs nothing")
     }
 
@@ -326,6 +352,14 @@ impl SandboxApi for HangsAtTheEnd {
     }
 
     async fn exec(&self, _request: SandboxExec) -> Result<Execution, ApiError> {
+        unreachable!("recovery runs nothing")
+    }
+
+    async fn exec_stream(
+        &self,
+        _request: SandboxExec,
+        _observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
         unreachable!("recovery runs nothing")
     }
 
@@ -423,6 +457,14 @@ impl SandboxApi for LatePublishedRow {
         *self.publish_at.lock().expect("publish time") =
             Some(tokio::time::Instant::now() + Duration::from_millis(950));
         Err(ApiError::new(Code::Unavailable, "response lost"))
+    }
+
+    async fn exec_stream(
+        &self,
+        request: SandboxExec,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
+        common::stream_from_exec(self.exec(request).await, observer)
     }
 
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {

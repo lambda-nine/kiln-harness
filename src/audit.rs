@@ -8,6 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::api::LiveDelivery;
 use crate::outputs::{DirectoryProblem, Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{StopReason, Usage};
 
@@ -61,6 +62,20 @@ pub struct OutputEvidence {
     pub observed_bytes: u64,
     pub total_bytes_known: bool,
     pub truncated: bool,
+}
+
+/// How a streamed tool execution's output reached the host live: kilnd's
+/// totals from `ExecFinished`, or, when the harness cut the stream off,
+/// its own counts, with `dropped_bytes_known: false`. Timing-dependent
+/// metadata, so never part of a model-visible result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveEvidence {
+    pub stdout: LiveDelivery,
+    pub stderr: LiveDelivery,
+    /// `output_limit` when the harness stopped the command because its
+    /// output passed the runaway limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +157,10 @@ pub enum AuditEvent {
         result: ContentSummary,
         stdout: OutputEvidence,
         stderr: OutputEvidence,
+        /// Present only for a call whose execution was streamed and
+        /// started: how its output was delivered live.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live: Option<LiveEvidence>,
     },
     FinalAnswer {
         turn: u32,

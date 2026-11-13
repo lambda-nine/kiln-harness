@@ -2,6 +2,7 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +22,7 @@ use kiln_harness::journal::{
     JournalEvent, JournalLimits, JsonlJournal, LoadedJournal, open_journal_source, read_journal,
     read_open_journal,
 };
+use kiln_harness::live::TerminalLive;
 use kiln_harness::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, Usage,
 };
@@ -53,6 +55,11 @@ enum Command {
         /// New session journal; defaults to `journal/demo-<unix_ms>.jsonl`.
         #[arg(long)]
         journal: Option<PathBuf>,
+        /// Print the model's command output to stderr as it arrives, each
+        /// line prefixed with its call and stream, every byte that is not
+        /// printable ASCII, a newline or a tab shown as `\xNN`.
+        #[arg(long)]
+        live: bool,
     },
     /// Run one task against a model server and kilnd.
     Run(Box<RunArgs>),
@@ -67,6 +74,11 @@ enum Command {
         /// New journal for the replay; defaults to `journal/replay-<unix_ms>.jsonl`.
         #[arg(long)]
         journal: Option<PathBuf>,
+        /// Print the model's command output to stderr as it arrives, each
+        /// line prefixed with its call and stream, every byte that is not
+        /// printable ASCII, a newline or a tab shown as `\xNN`.
+        #[arg(long)]
+        live: bool,
     },
     /// Inspect session journals offline.
     Journal {
@@ -198,6 +210,11 @@ struct RunArgs {
     /// New session journal; defaults to `journal/run-<unix_ms>.jsonl`.
     #[arg(long)]
     journal: Option<PathBuf>,
+    /// Print the model's command output to stderr as it arrives, each
+    /// line prefixed with its call and stream, every byte that is not
+    /// printable ASCII, a newline or a tab shown as `\xNN`.
+    #[arg(long)]
+    live: bool,
 }
 
 #[derive(Subcommand)]
@@ -262,9 +279,13 @@ enum JournalCommand {
 async fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Demo { audit, journal } => {
+        Command::Demo {
+            audit,
+            journal,
+            live,
+        } => {
             let journal = journal.unwrap_or_else(|| default_journal("demo"));
-            demo(cli.socket, &audit, &journal).await
+            demo(cli.socket, &audit, &journal, live).await
         }
         Command::Run(args) => {
             let journal = args
@@ -275,15 +296,16 @@ async fn main() -> Result<ExitCode> {
             // Everything is checked, and the key read, before any output is
             // opened or kilnd is contacted.
             let prepared = prepare_run(&args)?;
-            run(cli.socket, prepared, &audit, &journal).await
+            run(cli.socket, prepared, &audit, &journal, args.live).await
         }
         Command::Replay {
             from,
             audit,
             journal,
+            live,
         } => {
             let journal = journal.unwrap_or_else(|| default_journal("replay"));
-            replay(cli.socket, &from, &audit, &journal).await
+            replay(cli.socket, &from, &audit, &journal, live).await
         }
         Command::Journal {
             command: JournalCommand::Verify { path },
@@ -300,21 +322,31 @@ async fn main() -> Result<ExitCode> {
     }
 }
 
-async fn demo(socket: PathBuf, audit_path: &Path, journal_path: &Path) -> Result<ExitCode> {
+async fn demo(
+    socket: PathBuf,
+    audit_path: &Path,
+    journal_path: &Path,
+    live: bool,
+) -> Result<ExitCode> {
     refuse_aliases(&[
         ("--audit", FileIdentity::of_path(audit_path)?),
         ("--journal", FileIdentity::of_path(journal_path)?),
     ])?;
     let (audit, journal) = open_sinks(None, audit_path, journal_path)?;
     let api = connect(socket).await?;
-    let mut harness = Harness::new(
-        api.clone(),
-        ScriptedProvider::demo(),
-        audit,
-        journal,
-        HarnessConfig::default(),
+    let mut harness = with_live(
+        Harness::new(
+            api.clone(),
+            ScriptedProvider::demo(),
+            audit,
+            journal,
+            HarnessConfig::default(),
+        ),
+        live,
     );
-    let outcome = harness.run(&SessionTask::demo(), interrupt()).await?;
+    let outcome = harness.run(&SessionTask::demo(), interrupt()).await;
+    drain_live(&harness);
+    let outcome = outcome?;
     warn_if_unhealthy(&api, HarnessConfig::default().lifecycle_timeout).await;
     print_outcome(&outcome);
     println!("audit: {}", audit_path.display());
@@ -599,6 +631,7 @@ async fn run(
     prepared: PreparedRun,
     audit_path: &Path,
     journal_path: &Path,
+    live: bool,
 ) -> Result<ExitCode> {
     refuse_aliases(&[
         ("--audit", FileIdentity::of_path(audit_path)?),
@@ -622,8 +655,13 @@ async fn run(
         provider,
     } = prepared;
     let lifecycle = config.lifecycle_timeout;
-    let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
-    let outcome = match harness.run(&task, interrupt()).await {
+    let mut harness = with_live(
+        Harness::new(api.clone(), provider, audit, journal, config),
+        live,
+    );
+    let outcome = harness.run(&task, interrupt()).await;
+    drain_live(&harness);
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("journal: {}", journal_path.display());
@@ -642,6 +680,7 @@ async fn replay(
     from: &Path,
     audit_path: &Path,
     journal_path: &Path,
+    live: bool,
 ) -> Result<ExitCode> {
     // Hold the source open read-only for the whole replay and refuse any
     // output path that names the same file, before kilnd is contacted.
@@ -671,8 +710,12 @@ async fn replay(
     let (audit, journal) = open_sinks(Some(&source), audit_path, journal_path)?;
     let api = connect(socket).await?;
     let lifecycle = config.lifecycle_timeout;
-    let mut harness = Harness::new(api.clone(), provider, audit, journal, config);
+    let mut harness = with_live(
+        Harness::new(api.clone(), provider, audit, journal, config),
+        live,
+    );
     let result = harness.replay(interrupt()).await;
+    drain_live(&harness);
     warn_if_unhealthy(&api, lifecycle).await;
     println!("journal: {}", journal_path.display());
     match result {
@@ -965,6 +1008,30 @@ fn default_journal(kind: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
     PathBuf::from(format!("journal/{kind}-{unix_ms}.jsonl"))
+}
+
+/// Give `--live` output still queued, after the session and its cleanup,
+/// a short time to print before the command exits.
+fn drain_live<A, P, S, J>(harness: &Harness<A, P, S, J>)
+where
+    A: kiln_harness::api::SandboxApi,
+    P: Provider,
+    S: kiln_harness::audit::AuditSink,
+    J: kiln_harness::journal::JournalSink,
+{
+    let _ = harness.drain_live_output(Duration::from_secs(2));
+}
+
+/// `harness`, printing its streamed command output to stderr when `live`.
+fn with_live<P: Provider>(
+    harness: Harness<TonicKilnd, P, JsonlAudit, JsonlJournal>,
+    live: bool,
+) -> Harness<TonicKilnd, P, JsonlAudit, JsonlJournal> {
+    if live {
+        harness.with_live_output(Arc::new(TerminalLive::stderr()))
+    } else {
+        harness
+    }
 }
 
 /// Model text made safe for a terminal: C0 and C1 control characters and

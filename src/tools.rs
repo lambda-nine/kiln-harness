@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -9,12 +10,15 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{
-    ApiError, ApiLimits, CancelReason, CapturedOutput, EnvVar, Execution, ExecutionState,
-    ExpiryReason, SandboxApi, SandboxExec, execution_start_raced, sandbox_unusable_refusal,
+    ApiError, ApiLimits, CancelReason, CapturedOutput, EnvVar, Execution, ExecutionMode,
+    ExecutionState, ExpiryReason, LiveDelivery, LiveStream, SandboxApi, SandboxExec,
+    StreamObserver, StreamedExec, exec_stream_limit, execution_start_raced,
+    sandbox_unusable_refusal,
 };
-use crate::audit::{ContentSummary, OutputEvidence};
+use crate::audit::{ContentSummary, LiveEvidence, OutputEvidence};
 use crate::engine::{CheckOutcome, SeedFile, TaskCheck};
 use crate::journal::SessionLimits;
+use crate::live::LiveOutput;
 use crate::provider::{ToolCall, ToolDefinition};
 
 const WORKSPACE: &str = "/workspace";
@@ -36,8 +40,14 @@ pub(crate) enum ExecContext {
     /// Before kilnd's exec options: no cwd (kilnd's `/`) and no overrides.
     /// Only replay of a journal recorded without `exec_context` uses it.
     Legacy,
-    /// `/workspace` with [`EXEC_ENV`]. Every live session uses it.
+    /// `/workspace` with [`EXEC_ENV`], every execution unary. Only replay
+    /// of a journal recorded before streaming uses it.
     WorkspaceV1,
+    /// [`ExecContext::WorkspaceV1`], except that the model's `exec` calls go
+    /// through `ExecStream`: their output reaches the host live, and one
+    /// whose output passes [`RUNAWAY_OUTPUT_BYTES`] is stopped. Every live
+    /// session uses it.
+    WorkspaceStreamV1,
 }
 
 impl ExecContext {
@@ -48,16 +58,19 @@ impl ExecContext {
         match self {
             Self::Legacy => None,
             Self::WorkspaceV1 => Some("workspace_v1"),
+            Self::WorkspaceStreamV1 => Some("workspace_stream_v1"),
         }
     }
 
     /// The context a recorded `exec_context` names: absent is legacy, and
-    /// any value but `workspace_v1` is unknown (`None`).
+    /// any value but `workspace_v1` or `workspace_stream_v1` is unknown
+    /// (`None`).
     #[must_use]
     pub(crate) fn from_journal(name: Option<&str>) -> Option<Self> {
         match name {
             None => Some(Self::Legacy),
             Some("workspace_v1") => Some(Self::WorkspaceV1),
+            Some("workspace_stream_v1") => Some(Self::WorkspaceStreamV1),
             Some(_) => None,
         }
     }
@@ -66,7 +79,15 @@ impl ExecContext {
     /// `FEATURE_EXEC_ENV` and room for them in the advertised limits.
     #[must_use]
     pub(crate) fn sends_exec_options(self) -> bool {
-        self == Self::WorkspaceV1
+        matches!(self, Self::WorkspaceV1 | Self::WorkspaceStreamV1)
+    }
+
+    /// Whether the model's `exec` calls go through `ExecStream`, which
+    /// needs `FEATURE_EXEC_STREAM` and a stream timeout that fits the tool
+    /// timeout. Every other execution stays unary.
+    #[must_use]
+    pub(crate) fn streams_exec(self) -> bool {
+        self == Self::WorkspaceStreamV1
     }
 
     /// The `ExecRequest.cwd` every execution sends; empty is kilnd's `/`.
@@ -74,7 +95,7 @@ impl ExecContext {
     pub(crate) fn cwd(self) -> &'static str {
         match self {
             Self::Legacy => "",
-            Self::WorkspaceV1 => WORKSPACE,
+            Self::WorkspaceV1 | Self::WorkspaceStreamV1 => WORKSPACE,
         }
     }
 
@@ -83,7 +104,7 @@ impl ExecContext {
     pub(crate) fn env(self) -> Vec<EnvVar> {
         match self {
             Self::Legacy => Vec::new(),
-            Self::WorkspaceV1 => EXEC_ENV
+            Self::WorkspaceV1 | Self::WorkspaceStreamV1 => EXEC_ENV
                 .iter()
                 .map(|(name, value)| EnvVar {
                     name: (*name).to_string(),
@@ -143,10 +164,93 @@ pub(crate) fn exec_limits_problem(limits: &ApiLimits) -> Option<String> {
         })
 }
 
+/// The problem, if any, with streaming the model's commands under
+/// `limits` with tools of `tool_timeout`: kilnd's longest stream timeout
+/// must fit the tool timeout. Zero, as from a daemon that reports no
+/// limits, is too small.
+#[must_use]
+pub(crate) fn stream_limits_problem(limits: &ApiLimits, tool_timeout: Duration) -> Option<String> {
+    let needed = u64::try_from(tool_timeout.as_millis()).unwrap_or(u64::MAX);
+    let advertised = u64::from(limits.max_stream_timeout_ms);
+    (advertised < needed).then(|| {
+        format!(
+            "kilnd advertised max_stream_timeout_ms {advertised}; kiln-harness needs at least \
+             {needed} for exec_stream"
+        )
+    })
+}
+
 /// The message a session ends with when kilnd's record of an execution
 /// does not show the cwd and env overrides the harness sent.
 pub const EXEC_CONTEXT_MISMATCH: &str =
     "kilnd ran an execution with a different cwd or env than requested";
+
+/// The message a session ends with when kilnd's record of a streamed
+/// execution does not say it was streamed.
+pub const EXEC_MODE_MISMATCH: &str = "kilnd recorded a streamed execution as another mode";
+
+/// The message a session ends with when kilnd's record of a streamed
+/// execution holds no output bytes though it observed some: the daemon is
+/// not retaining output, so a result built from the row would be empty.
+pub const OUTPUT_NOT_RETAINED: &str = "kilnd did not retain the execution's output; kiln-harness \
+     needs kilnd to run with --output-storage full";
+
+/// The message a session ends with when a streamed execution's stream
+/// ended without its result, and kilnd's row of it could not be read as
+/// terminal within the call's time. It names no execution: it is part of a
+/// model-visible result, which replay compares.
+pub const STREAM_RESULT_UNREADABLE: &str =
+    "the command's result could not be read after its stream ended";
+
+/// The message a session ends with when kilnd broke the `ExecStream`
+/// protocol after starting a command. It names no execution, as it is part
+/// of a model-visible result.
+pub const STREAM_PROTOCOL_VIOLATION: &str = "kilnd broke the ExecStream protocol";
+
+/// Why a row kilnd returned for a streamed `exec` cannot be accepted, if it
+/// can't. `live_end` is, per stream (stdout, stderr), the furthest offset
+/// the live stream proved: chunk `offset+len` and gap `offset+dropped`.
+///
+/// The row must show the session's cwd and env, say it was streamed, and
+/// hold output wherever kilnd observed some or the live stream proved some.
+/// Under `--output-storage none` kilnd stores no bytes and no byte count,
+/// so only the live stream can prove the command wrote anything; a command
+/// whose output was all lost live is not caught. An `INTERRUPTED` row is
+/// exempt from the output check: kilnd's restart reconciliation marks a
+/// running row so without its capture, whatever the storage mode, so its
+/// empty output says nothing about retention.
+fn streamed_row_problem(
+    context: ExecContext,
+    execution: &Execution,
+    live_end: [u64; 2],
+) -> Option<&'static str> {
+    if !context.ran_as_sent(execution) {
+        return Some(EXEC_CONTEXT_MISMATCH);
+    }
+    if execution.mode != ExecutionMode::Stream {
+        return Some(EXEC_MODE_MISMATCH);
+    }
+    let withheld = |output: &CapturedOutput, live_end: u64| {
+        output.data.is_empty() && (output.observed_bytes > 0 || live_end > 0)
+    };
+    if execution.state != ExecutionState::Interrupted
+        && (withheld(&execution.stdout, live_end[0]) || withheld(&execution.stderr, live_end[1]))
+    {
+        return Some(OUTPUT_NOT_RETAINED);
+    }
+    None
+}
+
+/// A streamed command whose output on either stream is shown to pass this
+/// many bytes, by delivered chunks and reported gaps, is stopped then
+/// instead of running to its timeout. Live output is lossy: a command whose
+/// excess output was dropped live and that then goes quiet is bounded by
+/// its timeout instead.
+pub const RUNAWAY_OUTPUT_BYTES: u64 = 8 << 20;
+
+/// The `stopped` value of a result whose command passed
+/// [`RUNAWAY_OUTPUT_BYTES`].
+pub const OUTPUT_LIMIT: &str = "output_limit";
 
 /// The name a call to an unregistered tool is recorded and shown under.
 pub const UNKNOWN_TOOL: &str = "unknown";
@@ -225,10 +329,17 @@ impl Default for ToolLimits {
     }
 }
 
+/// What the `exec` description adds in a session whose model commands
+/// stream, so the cutoff is visible to the model whatever its system prompt.
+pub const EXEC_STREAM_DESCRIPTION: &str =
+    " A command whose stdout or stderr passes 8 MiB is stopped.";
+
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     limits: ToolLimits,
     definitions: Vec<ToolDefinition>,
+    /// The same tools as a streaming session describes them.
+    streaming_definitions: Vec<ToolDefinition>,
 }
 
 impl ToolRegistry {
@@ -236,13 +347,29 @@ impl ToolRegistry {
     pub fn new(limits: ToolLimits) -> Self {
         Self {
             limits,
-            definitions: definitions(),
+            definitions: definitions(false),
+            streaming_definitions: definitions(true),
         }
     }
 
+    /// The tools as a session that does not stream its model's commands
+    /// describes them: a recording made before streaming.
     #[must_use]
     pub fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
+    }
+
+    /// The tools as a session in `context` describes them. They are part of
+    /// every model request, which replay compares by hash, so a recording
+    /// keeps the definitions its context had: only a streaming session's
+    /// `exec` states the output cutoff.
+    #[must_use]
+    pub(crate) fn definitions_in(&self, context: ExecContext) -> &[ToolDefinition] {
+        if context.streams_exec() {
+            &self.streaming_definitions
+        } else {
+            &self.definitions
+        }
     }
 
     /// Capture the fixed workspace baseline for a newly created sandbox.
@@ -277,6 +404,8 @@ impl ToolRegistry {
             activity: Mutex::new((ready_at, 0)),
             last_exec_sent: Mutex::new(None),
             unusable: Mutex::new(None),
+            live: None,
+            stream_call: Mutex::new(None),
         };
         // The seed goes in before the baseline, so the baseline includes it
         // and `workspace_diff` shows only the agent's changes.
@@ -356,6 +485,21 @@ pub struct ToolSession<'a, A: SandboxApi> {
     /// Set once an execution reported that the sandbox cannot take another
     /// call, with kilnd's cancel reason if it gave one.
     unusable: Mutex<Option<ToolStop>>,
+    /// Where streamed output goes on the host, if anywhere.
+    live: Option<Arc<dyn LiveOutput>>,
+    /// The streamed `exec` in flight or last run, for response-loss
+    /// recovery. It lives outside the call's future, so a call dropped by
+    /// cancellation or its deadline still leaves what it learned.
+    stream_call: Mutex<Option<StreamCall>>,
+}
+
+/// What a streamed `exec` learned from its stream, kept for response-loss
+/// recovery: the execution kilnd started, once `ExecStarted` arrived, and
+/// per stream (stdout, stderr) the furthest offset the live stream proved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StreamCall {
+    pub(crate) execution_id: Option<String>,
+    pub(crate) live_end: [u64; 2],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -366,6 +510,9 @@ pub struct ToolRun {
     pub stdout: OutputEvidence,
     pub stderr: OutputEvidence,
     pub stop: Option<ToolStop>,
+    /// How a streamed execution's output was delivered live; `None` for
+    /// every unary call.
+    pub live: Option<Box<LiveEvidence>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,8 +533,12 @@ pub struct RecoveredExecutionEvidence {
     /// known about what kilnd assigned.
     pub unreadable: bool,
     /// The first recovered execution whose recorded cwd or env overrides
-    /// differ from what the session sends.
+    /// differ from what the session sends, or, after a streamed call, whose
+    /// row fails any check a returned streamed row must pass.
     pub mismatched: Option<String>,
+    /// Why [`RecoveredExecutionEvidence::mismatched`] was refused; `None`
+    /// reads as [`EXEC_CONTEXT_MISMATCH`].
+    pub mismatch: Option<&'static str>,
 }
 
 impl RecoveredExecutionEvidence {
@@ -396,7 +547,9 @@ impl RecoveredExecutionEvidence {
     #[must_use]
     pub fn stop(&self) -> Option<ToolStop> {
         if self.mismatched.is_some() {
-            return Some(ToolStop::Unusable(EXEC_CONTEXT_MISMATCH.to_string()));
+            return Some(ToolStop::Unusable(
+                self.mismatch.unwrap_or(EXEC_CONTEXT_MISMATCH).to_string(),
+            ));
         }
         if let Some(id) = &self.unsettled {
             return Some(ToolStop::Unusable(format!(
@@ -447,6 +600,7 @@ impl ToolRun {
             stdout: empty_evidence(),
             stderr: empty_evidence(),
             stop: None,
+            live: None,
         }
     }
 
@@ -458,6 +612,7 @@ impl ToolRun {
             stdout: evidence(&execution.stdout),
             stderr: evidence(&execution.stderr),
             stop: None,
+            live: None,
         }
     }
 
@@ -470,6 +625,7 @@ impl ToolRun {
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
             stop: Some(stop),
+            live: None,
         }
     }
 
@@ -591,6 +747,12 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         self.exec_context
     }
 
+    /// Send streamed output to `live` from now on. Host-only: it never
+    /// changes a result or a record.
+    pub(crate) fn set_live_output(&mut self, live: Option<Arc<dyn LiveOutput>>) {
+        self.live = live;
+    }
+
     fn unusable(&self) -> Option<ToolStop> {
         self.unusable
             .lock()
@@ -604,6 +766,19 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         deadline: Instant,
         cancel: &CancellationToken,
     ) -> RecoveredExecutionEvidence {
+        // What the streamed call this recovery follows learned, if it was
+        // one. An execution already known belongs to an earlier call that
+        // finished: a call dropped before it ran learned nothing.
+        let streamed = self
+            .stream_call
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .filter(|call| {
+                call.execution_id
+                    .as_ref()
+                    .is_none_or(|id| !known.contains(id))
+            });
         let recovered = recover_execution_evidence_in(
             self.api,
             &self.sandbox_id,
@@ -611,6 +786,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             known,
             deadline,
             cancel,
+            streamed,
         )
         .await;
         // A settled recovered row is an execution kilnd admitted and
@@ -652,9 +828,34 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         session_deadline: Instant,
     ) -> ToolRun {
         let deadline = session_deadline.min(Instant::now() + self.limits.timeout);
+        self.execute_call(tool, arguments, session_deadline, "", deadline)
+            .await
+    }
+
+    /// [`ToolSession::execute`] for the call the host audits as `call_id`,
+    /// the name its streamed output goes to the live sink under. A streamed
+    /// `exec` whose stream ended without its result reads kilnd's row of it
+    /// until `follow_deadline`, which may reach past the call's own time
+    /// into the window response-loss recovery would otherwise use.
+    pub(crate) async fn execute_call(
+        &self,
+        tool: &str,
+        arguments: Value,
+        session_deadline: Instant,
+        call_id: &str,
+        follow_deadline: Instant,
+    ) -> ToolRun {
+        *self
+            .stream_call
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let deadline = session_deadline.min(Instant::now() + self.limits.timeout);
         let run = match self.plan(tool, arguments) {
             Err(rejected) => rejected,
-            Ok(ToolPlan::Exec(plan)) => self.exec_tool(plan, deadline).await,
+            Ok(ToolPlan::Exec(plan)) => {
+                self.exec_tool(plan, deadline, call_id, follow_deadline)
+                    .await
+            }
             Ok(ToolPlan::Read { path, max_bytes }) => {
                 self.read_file(path, max_bytes, deadline).await
             }
@@ -672,6 +873,8 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     }
 
     /// Every host-side check of a tool call, before anything reaches kilnd.
+    // A refusal is built once per call, on the host's cold path.
+    #[allow(clippy::result_large_err)]
     fn plan(&self, tool: &str, arguments: Value) -> Result<ToolPlan, ToolRun> {
         match tool {
             "exec" => self.plan_exec(arguments).map(ToolPlan::Exec),
@@ -722,6 +925,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn plan_exec(&self, arguments: Value) -> Result<ExecPlan, ToolRun> {
         let args: ExecArgs = parse_arguments(arguments)?;
         if args.argv.is_empty() || args.argv.len() > 128 || args.argv[0].is_empty() {
@@ -775,14 +979,43 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         })
     }
 
-    async fn exec_tool(&self, plan: ExecPlan, deadline: Instant) -> ToolRun {
-        match self
-            .run(plan.argv, plan.stdin, plan.timeout, deadline)
-            .await
-        {
+    async fn exec_tool(
+        &self,
+        plan: ExecPlan,
+        deadline: Instant,
+        call_id: &str,
+        follow_deadline: Instant,
+    ) -> ToolRun {
+        if !self.exec_context.streams_exec() {
+            return match self
+                .run(plan.argv, plan.stdin, plan.timeout, deadline)
+                .await
+            {
+                Ok(execution) => execution_run(&execution, self.limits.max_result_bytes / 3),
+                Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
+            };
+        }
+        let streamed = self
+            .run_streamed(
+                plan.argv,
+                plan.stdin,
+                plan.timeout,
+                deadline,
+                call_id,
+                follow_deadline,
+            )
+            .await;
+        let stopped = streamed.live.as_ref().and_then(|live| live.stopped.clone());
+        let mut run = match streamed.execution {
             Ok(execution) => execution_run(&execution, self.limits.max_result_bytes / 3),
             Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
+        };
+        // The cutoff fired: the result says so, whatever kilnd's row did.
+        if let (Some(stopped), Value::Object(result)) = (stopped, &mut run.result) {
+            result.insert("stopped".to_string(), Value::String(stopped));
         }
+        run.live = streamed.live.map(Box::new);
+        run
     }
 
     async fn read_file(&self, path: String, max_bytes: usize, deadline: Instant) -> ToolRun {
@@ -850,6 +1083,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             stdout: merge_evidence(evidence(&stat.stdout), evidence(&read.stdout)),
             stderr: merge_evidence(evidence(&stat.stderr), evidence(&read.stderr)),
             stop: None,
+            live: None,
         };
         if size > max_bytes as u64 {
             run.stdout.truncated = true;
@@ -923,6 +1157,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                     stdout: manifest.stdout,
                     stderr: manifest.stderr,
                     stop: None,
+                    live: None,
                 }
             }
             Err(error) => tool_error_run(error, "workspace_diff_failed", self.typed_reasons),
@@ -990,13 +1225,16 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         })
     }
 
-    async fn run(
+    /// The start of every Exec: refuse on a sandbox already unusable, and
+    /// bound the call by the time left. Returns the RPC deadline and the
+    /// request, whose command timeout leaves kilnd its settlement reserve.
+    fn prepare_exec(
         &self,
         argv: Vec<String>,
         stdin: Vec<u8>,
         requested_timeout: Duration,
         deadline: Instant,
-    ) -> Result<Execution, ToolError> {
+    ) -> Result<(Instant, SandboxExec), ToolError> {
         if self.unusable().is_some() {
             return Err(ToolError::Api(ApiError::new(
                 tonic::Code::FailedPrecondition,
@@ -1012,16 +1250,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .min(remaining)
             .max(Duration::from_millis(1));
         let rpc_deadline = now + wall_timeout;
-        // Reserve a small part of the wall budget for kilnd to drain the exec
-        // cgroup and publish its terminal row. If settlement exceeds the wall
-        // budget, dropping the RPC requests cancellation and session cleanup
-        // deletes the sandbox through a separate bounded lifecycle path.
-        let command_timeout = |budget: Duration| {
-            budget
-                .saturating_sub(Duration::from_millis(250))
-                .max(Duration::from_millis(1))
-        };
-        let mut request = SandboxExec {
+        let request = SandboxExec {
             sandbox_id: self.sandbox_id.clone(),
             argv,
             stdin,
@@ -1029,13 +1258,87 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             cwd: self.exec_context.cwd().to_string(),
             env: self.exec_context.env(),
         };
+        Ok((rpc_deadline, request))
+    }
+
+    /// Record that an Exec request is being sent now, and return when.
+    fn note_sent(&self) -> Instant {
+        let sent = Instant::now();
+        *self
+            .last_exec_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sent);
+        sent
+    }
+
+    /// End the session at this call with `message`, keeping the
+    /// execution's ID as evidence and none of its output.
+    fn refuse_execution(&self, execution_id: String, message: &str) -> ToolError {
+        let stop = ToolStop::Unusable(message.to_string());
+        self.unusable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(stop.clone());
+        ToolError::Unusable {
+            stop,
+            execution_ids: vec![execution_id],
+        }
+    }
+
+    /// Accept an execution kilnd returned for a request sent at `sent`: it
+    /// is activity, it must have run as sent, and one that left the
+    /// sandbox unusable stops the session after this call. A streamed one,
+    /// given the furthest offsets its live stream proved, must also pass
+    /// [`streamed_row_problem`].
+    fn settle(
+        &self,
+        execution: Execution,
+        sent: Instant,
+        streamed: Option<[u64; 2]>,
+    ) -> Result<Execution, ToolError> {
+        // A returned execution proves kilnd saw activity after the request
+        // was sent, so the send time is the anchor, on the early side; while
+        // it ran, kilnd paused idle. A failed RPC proves nothing: an
+        // execution row found later by recovery is recorded then, and
+        // otherwise the last known activity stands, so the next boundary
+        // renews at once if a renew is overdue.
+        self.record_activity(sent);
+        // The command ran, but not as sent, for example on an older daemon
+        // that ignored the options after a reconnect: keep its ID as
+        // evidence, never its output, and stop at this call.
+        // A streamed row is the result itself, so it must also say it was
+        // streamed and hold the output it or the live stream showed: a
+        // daemon that does not retain output (`--output-storage metadata`
+        // or `none`) would make results silently empty.
+        let problem = match streamed {
+            Some(live_end) => streamed_row_problem(self.exec_context, &execution, live_end),
+            None => (!self.exec_context.ran_as_sent(&execution)).then_some(EXEC_CONTEXT_MISMATCH),
+        };
+        if let Some(problem) = problem {
+            return Err(self.refuse_execution(execution.id, problem));
+        }
+        if execution.sandbox_reusable == Some(false) {
+            let mut unusable = self
+                .unusable
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            unusable.get_or_insert(unusable_stop(execution.cancel_reason));
+        }
+        Ok(execution)
+    }
+
+    async fn run(
+        &self,
+        argv: Vec<String>,
+        stdin: Vec<u8>,
+        requested_timeout: Duration,
+        deadline: Instant,
+    ) -> Result<Execution, ToolError> {
+        let (rpc_deadline, mut request) =
+            self.prepare_exec(argv, stdin, requested_timeout, deadline)?;
         let mut raced = false;
         let (execution, sent) = loop {
-            let sent = Instant::now();
-            *self
-                .last_exec_sent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sent);
+            let sent = self.note_sent();
             match timeout_at(rpc_deadline, self.api.exec(request.clone())).await {
                 Err(_) => return Err(ToolError::Deadline),
                 // kilnd recorded nothing and the sandbox is READY again: send
@@ -1061,35 +1364,362 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 Ok(Ok(execution)) => break (execution, sent),
             }
         };
-        // A returned execution proves kilnd saw activity after the request
-        // was sent, so the send time is the anchor, on the early side; while
-        // it ran, kilnd paused idle. A failed RPC proves nothing: an
-        // execution row found later by recovery is recorded then, and
-        // otherwise the last known activity stands, so the next boundary
-        // renews at once if a renew is overdue.
-        self.record_activity(sent);
-        // The command ran, but not as sent, for example on an older daemon
-        // that ignored the options after a reconnect: keep its ID as
-        // evidence, never its output, and stop at this call.
-        if !self.exec_context.ran_as_sent(&execution) {
-            let stop = ToolStop::Unusable(EXEC_CONTEXT_MISMATCH.to_string());
-            self.unusable
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_or_insert(stop.clone());
-            return Err(ToolError::Unusable {
-                stop,
-                execution_ids: vec![execution.id],
-            });
+        self.settle(execution, sent, None)
+    }
+
+    /// [`ToolSession::run`] through `ExecStream`, for the model's `exec` in
+    /// a streaming context. Everything `run` does holds, and also: live
+    /// bytes go to the session's sink under `call_id`; output past
+    /// [`RUNAWAY_OUTPUT_BYTES`] on either stream drops the stream, so kilnd
+    /// cancels the command; a stream that ends without its result after
+    /// kilnd started the command is followed to kilnd's row until
+    /// `follow_deadline`; one that breaks before is a lost response, left
+    /// to the engine's recovery, which reads what this call learned from
+    /// [`ToolSession::stream_call`]; and a refusal for lack of stream
+    /// capacity is retried, never sent unary.
+    async fn run_streamed(
+        &self,
+        argv: Vec<String>,
+        stdin: Vec<u8>,
+        requested_timeout: Duration,
+        deadline: Instant,
+        call_id: &str,
+        follow_deadline: Instant,
+    ) -> StreamedRun {
+        *self
+            .stream_call
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(StreamCall::default());
+        let mut observer = CallObserver::new(call_id, self.live.clone(), &self.stream_call);
+        let execution = self
+            .stream_once(
+                argv,
+                stdin,
+                requested_timeout,
+                deadline,
+                follow_deadline,
+                &mut observer,
+            )
+            .await;
+        let live = observer.evidence();
+        observer.finish();
+        StreamedRun { execution, live }
+    }
+
+    async fn stream_once(
+        &self,
+        argv: Vec<String>,
+        stdin: Vec<u8>,
+        requested_timeout: Duration,
+        deadline: Instant,
+        follow_deadline: Instant,
+        observer: &mut CallObserver<'_>,
+    ) -> Result<Execution, ToolError> {
+        const FIRST_BUSY_DELAY: Duration = Duration::from_millis(50);
+        const MAX_BUSY_DELAY: Duration = Duration::from_secs(1);
+        let (rpc_deadline, mut request) =
+            self.prepare_exec(argv, stdin, requested_timeout, deadline)?;
+        let mut raced = false;
+        let mut busy_delay = FIRST_BUSY_DELAY;
+        let (streamed, sent) = loop {
+            let sent = self.note_sent();
+            match timeout_at(
+                rpc_deadline,
+                self.api.exec_stream(request.clone(), &mut *observer),
+            )
+            .await
+            {
+                Err(_) => return Err(ToolError::Deadline),
+                // As for a unary Exec: nothing ran, so send it once more.
+                Ok(Err(error)) if !raced && execution_start_raced(&error, self.typed_reasons) => {
+                    raced = true;
+                    let left = rpc_deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(ToolError::Deadline);
+                    }
+                    request.timeout = command_timeout(left);
+                }
+                Ok(Err(error)) if execution_start_raced(&error, self.typed_reasons) => {
+                    return Err(ToolError::Api(ApiError {
+                        reason: None,
+                        ..error
+                    }));
+                }
+                // Every stream permit is taken, and kilnd allocated nothing.
+                // Wait for one within the same budget. A unary Exec would
+                // get through, but results must not depend on contention.
+                Ok(Err(error)) if exec_stream_limit(&error, self.typed_reasons) => {
+                    let wake = Instant::now() + busy_delay;
+                    if wake >= rpc_deadline {
+                        return Err(ToolError::Api(ApiError::new(
+                            tonic::Code::ResourceExhausted,
+                            format!(
+                                "kilnd's stream capacity was busy for the whole call: {}",
+                                error.message
+                            ),
+                        )));
+                    }
+                    sleep_until(wake).await;
+                    busy_delay = (busy_delay * 2).min(MAX_BUSY_DELAY);
+                    request.timeout =
+                        command_timeout(rpc_deadline.saturating_duration_since(Instant::now()));
+                }
+                Ok(Err(error)) => return Err(ToolError::Api(error)),
+                Ok(Ok(streamed)) => break (streamed, sent),
+            }
+        };
+        match streamed {
+            StreamedExec::Finished {
+                execution,
+                stdout,
+                stderr,
+            } => {
+                observer.finished_totals = Some((stdout, stderr));
+                self.settle(execution, sent, Some(observer.observed_end))
+            }
+            // kilnd broke the protocol: nothing it sends for this command can
+            // be trusted, its row included, so the session ends with the ID,
+            // if one arrived, as evidence. Dropping the stream already made
+            // kilnd cancel the command, and cleanup deletes the sandbox.
+            // Without an ID the call has none, so response-loss recovery
+            // still looks for the row; the stop stands either way.
+            StreamedExec::Broken {
+                execution_id,
+                protocol_violation: true,
+                ..
+            } => {
+                let stop = ToolStop::Unusable(STREAM_PROTOCOL_VIOLATION.to_string());
+                self.unusable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert(stop.clone());
+                Err(ToolError::Unusable {
+                    stop,
+                    execution_ids: execution_id.into_iter().collect(),
+                })
+            }
+            // The cutoff dropped the stream, or it ended without its result
+            // after kilnd started the command: kilnd's row is the result,
+            // exactly what `ExecFinished` would have carried. Reading it
+            // here, rather than leaving it to response-loss recovery, gives
+            // the model the same result however late the row settles
+            // within the call's time and recovery window.
+            StreamedExec::Stopped { execution_id }
+            | StreamedExec::Broken {
+                execution_id: Some(execution_id),
+                protocol_violation: false,
+                ..
+            } => match follow_row(self.api, &execution_id, follow_deadline).await {
+                Some(execution) if is_terminal(&execution) => {
+                    self.settle(execution, sent, Some(observer.observed_end))
+                }
+                // The command's outcome, and whether the sandbox survived
+                // it, is unknown: keep its ID and end the session.
+                _ => Err(self.refuse_execution(execution_id, STREAM_RESULT_UNREADABLE)),
+            },
+            // As a lost unary response: no execution known, so the engine's
+            // recovery looks for what kilnd recorded.
+            StreamedExec::Broken {
+                execution_id: None,
+                error,
+                protocol_violation: false,
+            } => Err(ToolError::Api(error)),
         }
-        if execution.sandbox_reusable == Some(false) {
-            let mut unusable = self
-                .unusable
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            unusable.get_or_insert(unusable_stop(execution.cancel_reason));
+    }
+}
+
+/// Read `execution_id` until kilnd reports it terminal, backing off from
+/// 10 ms to 200 ms, until `deadline`. Returns the last row read, terminal or
+/// not, or `None` if every read failed.
+async fn follow_row<A: SandboxApi>(
+    api: &A,
+    execution_id: &str,
+    deadline: Instant,
+) -> Option<Execution> {
+    const FIRST_DELAY: Duration = Duration::from_millis(10);
+    const MAX_DELAY: Duration = Duration::from_millis(200);
+    let mut delay = FIRST_DELAY;
+    let mut last = None;
+    loop {
+        if let Ok(Ok(execution)) = timeout_at(deadline, api.get_execution(execution_id)).await
+            && execution.id == execution_id
+        {
+            let terminal = is_terminal(&execution);
+            last = Some(execution);
+            if terminal {
+                return last;
+            }
         }
-        Ok(execution)
+        let wake = Instant::now() + delay;
+        if wake >= deadline {
+            return last;
+        }
+        sleep_until(wake).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+}
+
+/// Reserve a small part of an Exec's wall budget for kilnd to drain the
+/// exec cgroup and publish its terminal row. If settlement exceeds the wall
+/// budget, dropping the RPC requests cancellation and session cleanup
+/// deletes the sandbox through a separate bounded lifecycle path.
+fn command_timeout(budget: Duration) -> Duration {
+    budget
+        .saturating_sub(Duration::from_millis(250))
+        .max(Duration::from_millis(1))
+}
+
+/// What a streamed `exec` produced: the execution as `run` would return it,
+/// and, once kilnd started it, how its output was delivered live.
+struct StreamedRun {
+    execution: Result<Execution, ToolError>,
+    live: Option<LiveEvidence>,
+}
+
+/// The harness's own observer of one streamed call: it forwards live
+/// output to the host sink, counts what arrived, and breaks off once
+/// either stream's output passes [`RUNAWAY_OUTPUT_BYTES`]. Dropped before
+/// [`CallObserver::finish`], as when the call is canceled or its deadline
+/// passes, it still tells the sink the call ended.
+struct CallObserver<'c> {
+    call_id: &'c str,
+    sink: Option<Arc<dyn LiveOutput>>,
+    /// Where the session keeps what this call learns, for recovery.
+    record: &'c Mutex<Option<StreamCall>>,
+    started: bool,
+    finished: bool,
+    /// Per stream (stdout, stderr): the furthest offset seen, bytes
+    /// delivered, and bytes reported dropped.
+    observed_end: [u64; 2],
+    delivered: [u64; 2],
+    dropped: [u64; 2],
+    /// Set when the runaway limit fired.
+    stopped: bool,
+    /// kilnd's own totals, from `ExecFinished`.
+    finished_totals: Option<(LiveDelivery, LiveDelivery)>,
+}
+
+impl<'c> CallObserver<'c> {
+    fn new(
+        call_id: &'c str,
+        sink: Option<Arc<dyn LiveOutput>>,
+        record: &'c Mutex<Option<StreamCall>>,
+    ) -> Self {
+        Self {
+            call_id,
+            sink,
+            record,
+            started: false,
+            finished: false,
+            observed_end: [0; 2],
+            delivered: [0; 2],
+            dropped: [0; 2],
+            stopped: false,
+            finished_totals: None,
+        }
+    }
+
+    fn index(stream: LiveStream) -> usize {
+        match stream {
+            LiveStream::Stdout => 0,
+            LiveStream::Stderr => 1,
+        }
+    }
+
+    /// Write what this call learned where recovery reads it.
+    fn remember(&self, update: impl FnOnce(&mut StreamCall)) {
+        if let Some(call) = self
+            .record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            update(call);
+        }
+    }
+
+    fn observe(&mut self, stream: LiveStream, end: u64) -> ControlFlow<()> {
+        let index = Self::index(stream);
+        self.observed_end[index] = self.observed_end[index].max(end);
+        let live_end = self.observed_end;
+        self.remember(|call| call.live_end = live_end);
+        if self.observed_end[index] > RUNAWAY_OUTPUT_BYTES {
+            self.stopped = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// What the audit records: kilnd's totals when the stream finished,
+    /// otherwise this observer's counts, with dropped bytes a lower bound.
+    /// `None` when kilnd never started the execution.
+    fn evidence(&self) -> Option<LiveEvidence> {
+        if !self.started {
+            return None;
+        }
+        let (stdout, stderr) = self.finished_totals.unwrap_or_else(|| {
+            let counted = |index: usize| LiveDelivery {
+                delivered_bytes: self.delivered[index],
+                dropped_bytes: self.dropped[index],
+                dropped_bytes_known: false,
+            };
+            (counted(0), counted(1))
+        });
+        Some(LiveEvidence {
+            stdout,
+            stderr,
+            stopped: self.stopped.then(|| OUTPUT_LIMIT.to_string()),
+        })
+    }
+
+    fn finish(&mut self) {
+        if self.started && !self.finished {
+            self.finished = true;
+            if let Some(sink) = &self.sink {
+                sink.finished(self.call_id, self.stopped.then_some(OUTPUT_LIMIT));
+            }
+        }
+    }
+}
+
+impl Drop for CallObserver<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+impl StreamObserver for CallObserver<'_> {
+    fn started(&mut self, execution_id: &str) {
+        self.started = true;
+        self.remember(|call| call.execution_id = Some(execution_id.to_string()));
+        if let Some(sink) = &self.sink {
+            sink.started(self.call_id, execution_id);
+        }
+    }
+
+    fn chunk(&mut self, stream: LiveStream, offset: u64, data: &[u8]) -> ControlFlow<()> {
+        let index = Self::index(stream);
+        let length = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        self.delivered[index] = self.delivered[index].saturating_add(length);
+        if let Some(sink) = &self.sink {
+            sink.chunk(self.call_id, stream, data);
+        }
+        self.observe(stream, offset.saturating_add(length))
+    }
+
+    fn gap(
+        &mut self,
+        stream: LiveStream,
+        offset: u64,
+        dropped: u64,
+        known: bool,
+    ) -> ControlFlow<()> {
+        let index = Self::index(stream);
+        self.dropped[index] = self.dropped[index].saturating_add(dropped);
+        if let Some(sink) = &self.sink {
+            sink.gap(self.call_id, stream, dropped, known);
+        }
+        self.observe(stream, offset.saturating_add(dropped))
     }
 }
 
@@ -1135,6 +1765,7 @@ struct ExecPlan {
     timeout: Duration,
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_arguments<T: serde::de::DeserializeOwned>(arguments: Value) -> Result<T, ToolRun> {
     serde_json::from_value(arguments)
         .map_err(|error| ToolRun::rejected("invalid_arguments", error.to_string()))
@@ -1477,6 +2108,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
                 .or_else(|| {
                     sandbox_unusable_refusal(&error, typed_reasons).then(ToolStop::unusable)
                 }),
+            live: None,
         },
         ToolError::Manifest {
             message,
@@ -1490,6 +2122,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stdout,
             stderr,
             stop: None,
+            live: None,
         },
         // Only seeding returns this, and never through a tool.
         ToolError::Seed {
@@ -1502,6 +2135,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
             stop: None,
+            live: None,
         },
         // Only the baseline returns this; a tool's own check in `execute`
         // sets the stop.
@@ -1522,6 +2156,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stdout: unknown_evidence(),
             stderr: unknown_evidence(),
             stop: Some(stop),
+            live: None,
         },
     }
 }
@@ -1639,12 +2274,25 @@ pub async fn recover_execution_evidence<A: SandboxApi>(
         known,
         deadline,
         cancel,
+        None,
     )
     .await
 }
 
 /// [`recover_execution_evidence`] for a session in `exec_context`: every
 /// recovered row must show it.
+///
+/// After a streamed `exec`, `streamed` is what that call learned. With
+/// the execution ID known, only that execution is followed, with
+/// `GetExecution`, independently of `GetSandbox`: a started stream made
+/// exactly one row. Never read as terminal in the window, it is reported
+/// unsettled, under its ID. With the ID unknown, rows are found as for a
+/// unary call, but each must also be read once with `GetExecution` after it
+/// is terminal, since `GetSandbox` leaves output out; one never so read
+/// counts as unsettled. Every terminal streamed row must pass the checks a
+/// returned streamed row passes, or it is reported mismatched with the
+/// reason. A cancellation that cuts recovery short reports a known ID
+/// unsettled rather than nothing.
 pub(crate) async fn recover_execution_evidence_in<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
@@ -1652,25 +2300,65 @@ pub(crate) async fn recover_execution_evidence_in<A: SandboxApi>(
     known: &BTreeSet<String>,
     deadline: Instant,
     cancel: &CancellationToken,
+    streamed: Option<StreamCall>,
 ) -> RecoveredExecutionEvidence {
+    // A cancellation that cuts recovery short keeps what is already known:
+    // the execution a stream named is evidence, its outcome unknown.
+    let known_id = streamed.as_ref().and_then(|call| call.execution_id.clone());
+    let recover = async {
+        match streamed {
+            Some(StreamCall {
+                execution_id: Some(execution_id),
+                live_end,
+            }) => follow_recovered(api, exec_context, execution_id, live_end, deadline).await,
+            streamed => {
+                let live_end = streamed.map(|call| call.live_end);
+                recover_until(api, sandbox_id, exec_context, known, deadline, live_end).await
+            }
+        }
+    };
     // Recovery after a cancellation still runs its bounded window, to record
     // what kilnd assigned; a cancellation arriving during it returns at
     // once, and the caller's Canceled stop wins.
     if cancel.is_cancelled() {
-        return recover_until(api, sandbox_id, exec_context, known, deadline).await;
+        return recover.await;
     }
     tokio::select! {
-        () = cancel.cancelled() => RecoveredExecutionEvidence::empty(),
-        recovered = recover_until(api, sandbox_id, exec_context, known, deadline) => recovered,
+        () = cancel.cancelled() => known_id.map_or_else(
+            RecoveredExecutionEvidence::empty,
+            RecoveredExecutionEvidence::unsettled,
+        ),
+        recovered = recover => recovered,
     }
 }
 
+/// Recovery of a streamed execution whose ID `ExecStarted` gave.
+async fn follow_recovered<A: SandboxApi>(
+    api: &A,
+    exec_context: ExecContext,
+    execution_id: String,
+    live_end: [u64; 2],
+    deadline: Instant,
+) -> RecoveredExecutionEvidence {
+    match follow_row(api, &execution_id, deadline).await {
+        // Every row read here came from `GetExecution`.
+        Some(row) => {
+            let confirmed = BTreeSet::from([row.id.clone()]);
+            aggregate_recovered(vec![row], exec_context, Some((live_end, &confirmed)))
+        }
+        None => RecoveredExecutionEvidence::unsettled(execution_id),
+    }
+}
+
+/// `streamed` is set, to the live stream's furthest offsets, when the lost
+/// call was a streamed `exec` whose execution ID never arrived.
 async fn recover_until<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     exec_context: ExecContext,
     known: &BTreeSet<String>,
     deadline: Instant,
+    streamed: Option<[u64; 2]>,
 ) -> RecoveredExecutionEvidence {
     const FIRST_DELAY: Duration = Duration::from_millis(10);
     const MAX_DELAY: Duration = Duration::from_millis(200);
@@ -1681,6 +2369,8 @@ async fn recover_until<A: SandboxApi>(
     let final_reserve = Duration::from_millis(100).min(window / 4);
     let final_pass_at = deadline.checked_sub(final_reserve).unwrap_or(deadline);
     let mut rows: Vec<Execution> = Vec::new();
+    // Streamed rows read with `GetExecution` once terminal.
+    let mut confirmed = BTreeSet::new();
     let mut listed = false;
     let mut delay = FIRST_DELAY;
     let mut pass = 0u32;
@@ -1692,20 +2382,30 @@ async fn recover_until<A: SandboxApi>(
             listed |= read;
             last_read = Some(read);
         }
-        for row in rows.iter_mut().filter(|row| !is_terminal(row)) {
+        let settled_row = |row: &Execution, confirmed: &BTreeSet<String>| {
+            is_terminal(row) && (streamed.is_none() || confirmed.contains(&row.id))
+        };
+        for row in &mut rows {
+            if settled_row(row, &confirmed) {
+                continue;
+            }
             if let Ok(Ok(execution)) = timeout_at(deadline, api.get_execution(&row.id)).await
                 && execution.id == row.id
             {
+                if is_terminal(&execution) {
+                    confirmed.insert(execution.id.clone());
+                }
                 *row = execution;
             }
         }
-        let settled = !rows.is_empty() && rows.iter().all(is_terminal);
+        let settled = !rows.is_empty() && rows.iter().all(|row| settled_row(row, &confirmed));
         if settled || last {
             // An earlier empty read does not stand in for a last one that
             // failed: with nothing found and the last read lost, nothing is
             // known.
             let unreadable = !listed || (rows.is_empty() && last && last_read == Some(false));
-            let mut recovered = aggregate_recovered(rows, exec_context);
+            let streamed = streamed.map(|live_end| (live_end, &confirmed));
+            let mut recovered = aggregate_recovered(rows, exec_context, streamed);
             recovered.unreadable = unreadable && !settled;
             return recovered;
         }
@@ -1747,6 +2447,17 @@ fn is_terminal(execution: &Execution) -> bool {
 }
 
 impl RecoveredExecutionEvidence {
+    /// `execution_id` is known, its outcome not.
+    fn unsettled(execution_id: String) -> Self {
+        Self {
+            execution_ids: vec![execution_id.clone()],
+            stdout: unknown_evidence(),
+            stderr: unknown_evidence(),
+            unsettled: Some(execution_id),
+            ..Self::empty()
+        }
+    }
+
     /// Nothing found, and nothing claimed.
     fn empty() -> Self {
         Self {
@@ -1758,24 +2469,40 @@ impl RecoveredExecutionEvidence {
             unsettled: None,
             unreadable: false,
             mismatched: None,
+            mismatch: None,
         }
     }
 }
 
+/// The evidence of recovered `rows`. After a streamed call, `streamed` is
+/// the live stream's furthest offsets and the rows read with `GetExecution`
+/// once terminal: only those are settled, and each must pass
+/// [`streamed_row_problem`].
 fn aggregate_recovered(
     rows: Vec<Execution>,
     exec_context: ExecContext,
+    streamed: Option<([u64; 2], &BTreeSet<String>)>,
 ) -> RecoveredExecutionEvidence {
     let mut recovered = RecoveredExecutionEvidence::empty();
     for execution in rows {
+        let confirmed = streamed.is_none_or(|(_, confirmed)| confirmed.contains(&execution.id));
+        let settled = is_terminal(&execution) && confirmed;
         // Every execution of this sandbox is this session's, so each must
-        // show what the session sends, settled or not.
-        if !exec_context.ran_as_sent(&execution) {
-            recovered
-                .mismatched
-                .get_or_insert_with(|| execution.id.clone());
+        // show what the session sends, settled or not; a settled streamed
+        // one must pass every check of a returned one.
+        let problem = match streamed {
+            Some((live_end, _)) if settled => {
+                streamed_row_problem(exec_context, &execution, live_end)
+            }
+            _ => (!exec_context.ran_as_sent(&execution)).then_some(EXEC_CONTEXT_MISMATCH),
+        };
+        if let Some(problem) = problem
+            && recovered.mismatched.is_none()
+        {
+            recovered.mismatched = Some(execution.id.clone());
+            recovered.mismatch = Some(problem);
         }
-        if !is_terminal(&execution) {
+        if !settled {
             recovered
                 .unsettled
                 .get_or_insert_with(|| execution.id.clone());
@@ -1794,12 +2521,18 @@ fn aggregate_recovered(
     recovered
 }
 
-fn definitions() -> Vec<ToolDefinition> {
+/// The registered tools; `streaming` describes `exec` as a streaming
+/// session runs it.
+fn definitions(streaming: bool) -> Vec<ToolDefinition> {
+    let mut exec =
+        "Execute literal argv in the session sandbox; no host shell is used.".to_string();
+    if streaming {
+        exec.push_str(EXEC_STREAM_DESCRIPTION);
+    }
     vec![
         ToolDefinition {
             name: "exec".to_string(),
-            description: "Execute literal argv in the session sandbox; no host shell is used."
-                .to_string(),
+            description: exec,
             input_schema: json!({
                 "type": "object",
                 "required": ["argv"],

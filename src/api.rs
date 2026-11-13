@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -182,6 +184,29 @@ pub enum ExecutionState {
     Unknown,
 }
 
+/// How kilnd says an execution was requested.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Recorded before kilnd had `ExecStream`, or a value this schema does
+    /// not name.
+    #[default]
+    Unspecified,
+    /// A unary `Exec`.
+    Unary,
+    /// An `ExecStream`.
+    Stream,
+}
+
+impl ExecutionMode {
+    fn from_proto(value: i32) -> Self {
+        match pb::ExecutionMode::try_from(value) {
+            Ok(pb::ExecutionMode::Unary) => Self::Unary,
+            Ok(pb::ExecutionMode::Stream) => Self::Stream,
+            Ok(pb::ExecutionMode::Unspecified) | Err(_) => Self::Unspecified,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapturedOutput {
     pub data: Vec<u8>,
@@ -211,6 +236,98 @@ pub struct Execution {
     /// kilnd's [`env_sha256`] of the effective overrides; empty when there
     /// are none.
     pub env_sha256: String,
+    /// Whether it was requested through `Exec` or `ExecStream`.
+    pub mode: ExecutionMode,
+}
+
+/// One output stream of an execution, as `ExecStream` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LiveStream {
+    Stdout,
+    Stderr,
+}
+
+impl LiveStream {
+    /// `stdout` or `stderr`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+
+    fn from_proto(value: i32) -> Option<Self> {
+        match pb::OutputStream::try_from(value) {
+            Ok(pb::OutputStream::Stdout) => Some(Self::Stdout),
+            Ok(pb::OutputStream::Stderr) => Some(Self::Stderr),
+            Ok(pb::OutputStream::Unspecified) | Err(_) => None,
+        }
+    }
+}
+
+/// Receives one `ExecStream`'s events in order, as they arrive. Bytes are
+/// untrusted sandbox output.
+pub trait StreamObserver {
+    /// kilnd recorded the execution and started it.
+    fn started(&mut self, execution_id: &str);
+    /// Live bytes at `offset` of `stream`. `Break` drops the stream at once,
+    /// which makes kilnd cancel the execution.
+    fn chunk(&mut self, stream: LiveStream, offset: u64, data: &[u8]) -> ControlFlow<()>;
+    /// `dropped` bytes from `offset` were not delivered live (`known ==
+    /// false`: a lower bound). `Break` drops the stream as for a chunk.
+    fn gap(
+        &mut self,
+        stream: LiveStream,
+        offset: u64,
+        dropped: u64,
+        known: bool,
+    ) -> ControlFlow<()>;
+}
+
+/// How much of one stream reached the client live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveDelivery {
+    pub delivered_bytes: u64,
+    pub dropped_bytes: u64,
+    /// `false`: `dropped_bytes` is a lower bound.
+    pub dropped_bytes_known: bool,
+}
+
+impl LiveDelivery {
+    fn from_proto(delivery: Option<pb::LiveDelivery>) -> Self {
+        delivery.map_or_else(Self::default, |delivery| Self {
+            delivered_bytes: delivery.delivered_bytes,
+            dropped_bytes: delivery.dropped_bytes,
+            dropped_bytes_known: delivery.dropped_bytes_known,
+        })
+    }
+}
+
+/// How an `ExecStream` that kilnd admitted ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamedExec {
+    /// `ExecFinished` arrived: the stored row and live-delivery totals.
+    Finished {
+        execution: Execution,
+        stdout: LiveDelivery,
+        stderr: LiveDelivery,
+    },
+    /// The observer broke off after `ExecStarted`; the stream was dropped,
+    /// so kilnd cancels the execution unless it had already finished. The
+    /// caller reads the final row itself.
+    Stopped { execution_id: String },
+    /// The stream ended without `ExecFinished`: a transport error, a daemon
+    /// restart, a clean end too early, or a protocol violation, after which
+    /// the stream was dropped. `execution_id` is set when `ExecStarted`
+    /// arrived. The execution may still be running, or never have started.
+    Broken {
+        execution_id: Option<String>,
+        error: ApiError,
+        /// kilnd broke `ExecStream`'s rules (order, offsets, totals, IDs),
+        /// rather than the stream failing: what it sent cannot be trusted.
+        protocol_violation: bool,
+    },
 }
 
 /// What one `GetSandbox` says about whether the sandbox stayed usable.
@@ -391,6 +508,11 @@ pub struct ApiLimits {
     pub max_env_value_bytes: u32,
     /// Most bytes of the env, each entry counted as name + value + 2.
     pub max_env_total_bytes: u32,
+    /// The timeout kilnd gives an `ExecStream` that sends none
+    /// (`FEATURE_EXEC_STREAM`).
+    pub default_stream_timeout_ms: u32,
+    /// The longest `ExecStream` timeout kilnd accepts.
+    pub max_stream_timeout_ms: u32,
 }
 
 /// What a daemon supports. An older daemon reports no features and no
@@ -627,13 +749,26 @@ pub fn exec_option_unsupported(error: &ApiError, typed_reasons: bool) -> bool {
 
 /// Whether an Exec refusal proves this session's sandbox cannot take
 /// another execution, though it was not expired or deleted: an
-/// [`UnusableReason`] or an unsupported exec option. Every boundary that
+/// [`UnusableReason`], an unsupported exec option, or a backend that cannot
+/// stream (`backend_unsupported:exec_stream`), since a session that streams
+/// its model's commands never falls back to unary. Every boundary that
 /// sends an Exec (seeding, the baseline, tools and the check) classifies
 /// refusals with this one function.
 #[must_use]
 pub fn sandbox_unusable_refusal(error: &ApiError, typed_reasons: bool) -> bool {
     UnusableReason::of(error, typed_reasons).is_some()
         || exec_option_unsupported(error, typed_reasons)
+        || backend_unsupported_feature(error, typed_reasons) == Some("exec_stream")
+}
+
+/// Whether an `ExecStream` refusal is kilnd's `exec_stream_limit`: the
+/// node's or the caller's stream permits were all taken. kilnd refuses it
+/// before anything is allocated, so the same request may be sent again
+/// once a permit is free.
+#[must_use]
+pub fn exec_stream_limit(error: &ApiError, typed_reasons: bool) -> bool {
+    error.code == tonic::Code::ResourceExhausted
+        && error.typed_reason(typed_reasons) == Some("exec_stream_limit")
 }
 
 /// Whether an Exec refusal is kilnd's `execution_start_raced`: the sandbox
@@ -656,6 +791,18 @@ pub trait SandboxApi: Send + Sync {
     async fn health(&self) -> Result<Health, ApiError>;
     async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError>;
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError>;
+    /// Run `request` through `ExecStream` (needs [`Feature::ExecStream`]).
+    /// Events go to `observer` in order; when `observer` returns
+    /// `ControlFlow::Break(())` the stream is dropped at once, which makes
+    /// kilnd cancel the execution (`CLIENT_DISCONNECTED`).
+    ///
+    /// Any RPC error before the first message is a refusal before the row,
+    /// returned as `Err` and classified exactly like an `exec` error.
+    async fn exec_stream(
+        &self,
+        request: SandboxExec,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError>;
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError>;
     /// Request idempotent deletion. Success acknowledges a deleted response state;
     /// callers must independently confirm absence via `non_deleted_sandboxes`.
@@ -839,6 +986,8 @@ fn capabilities_from_proto(capabilities: Option<pb::RuntimeCapabilities>) -> Cap
             max_env_name_bytes: limits.max_env_name_bytes,
             max_env_value_bytes: limits.max_env_value_bytes,
             max_env_total_bytes: limits.max_env_total_bytes,
+            default_stream_timeout_ms: limits.default_stream_timeout_ms,
+            max_stream_timeout_ms: limits.max_stream_timeout_ms,
         }),
     }
 }
@@ -897,6 +1046,73 @@ impl SandboxApi for TonicKilnd {
             .execution
             .ok_or_else(|| ApiError::local("response omitted execution"))?;
         Ok(execution_from_proto(execution))
+    }
+
+    async fn exec_stream(
+        &self,
+        request: SandboxExec,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
+        let request = pb::ExecStreamRequest {
+            exec: Some(exec_request_to_proto(request)?),
+        };
+        let mut stream = self
+            .client
+            .clone()
+            .exec_stream(request)
+            .await
+            .map_err(ApiError::from)?
+            .into_inner();
+        let mut protocol = StreamProtocol::default();
+        let broken = |protocol: &StreamProtocol, error: ApiError, protocol_violation: bool| {
+            Ok(StreamedExec::Broken {
+                execution_id: protocol.execution_id.clone(),
+                error,
+                protocol_violation,
+            })
+        };
+        let mut finished = None;
+        // Returning drops `stream`, which is the disconnect kilnd cancels on.
+        loop {
+            let message = match stream.message().await {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    return match finished {
+                        Some(finished) => Ok(finished),
+                        None => broken(
+                            &protocol,
+                            ApiError::local("ExecStream ended without ExecFinished"),
+                            false,
+                        ),
+                    };
+                }
+                Err(status) => {
+                    return match finished {
+                        // ExecFinished is the stored row; an error status
+                        // after it is no message and changes nothing.
+                        Some(finished) => Ok(finished),
+                        // A refusal before the row: nothing ran, classified
+                        // as for a unary Exec.
+                        None if protocol.next_seq == 0 => Err(ApiError::from(status)),
+                        None => broken(&protocol, ApiError::from(status), false),
+                    };
+                }
+            };
+            match protocol.accept(message, observer) {
+                StreamStep::Continue => {}
+                StreamStep::Stop(execution_id) => {
+                    return Ok(StreamedExec::Stopped { execution_id });
+                }
+                StreamStep::Finished(done) => finished = Some(*done),
+                StreamStep::Violation(message) => {
+                    return broken(
+                        &protocol,
+                        ApiError::new(tonic::Code::Internal, message),
+                        true,
+                    );
+                }
+            }
+        }
     }
 
     async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
@@ -1078,6 +1294,170 @@ fn execution_from_proto(execution: pb::Execution) -> Execution {
         cwd: execution.cwd,
         env_names: execution.env_names,
         env_sha256: execution.env_sha256,
+        mode: ExecutionMode::from_proto(execution.mode),
+    }
+}
+
+/// One step of an `ExecStream` as [`StreamProtocol`] judged it.
+#[derive(Debug)]
+enum StreamStep {
+    /// Keep reading.
+    Continue,
+    /// The observer broke off after `ExecStarted`.
+    Stop(String),
+    /// `ExecFinished`: the stream must end next.
+    Finished(Box<StreamedExec>),
+    /// kilnd broke the stream protocol.
+    Violation(&'static str),
+}
+
+/// The client side of `ExecStream`'s ordering rules: `seq` starts at 0 and
+/// grows by one; message 0 is `ExecStarted` and no other is; chunks and gaps
+/// name stdout or stderr; `ExecFinished` names the started execution and is
+/// the last message. Each output stream's offsets start at 0, and every
+/// chunk and gap starts exactly where the stream's previous one ended, so
+/// no byte is counted twice and none goes missing without a gap: kilnd's
+/// emitter sends an interior gap right before the chunk it precedes and
+/// tail gaps at the stream's end. `ExecFinished`'s live totals must equal
+/// what the stream carried.
+#[derive(Debug, Default)]
+struct StreamProtocol {
+    next_seq: u64,
+    execution_id: Option<String>,
+    finished: bool,
+    /// Per output stream (stdout, stderr): where its next chunk or gap must
+    /// start, the bytes its chunks carried, and the bytes its gaps
+    /// reported dropped.
+    next_offset: [u64; 2],
+    delivered: [u64; 2],
+    dropped: [u64; 2],
+}
+
+impl StreamProtocol {
+    fn accept(
+        &mut self,
+        message: pb::ExecStreamResponse,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> StreamStep {
+        use pb::exec_stream_response::Event;
+        if self.finished {
+            return StreamStep::Violation("ExecStream sent a message after ExecFinished");
+        }
+        if message.seq != self.next_seq {
+            return StreamStep::Violation("ExecStream messages were not numbered in order");
+        }
+        self.next_seq = self.next_seq.saturating_add(1);
+        let event = match (message.event, &self.execution_id) {
+            (Some(Event::Started(started)), None) => {
+                if started.execution_id.is_empty() {
+                    return StreamStep::Violation("ExecStarted named no execution");
+                }
+                observer.started(&started.execution_id);
+                self.execution_id = Some(started.execution_id);
+                return StreamStep::Continue;
+            }
+            (_, None) => {
+                return StreamStep::Violation("ExecStream did not start with ExecStarted");
+            }
+            (Some(Event::Started(_)), Some(_)) => {
+                return StreamStep::Violation("ExecStream sent a second ExecStarted");
+            }
+            (None, Some(_)) => return StreamStep::Violation("ExecStream sent an empty message"),
+            (Some(event), Some(_)) => event,
+        };
+        let flow = match event {
+            Event::Started(_) => unreachable!("handled above"),
+            Event::Chunk(chunk) => {
+                let Some(stream) = LiveStream::from_proto(chunk.stream) else {
+                    return StreamStep::Violation("OutputChunk named no output stream");
+                };
+                let length = u64::try_from(chunk.data.len()).unwrap_or(u64::MAX);
+                if let Err(violation) = self.advance(stream, chunk.offset, length, false) {
+                    return StreamStep::Violation(violation);
+                }
+                observer.chunk(stream, chunk.offset, &chunk.data)
+            }
+            Event::Gap(gap) => {
+                let Some(stream) = LiveStream::from_proto(gap.stream) else {
+                    return StreamStep::Violation("OutputGap named no output stream");
+                };
+                if let Err(violation) = self.advance(stream, gap.offset, gap.dropped_bytes, true) {
+                    return StreamStep::Violation(violation);
+                }
+                observer.gap(
+                    stream,
+                    gap.offset,
+                    gap.dropped_bytes,
+                    gap.dropped_bytes_known,
+                )
+            }
+            Event::Finished(finished) => {
+                let Some(execution) = finished.execution else {
+                    return StreamStep::Violation("ExecFinished omitted the execution");
+                };
+                if Some(&execution.id) != self.execution_id.as_ref() {
+                    return StreamStep::Violation("ExecFinished named another execution");
+                }
+                let stdout = LiveDelivery::from_proto(finished.stdout);
+                let stderr = LiveDelivery::from_proto(finished.stderr);
+                let carried = |index: usize, delivery: &LiveDelivery| {
+                    delivery.delivered_bytes == self.delivered[index]
+                        && delivery.dropped_bytes == self.dropped[index]
+                };
+                if !carried(0, &stdout) || !carried(1, &stderr) {
+                    return StreamStep::Violation(
+                        "ExecFinished's live totals differ from what the stream carried",
+                    );
+                }
+                self.finished = true;
+                return StreamStep::Finished(Box::new(StreamedExec::Finished {
+                    execution: execution_from_proto(execution),
+                    stdout,
+                    stderr,
+                }));
+            }
+        };
+        match flow {
+            ControlFlow::Continue(()) => StreamStep::Continue,
+            ControlFlow::Break(()) => {
+                StreamStep::Stop(self.execution_id.clone().unwrap_or_default())
+            }
+        }
+    }
+
+    /// Accept `length` bytes of `stream` at `offset`, carried by a chunk or,
+    /// with `gap`, reported dropped: they must start exactly where the
+    /// stream's previous chunk or gap ended, and no count may overflow.
+    fn advance(
+        &mut self,
+        stream: LiveStream,
+        offset: u64,
+        length: u64,
+        gap: bool,
+    ) -> Result<(), &'static str> {
+        let index = match stream {
+            LiveStream::Stdout => 0,
+            LiveStream::Stderr => 1,
+        };
+        if offset != self.next_offset[index] {
+            return Err(if gap {
+                "OutputGap did not start where the stream's previous output ended"
+            } else {
+                "OutputChunk did not start where the stream's previous output ended"
+            });
+        }
+        let total = if gap {
+            &mut self.dropped[index]
+        } else {
+            &mut self.delivered[index]
+        };
+        let (Some(next), Some(counted)) = (offset.checked_add(length), total.checked_add(length))
+        else {
+            return Err("ExecStream offsets overflowed");
+        };
+        self.next_offset[index] = next;
+        *total = counted;
+        Ok(())
     }
 }
 
@@ -1498,5 +1878,170 @@ mod status_contract_test {
             ])),
             ["NO_COLOR", "PAGER", "TERM"]
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_stream_is_read_in_order_and_cut_when_the_observer_says() {
+        use super::{
+            ExecutionMode, LiveStream, StreamObserver, StreamProtocol, StreamStep, StreamedExec,
+        };
+        use crate::pb;
+        use crate::pb::exec_stream_response::Event;
+        use std::ops::ControlFlow;
+
+        #[derive(Default)]
+        struct Cut {
+            limit: u64,
+            seen: Vec<(LiveStream, u64, u64)>,
+        }
+        impl StreamObserver for Cut {
+            fn started(&mut self, _execution_id: &str) {}
+            fn chunk(&mut self, stream: LiveStream, offset: u64, data: &[u8]) -> ControlFlow<()> {
+                self.gap(stream, offset, data.len() as u64, true)
+            }
+            fn gap(
+                &mut self,
+                stream: LiveStream,
+                offset: u64,
+                length: u64,
+                _known: bool,
+            ) -> ControlFlow<()> {
+                self.seen.push((stream, offset, length));
+                if offset + length > self.limit {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            }
+        }
+        let message = |seq, event| pb::ExecStreamResponse {
+            seq,
+            event: Some(event),
+        };
+        let started = Event::Started(pb::ExecStarted {
+            execution_id: "ex-1".to_string(),
+            ..pb::ExecStarted::default()
+        });
+        let chunk = |stream: pb::OutputStream, offset, data: &[u8]| {
+            Event::Chunk(pb::OutputChunk {
+                stream: stream as i32,
+                offset,
+                data: data.to_vec(),
+            })
+        };
+        // The stream below carries two bytes of stderr live.
+        let finished = Event::Finished(pb::ExecFinished {
+            execution: Some(pb::Execution {
+                id: "ex-1".to_string(),
+                mode: pb::ExecutionMode::Stream as i32,
+                ..pb::Execution::default()
+            }),
+            stderr: Some(pb::LiveDelivery {
+                delivered_bytes: 2,
+                dropped_bytes: 0,
+                dropped_bytes_known: true,
+            }),
+            ..pb::ExecFinished::default()
+        });
+
+        let mut protocol = StreamProtocol::default();
+        let mut observer = Cut {
+            limit: 100,
+            ..Cut::default()
+        };
+        assert!(matches!(
+            protocol.accept(message(0, started.clone()), &mut observer),
+            StreamStep::Continue
+        ));
+        assert!(matches!(
+            protocol.accept(
+                message(1, chunk(pb::OutputStream::Stderr, 0, b"ab")),
+                &mut observer
+            ),
+            StreamStep::Continue
+        ));
+        let StreamStep::Finished(done) =
+            protocol.accept(message(2, finished.clone()), &mut observer)
+        else {
+            panic!("finished");
+        };
+        assert!(matches!(*done, StreamedExec::Finished { ref execution, .. }
+            if execution.mode == ExecutionMode::Stream));
+        assert!(matches!(
+            protocol.accept(
+                message(3, chunk(pb::OutputStream::Stdout, 0, b"x")),
+                &mut observer
+            ),
+            StreamStep::Violation(_)
+        ));
+        assert_eq!(observer.seen, [(LiveStream::Stderr, 0, 2)]);
+
+        // Past the observer's limit: stop with the started ID.
+        let mut protocol = StreamProtocol::default();
+        let mut observer = Cut {
+            limit: 4,
+            ..Cut::default()
+        };
+        protocol.accept(message(0, started.clone()), &mut observer);
+        assert!(matches!(
+            protocol.accept(message(1, chunk(pb::OutputStream::Stdout, 0, b"yyyyy")), &mut observer),
+            StreamStep::Stop(ref id) if id == "ex-1"
+        ));
+
+        // Out of order, unnamed or empty messages are violations.
+        for (first, second) in [
+            (message(1, started.clone()), None),
+            (message(0, finished.clone()), None),
+            (
+                message(0, started.clone()),
+                Some(message(1, started.clone())),
+            ),
+            (
+                message(0, started.clone()),
+                Some(message(1, chunk(pb::OutputStream::Unspecified, 0, b"x"))),
+            ),
+            (
+                message(0, started.clone()),
+                Some(pb::ExecStreamResponse {
+                    seq: 1,
+                    event: None,
+                }),
+            ),
+            (message(0, Event::Started(pb::ExecStarted::default())), None),
+        ] {
+            let mut protocol = StreamProtocol::default();
+            let mut observer = Cut {
+                limit: 100,
+                ..Cut::default()
+            };
+            let step = match second {
+                None => protocol.accept(first, &mut observer),
+                Some(second) => {
+                    assert!(matches!(
+                        protocol.accept(first, &mut observer),
+                        StreamStep::Continue
+                    ));
+                    protocol.accept(second, &mut observer)
+                }
+            };
+            assert!(matches!(step, StreamStep::Violation(_)), "{step:?}");
+        }
+    }
+
+    #[test]
+    fn execution_modes_map_from_the_wire() {
+        use super::ExecutionMode;
+        use crate::pb;
+        assert_eq!(
+            ExecutionMode::from_proto(pb::ExecutionMode::Unary as i32),
+            ExecutionMode::Unary
+        );
+        assert_eq!(
+            ExecutionMode::from_proto(pb::ExecutionMode::Stream as i32),
+            ExecutionMode::Stream
+        );
+        assert_eq!(ExecutionMode::from_proto(0), ExecutionMode::Unspecified);
+        assert_eq!(ExecutionMode::from_proto(99), ExecutionMode::Unspecified);
     }
 }

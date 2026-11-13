@@ -10,6 +10,7 @@ pub mod engine;
 pub mod eval;
 pub mod files;
 pub mod journal;
+pub mod live;
 mod outputs;
 pub mod provider;
 pub mod providers;

@@ -19,6 +19,7 @@ use kiln_harness::journal::{JournalEvent, MemoryJournal};
 use kiln_harness::pb;
 use kiln_harness::pb::kilnd_service_server::{KilndService, KilndServiceServer};
 use kiln_harness::provider::{ModelResponse, ScriptedProvider, ToolCall};
+use kiln_harness::tools::STREAM_PROTOCOL_VIOLATION;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -52,9 +53,222 @@ struct Stub {
     running_then_settles: bool,
     /// Rows `GetSandbox` reports, newest first.
     recent: Arc<std::sync::Mutex<Vec<pb::Execution>>>,
+    /// Every `ExecStream` request as it arrived on the wire.
+    stream_requests: Arc<std::sync::Mutex<Vec<pb::ExecRequest>>>,
+    /// What a streamed execution writes to stdout, sent live in two chunks
+    /// split mid-line and retained in its row.
+    stream_stdout: Vec<u8>,
+    /// Break `ExecStream`'s message rules this way.
+    stream_violation: Option<Violation>,
+    /// Send [`gapped_messages`] instead, which keeps every rule.
+    stream_gapped: bool,
     health_calls: Arc<AtomicU32>,
     execs: Arc<AtomicU32>,
     deleted: Arc<AtomicU32>,
+}
+
+/// One way a stream can break kilnd's `ExecStream` ordering rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Violation {
+    /// `seq` jumps from 0 to 2.
+    SeqGap,
+    /// The first message is a chunk, not `ExecStarted`.
+    NotStartedFirst,
+    /// `ExecFinished` names another execution.
+    IdMismatch,
+    /// A chunk follows `ExecFinished`.
+    AfterFinished,
+    /// A chunk names no output stream.
+    UnnamedStream,
+    /// The stream ends after `ExecStarted` with no `ExecFinished`.
+    EndsEarly,
+    /// A chunk starts again at offset 0.
+    RegressingOffset,
+    /// A chunk starts inside the previous one.
+    OverlappingOffset,
+    /// A chunk starts past the previous one's end, with no gap between.
+    HoleWithoutGap,
+    /// A gap starts past the previous chunk's end.
+    GapAtWrongOffset,
+    /// A gap's end overflows `u64`.
+    OffsetOverflow,
+    /// `ExecFinished` reports more bytes delivered than the chunks carried.
+    WrongFinalTotals,
+}
+
+fn message(seq: u64, event: pb::exec_stream_response::Event) -> pb::ExecStreamResponse {
+    pb::ExecStreamResponse {
+        seq,
+        event: Some(event),
+    }
+}
+
+fn started(execution: &pb::Execution) -> pb::exec_stream_response::Event {
+    pb::exec_stream_response::Event::Started(pb::ExecStarted {
+        execution_id: execution.id.clone(),
+        sandbox_id: execution.sandbox_id.clone(),
+        started_at_unix_ms: 1,
+        timeout_ms: 1_000,
+    })
+}
+
+fn chunk(stream: pb::OutputStream, offset: u64, data: &[u8]) -> pb::exec_stream_response::Event {
+    pb::exec_stream_response::Event::Chunk(pb::OutputChunk {
+        stream: stream as i32,
+        offset,
+        data: data.to_vec(),
+    })
+}
+
+fn gap(
+    stream: pb::OutputStream,
+    offset: u64,
+    dropped: u64,
+    known: bool,
+) -> pb::exec_stream_response::Event {
+    pb::exec_stream_response::Event::Gap(pb::OutputGap {
+        stream: stream as i32,
+        offset,
+        dropped_bytes: dropped,
+        dropped_bytes_known: known,
+    })
+}
+
+fn finished(execution: pb::Execution, delivered: u64) -> pb::exec_stream_response::Event {
+    pb::exec_stream_response::Event::Finished(pb::ExecFinished {
+        execution: Some(execution),
+        stdout: Some(pb::LiveDelivery {
+            delivered_bytes: delivered,
+            dropped_bytes: 0,
+            dropped_bytes_known: true,
+        }),
+        stderr: Some(pb::LiveDelivery {
+            dropped_bytes_known: true,
+            ..pb::LiveDelivery::default()
+        }),
+    })
+}
+
+/// The messages of one stream for `execution`, whose retained stdout is
+/// what it wrote: `ExecStarted`, that output in two chunks, `ExecFinished`;
+/// or the same broken as `violation` says.
+fn stream_messages(
+    execution: pb::Execution,
+    violation: Option<Violation>,
+) -> Vec<pb::ExecStreamResponse> {
+    use pb::OutputStream::{Stdout, Unspecified};
+    let output = execution
+        .stdout
+        .as_ref()
+        .map(|output| output.data.clone())
+        .unwrap_or_default();
+    let split = output.len() / 2;
+    let (head, tail) = output.split_at(split);
+    let offset = split as u64;
+    let delivered = output.len() as u64;
+    match violation {
+        None => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, head)),
+            message(2, chunk(Stdout, offset, tail)),
+            message(3, finished(execution, delivered)),
+        ],
+        Some(Violation::SeqGap) => vec![
+            message(0, started(&execution)),
+            message(2, chunk(Stdout, 0, head)),
+            message(3, finished(execution, delivered)),
+        ],
+        Some(Violation::NotStartedFirst) => vec![
+            message(0, chunk(Stdout, 0, head)),
+            message(1, started(&execution)),
+            message(2, finished(execution, delivered)),
+        ],
+        Some(Violation::IdMismatch) => {
+            let other = pb::Execution {
+                id: "ex-00000000000000ff".to_string(),
+                ..execution.clone()
+            };
+            vec![
+                message(0, started(&execution)),
+                message(1, finished(other, delivered)),
+            ]
+        }
+        Some(Violation::AfterFinished) => vec![
+            message(0, started(&execution)),
+            message(1, finished(execution, delivered)),
+            message(2, chunk(Stdout, 0, head)),
+        ],
+        Some(Violation::UnnamedStream) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Unspecified, 0, head)),
+            message(2, finished(execution, delivered)),
+        ],
+        Some(Violation::EndsEarly) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, head)),
+        ],
+        Some(Violation::RegressingOffset) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, b"abc")),
+            message(2, chunk(Stdout, 0, b"abc")),
+            message(3, finished(execution, 6)),
+        ],
+        Some(Violation::OverlappingOffset) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, b"abcd")),
+            message(2, chunk(Stdout, 2, b"cdef")),
+            message(3, finished(execution, 8)),
+        ],
+        Some(Violation::HoleWithoutGap) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, b"abc")),
+            message(2, chunk(Stdout, 5, b"fg")),
+            message(3, finished(execution, 5)),
+        ],
+        Some(Violation::GapAtWrongOffset) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, b"abc")),
+            message(2, gap(Stdout, 5, 2, true)),
+            message(3, finished(execution, 3)),
+        ],
+        Some(Violation::OffsetOverflow) => vec![
+            message(0, started(&execution)),
+            message(1, gap(Stdout, 0, u64::MAX, true)),
+            message(2, gap(Stdout, u64::MAX, 1, true)),
+            message(3, finished(execution, 0)),
+        ],
+        Some(Violation::WrongFinalTotals) => vec![
+            message(0, started(&execution)),
+            message(1, chunk(Stdout, 0, head)),
+            message(2, chunk(Stdout, offset, tail)),
+            message(3, finished(execution, delivered + 1)),
+        ],
+    }
+}
+
+/// [`stream_messages`] for a stream that keeps every rule but drops bytes:
+/// a chunk, an exact interior gap, the next chunk right after it, and an
+/// inexact empty tail gap, as kilnd's emitter sends them.
+fn gapped_messages(execution: pb::Execution) -> Vec<pb::ExecStreamResponse> {
+    use pb::OutputStream::{Stderr, Stdout};
+    let start = started(&execution);
+    let mut done = finished(execution, 5);
+    if let pb::exec_stream_response::Event::Finished(finished) = &mut done {
+        finished.stdout = Some(pb::LiveDelivery {
+            delivered_bytes: 5,
+            dropped_bytes: 2,
+            dropped_bytes_known: false,
+        });
+    }
+    vec![
+        message(0, start),
+        message(1, chunk(Stdout, 0, b"abc")),
+        message(2, gap(Stdout, 3, 2, true)),
+        message(3, chunk(Stdout, 5, b"fg")),
+        message(4, gap(Stdout, 7, 0, false)),
+        message(5, gap(Stderr, 0, 0, true)),
+        message(6, done),
+    ]
 }
 
 fn sandbox(state: pb::SandboxState) -> pb::Sandbox {
@@ -67,7 +281,8 @@ fn sandbox(state: pb::SandboxState) -> pb::Sandbox {
     }
 }
 
-/// kilnd 0c79944's default exec-option bounds, on the wire.
+/// kilnd 0c79944's default exec-option bounds and kilnd 2562a53's default
+/// stream timeouts, on the wire.
 fn stub_exec_limits() -> pb::ApiLimits {
     pb::ApiLimits {
         max_cwd_bytes: 4096,
@@ -75,6 +290,8 @@ fn stub_exec_limits() -> pb::ApiLimits {
         max_env_name_bytes: 128,
         max_env_value_bytes: 4096,
         max_env_total_bytes: 32_768,
+        default_stream_timeout_ms: 1_800_000,
+        max_stream_timeout_ms: 7_200_000,
         ..pb::ApiLimits::default()
     }
 }
@@ -83,6 +300,76 @@ fn settled() -> pb::Output {
     pb::Output {
         total_bytes_known: true,
         ..pb::Output::default()
+    }
+}
+
+impl Stub {
+    /// Record one `Exec` or `ExecStream` as the scripted kilnd would and return
+    /// its row, or the status it answers with instead.
+    fn record(
+        &self,
+        request: &pb::ExecRequest,
+        mode: pb::ExecutionMode,
+    ) -> Result<pb::Execution, Status> {
+        let number = self.execs.fetch_add(1, Ordering::SeqCst) + 1;
+        self.exec_requests
+            .lock()
+            .expect("exec requests")
+            .push(request.clone());
+        let baseline = request
+            .argv
+            .first()
+            .is_some_and(|arg| arg == "/usr/bin/find");
+        let (cwd, env_names, env_sha256) = common::pb_recorded_context(request);
+        let stdout = if mode == pb::ExecutionMode::Stream {
+            pb::Output {
+                data: self.stream_stdout.clone(),
+                total_bytes: self.stream_stdout.len() as u64,
+                ..settled()
+            }
+        } else {
+            settled()
+        };
+        let mut execution = pb::Execution {
+            id: format!("ex-{number:016x}"),
+            cwd,
+            env_names,
+            env_sha256,
+            sandbox_id: "sb-0000000000000001".to_string(),
+            state: pb::ExecutionState::Exited as i32,
+            exit_code: Some(0),
+            stdout: Some(stdout),
+            stderr: Some(settled()),
+            sandbox_reusable: self.current.then_some(true),
+            mode: mode as i32,
+            ..pb::Execution::default()
+        };
+        if self.deleted_during_exec && !baseline {
+            execution.state = pb::ExecutionState::Canceled as i32;
+            execution.exit_code = None;
+            execution.failure_reason = "sandbox was deleted while the execution ran".to_string();
+            execution.sandbox_reusable = Some(false);
+            execution.cancel_reason = pb::CancelReason::SandboxDeleted as i32;
+        }
+        if self.running_then_settles && !baseline {
+            execution.state = pb::ExecutionState::Running as i32;
+            execution.exit_code = None;
+            execution.sandbox_reusable = None;
+            self.recent.lock().expect("recent").insert(0, execution);
+            return Err(Status::unavailable(
+                "connection lost while the execution was still running",
+            ));
+        }
+        self.recent
+            .lock()
+            .expect("recent")
+            .insert(0, execution.clone());
+        if self.lose_tool_response && !baseline {
+            return Err(Status::unavailable(
+                "response lost after terminal execution publication",
+            ));
+        }
+        Ok(execution)
     }
 }
 
@@ -95,8 +382,13 @@ impl KilndService for Stub {
         if self.health_calls.fetch_add(1, Ordering::SeqCst) >= self.health_answers {
             std::future::pending::<()>().await;
         }
-        // Every kilnd the harness accepts lists the exec options.
-        let exec_options = [pb::Feature::ExecCwd as i32, pb::Feature::ExecEnv as i32];
+        // Every kilnd a live session accepts lists the exec options and
+        // exec streaming.
+        let exec_options = [
+            pb::Feature::ExecCwd as i32,
+            pb::Feature::ExecEnv as i32,
+            pb::Feature::ExecStream as i32,
+        ];
         let exec_limits = stub_exec_limits();
         let runtime_capabilities = Some(if self.current {
             pb::RuntimeCapabilities {
@@ -174,69 +466,37 @@ impl KilndService for Stub {
         &self,
         request: Request<pb::ExecRequest>,
     ) -> Result<Response<pb::ExecResponse>, Status> {
-        let number = self.execs.fetch_add(1, Ordering::SeqCst) + 1;
-        self.exec_requests
-            .lock()
-            .expect("exec requests")
-            .push(request.get_ref().clone());
-        let baseline = request
-            .get_ref()
-            .argv
-            .first()
-            .is_some_and(|arg| arg == "/usr/bin/find");
-        let (cwd, env_names, env_sha256) = common::pb_recorded_context(request.get_ref());
-        let mut execution = pb::Execution {
-            id: format!("ex-{number:016x}"),
-            cwd,
-            env_names,
-            env_sha256,
-            sandbox_id: "sb-0000000000000001".to_string(),
-            state: pb::ExecutionState::Exited as i32,
-            exit_code: Some(0),
-            stdout: Some(settled()),
-            stderr: Some(settled()),
-            sandbox_reusable: self.current.then_some(true),
-            ..pb::Execution::default()
-        };
-        if self.deleted_during_exec && !baseline {
-            execution.state = pb::ExecutionState::Canceled as i32;
-            execution.exit_code = None;
-            execution.failure_reason = "sandbox was deleted while the execution ran".to_string();
-            execution.sandbox_reusable = Some(false);
-            execution.cancel_reason = pb::CancelReason::SandboxDeleted as i32;
-        }
-        if self.running_then_settles && !baseline {
-            execution.state = pb::ExecutionState::Running as i32;
-            execution.exit_code = None;
-            execution.sandbox_reusable = None;
-            self.recent.lock().expect("recent").insert(0, execution);
-            return Err(Status::unavailable(
-                "connection lost while the execution was still running",
-            ));
-        }
-        self.recent
-            .lock()
-            .expect("recent")
-            .insert(0, execution.clone());
-        if self.lose_tool_response && !baseline {
-            return Err(Status::unavailable(
-                "response lost after terminal execution publication",
-            ));
-        }
+        let execution = self.record(request.get_ref(), pb::ExecutionMode::Unary)?;
         Ok(Response::new(pb::ExecResponse {
             execution: Some(execution),
         }))
     }
 
-    type ExecStreamStream =
-        tonic::codegen::tokio_stream::Empty<Result<pb::ExecStreamResponse, Status>>;
+    type ExecStreamStream = std::pin::Pin<
+        Box<
+            dyn tonic::codegen::tokio_stream::Stream<Item = Result<pb::ExecStreamResponse, Status>>
+                + Send,
+        >,
+    >;
 
-    /// The harness never streams.
     async fn exec_stream(
         &self,
-        _request: Request<pb::ExecStreamRequest>,
+        request: Request<pb::ExecStreamRequest>,
     ) -> Result<Response<Self::ExecStreamStream>, Status> {
-        Err(Status::unimplemented("test stub"))
+        let exec = request.into_inner().exec.unwrap_or_default();
+        self.stream_requests
+            .lock()
+            .expect("stream requests")
+            .push(exec.clone());
+        let execution = self.record(&exec, pb::ExecutionMode::Stream)?;
+        let messages = if self.stream_gapped {
+            gapped_messages(execution)
+        } else {
+            stream_messages(execution, self.stream_violation)
+        };
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            messages.into_iter().map(Ok),
+        ))))
     }
 
     async fn delete_sandbox(
@@ -684,7 +944,14 @@ impl Servers {
     }
 
     fn run(&self, dir: &Path, session_timeout_secs: &str) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+        self.command(dir, session_timeout_secs)
+            .spawn()
+            .expect("start the CLI")
+    }
+
+    fn command(&self, dir: &Path, session_timeout_secs: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kiln-harness"));
+        command
             .arg("--socket")
             .arg(&self.socket)
             .arg("run")
@@ -696,9 +963,8 @@ impl Servers {
             .arg("--journal")
             .arg(dir.join("out/run.jsonl"))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start the CLI")
+            .stderr(Stdio::piped());
+        command
     }
 }
 
@@ -823,4 +1089,425 @@ fn a_post_session_health_that_never_answers_warns_and_keeps_success() {
         "{stderr}"
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+}
+
+/// Everything an `ExecStream` observer was told.
+#[derive(Default)]
+struct Seen {
+    started: Vec<String>,
+    stdout: Vec<u8>,
+    chunks: u32,
+    gaps: u32,
+    /// Where stdout's next chunk or gap starts.
+    next: u64,
+}
+
+impl kiln_harness::api::StreamObserver for Seen {
+    fn started(&mut self, execution_id: &str) {
+        self.started.push(execution_id.to_string());
+    }
+
+    fn chunk(
+        &mut self,
+        stream: kiln_harness::api::LiveStream,
+        offset: u64,
+        data: &[u8],
+    ) -> std::ops::ControlFlow<()> {
+        assert_eq!(stream, kiln_harness::api::LiveStream::Stdout);
+        assert_eq!(offset, self.next);
+        self.next += data.len() as u64;
+        self.stdout.extend_from_slice(data);
+        self.chunks += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn gap(
+        &mut self,
+        stream: kiln_harness::api::LiveStream,
+        offset: u64,
+        dropped: u64,
+        _known: bool,
+    ) -> std::ops::ControlFlow<()> {
+        if stream == kiln_harness::api::LiveStream::Stdout {
+            assert_eq!(offset, self.next);
+            self.next = self.next.saturating_add(dropped);
+        }
+        self.gaps += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+fn echo_request() -> kiln_harness::api::SandboxExec {
+    kiln_harness::api::SandboxExec {
+        sandbox_id: "sb-0000000000000001".to_string(),
+        argv: vec!["/bin/echo".to_string(), "hello".to_string()],
+        stdin: Vec::new(),
+        timeout: Duration::from_millis(1_000),
+        cwd: "/workspace".to_string(),
+        env: common::workspace_env(),
+    }
+}
+
+#[tokio::test]
+async fn the_adapter_accepts_gaps_that_keep_the_offset_rules() {
+    use kiln_harness::api::StreamedExec;
+    // An exact interior gap, the next chunk right after it, and inexact
+    // and empty tail gaps are accepted, with kilnd's totals.
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        stream_stdout: b"abcfg".to_vec(),
+        stream_gapped: true,
+        ..Stub::default()
+    };
+    let shutdown = serve(stub, &socket);
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let mut seen = Seen::default();
+    let streamed = api
+        .exec_stream(echo_request(), &mut seen)
+        .await
+        .expect("admitted");
+    let StreamedExec::Finished { stdout, .. } = streamed else {
+        panic!("gapped: {streamed:?}");
+    };
+    assert_eq!((stdout.delivered_bytes, stdout.dropped_bytes), (5, 2));
+    assert_eq!(
+        (seen.stdout.as_slice(), seen.chunks, seen.gaps),
+        (&b"abcfg"[..], 2, 3)
+    );
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn the_adapter_reads_a_stream_and_rejects_protocol_breaks() {
+    use kiln_harness::api::{ExecutionMode, StreamedExec};
+    // A well-formed stream: ExecStarted, two chunks split mid-line, then
+    // ExecFinished with the stored row.
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        stream_stdout: b"hello\nwor".to_vec(),
+        ..Stub::default()
+    };
+    let requests = Arc::clone(&stub.stream_requests);
+    let shutdown = serve(stub, &socket);
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let mut seen = Seen::default();
+    let streamed = api
+        .exec_stream(echo_request(), &mut seen)
+        .await
+        .expect("admitted");
+    let StreamedExec::Finished {
+        execution, stdout, ..
+    } = streamed
+    else {
+        panic!("{streamed:?}");
+    };
+    assert_eq!(execution.mode, ExecutionMode::Stream);
+    assert_eq!(execution.stdout.data, b"hello\nwor");
+    assert_eq!(stdout.delivered_bytes, 9);
+    assert_eq!(seen.started, [execution.id.clone()]);
+    assert_eq!(
+        (seen.stdout.as_slice(), seen.chunks),
+        (&b"hello\nwor"[..], 2)
+    );
+    // The ExecRequest went inside ExecStreamRequest as for a unary Exec.
+    let sent = requests.lock().expect("requests")[0].clone();
+    assert_eq!(sent.argv, ["/bin/echo", "hello"]);
+    assert_eq!((sent.cwd.as_str(), sent.timeout_ms), ("/workspace", 1_000));
+    let _ = shutdown.send(());
+
+    // Each break, with what the observer saw before it: the offending
+    // message never reaches it.
+    for (violation, started, chunks, gaps) in [
+        (Violation::SeqGap, true, 0, 0),
+        (Violation::NotStartedFirst, false, 0, 0),
+        (Violation::IdMismatch, true, 0, 0),
+        (Violation::AfterFinished, true, 0, 0),
+        (Violation::UnnamedStream, true, 0, 0),
+        (Violation::EndsEarly, true, 1, 0),
+        (Violation::RegressingOffset, true, 1, 0),
+        (Violation::OverlappingOffset, true, 1, 0),
+        (Violation::HoleWithoutGap, true, 1, 0),
+        (Violation::GapAtWrongOffset, true, 1, 0),
+        (Violation::OffsetOverflow, true, 0, 1),
+        (Violation::WrongFinalTotals, true, 2, 0),
+    ] {
+        let temp = common::private_tempdir().expect("tempdir");
+        let socket = temp.path().join("kilnd.sock");
+        let stub = Stub {
+            health_answers: u32::MAX,
+            stream_stdout: b"hello\n".to_vec(),
+            stream_violation: Some(violation),
+            ..Stub::default()
+        };
+        let shutdown = serve(stub, &socket);
+        let api = TonicKilnd::connect(socket).await.expect("connect");
+        let mut seen = Seen::default();
+        let streamed = api
+            .exec_stream(echo_request(), &mut seen)
+            .await
+            .expect("admitted");
+        let StreamedExec::Broken {
+            execution_id,
+            error,
+            protocol_violation,
+        } = streamed
+        else {
+            panic!("{violation:?}: {streamed:?}");
+        };
+        let expected_id = started.then(|| "ex-0000000000000001".to_string());
+        assert_eq!(execution_id, expected_id, "{violation:?}");
+        let code = if violation == Violation::EndsEarly {
+            tonic::Code::Unknown
+        } else {
+            tonic::Code::Internal
+        };
+        assert_eq!(error.code, code, "{violation:?}: {error}");
+        assert_eq!(error.reason, None, "{violation:?}");
+        // A clean end without ExecFinished is a broken stream, not a
+        // broken protocol.
+        assert_eq!(
+            protocol_violation,
+            violation != Violation::EndsEarly,
+            "{violation:?}"
+        );
+        assert_eq!((seen.chunks, seen.gaps), (chunks, gaps), "{violation:?}");
+        let _ = shutdown.send(());
+    }
+}
+
+/// Run one `exec` session against a stub that breaks the stream as
+/// `violation` says, and return the harness and how the session ended.
+async fn session_with_violation(
+    violation: Violation,
+) -> (
+    Harness<TonicKilnd, ScriptedProvider, MemoryAudit, MemoryJournal>,
+    Result<kiln_harness::engine::SessionOutcome, HarnessError>,
+) {
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let stub = Stub {
+        health_answers: u32::MAX,
+        current: true,
+        stream_stdout: b"abc".to_vec(),
+        stream_violation: Some(violation),
+        ..Stub::default()
+    };
+    let shutdown = serve(stub, &socket);
+    let api = TonicKilnd::connect(socket).await.expect("connect");
+    let provider = ScriptedProvider::new([
+        ModelResponse::tool_use([ToolCall::new(
+            "call-1",
+            "exec",
+            json!({"argv": ["/bin/true"]}),
+        )]),
+        ModelResponse::final_text("done"),
+    ]);
+    let mut harness = Harness::new(
+        api,
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        HarnessConfig::default(),
+    );
+    let ended = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await;
+    let _ = shutdown.send(());
+    (harness, ended)
+}
+
+#[tokio::test]
+async fn a_protocol_violation_ends_the_session_and_is_never_a_result() {
+    // M4-12: whatever rule kilnd broke, before or after naming the
+    // execution, the call is never an ordinary result. The session ends as
+    // unusable with a fixed message, the execution is evidence (from the
+    // stream, or found by recovery when the stream named none), and the
+    // model-visible result names no execution.
+    for violation in [
+        Violation::SeqGap,
+        Violation::NotStartedFirst,
+        Violation::IdMismatch,
+        Violation::AfterFinished,
+        Violation::UnnamedStream,
+        Violation::RegressingOffset,
+        Violation::OverlappingOffset,
+        Violation::HoleWithoutGap,
+        Violation::GapAtWrongOffset,
+        Violation::WrongFinalTotals,
+    ] {
+        let (harness, ended) = session_with_violation(violation).await;
+        let Err(error) = ended else {
+            panic!("{violation:?}: a broken protocol ends the session");
+        };
+        assert!(
+            matches!(&error, HarnessError::Api(error)
+                if error.code == tonic::Code::FailedPrecondition
+                    && error.message == STREAM_PROTOCOL_VIOLATION),
+            "{violation:?}: {error}"
+        );
+        let executed: Vec<_> = harness
+            .journal()
+            .records
+            .iter()
+            .filter_map(|record| match &record.event {
+                JournalEvent::ToolExecuted {
+                    ok,
+                    result,
+                    execution_ids,
+                    ..
+                } => Some((*ok, result.clone(), execution_ids.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            executed.len(),
+            1,
+            "{violation:?}: the model is not asked again"
+        );
+        let (ok, result, ids) = &executed[0];
+        assert!(!ok, "{violation:?}: {result}");
+        assert_eq!(
+            result["message"], STREAM_PROTOCOL_VIOLATION,
+            "{violation:?}"
+        );
+        assert!(result.get("stdout").is_none(), "{violation:?}: {result}");
+        assert!(
+            !result.to_string().contains("ex-"),
+            "{violation:?}: {result}"
+        );
+        assert_eq!(ids, &["ex-0000000000000002".to_string()], "{violation:?}");
+    }
+
+    // An offset can only overflow after a legal gap past 8 MiB, so in a
+    // session the cutoff stops the stream first: the row is the result,
+    // marked stopped.
+    let (harness, ended) = session_with_violation(Violation::OffsetOverflow).await;
+    ended.expect("the cutoff comes first");
+    assert!(harness.journal().records.iter().any(|record| matches!(
+        &record.event,
+        JournalEvent::ToolExecuted { result, .. } if result["stopped"] == "output_limit"
+    )));
+
+    // A stream that just ends early broke no rule: the row is the result.
+    let (harness, ended) = session_with_violation(Violation::EndsEarly).await;
+    ended.expect("an early end is a broken stream, not a broken protocol");
+    assert!(harness.journal().records.iter().any(|record| matches!(
+        &record.event,
+        JournalEvent::ToolExecuted { execution_ids, ok: true, result, .. }
+            if execution_ids == &["ex-0000000000000002".to_string()]
+                && result["stdout"] == "abc"
+    )));
+}
+
+#[tokio::test]
+async fn regressing_offsets_break_the_stream_before_they_count() {
+    // M4-07 on the wire: a chunk that starts again at offset 0 would make
+    // bytes count twice, or hide a flood from the cutoff. The adapter drops
+    // the stream at it, the session ends, and the live evidence holds only
+    // the bytes the stream carried by the rules.
+    let (harness, ended) = session_with_violation(Violation::RegressingOffset).await;
+    ended.expect_err("a broken protocol ends the session");
+    let live = harness
+        .audit()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            kiln_harness::audit::AuditEvent::ToolCompleted { live, .. } => live.clone(),
+            _ => None,
+        })
+        .expect("live evidence");
+    assert_eq!(live.stdout.delivered_bytes, 3);
+    assert!(!live.stdout.dropped_bytes_known);
+    assert_eq!(live.stopped, None);
+}
+
+/// A model that calls `exec` once, then answers.
+fn exec_then_done() -> Vec<Reply> {
+    let usage = json!({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120});
+    let call = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{\"argv\":[\"/bin/cat\"]}"},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": usage,
+    });
+    let done = json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop",
+        }],
+        "usage": usage,
+    });
+    vec![Reply::json(200, &call), Reply::json(200, &done)]
+}
+
+#[test]
+fn the_cli_prints_live_output_sanitized_only_with_live() {
+    // Escape sequences, a carriage return, a bell, NUL, invalid UTF-8 and
+    // a line the stub splits across two chunks.
+    let hostile = b"plain\n\x1b]0;owned\x07\x1b[2J\rover\0\xff\xc3\xa9 tail\nlast".to_vec();
+    for live in [true, false] {
+        let temp = common::private_tempdir().expect("tempdir");
+        let stub = Stub {
+            health_answers: u32::MAX,
+            stream_stdout: hostile.clone(),
+            ..Stub::default()
+        };
+        let servers = Servers::start(temp.path(), stub, exec_then_done());
+        let mut command = servers.command(temp.path(), "60");
+        if live {
+            command.arg("--live");
+        }
+        let child = command.spawn().expect("start the CLI");
+        let output = exit_within(child, Duration::from_secs(30)).expect("the CLI exits");
+        let stderr = String::from_utf8(output.stderr).expect("stderr is ASCII");
+        assert!(output.status.success(), "{stderr}");
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.starts_with("[call-1-1"))
+            .collect();
+        if live {
+            assert_eq!(
+                lines,
+                [
+                    "[call-1-1 out] plain",
+                    "[call-1-1 out] \\x1b]0;owned\\x07\\x1b[2J\\x0dover\\x00\\xff\\xc3\\xa9 tail",
+                    "[call-1-1 out] last",
+                ],
+                "{stderr}"
+            );
+        } else {
+            assert!(lines.is_empty(), "{stderr}");
+        }
+        // No raw control byte reaches the terminal either way.
+        assert!(
+            !stderr
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\n' && byte != b'\t'),
+            "{stderr:?}"
+        );
+        // Live output is host-only: the journal holds the same result.
+        let journal = std::fs::read_to_string(temp.path().join("out/run.jsonl")).expect("journal");
+        assert!(journal.contains("\"exec_context\":\"workspace_stream_v1\""));
+    }
 }
