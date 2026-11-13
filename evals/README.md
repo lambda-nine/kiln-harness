@@ -91,6 +91,7 @@ Audits and journals go under `--out`, which must not exist.
 | `--task ID` | run only this task; repeatable; an unknown ID is an error |
 | `--trials N` | runs per task, 1 to 100, default 1 |
 | `--concurrency N` | runs at a time, 1 to 8, default 1 |
+| `--max-run-secs N` | longest any run may take, 1 to 21600; caps every task's session timeout, its own included |
 | `--out DIR` | required; must not exist; created with mode 0700 |
 | `--label TEXT` | free text for the report, at most 128 bytes |
 | `--replay` | replay each completed run's journal against a fresh sandbox |
@@ -116,9 +117,14 @@ the effective user is root, a path inside another user's home directory is
 refused; use a root-owned private directory instead, such as one made by
 `sudo mktemp -d`.
 
-Runs start in task ID order and trials 1 to N, up to `--concurrency` at
-once, each with its own sandbox and its own kilnd connection; a new run
-starts as soon as one ends. Lines in `results.jsonl` are in completion
+Runs start longest session timeout first (ties in task ID order) and
+trials 1 to N, up to `--concurrency` at once, each with its own sandbox and
+its own kilnd connection; a new run starts as soon as one ends.
+`--max-run-secs` makes each run's session timeout the smaller of N and the
+task's own (or `--session-timeout-secs`); it must be at least twice every
+task's check timeout, and a run that reaches it ends at the session deadline
+and fails. The report notes the cap, and `eval compare` says when two
+reports differ in it. Lines in `results.jsonl` are in completion
 order, while the report lists tasks and trials in order. Each run holds at
 most one command stream at a time, so 8 stays within kilnd's default cap on
 streams per user; other harness sessions running as the same user at the

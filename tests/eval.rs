@@ -2046,6 +2046,7 @@ fn options(out: &Path, trials: u32, replay: bool) -> SuiteOptions {
         out: out.to_path_buf(),
         trials,
         concurrency: 1,
+        max_run_secs: None,
         replay,
         label: Some("test | run".to_string()),
         base_config: config(),
@@ -3253,6 +3254,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         tasks: strings(tasks),
         trials,
         concurrency: 1,
+        max_run_secs: None,
         replay: true,
         started_unix_ms: 1,
         ended_unix_ms: 2,
@@ -3495,6 +3497,7 @@ fn eval_run_help_lists_the_shared_flags() {
         "--task",
         "--trials",
         "--concurrency",
+        "--max-run-secs",
         "--out",
         "--label",
         "--replay",
@@ -3778,4 +3781,298 @@ async fn a_checked_seeded_session_against_a_current_kilnd_completes() {
         .expiry
         .map(|policy| policy.max_lifetime_ms);
     assert_eq!(lifetime, Some(30_000 + 100 + 60_000));
+}
+
+// ---------------------------------------------------------------------------
+// --max-run-secs and launch order
+
+/// Tasks named `ids`, in that (sorted) order, each with its own session
+/// timeout in seconds, or none.
+fn timed_tasks(root: &Path, timed: &[(&str, Option<u64>)], base: &HarnessConfig) -> Vec<EvalTask> {
+    for (id, secs) in timed {
+        let mut json = task_json(id);
+        if let Some(secs) = secs {
+            json["session_timeout_secs"] = json!(secs);
+        }
+        make_task(root, id, &json, &[]);
+    }
+    load_tasks(root, &[], base).expect("loads")
+}
+
+fn session_timeouts(tasks: &[EvalTask]) -> Vec<Option<u64>> {
+    tasks
+        .iter()
+        .map(|task| task.session_timeout.map(|timeout| timeout.as_secs()))
+        .collect()
+}
+
+#[test]
+fn max_run_secs_caps_each_tasks_session_timeout() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let base = config();
+    let timed = [("a", Some(1500)), ("b", Some(300)), ("c", None)];
+    let original = timed_tasks(&temp.path().join("tasks"), &timed, &base);
+    assert_eq!(base.session_timeout, Duration::from_secs(30));
+
+    let mut tasks = original.clone();
+    eval::cap_run_time(&mut tasks, &base, None).expect("no cap");
+    assert_eq!(tasks, original, "unset changes nothing");
+
+    eval::cap_run_time(&mut tasks, &base, Some(600)).expect("caps");
+    assert_eq!(session_timeouts(&tasks), [Some(600), Some(300), Some(30)]);
+    for (capped, task) in tasks.iter().zip(&original) {
+        assert_eq!(
+            EvalTask {
+                session_timeout: task.session_timeout,
+                ..capped.clone()
+            },
+            *task,
+            "only the session timeout changes"
+        );
+    }
+
+    // A task without its own timeout takes the smaller of the base's and
+    // the cap.
+    let long_base = HarnessConfig {
+        session_timeout: Duration::from_secs(1200),
+        ..config()
+    };
+    let mut tasks = original.clone();
+    eval::cap_run_time(&mut tasks, &long_base, Some(600)).expect("caps");
+    assert_eq!(session_timeouts(&tasks), [Some(600), Some(300), Some(600)]);
+}
+
+#[test]
+fn max_run_secs_out_of_range_or_under_a_check_window_is_refused() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let base = config();
+    let original = timed_tasks(
+        &temp.path().join("tasks"),
+        &[("a", Some(1500)), ("b", None)],
+        &base,
+    );
+    for refused in [0, 6 * 60 * 60 + 1] {
+        let mut tasks = original.clone();
+        let error = eval::cap_run_time(&mut tasks, &base, Some(refused)).expect_err("refused");
+        assert!(matches!(error, EvalError::Options(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "--max-run-secs must be between 1 and 21600"
+        );
+        assert_eq!(tasks, original);
+    }
+    // Each task's check timeout is 10 s, so the cap must be at least 20.
+    let mut tasks = original.clone();
+    let error = eval::cap_run_time(&mut tasks, &base, Some(19)).expect_err("refused");
+    assert_eq!(
+        error.to_string(),
+        "--max-run-secs 19 is less than twice task a's check timeout of 10 s"
+    );
+    assert_eq!(tasks, original, "an error leaves every task unchanged");
+    eval::cap_run_time(&mut tasks, &base, Some(20)).expect("exactly twice is allowed");
+    assert_eq!(session_timeouts(&tasks), [Some(20), Some(20)]);
+}
+
+#[test]
+fn max_run_secs_reaches_the_manifest_report_and_comparison() {
+    let mut capped = manifest(&["a"], 1);
+    capped.max_run_secs = Some(600);
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let base = eval::report(&runs, &manifest(&["a"], 1));
+    let new = eval::report(&runs, &capped);
+    assert_eq!((base.max_run_secs, new.max_run_secs), (None, Some(600)));
+
+    let json = serde_json::to_value(&capped).expect("manifest JSON");
+    assert_eq!(json["max_run_secs"], 600);
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, capped);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    assert_eq!(json["max_run_secs"], 600);
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+
+    // Unset, and in files written before the field existed: no key.
+    let unset = serde_json::to_value(manifest(&["a"], 1)).expect("manifest JSON");
+    assert!(unset.get("max_run_secs").is_none(), "{unset}");
+    let older: Manifest = serde_json::from_value(unset).expect("an older manifest parses");
+    assert_eq!(older.max_run_secs, None);
+    let unset = serde_json::to_value(&base).expect("report JSON");
+    assert!(unset.get("max_run_secs").is_none(), "{unset}");
+    let temp = common::private_tempdir().expect("tempdir");
+    write(
+        &temp.path().join("report.json"),
+        unset.to_string().as_bytes(),
+    );
+    assert_eq!(
+        eval::read_report(temp.path())
+            .expect("an older report reads")
+            .max_run_secs,
+        None
+    );
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown.contains("- Runs at a time: 1\n- Longest run allowed: 600 s\n"),
+        "{markdown}"
+    );
+    assert!(
+        !eval::report_markdown(&base).contains("Longest run"),
+        "unset says nothing"
+    );
+
+    let differing = eval::compare(&base, &new);
+    assert!(
+        differing.ends_with(
+            ").\n\nLongest run allowed differs (none → 600); pass rates and wall times are not \
+             directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    let mut shorter = new.clone();
+    shorter.max_run_secs = Some(300);
+    assert!(
+        eval::compare(&new, &shorter).contains("Longest run allowed differs (600 → 300)"),
+        "both set"
+    );
+    for same in [eval::compare(&base, &base), eval::compare(&new, &new)] {
+        assert!(!same.contains("Longest run"), "{same}");
+    }
+}
+
+#[tokio::test]
+async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = timed_tasks(
+        &temp.path().join("tasks"),
+        &[("a", Some(300)), ("b", Some(1500)), ("c", Some(900))],
+        &config(),
+    );
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let mut progress = Vec::new();
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &options(&out, 2, false),
+        || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
+        &CancellationToken::new(),
+        &mut |result| {
+            progress.push((result.task.clone(), result.trial));
+            Ok(())
+        },
+    )
+    .await
+    .expect("the suite runs");
+
+    // One at a time, so runs end in the order they started.
+    let started = [("b", 1), ("b", 2), ("c", 1), ("c", 2), ("a", 1), ("a", 2)]
+        .map(|(task, trial)| (task.to_string(), trial));
+    assert_eq!(progress, started);
+    let lines = read_lines(&out.join("results.jsonl"))
+        .into_iter()
+        .map(|result| (result.task, result.trial))
+        .collect::<Vec<_>>();
+    assert_eq!(lines, started);
+
+    let canonical = [("a", 1), ("a", 2), ("b", 1), ("b", 2), ("c", 1), ("c", 2)]
+        .map(|(task, trial)| (task.to_string(), trial));
+    let results = summary
+        .results
+        .iter()
+        .map(|result| (result.task.clone(), result.trial))
+        .collect::<Vec<_>>();
+    assert_eq!(results, canonical);
+    let report_tasks = summary
+        .report
+        .tasks
+        .iter()
+        .map(|task| task.task.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(report_tasks, ["a", "b", "c"]);
+    assert_eq!(read_manifest(&out).tasks, ["a", "b", "c"]);
+    assert_eq!(read_manifest(&out).max_run_secs, None);
+    let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
+    let rows = markdown
+        .lines()
+        .filter(|line| line.starts_with("| ") && !line.starts_with("| Task"))
+        .filter_map(|line| line.split(' ').nth(1))
+        .filter(|task| ["a", "b", "c"].contains(task))
+        .collect::<Vec<_>>();
+    assert_eq!(rows, ["a", "b", "c"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_capped_run_ends_at_the_deadline_and_fails() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let mut tasks = timed_tasks(&temp.path().join("tasks"), &[("a", Some(1500))], &config());
+    eval::cap_run_time(&mut tasks, &config(), Some(20)).expect("caps");
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let seen = Seen::default();
+    let started = Instant::now();
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &SuiteOptions {
+            max_run_secs: Some(20),
+            ..options(&out, 1, false)
+        },
+        || {
+            // Slower than the cap, well inside the task's own 1500 s.
+            let mut slow = Observing::new(&api, &seen, vec![ModelResponse::final_text("done")]);
+            slow.delay = Duration::from_secs(60);
+            Ok(slow)
+        },
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite runs");
+
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    let [result] = &summary.results[..] else {
+        panic!("one run: {:?}", summary.results);
+    };
+    assert_eq!(result.outcome, "deadline", "{result:?}");
+    assert!(!result.passed());
+    assert_eq!(summary.report.overall.passed, 0);
+    assert_eq!(read_manifest(&out).max_run_secs, Some(20));
+}
+
+#[test]
+fn eval_run_refuses_an_out_of_range_max_run_secs_before_contacting_anything() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tasks");
+    let out = temp.path().join("out");
+    for max_run_secs in ["0", "21601"] {
+        let output = cli(&[
+            "--socket",
+            temp.path().join("no.sock").to_str().expect("utf-8"),
+            "eval",
+            "run",
+            "--provider",
+            "openai-compat",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--model",
+            "m",
+            "--tasks",
+            tasks.to_str().expect("utf-8"),
+            "--max-run-secs",
+            max_run_secs,
+            "--out",
+            out.to_str().expect("utf-8"),
+        ]);
+        assert!(!output.status.success(), "{max_run_secs}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--max-run-secs must be between 1 and 21600"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("no.sock"), "{stderr}");
+        assert!(!out.exists());
+    }
 }

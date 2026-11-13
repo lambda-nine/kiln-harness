@@ -1302,10 +1302,17 @@ Model-turn divergence is unchanged.
 `eval run` loads and validates every task before anything runs, refuses an
 existing `--out`, reads kilnd's Health once for the manifest's feature list,
 then creates `--out` with mode 0700 through the same descriptor walk as the
-journal. Runs start in task ID order and trials 1 to N, each with a fresh
-provider and its own sandbox, up to `--concurrency` (1 to 8, default 1) at
-once, all polled within the suite's own task. Each running run holds its own
-kilnd connection: kilnd caps every connection's HTTP/2 streams, and an
+journal. Runs start longest session timeout first (ties in task ID order),
+trials 1 to N, each with a fresh provider and its own sandbox, up to
+`--concurrency` (1 to 8, default 1) at once, all polled within the suite's
+own task, so the runs most likely to be long are not left until last.
+`--max-run-secs N` caps every task's session timeout at N seconds before
+anything runs (the smaller of N and the task's own, or the command line's),
+and is refused when it is under twice any task's check timeout; a run that
+reaches it ends at the session deadline and fails, and the cap is part of
+the journal's recorded limits, so a replay runs under it too. Each running
+run holds its own kilnd connection: kilnd caps every connection's HTTP/2
+streams, and an
 `ExecStream` holds one for its whole life, so eight runs on one connection
 would sit at that cap. Connections are pooled and reused, and one is opened
 only when none is idle, so one run at a time never opens a second. Each run
@@ -1314,7 +1321,8 @@ per-user stream cap. Each run's results line is built from its journal
 (session ID, outcome, steps, tool calls, usage, check, truncation
 recoveries) and appended to `results.jsonl` as soon as the run ends, in
 completion order; the summary and reports are in task and trial order, and
-the manifest and report record `concurrency` (a file without it reads as 1).
+the manifest and report record `concurrency` (a file without it reads as 1)
+and `max_run_secs` (absent when unset).
 `truncation_recoveries` is always written, and a line without it reads as 0.
 With `--replay`, a completed run is replayed against a fresh sandbox right
 after it, on the same connection. The suite fails closed: a run or replay

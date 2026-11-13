@@ -262,6 +262,12 @@ struct EvalRunArgs {
     /// most one command stream, within kilnd's default of 8 streams per user.
     #[arg(long, default_value_t = 1)]
     concurrency: u32,
+    /// Longest any run may take, in seconds, sandbox creation and the check
+    /// included: each run's session timeout becomes the smaller of this and
+    /// the task's own (or --session-timeout-secs). A run that reaches it ends
+    /// at the session deadline and fails. Unset, runs keep their own limits.
+    #[arg(long)]
+    max_run_secs: Option<u64>,
     /// New directory for every run's audit and journal, the results and
     /// the report; must not exist.
     #[arg(long)]
@@ -1061,10 +1067,11 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
     let config = model_config(&args.model)?;
     eval::validate_trials_and_label(args.trials, args.label.as_deref())?;
     eval::validate_concurrency(args.concurrency)?;
-    let tasks = eval::load_tasks(&args.tasks, &args.only, &config)?;
+    let mut tasks = eval::load_tasks(&args.tasks, &args.only, &config)?;
     if tasks.is_empty() {
         bail!("{} holds no tasks", args.tasks.display());
     }
+    eval::cap_run_time(&mut tasks, &config, args.max_run_secs)?;
     let provider = build_provider(&args.model)?.info();
     eval::refuse_existing_out(&args.out)?;
     let api = connect(socket).await?;
@@ -1072,6 +1079,7 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
         out: args.out.clone(),
         trials: args.trials,
         concurrency: args.concurrency,
+        max_run_secs: args.max_run_secs,
         replay: args.replay,
         label: args.label.clone(),
         base_config: config,

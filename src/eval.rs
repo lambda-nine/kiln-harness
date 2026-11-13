@@ -537,6 +537,9 @@ pub struct Manifest {
     /// Runs at a time; missing in older manifests, which ran one.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
+    /// `--max-run-secs`; missing when unset and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_secs: Option<u64>,
     pub replay: bool,
     pub started_unix_ms: u64,
     pub ended_unix_ms: u64,
@@ -647,6 +650,9 @@ pub struct Report {
     /// Runs at a time; missing in older reports, which ran one.
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
+    /// `--max-run-secs`; missing when unset and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_secs: Option<u64>,
     pub stopped: Option<String>,
     pub tasks: Vec<TaskReport>,
     pub overall: OverallReport,
@@ -735,6 +741,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         model: manifest.model.clone(),
         trials: manifest.trials,
         concurrency: manifest.concurrency,
+        max_run_secs: manifest.max_run_secs,
         stopped: manifest.stopped.clone(),
         overall: OverallReport {
             tasks: u32::try_from(tasks.len()).unwrap_or(u32::MAX),
@@ -795,6 +802,9 @@ pub fn report_markdown(report: &Report) -> String {
     }
     let _ = writeln!(text, "- Trials per task: {}", report.trials);
     let _ = writeln!(text, "- Runs at a time: {}", report.concurrency);
+    if let Some(secs) = report.max_run_secs {
+        let _ = writeln!(text, "- Longest run allowed: {secs} s");
+    }
     if let Some(stopped) = &report.stopped {
         let _ = writeln!(text, "- Stopped early: {}", cell(stopped));
     }
@@ -963,6 +973,17 @@ pub fn compare(base: &Report, new: &Report) -> String {
             base.concurrency, new.concurrency
         );
     }
+    if base.max_run_secs != new.max_run_secs {
+        let secs =
+            |secs: Option<u64>| secs.map_or_else(|| "none".to_string(), |secs| secs.to_string());
+        let _ = writeln!(
+            text,
+            "\nLongest run allowed differs ({} → {}); pass rates and wall times are not directly \
+             comparable.",
+            secs(base.max_run_secs),
+            secs(new.max_run_secs)
+        );
+    }
     text
 }
 
@@ -996,6 +1017,9 @@ pub struct SuiteOptions {
     pub trials: u32,
     /// Runs at a time, 1 to [`MAX_CONCURRENCY`].
     pub concurrency: u32,
+    /// --max-run-secs, recorded in the manifest; the cap itself is already
+    /// in each task's session timeout.
+    pub max_run_secs: Option<u64>,
     pub replay: bool,
     pub label: Option<String>,
     /// The run limits before each task's overrides.
@@ -1031,6 +1055,52 @@ pub fn validate_concurrency(concurrency: u32) -> Result<(), EvalError> {
             "--concurrency must be between 1 and {MAX_CONCURRENCY}"
         )))
     }
+}
+
+/// Cap every task's session timeout at `cap` seconds (`--max-run-secs`):
+/// each becomes the smaller of `cap` and its own, or `base`'s when it has
+/// none. `None` changes nothing.
+///
+/// # Errors
+///
+/// [`EvalError::Options`] when `cap` is 0 or above [`MAX_SESSION_TIMEOUT`],
+/// or is less than twice a task's check timeout (naming the task); the
+/// tasks are then unchanged.
+pub fn cap_run_time(
+    tasks: &mut [EvalTask],
+    base: &HarnessConfig,
+    cap: Option<u64>,
+) -> Result<(), EvalError> {
+    let Some(cap) = cap else {
+        return Ok(());
+    };
+    if !(1..=MAX_SESSION_TIMEOUT.as_secs()).contains(&cap) {
+        return Err(EvalError::Options(format!(
+            "--max-run-secs must be between 1 and {}",
+            MAX_SESSION_TIMEOUT.as_secs()
+        )));
+    }
+    let limit = Duration::from_secs(cap);
+    // Every task is checked before any is changed.
+    let capped = tasks
+        .iter()
+        .map(|task| {
+            let capped = task.config(base).session_timeout.min(limit);
+            if task.check.timeout.saturating_mul(2) > capped {
+                Err(EvalError::Options(format!(
+                    "--max-run-secs {cap} is less than twice task {}'s check timeout of {} s",
+                    task.id,
+                    task.check.timeout.as_secs()
+                )))
+            } else {
+                Ok(capped)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (task, capped) in tasks.iter_mut().zip(capped) {
+        task.session_timeout = Some(capped);
+    }
+    Ok(())
 }
 
 /// `--trials` must be 1 to [`MAX_TRIALS`], and `--label` at most
@@ -1169,11 +1239,13 @@ fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
 
 /// Run every task `trials` times against providers from `provider`, up to
 /// `options.concurrency` runs at once, each in its own sandbox. Runs start
-/// in task order and trials 1 to N, and a new one starts as soon as one
-/// finishes. Each running run holds its own kilnd connection: kilnd caps
-/// every connection's HTTP/2 streams and an `ExecStream` holds one for its
-/// whole life, so connections are pooled, reused by later runs, and opened
-/// only when none is idle; one run at a time never opens a second.
+/// longest session timeout first (ties in task order), trials 1 to N, so
+/// the runs most likely to be long start before the short ones, and a new
+/// one starts as soon as one finishes. Each running run holds its own kilnd
+/// connection: kilnd caps every connection's HTTP/2 streams and an
+/// `ExecStream` holds one for its whole life, so connections are pooled,
+/// reused by later runs, and opened only when none is idle; one run at a
+/// time never opens a second.
 ///
 /// Each run writes `OUT/runs/<id>/<trial>/audit.jsonl` and `journal.jsonl`
 /// (with `replay`, a replay of that journal against a fresh sandbox writes
@@ -1238,10 +1310,16 @@ where
     // Every stop cancels this token, never the caller's, so the runs in
     // flight stop and clean up while the suite tells the stops apart.
     let runs_cancel = cancel.child_token();
-    let mut queue = tasks
-        .iter()
-        .enumerate()
-        .flat_map(|(index, task)| (1..=options.trials).map(move |trial| (index, task, trial)));
+    // Longest budget first; the sort is stable, so ties keep task order.
+    // `index` stays the task's place in `tasks`, which orders the results.
+    let mut order: Vec<usize> = (0..tasks.len()).collect();
+    order.sort_by_key(|&index| {
+        std::cmp::Reverse(tasks[index].config(&options.base_config).session_timeout)
+    });
+    let mut queue = order.into_iter().flat_map(|index| {
+        let task = &tasks[index];
+        (1..=options.trials).map(move |trial| (index, task, trial))
+    });
     let mut idle: Vec<A> = vec![api.clone()];
     let mut running = FuturesUnordered::new();
     let mut finished: Vec<(usize, u32, RunResult)> = Vec::new();
@@ -1352,6 +1430,7 @@ where
         tasks: tasks.iter().map(|task| task.id.clone()).collect(),
         trials: options.trials,
         concurrency: options.concurrency,
+        max_run_secs: options.max_run_secs,
         replay: options.replay,
         started_unix_ms,
         ended_unix_ms: unix_ms(),

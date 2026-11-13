@@ -6,6 +6,16 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `eval run --max-run-secs N` (1 to 21600) caps every run's session timeout
+  at N seconds, sandbox creation and the check included, even for tasks
+  whose `task.json` sets a longer one; it is refused before anything runs
+  when it is under twice any task's check timeout. A run that reaches it
+  ends at the session deadline and fails. Runs now start longest session
+  timeout first (ties in task order, trials 1 to N), so long runs no longer
+  start last; the report still lists tasks in order. `manifest.json` and
+  `report.json` gain `max_run_secs` (absent when unset and in older files),
+  `report.md` prints the longest run allowed, and `eval compare` notes when
+  two reports differ in it.
 - `eval run --concurrency N` (1 to 8, default 1) runs up to N runs at once,
   each with its own sandbox and its own kilnd connection, and starts the
   next as soon as one ends; one at a time behaves as before. Lines in
