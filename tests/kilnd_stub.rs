@@ -1623,6 +1623,7 @@ fn eval_run_with_a_closed_stdout_stops_and_cleans_up_every_run() {
     assert!(report.get("effort").is_none(), "{report}");
     assert!(report.get("clear_thinking").is_none(), "{report}");
     assert_eq!(report["max_output_tokens"], 16_384, "{report}");
+    assert_unpriced(&out, &report);
     let stopped = report["stopped"].as_str().expect("stopped");
     assert!(stopped.starts_with("progress output: "), "{stopped}");
     let lines = std::fs::read_to_string(out.join("results.jsonl")).expect("results");
@@ -1630,6 +1631,7 @@ fn eval_run_with_a_closed_stdout_stops_and_cleans_up_every_run() {
         .lines()
         .map(|line| {
             let line: serde_json::Value = serde_json::from_str(line).expect("result line");
+            assert!(line.get("cost_micro_usd").is_none(), "{line}");
             line["outcome"].as_str().expect("outcome").to_string()
         })
         .collect::<Vec<_>>();
@@ -1649,9 +1651,128 @@ fn eval_run_with_a_closed_stdout_stops_and_cleans_up_every_run() {
     assert!(deleted.load(Ordering::SeqCst) >= 3);
 }
 
+/// An openai-compat suite in `out` has no price table: unpriced, with the
+/// reason, no cost anywhere, and `eval cost` refuses it.
+fn assert_unpriced(out: &Path, report: &serde_json::Value) {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).expect("manifest"))
+            .expect("manifest JSON");
+    for value in [&manifest, report] {
+        assert_eq!(
+            value["unpriced_reason"], "openai-compat has no price table",
+            "{value}"
+        );
+    }
+    assert!(manifest.get("pricing").is_none(), "{manifest}");
+    assert!(report.get("pricing_version").is_none(), "{report}");
+    assert!(
+        report["overall"]["totals"].get("cost_micro_usd").is_none(),
+        "{report}"
+    );
+    let markdown = std::fs::read_to_string(out.join("report.md")).expect("report.md");
+    assert!(
+        markdown.contains("- Cost: unpriced (openai-compat has no price table)\n"),
+        "{markdown}"
+    );
+    let cost = eval_cost(out);
+    assert!(!cost.status.success());
+    assert!(
+        String::from_utf8_lossy(&cost.stderr).contains("openai-compat has no price table"),
+        "{cost:?}"
+    );
+    assert!(cost.stdout.is_empty(), "{cost:?}");
+}
+
+/// The Haiku 5.5 suite in `out`, one response with a 125,000-token prompt,
+/// is priced on the long-prompt card in its results, manifest and reports,
+/// `eval cost` reproduces the total, and refuses an edited journal.
+fn assert_priced_and_repriced(out: &Path, markdown: &str) {
+    // Per million: 2,000 × $0.50 + 3,000 × $0.625 + 120,000 × $0.05 +
+    // 2,000 × $2.50 = 1,000 + 1,875 + 6,000 + 5,000 micro-dollars.
+    let micro = 13_875;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("manifest.json")).expect("manifest"))
+            .expect("manifest JSON");
+    assert_eq!(manifest["pricing"]["version"], "2026-11-13", "{manifest}");
+    assert_eq!(
+        manifest["pricing"]["model"], "claude-haiku-5-5",
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["pricing"]["long_prompt"]["rates"]["cache_read"], 50_000,
+        "{manifest}"
+    );
+    assert!(manifest.get("unpriced_reason").is_none(), "{manifest}");
+    let lines = std::fs::read_to_string(out.join("results.jsonl")).expect("results");
+    let results = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("result line"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["cost_micro_usd"], micro, "{}", results[0]);
+    assert_eq!(results[0]["long_prompt_requests"], 1, "{}", results[0]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("report.json")).expect("report"))
+            .expect("report JSON");
+    assert_eq!(report["overall"]["totals"]["cost_micro_usd"], micro);
+    assert_eq!(report["pricing_version"], "2026-11-13");
+    let sentence = "Cost: $0.0139 ($0.0139 per passed run; 1 response on the long-prompt \
+                    rate).\n";
+    assert!(
+        markdown.contains(
+            "- Model limits: 1000000-token context, 128000 output tokens; prices as of \
+             2026-11-13\n"
+        ),
+        "{markdown}"
+    );
+    assert!(
+        markdown.ends_with(&format!(" ms. {sentence}")),
+        "{markdown}"
+    );
+
+    // `eval cost` prices the journals again to the same total, with no
+    // kilnd to talk to.
+    let cost = eval_cost(out);
+    let text = String::from_utf8_lossy(&cost.stdout);
+    assert!(cost.status.success(), "{cost:?}");
+    assert!(
+        text.contains("| say-done | 1 | 1 | $0.0139 | 1 |"),
+        "{text}"
+    );
+    assert!(text.ends_with(&format!("\n{sentence}")), "{text}");
+
+    // A journal edited after the run is refused, naming the run.
+    let journal = out.join("runs/say-done/1/journal.jsonl");
+    let recorded_journal = std::fs::read_to_string(&journal).expect("journal");
+    let needle = "\"cache_read_input_tokens\":120000";
+    assert!(recorded_journal.contains(needle), "{recorded_journal}");
+    std::fs::write(
+        &journal,
+        recorded_journal.replace(needle, "\"cache_read_input_tokens\":1"),
+    )
+    .expect("tamper");
+    let cost = eval_cost(out);
+    let stderr = String::from_utf8_lossy(&cost.stderr);
+    assert!(!cost.status.success(), "{cost:?}");
+    assert!(stderr.contains("task say-done trial 1: "), "{stderr}");
+    assert!(cost.stdout.is_empty(), "{cost:?}");
+}
+
+/// `eval cost DIR`, with a socket that does not exist: it never needs one.
+fn eval_cost(dir: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+        .arg("--socket")
+        .arg(dir.join("no-kilnd.sock"))
+        .args(["eval", "cost"])
+        .arg(dir)
+        .output()
+        .expect("run eval cost")
+}
+
 /// `eval run --provider anthropic` records the effort it sent, its thinking
 /// clearing, and the output limit per response in the manifest and both
-/// reports.
+/// reports, and prices each response at the model's list prices, which
+/// `eval cost` reproduces from the journals.
 #[test]
 fn eval_run_records_the_effort_clearing_and_output_limit() {
     for (clearing, recorded) in [(&[][..], "off"), (&["--clear-thinking", "2"][..], "keep 2")] {
@@ -1681,7 +1802,9 @@ fn eval_run_records_the_effort_clearing_and_output_limit() {
             "content": [{"type": "text", "text": "done"}],
             "stop_reason": "end_turn",
             "stop_details": null,
-            "usage": common::anthropic::live_usage(100, 20, 0, 0),
+            // A 125,000-token prompt, mostly cache reads: Haiku 5.5's long
+            // card on every category.
+            "usage": common::anthropic::live_usage(2_000, 2_000, 120_000, 3_000),
         });
         let servers = Servers::start(temp.path(), stub, vec![Reply::json(200, &message)]);
         let out = temp.path().join("out/eval");
@@ -1724,5 +1847,7 @@ fn eval_run_records_the_effort_clearing_and_output_limit() {
             )),
             "{markdown}"
         );
+
+        assert_priced_and_repriced(&out, &markdown);
     }
 }

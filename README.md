@@ -384,8 +384,11 @@ milliseconds, the unit the journal records.
 seeded workspace, a prompt, and a check script the model never sees, run in
 the sandbox after the final answer. `eval selftest` proves every check against
 kilnd with no model, `eval run` runs the suite N times against one provider
-(optionally replaying each journal) and writes a per-model report, and
-`eval compare` diffs two reports. See [evals/README.md](evals/README.md).
+(optionally replaying each journal) and writes a per-model report with an
+estimated list-price cost (or "unpriced" with the reason, for openai-compat,
+a model without prices, or `--fallbacks`), `eval compare` diffs two reports,
+and `eval cost` prices a finished run again from its journals. See
+[evals/README.md](evals/README.md).
 
 ## Checks
 

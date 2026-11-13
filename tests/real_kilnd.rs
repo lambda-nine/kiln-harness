@@ -642,6 +642,8 @@ async fn concurrent_eval_runs_stream_side_by_side_through_installed_kilnd() {
         max_run_secs: None,
         effort: None,
         clear_thinking: None,
+        pricing: None,
+        unpriced_reason: None,
         replay: false,
         label: None,
         base_config: config,

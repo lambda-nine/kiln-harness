@@ -24,6 +24,7 @@ use kiln_harness::journal::{
     read_open_journal,
 };
 use kiln_harness::live::TerminalLive;
+use kiln_harness::pricing::{self, ModelPricing};
 use kiln_harness::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, Usage,
 };
@@ -39,7 +40,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser)]
 #[command(version, about = "Provider-neutral AI harness over kilnd.v1")]
 struct Cli {
-    /// kilnd's Unix socket (unused by `journal verify`).
+    /// kilnd's Unix socket (unused by `journal verify`, `eval compare` and
+    /// `eval cost`).
     #[arg(long, default_value = "/run/kilnd/kilnd.sock", global = true)]
     socket: PathBuf,
     #[command(subcommand)]
@@ -234,6 +236,12 @@ enum EvalCommand {
         /// Output directory of the new run.
         new: PathBuf,
     },
+    /// Price a finished eval run from its journals with the current price
+    /// table, as Markdown on stdout.
+    Cost {
+        /// Output directory of the run.
+        dir: PathBuf,
+    },
     /// Prove each task's check: it fails on the bare seed and passes after
     /// the reference solution, through the real engine with a scripted
     /// model; no network provider is built.
@@ -332,6 +340,9 @@ async fn main() -> Result<ExitCode> {
         Command::Eval {
             command: EvalCommand::Compare { base, new },
         } => eval_compare(&base, &new),
+        Command::Eval {
+            command: EvalCommand::Cost { dir },
+        } => eval_cost(&dir),
         Command::Eval {
             command: EvalCommand::Selftest { tasks, only, out },
         } => eval_selftest(cli.socket, &tasks, &only, &out).await,
@@ -483,6 +494,16 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         args.max_output_tokens,
         MAX_OUTPUT_TOKENS_PER_REQUEST,
     )?;
+    if let Some(model) = model_metadata(args)
+        && args.max_output_tokens > model.max_output_tokens
+    {
+        bail!(
+            "--max-output-tokens {} exceeds {}'s {}-token output limit",
+            args.max_output_tokens,
+            model.model,
+            model.max_output_tokens
+        );
+    }
     if args.max_truncation_recoveries > MAX_TRUNCATION_RECOVERIES {
         bail!("--max-truncation-recoveries must be between 0 and {MAX_TRUNCATION_RECOVERIES}");
     }
@@ -533,6 +554,34 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
     };
     config.validate()?;
     Ok(config)
+}
+
+/// The table entry for the model the flags ask for: only Anthropic's
+/// models are in the table, so `None` for openai-compat whatever its model
+/// is called, and for a model the table does not list.
+fn model_metadata(args: &ModelArgs) -> Option<&'static ModelPricing> {
+    match args.provider {
+        ProviderKind::Anthropic => pricing::lookup(args.model.as_deref().unwrap_or(DEFAULT_MODEL)),
+        ProviderKind::OpenAiCompat => None,
+    }
+}
+
+/// The prices `eval run` estimates cost at, or why it cannot: openai-compat
+/// has no table, a model the table does not list has no prices, and with
+/// `--fallbacks` another model may serve, and bill, a turn.
+fn suite_pricing(args: &ModelArgs) -> (Option<&'static ModelPricing>, Option<String>) {
+    let unpriced = |reason: String| (None, Some(reason));
+    match args.provider {
+        ProviderKind::OpenAiCompat => unpriced("openai-compat has no price table".to_string()),
+        ProviderKind::Anthropic => match model_metadata(args) {
+            None => unpriced(format!(
+                "no price table for {}",
+                args.model.as_deref().unwrap_or(DEFAULT_MODEL)
+            )),
+            Some(_) if args.fallbacks => unpriced("--fallbacks may bill another model".to_string()),
+            Some(pricing) => (Some(pricing), None),
+        },
+    }
 }
 
 /// The base URL's host alone, for the eval manifest: never a user,
@@ -1081,6 +1130,7 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
     eval::check_run_cap(&tasks, &config, args.max_run_secs)?;
     let provider = build_provider(&args.model)?.info();
     eval::refuse_existing_out(&args.out)?;
+    let (pricing, unpriced_reason) = suite_pricing(&args.model);
     let api = connect(socket).await?;
     let options = eval::SuiteOptions {
         out: args.out.clone(),
@@ -1099,6 +1149,8 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
             ),
             ProviderKind::OpenAiCompat => None,
         },
+        pricing,
+        unpriced_reason,
         replay: args.replay,
         label: args.label.clone(),
         base_config: config,
@@ -1229,6 +1281,21 @@ fn eval_compare(base: &Path, new: &Path) -> Result<ExitCode> {
     let base = eval::read_report(base)?;
     let new = eval::read_report(new)?;
     print!("{}", eval::compare(&base, &new));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Price a finished run again from its journals. Like `compare`, it reads
+/// files only and never contacts kilnd.
+fn eval_cost(dir: &Path) -> Result<ExitCode> {
+    let manifest = eval::read_manifest(dir)?;
+    if manifest.provider != "anthropic" {
+        bail!("{} has no price table", terminal_safe(&manifest.provider));
+    }
+    let Some(pricing) = pricing::lookup(&manifest.model) else {
+        bail!("no price table for {}", terminal_safe(&manifest.model));
+    };
+    let summary = eval::reprice(dir, pricing)?;
+    print!("{}", summary.markdown());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1375,6 +1442,70 @@ mod tests {
                 "--max-truncation-recoveries must be between 0 and 16"
             );
         }
+    }
+
+    fn run_model_args(extra: &[&str]) -> ModelArgs {
+        let mut argv = vec!["kiln-harness", "run", "--prompt", "x"];
+        argv.extend(extra);
+        match Cli::parse_from(argv).command {
+            Command::Run(run) => run.model,
+            _ => panic!("parsed as run"),
+        }
+    }
+
+    #[test]
+    fn eval_runs_are_priced_only_at_a_listed_model_without_fallbacks() {
+        let pricing = |extra: &[&str]| {
+            let (pricing, reason) = suite_pricing(&run_model_args(extra));
+            (pricing.map(|pricing| pricing.model), reason)
+        };
+        assert_eq!(
+            pricing(&["--provider", "anthropic"]),
+            (Some("claude-opus-5-5"), None)
+        );
+        assert_eq!(
+            pricing(&["--provider", "anthropic", "--model", "claude-haiku-5-5"]),
+            (Some("claude-haiku-5-5"), None)
+        );
+        assert_eq!(
+            pricing(&["--provider", "anthropic", "--model", "claude-haiku-4-5"]),
+            (
+                None,
+                Some("no price table for claude-haiku-4-5".to_string())
+            )
+        );
+        assert_eq!(
+            pricing(&["--provider", "anthropic", "--fallbacks"]),
+            (None, Some("--fallbacks may bill another model".to_string()))
+        );
+        // A served model's name does not make openai-compat priced.
+        let compat = [
+            "--provider",
+            "openai-compat",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--model",
+            "claude-haiku-5-5",
+        ];
+        assert_eq!(
+            pricing(&compat),
+            (None, Some("openai-compat has no price table".to_string()))
+        );
+        assert_eq!(model_metadata(&run_model_args(&compat)), None);
+        // The output limit still holds with --fallbacks: it is the
+        // requested model's.
+        let error = model_config(&run_model_args(&[
+            "--provider",
+            "anthropic",
+            "--fallbacks",
+            "--max-output-tokens",
+            "128001",
+        ]))
+        .expect_err("over the model's limit");
+        assert_eq!(
+            error.to_string(),
+            "--max-output-tokens 128001 exceeds claude-opus-5-5's 128000-token output limit"
+        );
     }
 
     #[test]

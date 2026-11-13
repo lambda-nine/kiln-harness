@@ -522,3 +522,63 @@ fn keyless_anthropic_needs_a_proxy_and_may_use_plain_http() {
         .output();
     refused(dir, &keyed, "requires an https base URL");
 }
+
+#[test]
+fn an_output_limit_over_the_models_own_is_refused() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    // Over the listed model's 128,000: refused before any connection, with
+    // the model and its limit named.
+    let over = Run::anthropic(dir)
+        .env("KILN_TEST_KEY", SENTINEL_KEY)
+        .arg("--prompt", "hi")
+        .arg("--base-url", "https://models.example.com")
+        .arg("--model", "claude-haiku-5-5")
+        .arg("--max-output-tokens", "128001")
+        .output();
+    refused(
+        dir,
+        &over,
+        "--max-output-tokens 128001 exceeds claude-haiku-5-5's 128000-token output limit",
+    );
+    assert!(
+        !stderr(&over).contains("no-kilnd.sock"),
+        "{}",
+        stderr(&over)
+    );
+
+    // At the limit, and above it for models the table does not list, only
+    // the absent socket stops the run.
+    let reaches_kilnd = |run: Run<'_>| {
+        let output = run.output();
+        let text = stderr(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(!text.contains("exceeds"), "{text}");
+        assert!(!text.contains("must be between"), "{text}");
+        assert!(
+            text.to_lowercase().contains("connect") || text.contains("no-kilnd.sock"),
+            "{text}"
+        );
+    };
+    reaches_kilnd(
+        Run::anthropic(dir)
+            .env("KILN_TEST_KEY", SENTINEL_KEY)
+            .arg("--prompt", "hi")
+            .arg("--base-url", "https://models.example.com")
+            .arg("--model", "claude-haiku-5-5")
+            .arg("--max-output-tokens", "128000"),
+    );
+    reaches_kilnd(
+        Run::anthropic(dir)
+            .env("KILN_TEST_KEY", SENTINEL_KEY)
+            .arg("--prompt", "hi")
+            .arg("--base-url", "https://models.example.com")
+            .arg("--model", "claude-unlisted-9")
+            .arg("--max-output-tokens", "500000"),
+    );
+    reaches_kilnd(
+        Run::new(dir)
+            .arg("--prompt", "hi")
+            .arg("--max-output-tokens", "500000"),
+    );
+}

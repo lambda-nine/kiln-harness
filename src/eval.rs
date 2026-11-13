@@ -32,6 +32,7 @@ use crate::engine::{
 };
 use crate::files::{InputFileError, read_regular_file};
 use crate::journal::{JournalEvent, JsonlJournal, LoadedJournal, read_journal};
+use crate::pricing::{ModelPricing, PricingRecord, dollars, picodollars_to_micro};
 use crate::provider::{ModelResponse, Provider, ProviderInfo, ScriptedProvider, ToolCall};
 use crate::providers::default_system_prompt;
 use crate::replay::ReplayProvider;
@@ -519,6 +520,14 @@ pub struct RunResult {
     /// Truncated responses the session discarded and went on from.
     #[serde(default)]
     pub truncation_recoveries: u32,
+    /// The estimated list-price cost of the run's model responses, in USD
+    /// micro-dollars: `Some` exactly when the suite was priced, 0 for a run
+    /// that never reached the model; missing otherwise and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
+    /// Of the run's model responses, those priced on a long-prompt card.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub long_prompt_requests: u32,
     /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`; `None`
     /// without `--replay` or for a run that did not complete.
     pub replay: Option<String>,
@@ -564,6 +573,13 @@ pub struct Manifest {
     /// missing in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// The price table version, model limits and rates the runs were priced
+    /// with; missing when unpriced and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<PricingRecord>,
+    /// Why the runs were not priced; missing when priced and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_reason: Option<String>,
     pub replay: bool,
     pub started_unix_ms: u64,
     pub ended_unix_ms: u64,
@@ -622,6 +638,13 @@ pub struct TaskReport {
     pub input_tokens: Stat,
     pub output_tokens: Stat,
     pub wall_ms: Stat,
+    /// Of the runs' cost in USD micro-dollars; missing unless the task has
+    /// runs and every one of them was priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<Stat>,
+    /// Responses priced on a long-prompt card, over every run.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub long_prompt_requests: u32,
     pub replay_matched: u32,
     /// Diverged at a turn or at the check.
     pub replay_diverged: u32,
@@ -636,6 +659,10 @@ pub struct Totals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub wall_ms: u64,
+    /// USD micro-dollars; missing unless there is a run and every run was
+    /// priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
 }
 
 /// Means over every run; `None` without runs.
@@ -646,6 +673,9 @@ pub struct Means {
     pub input_tokens: Option<f64>,
     pub output_tokens: Option<f64>,
     pub wall_ms: Option<f64>,
+    /// USD micro-dollars; `None` unless [`Totals::cost_micro_usd`] is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -661,6 +691,13 @@ pub struct OverallReport {
     pub trials: u32,
     pub totals: Totals,
     pub means: Means,
+    /// Total cost over passed runs, in USD micro-dollars; `None` when
+    /// unpriced or nothing passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_pass_micro_usd: Option<f64>,
+    /// Responses priced on a long-prompt card, over every run.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub long_prompt_requests: u32,
 }
 
 /// `report.json`.
@@ -686,6 +723,19 @@ pub struct Report {
     /// As in [`Manifest::max_output_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// The price table version of [`Manifest::pricing`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_version: Option<String>,
+    /// As in [`Manifest::unpriced_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_reason: Option<String>,
+    /// The model's context window in tokens, from [`Manifest::pricing`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// The model's own output limit per response, from
+    /// [`Manifest::pricing`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_max_output_tokens: Option<u32>,
     pub stopped: Option<String>,
     pub tasks: Vec<TaskReport>,
     pub overall: OverallReport,
@@ -694,6 +744,12 @@ pub struct Report {
 /// What a manifest or report without `concurrency` ran at.
 fn default_concurrency() -> u32 {
     1
+}
+
+/// Counters written only when nonzero.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -706,9 +762,83 @@ fn mean_of(total: u64, count: u32) -> Option<f64> {
     (count > 0).then(|| total as f64 / f64::from(count))
 }
 
+impl Means {
+    /// `totals` over `runs` runs.
+    fn of(totals: &Totals, runs: u32) -> Self {
+        Self {
+            steps: mean_of(totals.steps, runs),
+            tool_calls: mean_of(totals.tool_calls, runs),
+            input_tokens: mean_of(totals.input_tokens, runs),
+            output_tokens: mean_of(totals.output_tokens, runs),
+            wall_ms: mean_of(totals.wall_ms, runs),
+            cost_micro_usd: totals.cost_micro_usd.and_then(|total| mean_of(total, runs)),
+        }
+    }
+}
+
+/// Every run's cost, or `None` if any run is unpriced, and the long-prompt
+/// responses over them.
+fn run_costs(runs: &[&RunResult]) -> (Option<Vec<u64>>, u32) {
+    let costs = runs.iter().map(|result| result.cost_micro_usd).collect();
+    let long = runs.iter().fold(0u32, |sum, result| {
+        sum.saturating_add(result.long_prompt_requests)
+    });
+    (costs, long)
+}
+
+/// One task's report from its runs, each added to `totals`.
+fn task_report(id: &str, mine: &[&RunResult], totals: &mut Totals) -> TaskReport {
+    let count = u32::try_from(mine.len()).unwrap_or(u32::MAX);
+    let task_passed =
+        u32::try_from(mine.iter().filter(|result| result.passed()).count()).unwrap_or(0);
+    let mut outcomes = BTreeMap::new();
+    let mut replay = (0u32, 0u32, 0u32);
+    for result in mine {
+        *outcomes.entry(result.outcome.clone()).or_insert(0) += 1;
+        match result.replay.as_deref() {
+            Some("matched") => replay.0 += 1,
+            Some(status) if status.starts_with("diverged") => replay.1 += 1,
+            Some(_) => replay.2 += 1,
+            None => {}
+        }
+        totals.steps += u64::from(result.steps);
+        totals.tool_calls += u64::from(result.tool_calls);
+        totals.input_tokens = totals.input_tokens.saturating_add(result.input_tokens);
+        totals.output_tokens = totals.output_tokens.saturating_add(result.output_tokens);
+        totals.wall_ms = totals.wall_ms.saturating_add(result.wall_ms);
+    }
+    let column = |value: fn(&RunResult) -> u64| {
+        Stat::of(&mine.iter().map(|result| value(result)).collect::<Vec<_>>())
+    };
+    let (costs, long_prompt_requests) = run_costs(mine);
+    TaskReport {
+        task: id.to_string(),
+        runs: count,
+        passed: task_passed,
+        pass_rate: ratio(task_passed, count),
+        outcomes,
+        steps: column(|result| u64::from(result.steps)),
+        tool_calls: column(|result| u64::from(result.tool_calls)),
+        input_tokens: column(|result| result.input_tokens),
+        output_tokens: column(|result| result.output_tokens),
+        wall_ms: column(|result| result.wall_ms),
+        cost_micro_usd: costs
+            .filter(|costs| !costs.is_empty())
+            .map(|costs| Stat::of(&costs)),
+        long_prompt_requests,
+        replay_matched: replay.0,
+        replay_diverged: replay.1,
+        replay_failed: replay.2,
+    }
+}
+
 /// Build the report from a suite's results. Tasks appear in the
 /// manifest's order, those without runs included; results for tasks the
 /// manifest does not list are ignored.
+///
+/// Cost is known only where every run is priced: a task's cost needs each
+/// of its runs priced, and the totals need at least one run and every run
+/// in them priced. Unknown is never counted as zero.
 #[must_use]
 pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
     let mut tasks = Vec::with_capacity(manifest.tasks.len());
@@ -720,45 +850,10 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
             .iter()
             .filter(|result| &result.task == id)
             .collect::<Vec<_>>();
-        let count = u32::try_from(mine.len()).unwrap_or(u32::MAX);
-        let task_passed =
-            u32::try_from(mine.iter().filter(|result| result.passed()).count()).unwrap_or(0);
-        let mut outcomes = BTreeMap::new();
-        let mut replay = (0u32, 0u32, 0u32);
-        for result in &mine {
-            *outcomes.entry(result.outcome.clone()).or_insert(0) += 1;
-            match result.replay.as_deref() {
-                Some("matched") => replay.0 += 1,
-                Some(status) if status.starts_with("diverged") => replay.1 += 1,
-                Some(_) => replay.2 += 1,
-                None => {}
-            }
-            totals.steps += u64::from(result.steps);
-            totals.tool_calls += u64::from(result.tool_calls);
-            totals.input_tokens = totals.input_tokens.saturating_add(result.input_tokens);
-            totals.output_tokens = totals.output_tokens.saturating_add(result.output_tokens);
-            totals.wall_ms = totals.wall_ms.saturating_add(result.wall_ms);
-        }
-        let column = |value: fn(&RunResult) -> u64| {
-            Stat::of(&mine.iter().map(|result| value(result)).collect::<Vec<_>>())
-        };
-        runs += count;
-        passed += task_passed;
-        tasks.push(TaskReport {
-            task: id.clone(),
-            runs: count,
-            passed: task_passed,
-            pass_rate: ratio(task_passed, count),
-            outcomes,
-            steps: column(|result| u64::from(result.steps)),
-            tool_calls: column(|result| u64::from(result.tool_calls)),
-            input_tokens: column(|result| result.input_tokens),
-            output_tokens: column(|result| result.output_tokens),
-            wall_ms: column(|result| result.wall_ms),
-            replay_matched: replay.0,
-            replay_diverged: replay.1,
-            replay_failed: replay.2,
-        });
+        let task = task_report(id, &mine, &mut totals);
+        runs += task.runs;
+        passed += task.passed;
+        tasks.push(task);
     }
     let rates = tasks
         .iter()
@@ -767,6 +862,17 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
     #[allow(clippy::cast_precision_loss)]
     let macro_pass_rate =
         (!rates.is_empty()).then(|| rates.iter().sum::<f64>() / rates.len() as f64);
+    let counted = results
+        .iter()
+        .filter(|result| manifest.tasks.contains(&result.task))
+        .collect::<Vec<_>>();
+    let (costs, long_prompt_requests) = run_costs(&counted);
+    totals.cost_micro_usd = costs.filter(|costs| !costs.is_empty()).map(|costs| {
+        costs
+            .iter()
+            .fold(0u64, |sum, cost| sum.saturating_add(*cost))
+    });
+    let pricing = manifest.pricing.as_ref();
     Report {
         schema: REPORT_SCHEMA,
         label: manifest.label.clone(),
@@ -778,6 +884,10 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         effort: manifest.effort.clone(),
         clear_thinking: manifest.clear_thinking.clone(),
         max_output_tokens: manifest.max_output_tokens,
+        pricing_version: pricing.map(|pricing| pricing.version.clone()),
+        unpriced_reason: manifest.unpriced_reason.clone(),
+        context_window: pricing.map(|pricing| pricing.context_window),
+        model_max_output_tokens: pricing.map(|pricing| pricing.max_output_tokens),
         stopped: manifest.stopped.clone(),
         overall: OverallReport {
             tasks: u32::try_from(tasks.len()).unwrap_or(u32::MAX),
@@ -787,13 +897,11 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
             pass_at_1: macro_pass_rate,
             trials: manifest.trials,
             totals,
-            means: Means {
-                steps: mean_of(totals.steps, runs),
-                tool_calls: mean_of(totals.tool_calls, runs),
-                input_tokens: mean_of(totals.input_tokens, runs),
-                output_tokens: mean_of(totals.output_tokens, runs),
-                wall_ms: mean_of(totals.wall_ms, runs),
-            },
+            means: Means::of(&totals, runs),
+            cost_per_pass_micro_usd: totals
+                .cost_micro_usd
+                .and_then(|total| mean_of(total, passed)),
+            long_prompt_requests,
         },
         tasks,
     }
@@ -805,6 +913,28 @@ fn percent(rate: Option<f64>) -> String {
 
 fn number(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.1}"))
+}
+
+/// A mean or ratio of micro-dollars, rounded to whole ones, as dollars.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn mean_dollars(micro: Option<f64>) -> String {
+    // A float-to-integer `as` saturates, and NaN becomes 0.
+    micro.map_or_else(|| "n/a".to_string(), |micro| dollars(micro.round() as u64))
+}
+
+/// `Cost: $T ($P per passed run; N responses on the long-prompt rate).`,
+/// the sentence [`report_markdown`] and [`CostSummary::markdown`] end with.
+fn cost_sentence(total: u64, per_pass: Option<f64>, long_prompt_requests: u32) -> String {
+    let mut parts = vec![match per_pass {
+        Some(_) => format!("{} per passed run", mean_dollars(per_pass)),
+        None => "no passed runs".to_string(),
+    }];
+    match long_prompt_requests {
+        0 => {}
+        1 => parts.push("1 response on the long-prompt rate".to_string()),
+        count => parts.push(format!("{count} responses on the long-prompt rate")),
+    }
+    format!("Cost: {} ({}).", dollars(total), parts.join("; "))
 }
 
 /// Text from a report made safe for one Markdown table cell or line.
@@ -821,11 +951,8 @@ fn cell(text: &str) -> String {
         .replace('|', "\\|")
 }
 
-/// `report.md`: a header naming the provider, model and label, then one
-/// table row per task and an overall row.
-#[must_use]
-pub fn report_markdown(report: &Report) -> String {
-    let mut text = String::new();
+/// `report.md`'s title and its list of what was run and how.
+fn write_report_header(text: &mut String, report: &Report) {
     let _ = writeln!(text, "# Eval report\n");
     let _ = writeln!(
         text,
@@ -833,6 +960,7 @@ pub fn report_markdown(report: &Report) -> String {
         cell(&report.provider),
         cell(&report.model)
     );
+    write_pricing_line(text, report);
     if let Some(label) = &report.label {
         let _ = writeln!(text, "- Label: {}", cell(label));
     }
@@ -853,15 +981,41 @@ pub fn report_markdown(report: &Report) -> String {
     if let Some(stopped) = &report.stopped {
         let _ = writeln!(text, "- Stopped early: {}", cell(stopped));
     }
+}
+
+/// The header line after the model: its limits and the price table's date
+/// when priced, or why it is unpriced; nothing for an older report.
+fn write_pricing_line(text: &mut String, report: &Report) {
+    if let (Some(version), Some(context), Some(output)) = (
+        &report.pricing_version,
+        report.context_window,
+        report.model_max_output_tokens,
+    ) {
+        let _ = writeln!(
+            text,
+            "- Model limits: {context}-token context, {output} output tokens; prices as of {}",
+            cell(version)
+        );
+    } else if let Some(reason) = &report.unpriced_reason {
+        let _ = writeln!(text, "- Cost: unpriced ({})", cell(reason));
+    }
+}
+
+/// `report.md`: a header naming the provider, model and label, then one
+/// table row per task and an overall row.
+#[must_use]
+pub fn report_markdown(report: &Report) -> String {
+    let mut text = String::new();
+    write_report_header(&mut text, report);
     let _ = writeln!(
         text,
         "\n| Task | Runs | Passed | Pass rate | Outcomes | Steps (mean / median) | Tool calls \
-         (mean / median) | Input tokens (mean) | Output tokens (mean) | Wall ms (mean / median) \
-         | Replay matched / diverged / failed |"
+         (mean / median) | Input tokens (mean) | Output tokens (mean) | Cost (mean) | Wall ms \
+         (mean / median) | Replay matched / diverged / failed |"
     );
     let _ = writeln!(
         text,
-        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"
     );
     for task in &report.tasks {
         let outcomes = task
@@ -872,7 +1026,7 @@ pub fn report_markdown(report: &Report) -> String {
             .join(", ");
         let _ = writeln!(
             text,
-            "| {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} / {} | {} / {} / {} |",
+            "| {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} | {} / {} | {} / {} / {} |",
             cell(&task.task),
             task.runs,
             task.passed,
@@ -884,6 +1038,7 @@ pub fn report_markdown(report: &Report) -> String {
             number(task.tool_calls.median),
             number(task.input_tokens.mean),
             number(task.output_tokens.mean),
+            mean_dollars(task.cost_micro_usd.and_then(|cost| cost.mean)),
             number(task.wall_ms.mean),
             number(task.wall_ms.median),
             task.replay_matched,
@@ -894,7 +1049,7 @@ pub fn report_markdown(report: &Report) -> String {
     let overall = &report.overall;
     let _ = writeln!(
         text,
-        "| **Overall** | {} | {} | {} (macro) | | {} | {} | {} | {} | {} | |",
+        "| **Overall** | {} | {} | {} (macro) | | {} | {} | {} | {} | {} | {} | |",
         overall.runs,
         overall.passed,
         percent(overall.macro_pass_rate),
@@ -902,9 +1057,10 @@ pub fn report_markdown(report: &Report) -> String {
         number(overall.means.tool_calls),
         number(overall.means.input_tokens),
         number(overall.means.output_tokens),
+        mean_dollars(overall.means.cost_micro_usd),
         number(overall.means.wall_ms),
     );
-    let _ = writeln!(
+    let _ = write!(
         text,
         "\nMacro pass rate (mean of task pass rates): {}. pass@1 from {} trial(s) per task: {}. \
          Totals: {} steps, {} tool calls, {} input and {} output tokens, {} ms.",
@@ -917,6 +1073,18 @@ pub fn report_markdown(report: &Report) -> String {
         overall.totals.output_tokens,
         overall.totals.wall_ms,
     );
+    if let Some(total) = overall.totals.cost_micro_usd {
+        let _ = write!(
+            text,
+            " {}",
+            cost_sentence(
+                total,
+                overall.cost_per_pass_micro_usd,
+                overall.long_prompt_requests
+            )
+        );
+    }
+    let _ = writeln!(text);
     text
 }
 
@@ -934,8 +1102,8 @@ fn mean_tokens(task: &TaskReport) -> Option<f64> {
 /// Markdown comparing two reports, such as two models or a harness change:
 /// per task (the union, sorted by ID) the pass rate, mean steps and mean
 /// total tokens from `base` to `new` with deltas, tasks present on one side
-/// only marked, then an overall line, and a note when the two ran a
-/// different number of runs at a time.
+/// only marked, then an overall line, the total cost when both reports have
+/// one, and a note for each run setting the two differ in.
 #[must_use]
 pub fn compare(base: &Report, new: &Report) -> String {
     let mut text = String::new();
@@ -1011,6 +1179,25 @@ pub fn compare(base: &Report, new: &Report) -> String {
         number(total_tokens(new)),
         delta(total_tokens(base), total_tokens(new), 1.0, ""),
     );
+    // Unknown cost is not zero: shown only when both sides have it.
+    if let (Some(base_cost), Some(new_cost)) = (
+        base.overall.totals.cost_micro_usd,
+        new.overall.totals.cost_micro_usd,
+    ) {
+        let change = if new_cost >= base_cost {
+            format!("+{}", dollars(new_cost - base_cost))
+        } else {
+            format!("-{}", dollars(base_cost - new_cost))
+        };
+        let _ = writeln!(
+            text,
+            "Total cost: {} → {} ({change}); per passed run {} → {}.",
+            dollars(base_cost),
+            dollars(new_cost),
+            mean_dollars(base.overall.cost_per_pass_micro_usd),
+            mean_dollars(new.overall.cost_per_pass_micro_usd),
+        );
+    }
     write_setting_notes(&mut text, base, new);
     text
 }
@@ -1069,6 +1256,16 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
              rates and tokens are not directly comparable."
         );
     }
+    if let (Some(base_version), Some(new_version)) = (&base.pricing_version, &new.pricing_version)
+        && base_version != new_version
+    {
+        let _ = writeln!(
+            text,
+            "\nPrice tables differ ({} → {}); costs are not directly comparable.",
+            cell(base_version),
+            cell(new_version)
+        );
+    }
 }
 
 /// Read a `report.json` written by [`run_suite`].
@@ -1093,6 +1290,281 @@ pub fn read_report(dir: &Path) -> Result<Report, EvalError> {
     Ok(report)
 }
 
+/// Read a `manifest.json` written by [`run_suite`].
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or is not a manifest.
+pub fn read_manifest(dir: &Path) -> Result<Manifest, EvalError> {
+    let path = dir.join("manifest.json");
+    let bytes = read_regular_file(&path, 16 << 20).map_err(|error| output_error(&path, error))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|error| output_error(&path, error))?;
+    if manifest.schema != REPORT_SCHEMA {
+        return Err(output_error(
+            &path,
+            format!(
+                "manifest schema {} is unsupported; expected {REPORT_SCHEMA}",
+                manifest.schema
+            ),
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Largest `results.jsonl` [`reprice`] reads: [`MAX_TASKS`] times
+/// [`MAX_TRIALS`] lines of about 2 KiB each, with room to spare.
+const MAX_RESULTS_BYTES: usize = 256 << 20;
+
+/// One task's line in a [`CostSummary`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCost {
+    pub task: String,
+    pub runs: u32,
+    pub passed: u32,
+    /// USD micro-dollars, the sum of each run's rounded cost.
+    pub cost_micro_usd: u64,
+    /// Responses priced on a long-prompt card.
+    pub long_prompt_requests: u32,
+}
+
+/// A finished eval run priced again from its journals by [`reprice`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostSummary {
+    pub provider: String,
+    pub model: String,
+    pub label: Option<String>,
+    /// The price table this summary used.
+    pub price_table_version: String,
+    /// The price table the run's own report used, if it was priced.
+    pub recorded_pricing_version: Option<String>,
+    /// Why the run's own report was unpriced, if it said.
+    pub recorded_unpriced_reason: Option<String>,
+    /// In the manifest's task order, tasks without runs included.
+    pub tasks: Vec<TaskCost>,
+    pub runs: u32,
+    pub passed: u32,
+    /// USD micro-dollars over every run.
+    pub cost_micro_usd: u64,
+    pub long_prompt_requests: u32,
+}
+
+impl CostSummary {
+    /// The total cost over passed runs, in USD micro-dollars; `None` when
+    /// nothing passed.
+    #[must_use]
+    pub fn cost_per_pass_micro_usd(&self) -> Option<f64> {
+        mean_of(self.cost_micro_usd, self.passed)
+    }
+
+    /// The summary as Markdown: a header naming the model and price table
+    /// and its assumption, one row per task and an overall row, and the
+    /// totals sentence.
+    #[must_use]
+    pub fn markdown(&self) -> String {
+        let mut text = String::new();
+        let _ = writeln!(text, "# Eval cost\n");
+        let _ = writeln!(
+            text,
+            "- Provider: {}, model: {}",
+            cell(&self.provider),
+            cell(&self.model)
+        );
+        if let Some(label) = &self.label {
+            let _ = writeln!(text, "- Label: {}", cell(label));
+        }
+        let _ = writeln!(
+            text,
+            "- Priced from each run's journal at list prices as of {}, assuming every turn was \
+             served by the requested model",
+            cell(&self.price_table_version)
+        );
+        if let Some(version) = self
+            .recorded_pricing_version
+            .as_ref()
+            .filter(|version| **version != self.price_table_version)
+        {
+            let _ = writeln!(
+                text,
+                "- The run's own report used prices as of {}",
+                cell(version)
+            );
+        }
+        if let Some(reason) = &self.recorded_unpriced_reason {
+            let _ = writeln!(
+                text,
+                "- The run's own report was unpriced ({})",
+                cell(reason)
+            );
+        }
+        let _ = writeln!(
+            text,
+            "\n| Task | Runs | Passed | Cost | Long-prompt responses |\n|---|---:|---:|---:|---:|"
+        );
+        for task in &self.tasks {
+            let _ = writeln!(
+                text,
+                "| {} | {} | {} | {} | {} |",
+                cell(&task.task),
+                task.runs,
+                task.passed,
+                dollars(task.cost_micro_usd),
+                task.long_prompt_requests
+            );
+        }
+        let _ = writeln!(
+            text,
+            "| **Overall** | {} | {} | {} | {} |",
+            self.runs,
+            self.passed,
+            dollars(self.cost_micro_usd),
+            self.long_prompt_requests
+        );
+        let _ = writeln!(
+            text,
+            "\n{}",
+            cost_sentence(
+                self.cost_micro_usd,
+                self.cost_per_pass_micro_usd(),
+                self.long_prompt_requests
+            )
+        );
+        text
+    }
+}
+
+/// The verified journal of the run `result` describes, read from where
+/// [`run_suite`] wrote it, after its task and trial were checked; `None`
+/// for a run that journaled nothing.
+fn run_journal(dir: &Path, result: &RunResult) -> Result<Option<LoadedJournal>, EvalError> {
+    let run = format!("task {} trial {}", result.task, result.trial);
+    let path = dir
+        .join("runs")
+        .join(&result.task)
+        .join(result.trial.to_string())
+        .join("journal.jsonl");
+    let loaded = match read_journal(&path) {
+        Ok(loaded) => loaded,
+        // As in `run_one`: a session that journaled nothing leaves an empty
+        // journal and no session ID.
+        Err(_) if result.session_id.is_none() && known_empty(&path) => return Ok(None),
+        Err(error) => return Err(output_error(&path, format!("{run}: {error}"))),
+    };
+    if result.session_id.as_deref() != Some(loaded.session_id()) {
+        return Err(output_error(
+            &path,
+            format!(
+                "{run}: the journal is session {:?}, not the result's {:?}",
+                loaded.session_id(),
+                result.session_id.as_deref().unwrap_or("")
+            ),
+        ));
+    }
+    Ok(Some(loaded))
+}
+
+/// Price a finished eval run in `dir` again from its journals at
+/// `pricing`, which must be for the manifest's model. Each line of
+/// `results.jsonl` names a run whose journal, at the path [`run_suite`]
+/// wrote it, is read and verified, hash chain included, then priced per
+/// model response as the suite does; per-run costs are rounded to
+/// micro-dollars before they are summed, as in the report. A run that
+/// journaled nothing is priced at zero.
+///
+/// # Errors
+///
+/// Fails as a whole, with no partial totals, when the manifest or results
+/// cannot be read, a result names a task the manifest does not list or a
+/// run twice, or a run's journal is missing, fails verification or belongs
+/// to another session; the error names the run.
+pub fn reprice(dir: &Path, pricing: &ModelPricing) -> Result<CostSummary, EvalError> {
+    let manifest = read_manifest(dir)?;
+    if manifest.model != pricing.model {
+        return Err(output_error(
+            &dir.join("manifest.json"),
+            format!(
+                "the run used model {:?}, not {}",
+                manifest.model, pricing.model
+            ),
+        ));
+    }
+    let results_path = dir.join("results.jsonl");
+    let bytes = read_regular_file(&results_path, MAX_RESULTS_BYTES)
+        .map_err(|error| output_error(&results_path, error))?;
+    let text = String::from_utf8(bytes).map_err(|_| output_error(&results_path, "not UTF-8"))?;
+    let mut tasks = manifest
+        .tasks
+        .iter()
+        .map(|task| TaskCost {
+            task: task.clone(),
+            runs: 0,
+            passed: 0,
+            cost_micro_usd: 0,
+            long_prompt_requests: 0,
+        })
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        let at =
+            |message: String| output_error(&results_path, format!("line {}: {message}", index + 1));
+        let result: RunResult =
+            serde_json::from_str(line).map_err(|error| at(error.to_string()))?;
+        // The task names a directory: only an ID the manifest lists, and
+        // only a trial it ran, may be joined to a path.
+        let Some(entry) = tasks
+            .iter_mut()
+            .find(|entry| entry.task == result.task && task_id_is_valid(&entry.task))
+        else {
+            return Err(at(format!(
+                "task {:?} is not a task the manifest lists",
+                result.task
+            )));
+        };
+        if !(1..=manifest.trials).contains(&result.trial) {
+            return Err(at(format!(
+                "task {} trial {} is outside the manifest's {} trial(s)",
+                result.task, result.trial, manifest.trials
+            )));
+        }
+        if !seen.insert((result.task.clone(), result.trial)) {
+            return Err(at(format!(
+                "task {} trial {} appears twice",
+                result.task, result.trial
+            )));
+        }
+        let loaded = run_journal(dir, &result)?;
+        let recorded = recorded(loaded.as_ref(), Some(pricing));
+        entry.runs += 1;
+        entry.passed += u32::from(result.passed());
+        entry.cost_micro_usd = entry
+            .cost_micro_usd
+            .saturating_add(picodollars_to_micro(recorded.cost_picodollars));
+        entry.long_prompt_requests = entry
+            .long_prompt_requests
+            .saturating_add(recorded.long_prompt_requests);
+    }
+    let sum = |value: fn(&TaskCost) -> u32| {
+        tasks
+            .iter()
+            .fold(0u32, |sum, task| sum.saturating_add(value(task)))
+    };
+    Ok(CostSummary {
+        provider: manifest.provider.clone(),
+        model: manifest.model.clone(),
+        label: manifest.label.clone(),
+        price_table_version: crate::pricing::PRICE_TABLE_VERSION.to_string(),
+        recorded_pricing_version: manifest.pricing.map(|pricing| pricing.version),
+        recorded_unpriced_reason: manifest.unpriced_reason,
+        runs: sum(|task| task.runs),
+        passed: sum(|task| task.passed),
+        cost_micro_usd: tasks
+            .iter()
+            .fold(0u64, |sum, task| sum.saturating_add(task.cost_micro_usd)),
+        long_prompt_requests: sum(|task| task.long_prompt_requests),
+        tasks,
+    })
+}
+
 /// What `eval run` was asked for, besides the tasks.
 #[derive(Debug, Clone)]
 pub struct SuiteOptions {
@@ -1111,6 +1583,12 @@ pub struct SuiteOptions {
     /// The provider's thinking clearing (`"off"` or `"keep N"`), for the
     /// manifest; `None` for a provider without it.
     pub clear_thinking: Option<String>,
+    /// The list prices each model response is priced at, pinned in the
+    /// manifest; `None` leaves every run unpriced.
+    pub pricing: Option<&'static ModelPricing>,
+    /// Why the runs are unpriced, for the manifest and report: `None` when
+    /// priced.
+    pub unpriced_reason: Option<String>,
     pub replay: bool,
     pub label: Option<String>,
     /// The run limits before each task's overrides.
@@ -1272,9 +1750,15 @@ struct Recorded {
     usage: crate::provider::Usage,
     check: Option<CheckOutcome>,
     truncation_recoveries: u32,
+    /// The responses' list-price cost, when priced.
+    cost_picodollars: u128,
+    /// Responses priced on a long-prompt card.
+    long_prompt_requests: u32,
 }
 
-fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
+/// What `journal` says about its session, each model response priced at
+/// `pricing` when given.
+fn recorded(journal: Option<&LoadedJournal>, pricing: Option<&ModelPricing>) -> Recorded {
     let mut recorded = Recorded::default();
     let Some(journal) = journal else {
         return recorded;
@@ -1298,6 +1782,16 @@ fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
             JournalEvent::ModelResponded { response, .. } => {
                 recorded.usage = recorded.usage + response.usage;
                 truncated = response.stop_reason == crate::provider::StopReason::MaxTokens;
+                // Each response on its own card: a long prompt changes the
+                // rates of that request only.
+                if let Some(pricing) = pricing {
+                    recorded.cost_picodollars = recorded
+                        .cost_picodollars
+                        .saturating_add(pricing.cost_picodollars(&response.usage));
+                    if pricing.is_long_prompt(&response.usage) {
+                        recorded.long_prompt_requests += 1;
+                    }
+                }
             }
             JournalEvent::ToolExecuted { .. } => recorded.tool_calls += 1,
             JournalEvent::CheckCompleted { outcome, .. } => {
@@ -1518,6 +2012,8 @@ where
         effort: options.effort.clone(),
         clear_thinking: options.clear_thinking.clone(),
         max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
+        pricing: options.pricing.map(PricingRecord::from),
+        unpriced_reason: options.unpriced_reason.clone(),
         replay: options.replay,
         started_unix_ms,
         ended_unix_ms: unix_ms(),
@@ -1674,7 +2170,7 @@ where
         _ => None,
     };
     let loaded = read_back.ok();
-    let recorded = recorded(loaded.as_ref());
+    let recorded = recorded(loaded.as_ref(), options.pricing);
     let (outcome_name, work_outcome) = recorded.outcome.clone().unwrap_or_else(|| {
         let outcome = match &outcome {
             Err(error) if cleanup_unconfirmed(error) => "cleanup_failed",
@@ -1713,6 +2209,14 @@ where
             .then_some(usage.cache_creation_input_tokens),
         wall_ms,
         truncation_recoveries: recorded.truncation_recoveries,
+        // A journal that could not be read back, or a session whose journal
+        // write failed, may hold fewer responses than were billed: its cost
+        // is unknown, never zero.
+        cost_micro_usd: options
+            .pricing
+            .filter(|_| unreadable.is_none() && sink_error(&outcome).is_none())
+            .map(|_| picodollars_to_micro(recorded.cost_picodollars)),
+        long_prompt_requests: recorded.long_prompt_requests,
         replay: None,
         error: outcome.as_ref().err().map(ToString::to_string),
     };
@@ -2067,6 +2571,75 @@ mod tests {
         let canceled = CancellationToken::new();
         canceled.cancel();
         assert!(!replay_due(true, true, None, &canceled));
+    }
+
+    fn responded(turn: u32, usage: crate::provider::Usage) -> crate::journal::JournalRecord {
+        crate::journal::JournalRecord {
+            sequence: u64::from(turn),
+            unix_ms: 1,
+            session_id: "hs-priced".to_string(),
+            prev_sha256: String::new(),
+            event: JournalEvent::ModelResponded {
+                turn,
+                response: ModelResponse {
+                    usage,
+                    ..ModelResponse::final_text("done")
+                },
+                latency_ms: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn each_haiku_response_is_priced_on_its_own_card() {
+        use crate::provider::Usage;
+        let journal = LoadedJournal {
+            records: vec![
+                // A 90,000-token prompt: 1,000 + 9,000 + 80,000.
+                responded(
+                    1,
+                    Usage {
+                        input_tokens: 1_000,
+                        output_tokens: 2_000,
+                        cache_read_input_tokens: 80_000,
+                        cache_creation_input_tokens: 9_000,
+                    },
+                ),
+                // A 120,000-token prompt, mostly cache reads.
+                responded(
+                    2,
+                    Usage {
+                        input_tokens: 2_000,
+                        output_tokens: 3_000,
+                        cache_read_input_tokens: 110_000,
+                        cache_creation_input_tokens: 8_000,
+                    },
+                ),
+            ],
+            complete: false,
+        };
+        let haiku = crate::pricing::lookup("claude-haiku-5-5").expect("haiku");
+        let priced = recorded(Some(&journal), Some(haiku));
+        // Standard card, per million: 1,000 × $0.10 + 9,000 × $0.125 +
+        // 80,000 × $0.01 + 2,000 × $0.50 = 100 + 1,125 + 800 + 1,000 µ$.
+        let first = 3_025_000_000u128;
+        // Long card on every category: 2,000 × $0.50 + 8,000 × $0.625 +
+        // 110,000 × $0.05 + 3,000 × $2.50 = 1,000 + 5,000 + 5,500 + 7,500 µ$.
+        let second = 19_000_000_000u128;
+        assert_eq!(priced.cost_picodollars, first + second);
+        assert_eq!(picodollars_to_micro(priced.cost_picodollars), 22_025);
+        assert_eq!(priced.long_prompt_requests, 1);
+        // The usage sum is unchanged, and pricing the run's total on one
+        // card would be wrong: 210,000 prompt tokens is all long.
+        assert_eq!(priced.usage.total_input_tokens(), 210_000);
+        assert_ne!(haiku.cost_picodollars(&priced.usage), first + second);
+        // Unpriced: the same usage, no cost.
+        let unpriced = recorded(Some(&journal), None);
+        assert_eq!(unpriced.usage, priced.usage);
+        assert_eq!(
+            (unpriced.cost_picodollars, unpriced.long_prompt_requests),
+            (0, 0)
+        );
     }
 
     #[test]

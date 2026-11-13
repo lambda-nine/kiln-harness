@@ -12,6 +12,7 @@ pub mod files;
 pub mod journal;
 pub mod live;
 mod outputs;
+pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod replay;

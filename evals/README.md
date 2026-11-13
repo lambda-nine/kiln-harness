@@ -151,16 +151,55 @@ session did not end in an accepted final answer. `input_tokens` counts all
 input, cached included; `cache_read_tokens` appears when some was read from a
 prompt cache, and `cache_write_tokens` when some was written to one. `replay` is `matched`, `diverged_turn:<n>`, `diverged_check`,
 `failed`, or `null` without `--replay` or for a run that did not complete.
+In a priced suite, `cost_micro_usd` is the run's estimated cost in US
+micro-dollars (0 for a run that never reached the model), and
+`long_prompt_requests` appears when some responses were priced at a
+long-prompt rate.
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
 kind and model, the base URL's host only, tasks, trials, runs at a time,
 the run cap when set, the effort sent and the thinking clearing (`off` or
 `keep N`, Anthropic only), the output limit per
-response, start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
+response, the price table and rates used or why the runs are unpriced,
+start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
 task the runs, passes, pass rate, outcome counts, mean and median steps, tool
-calls and wall time, mean tokens, and replay counts; overall the macro pass
+calls and wall time, mean tokens, mean cost, and replay counts; overall the macro pass
 rate (the mean of the task pass rates), pass@1 with the number of trials, and
-totals and means.
+totals and means, with the total cost and the cost per passed run.
+
+### Cost
+
+Cost is an estimate from the usage each model response reported, at
+Anthropic's list prices for Claude Fable 5.2, Opus 5.5, Sonnet 5.5 and
+Haiku 5.5 (the table of 2026-11-13, pinned with its rates in the manifest).
+It is not billing and never a limit; the token, byte and time limits are
+the controls. Each response is priced on its own: a Claude Haiku 5.5 request
+whose prompt, counting uncached input, cache reads and cache writes, is over
+100,000 tokens pays the long-prompt rates on every category, output
+included, and the report counts those responses. Cache writes are priced at
+the 5-minute rate, the only cache the harness asks for. The report's header
+gives the model's context window and output limit with the table's date.
+
+A suite is unpriced, and `report.md` says `Cost: unpriced` with the reason,
+for openai-compat, a model the table does not list, or `--fallbacks`, since
+another model may then serve, and bill, a turn. A task's or the suite's cost
+is shown only when every run in it was priced; an unknown cost is never
+counted as zero. For a listed model, `run` and `eval run` refuse a
+`--max-output-tokens` above its output limit of 128,000 before anything
+runs.
+
+```sh
+cargo run --locked -- eval cost evals-out/haiku-hard
+```
+
+prices a finished run again from its journals with the current price table
+and prints Markdown: per task the runs, passes, cost and long-prompt
+responses, then the total and the cost per passed run. It assumes every turn
+was served by the requested model. Each journal is verified, hash chain
+included, before it is priced, and a missing or altered journal fails the
+whole command rather than leaving a partial total. Like `eval compare`, it
+reads files only and never contacts kilnd; it refuses an openai-compat run
+or a model without prices.
 
 The suite fails closed. After a run whose sandbox deletion was not confirmed
 (outcome `cleanup_failed`, or a `Cleanup` or `CreateUncertain` error,
@@ -183,9 +222,12 @@ cargo run --locked -- eval compare evals-out/qwen-baseline evals-out/qwen-new-pr
 
 prints Markdown: for every task in either report, sorted, the pass rate, mean
 steps and mean total tokens from base to new with their deltas, tasks present
-on one side only marked as such, and an overall line. It adds a note when
+on one side only marked as such, and an overall line. When both reports are
+priced, it adds the total cost and the cost per passed run from base to new.
+It adds a note when
 the two reports ran at different concurrency, run caps, effort, thinking
-clearing or output limits per response; reports written before these were
+clearing or output limits per response, or were priced with different price
+tables; reports written before these were
 recorded carry none of them, and an unknown setting is not reported as a
 difference.
 

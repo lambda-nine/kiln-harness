@@ -6,6 +6,26 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Eval reports estimate cost in US dollars from each model response's
+  reported usage at Anthropic's list prices (table of 2026-11-13, pinned
+  with its rates in `manifest.json` as `pricing`). Each response is priced
+  on its own card, so a Claude Haiku 5.5 request whose prompt (uncached
+  input, cache reads and cache writes together) is over 100,000 tokens
+  pays the higher long-prompt rates on every category, output included;
+  cache writes are priced at the 5-minute rate. `results.jsonl` gains
+  `cost_micro_usd` and `long_prompt_requests`, `report.json` gains cost per
+  task, totals, means and cost per passed run, `report.md` shows the
+  model's context and output limits, a `Cost (mean)` column and the total,
+  and `eval compare` shows total cost when both reports have it and notes
+  differing price tables. A run is unpriced, with the reason recorded and
+  shown, for openai-compat, a model not in the table, or `--fallbacks`, and
+  a task or suite is priced only when every run in it is: unknown cost is
+  never counted as zero. Older files parse unchanged. New `eval cost DIR`
+  prices a finished run again from its verified journals with the current
+  table, as Markdown on stdout, without contacting kilnd; it refuses a
+  missing or tampered journal. `run` and `eval run` refuse a
+  `--max-output-tokens` above a listed model's own output limit (128,000)
+  before anything runs. Requests are unchanged.
 - `--clear-thinking N` (1 to 1000, `--provider anthropic` only, off by
   default) sends the `clear_thinking_20251015` context edit with the
   `context-management-2025-06-27` beta, so the API clears thinking from all

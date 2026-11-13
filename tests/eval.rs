@@ -26,8 +26,10 @@ use kiln_harness::journal::{
     JournalEvent, LoadedJournal, MAX_JOURNAL_LINE_BYTES, MemoryJournal, RecordedSeedFile,
     read_journal,
 };
+use kiln_harness::pricing::{self, ModelPricing, PricingRecord};
 use kiln_harness::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, ToolCall,
+    Usage,
 };
 use kiln_harness::replay::ReplayProvider;
 use kiln_harness::tools::{EXEC_STREAM_DESCRIPTION, ToolRegistry};
@@ -2049,6 +2051,8 @@ fn options(out: &Path, trials: u32, replay: bool) -> SuiteOptions {
         max_run_secs: None,
         effort: None,
         clear_thinking: None,
+        pricing: None,
+        unpriced_reason: None,
         replay,
         label: Some("test | run".to_string()),
         base_config: config(),
@@ -3240,6 +3244,8 @@ fn result(
         cache_write_tokens: None,
         wall_ms: u64::from(steps) * 1000,
         truncation_recoveries: 0,
+        cost_micro_usd: None,
+        long_prompt_requests: 0,
         replay: None,
         error: None,
     }
@@ -3260,6 +3266,8 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         effort: None,
         clear_thinking: None,
         max_output_tokens: None,
+        pricing: None,
+        unpriced_reason: None,
         replay: true,
         started_unix_ms: 1,
         ended_unix_ms: 2,
@@ -3552,6 +3560,41 @@ fn eval_run_refuses_an_out_of_range_concurrency_before_contacting_anything() {
         assert!(!stderr.contains("no.sock"), "{stderr}");
         assert!(!out.exists());
     }
+}
+
+#[test]
+fn eval_run_refuses_an_output_limit_over_the_models_before_contacting_anything() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tasks");
+    let out = temp.path().join("out");
+    let output = cli(&[
+        "--socket",
+        temp.path().join("no.sock").to_str().expect("utf-8"),
+        "eval",
+        "run",
+        "--provider",
+        "anthropic",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--model",
+        "claude-sonnet-5-5",
+        "--max-output-tokens",
+        "200000",
+        "--tasks",
+        tasks.to_str().expect("utf-8"),
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "--max-output-tokens 200000 exceeds claude-sonnet-5-5's 128000-token output limit"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no.sock"), "{stderr}");
+    assert!(!out.exists());
 }
 
 #[test]
@@ -4270,5 +4313,659 @@ fn eval_run_refuses_an_out_of_range_max_run_secs_before_contacting_anything() {
         );
         assert!(!stderr.contains("no.sock"), "{stderr}");
         assert!(!out.exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cost
+
+fn priced(mut run: RunResult, micro: u64, long_prompt_requests: u32) -> RunResult {
+    run.cost_micro_usd = Some(micro);
+    run.long_prompt_requests = long_prompt_requests;
+    run
+}
+
+fn haiku() -> &'static ModelPricing {
+    pricing::lookup("claude-haiku-5-5").expect("haiku is priced")
+}
+
+fn priced_manifest(tasks: &[&str], trials: u32) -> Manifest {
+    Manifest {
+        provider: "anthropic".to_string(),
+        model: "claude-haiku-5-5".to_string(),
+        pricing: Some(PricingRecord::from(haiku())),
+        ..manifest(tasks, trials)
+    }
+}
+
+fn unpriced_manifest(tasks: &[&str], trials: u32) -> Manifest {
+    Manifest {
+        unpriced_reason: Some("openai-compat has no price table".to_string()),
+        ..manifest(tasks, trials)
+    }
+}
+
+#[test]
+fn the_report_prices_each_task_and_the_suite_from_its_runs() {
+    let results = vec![
+        priced(result("a", 1, Some("passed"), 2, (100, 10)), 12_000, 0),
+        priced(result("a", 2, Some("failed"), 2, (100, 10)), 30_000, 2),
+        priced(result("a", 3, Some("passed"), 2, (100, 10)), 18_000, 1),
+        priced(result("b", 1, Some("passed"), 1, (5, 1)), 1_000_000, 0),
+        // Not in the manifest: ignored, cost included.
+        priced(
+            result("ignored", 1, Some("passed"), 1, (1, 1)),
+            9_999_999,
+            9,
+        ),
+    ];
+    let report = eval::report(&results, &priced_manifest(&["a", "b", "c"], 3));
+
+    let a = &report.tasks[0];
+    assert_eq!(
+        a.cost_micro_usd,
+        Some(Stat {
+            mean: Some(20_000.0),
+            median: Some(18_000.0)
+        })
+    );
+    assert_eq!(a.long_prompt_requests, 3);
+    let b = &report.tasks[1];
+    assert_eq!(
+        b.cost_micro_usd.and_then(|cost| cost.mean),
+        Some(1_000_000.0)
+    );
+    assert_eq!(b.long_prompt_requests, 0);
+    // A task without runs has no cost, not a zero one.
+    assert_eq!(report.tasks[2].cost_micro_usd, None);
+
+    let overall = &report.overall;
+    assert_eq!(overall.totals.cost_micro_usd, Some(1_060_000));
+    assert_eq!(overall.means.cost_micro_usd, Some(265_000.0));
+    assert_eq!(overall.cost_per_pass_micro_usd, Some(1_060_000.0 / 3.0));
+    assert_eq!(overall.long_prompt_requests, 3);
+    assert_eq!(
+        (
+            report.pricing_version.as_deref(),
+            report.context_window,
+            report.model_max_output_tokens,
+            report.unpriced_reason.as_deref()
+        ),
+        (Some("2026-11-13"), Some(1_000_000), Some(128_000), None)
+    );
+
+    let json = serde_json::to_value(&report).expect("report JSON");
+    assert_eq!(json["overall"]["totals"]["cost_micro_usd"], 1_060_000);
+    assert_eq!(json["overall"]["long_prompt_requests"], 3);
+    assert_eq!(json["tasks"][0]["cost_micro_usd"]["median"], 18_000.0);
+    assert!(json["tasks"][1].get("long_prompt_requests").is_none());
+    assert!(json["tasks"][2].get("cost_micro_usd").is_none());
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, report);
+
+    let markdown = eval::report_markdown(&report);
+    assert!(
+        markdown.contains(
+            "- Provider: anthropic, model: claude-haiku-5-5\n- Model limits: 1000000-token \
+             context, 128000 output tokens; prices as of 2026-11-13\n"
+        ),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("unpriced"), "{markdown}");
+    assert!(
+        markdown.contains("| Output tokens (mean) | Cost (mean) | Wall ms"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| 100.0 | 10.0 | $0.0200 | 2000.0 /"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| 5.0 | 1.0 | $1.00 | 1000.0 /"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| c | 0 | 0 | n/a |  | n/a / n/a | n/a / n/a | n/a | n/a | n/a | n/a"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| 76.2 | 7.8 | $0.2650 | 1750.0 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.ends_with(
+            " ms. Cost: $1.06 ($0.3533 per passed run; 3 responses on the long-prompt rate).\n"
+        ),
+        "{markdown}"
+    );
+
+    // One long-prompt response, and none.
+    let one = eval::report(
+        &[priced(result("a", 1, Some("passed"), 2, (1, 1)), 50, 1)],
+        &priced_manifest(&["a"], 1),
+    );
+    assert!(eval::report_markdown(&one).ends_with(
+        "Cost: $0.0001 ($0.0001 per passed run; 1 response on the long-prompt rate).\n"
+    ));
+    let none = eval::report(
+        &[priced(result("a", 1, Some("passed"), 2, (1, 1)), 49, 0)],
+        &priced_manifest(&["a"], 1),
+    );
+    assert!(eval::report_markdown(&none).ends_with("Cost: $0.0000 ($0.0000 per passed run).\n"));
+}
+
+#[test]
+fn one_unpriced_run_leaves_its_task_and_the_totals_unpriced() {
+    let results = vec![
+        priced(result("a", 1, Some("passed"), 2, (100, 10)), 10_000, 0),
+        result("a", 2, Some("passed"), 2, (100, 10)),
+        priced(result("b", 1, Some("passed"), 1, (5, 1)), 5_000, 1),
+    ];
+    let report = eval::report(&results, &priced_manifest(&["a", "b"], 2));
+    assert_eq!(report.tasks[0].cost_micro_usd, None);
+    assert_eq!(
+        report.tasks[1].cost_micro_usd.and_then(|cost| cost.mean),
+        Some(5_000.0)
+    );
+    let overall = &report.overall;
+    assert_eq!(overall.totals.cost_micro_usd, None);
+    assert_eq!(overall.means.cost_micro_usd, None);
+    assert_eq!(overall.cost_per_pass_micro_usd, None);
+    assert_eq!(overall.long_prompt_requests, 1);
+    let markdown = eval::report_markdown(&report);
+    assert!(markdown.contains("| 100.0 | 10.0 | n/a |"), "{markdown}");
+    assert!(markdown.contains("| 5.0 | 1.0 | $0.0050 |"), "{markdown}");
+    assert!(!markdown.contains("Cost: "), "{markdown}");
+
+    // An unpriced suite says why, and shows no limits or totals.
+    let unpriced = eval::report(
+        &[result("a", 1, Some("passed"), 2, (100, 10))],
+        &unpriced_manifest(&["a"], 1),
+    );
+    assert_eq!(
+        unpriced.unpriced_reason.as_deref(),
+        Some("openai-compat has no price table")
+    );
+    assert_eq!(
+        (unpriced.pricing_version.as_deref(), unpriced.context_window),
+        (None, None)
+    );
+    let markdown = eval::report_markdown(&unpriced);
+    assert!(
+        markdown.contains(
+            "- Provider: openai-compat, model: local-coder\n- Cost: unpriced (openai-compat has \
+             no price table)\n"
+        ),
+        "{markdown}"
+    );
+    assert!(
+        !markdown.contains("Model limits") && !markdown.contains("Cost: $"),
+        "{markdown}"
+    );
+    // A hostile reason stays inside its line.
+    let mut odd = unpriced_manifest(&["a"], 1);
+    odd.unpriced_reason = Some("no price table for x|y\nz".to_string());
+    assert!(
+        eval::report_markdown(&eval::report(&[], &odd))
+            .contains("- Cost: unpriced (no price table for x\\|y z)\n")
+    );
+
+    // Priced, but nothing passed; and no runs at all.
+    let failed = eval::report(
+        &[
+            priced(result("a", 1, Some("failed"), 2, (1, 1)), 10_000, 0),
+            priced(result("a", 2, None, 2, (1, 1)), 5_000, 0),
+        ],
+        &priced_manifest(&["a"], 2),
+    );
+    assert_eq!(failed.overall.totals.cost_micro_usd, Some(15_000));
+    assert_eq!(failed.overall.cost_per_pass_micro_usd, None);
+    assert!(
+        eval::report_markdown(&failed).ends_with(" ms. Cost: $0.0150 (no passed runs).\n"),
+        "{}",
+        eval::report_markdown(&failed)
+    );
+    let empty = eval::report(&[], &priced_manifest(&["a"], 1));
+    assert_eq!(empty.overall.totals.cost_micro_usd, None);
+    assert!(!eval::report_markdown(&empty).contains("Cost: "));
+}
+
+#[test]
+fn compare_shows_cost_only_when_both_sides_have_it() {
+    let base = eval::report(
+        &[
+            priced(result("a", 1, Some("passed"), 2, (100, 10)), 20_000, 0),
+            priced(result("a", 2, Some("failed"), 2, (100, 10)), 10_000, 0),
+        ],
+        &priced_manifest(&["a"], 2),
+    );
+    let new = eval::report(
+        &[
+            priced(result("a", 1, Some("passed"), 2, (100, 10)), 1_500_000, 3),
+            priced(result("a", 2, Some("passed"), 2, (100, 10)), 500_000, 0),
+        ],
+        &priced_manifest(&["a"], 2),
+    );
+    let text = eval::compare(&base, &new);
+    assert!(
+        text.contains(
+            ").\nTotal cost: $0.0300 → $2.00 (+$1.97); per passed run $0.0300 → $1.00.\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Price tables"), "{text}");
+    let text = eval::compare(&new, &base);
+    assert!(
+        text.contains("Total cost: $2.00 → $0.0300 (-$1.97); per passed run $1.00 → $0.0300.\n"),
+        "{text}"
+    );
+    let failed = eval::report(
+        &[priced(result("a", 1, Some("failed"), 2, (1, 1)), 7_000, 0)],
+        &priced_manifest(&["a"], 1),
+    );
+    let text = eval::compare(&base, &failed);
+    assert!(
+        text.contains("Total cost: $0.0300 → $0.0070 (-$0.0230); per passed run $0.0300 → n/a.\n"),
+        "{text}"
+    );
+
+    // Unknown is not zero: one unpriced side shows no cost at all.
+    let unpriced = eval::report(
+        &[result("a", 1, Some("passed"), 2, (100, 10))],
+        &unpriced_manifest(&["a"], 1),
+    );
+    for text in [
+        eval::compare(&base, &unpriced),
+        eval::compare(&unpriced, &new),
+    ] {
+        assert!(!text.contains("cost"), "{text}");
+        assert!(!text.contains("Price tables"), "{text}");
+    }
+
+    let mut newer = new.clone();
+    newer.pricing_version = Some("2027-01-01".to_string());
+    let text = eval::compare(&base, &newer);
+    assert!(
+        text.ends_with(
+            "\n\nPrice tables differ (2026-11-13 → 2027-01-01); costs are not directly \
+             comparable.\n"
+        ),
+        "{text}"
+    );
+    assert!(!eval::compare(&new, &new).contains("Price tables"));
+}
+
+#[test]
+fn results_manifests_and_reports_without_cost_still_parse() {
+    // Unpriced: none of the new keys are written.
+    let run = result("a", 1, Some("passed"), 2, (10, 1));
+    let json = serde_json::to_value(&run).expect("result JSON");
+    for key in ["cost_micro_usd", "long_prompt_requests"] {
+        assert!(json.get(key).is_none(), "{json}");
+    }
+    let older = manifest(&["a"], 1);
+    let json = serde_json::to_value(&older).expect("manifest JSON");
+    for key in ["pricing", "unpriced_reason"] {
+        assert!(json.get(key).is_none(), "{json}");
+    }
+    let report = eval::report(std::slice::from_ref(&run), &older);
+    let json = serde_json::to_value(&report).expect("report JSON");
+    for key in [
+        "pricing_version",
+        "unpriced_reason",
+        "context_window",
+        "model_max_output_tokens",
+    ] {
+        assert!(json.get(key).is_none(), "{json}");
+    }
+    for key in ["cost_per_pass_micro_usd", "long_prompt_requests"] {
+        assert!(json["overall"].get(key).is_none(), "{json}");
+    }
+    assert!(json["overall"]["totals"].get("cost_micro_usd").is_none());
+    assert!(json["overall"]["means"].get("cost_micro_usd").is_none());
+    for key in ["cost_micro_usd", "long_prompt_requests"] {
+        assert!(json["tasks"][0].get(key).is_none(), "{json}");
+    }
+
+    // Lines and files written before the fields existed: a priced run's
+    // JSON with them removed.
+    let mut line = serde_json::to_value(priced(run.clone(), 10, 1)).expect("result JSON");
+    for key in ["cost_micro_usd", "long_prompt_requests"] {
+        line.as_object_mut()
+            .expect("object")
+            .remove(key)
+            .expect(key);
+    }
+    let parsed: RunResult = serde_json::from_value(line).expect("an older line parses");
+    assert_eq!(parsed, run);
+    let mut file = serde_json::to_value(priced_manifest(&["a"], 1)).expect("manifest JSON");
+    file.as_object_mut()
+        .expect("object")
+        .remove("pricing")
+        .expect("pricing");
+    let parsed: Manifest = serde_json::from_value(file).expect("an older manifest parses");
+    assert_eq!((parsed.pricing, parsed.unpriced_reason), (None, None));
+
+    let temp = common::private_tempdir().expect("tempdir");
+    let mut file = serde_json::to_value(eval::report(
+        &[priced(run, 10, 1)],
+        &priced_manifest(&["a"], 1),
+    ))
+    .expect("report JSON");
+    let object = file.as_object_mut().expect("object");
+    for key in [
+        "pricing_version",
+        "context_window",
+        "model_max_output_tokens",
+    ] {
+        object.remove(key).expect(key);
+    }
+    let overall = object["overall"].as_object_mut().expect("overall");
+    for key in ["cost_per_pass_micro_usd", "long_prompt_requests"] {
+        overall.remove(key).expect(key);
+    }
+    for part in ["totals", "means"] {
+        overall[part]
+            .as_object_mut()
+            .expect(part)
+            .remove("cost_micro_usd")
+            .expect(part);
+    }
+    let task = object["tasks"][0].as_object_mut().expect("task");
+    for key in ["cost_micro_usd", "long_prompt_requests"] {
+        task.remove(key).expect(key);
+    }
+    write(
+        &temp.path().join("report.json"),
+        file.to_string().as_bytes(),
+    );
+    let parsed = eval::read_report(temp.path()).expect("an older report reads");
+    assert_eq!(parsed.overall.totals.cost_micro_usd, None);
+    assert_eq!(parsed.overall.long_prompt_requests, 0);
+    assert_eq!(parsed.tasks[0].cost_micro_usd, None);
+    assert_eq!(parsed.pricing_version, None);
+    let markdown = eval::report_markdown(&parsed);
+    assert!(
+        !markdown.contains("Cost: ") && !markdown.contains("Model limits"),
+        "{markdown}"
+    );
+}
+
+/// A scripted answer that reports `usage`.
+fn answer_with(usage: Usage) -> ModelResponse {
+    ModelResponse {
+        usage,
+        ..ModelResponse::final_text("done")
+    }
+}
+
+fn usage(input: u64, cache_write: u64, cache_read: u64, output: u64) -> Usage {
+    Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_write,
+    }
+}
+
+/// A priced suite of `alpha` and `beta`, two trials each, every run one
+/// answer with `usage`.
+async fn priced_suite(out: &Path, tasks: &[EvalTask], usage: Usage) -> eval::SuiteSummary {
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let options = SuiteOptions {
+        pricing: Some(haiku()),
+        provider: ProviderInfo {
+            name: "anthropic".to_string(),
+            model: "claude-haiku-5-5".to_string(),
+        },
+        ..options(out, 2, false)
+    };
+    eval::run_suite(
+        &api,
+        tasks,
+        &options,
+        || Ok(ScriptedProvider::new([answer_with(usage)])),
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite runs")
+}
+
+#[tokio::test]
+async fn a_run_whose_journal_failed_is_unpriced_not_free() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let options = SuiteOptions {
+        pricing: Some(haiku()),
+        provider: ProviderInfo {
+            name: "anthropic".to_string(),
+            model: "claude-haiku-5-5".to_string(),
+        },
+        ..options(&out, 1, false)
+    };
+    // The response was billed, but its journal line is over the limit, so
+    // the journal never holds it: its cost is unknown, not zero.
+    let billed = ModelResponse {
+        usage: usage(1_000, 0, 0, 2_000),
+        ..ModelResponse::final_text("x".repeat(MAX_JOURNAL_LINE_BYTES + 1))
+    };
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &options,
+        || Ok(ScriptedProvider::new([billed.clone()])),
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite stops cleanly");
+    assert!(summary.stopped.is_some(), "{summary:?}");
+    assert_eq!(summary.results.len(), 1);
+    assert_eq!(
+        summary.results[0].cost_micro_usd, None,
+        "{:?}",
+        summary.results[0]
+    );
+    let report = eval::read_report(&out).expect("report");
+    assert_eq!(report.overall.totals.cost_micro_usd, None);
+}
+
+#[tokio::test]
+async fn the_runner_prices_each_run_and_reprice_agrees() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = two_tasks(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    // A 120,000-token prompt: the long card. 1,000 × $0.50 + 9,000 ×
+    // $0.625 + 110,000 × $0.05 + 2,000 × $2.50 per million: 500 + 5,625 +
+    // 5,500 + 5,000 micro-dollars.
+    let summary = priced_suite(&out, &tasks, usage(1_000, 9_000, 110_000, 2_000)).await;
+    for result in &summary.results {
+        assert_eq!(result.cost_micro_usd, Some(16_625), "{result:?}");
+        assert_eq!(result.long_prompt_requests, 1);
+    }
+    let manifest = eval::read_manifest(&out).expect("manifest");
+    assert_eq!(manifest.pricing, Some(PricingRecord::from(haiku())));
+    assert_eq!(manifest.unpriced_reason, None);
+    let report = eval::read_report(&out).expect("report");
+    assert_eq!(report.overall.totals.cost_micro_usd, Some(4 * 16_625));
+    assert_eq!(report.overall.long_prompt_requests, 4);
+
+    let cost = eval::reprice(&out, haiku()).expect("reprices");
+    assert_eq!(cost.cost_micro_usd, 4 * 16_625);
+    assert_eq!((cost.runs, cost.long_prompt_requests), (4, 4));
+    assert_eq!(cost.passed, report.overall.passed);
+    assert_eq!(
+        cost.tasks
+            .iter()
+            .map(|task| (task.task.as_str(), task.runs, task.cost_micro_usd))
+            .collect::<Vec<_>>(),
+        [("alpha", 2, 2 * 16_625), ("beta", 2, 2 * 16_625)]
+    );
+    let markdown = cost.markdown();
+    assert!(
+        markdown.contains(
+            "- Priced from each run's journal at list prices as of 2026-11-13, assuming every \
+             turn was served by the requested model\n"
+        ),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| alpha | 2 | 0 | $0.0333 | 2 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown
+            .ends_with("\nCost: $0.0665 (no passed runs; 4 responses on the long-prompt rate).\n"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("own report"), "{markdown}");
+
+    // Another model's prices are refused.
+    let opus = pricing::lookup("claude-opus-5-5").expect("opus");
+    let error = eval::reprice(&out, opus).expect_err("another model");
+    assert!(error.to_string().contains("not claude-opus-5-5"), "{error}");
+}
+
+#[tokio::test]
+async fn reprice_fails_whole_on_any_bad_run() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = two_tasks(&temp.path().join("tasks"));
+    let pristine = temp.path().join("pristine");
+    priced_suite(&pristine, &tasks, usage(100, 0, 0, 20)).await;
+    eval::reprice(&pristine, haiku()).expect("the pristine run reprices");
+    let copy = |name: &str| {
+        let to = temp.path().join(name);
+        let status = Command::new("cp")
+            .arg("-R")
+            .arg(&pristine)
+            .arg(&to)
+            .status()
+            .expect("cp");
+        assert!(status.success());
+        to
+    };
+    let journal = |dir: &Path, task: &str, trial: u32| {
+        dir.join("runs")
+            .join(task)
+            .join(trial.to_string())
+            .join("journal.jsonl")
+    };
+
+    // A usage figure edited after the fact breaks the hash chain.
+    let tampered = copy("tampered");
+    let path = journal(&tampered, "beta", 2);
+    let text = std::fs::read_to_string(&path).expect("journal");
+    assert!(text.contains("\"output_tokens\":20"), "{text}");
+    std::fs::write(
+        &path,
+        text.replace("\"output_tokens\":20", "\"output_tokens\":2"),
+    )
+    .expect("tamper");
+    let error = eval::reprice(&tampered, haiku()).expect_err("tampered");
+    assert!(error.to_string().contains("task beta trial 2: "), "{error}");
+
+    let missing = copy("missing");
+    std::fs::remove_file(journal(&missing, "alpha", 1)).expect("remove");
+    let error = eval::reprice(&missing, haiku()).expect_err("missing");
+    assert!(
+        error.to_string().contains("task alpha trial 1: "),
+        "{error}"
+    );
+
+    // A journal of another run, verified on its own, is still refused.
+    let swapped = copy("swapped");
+    std::fs::copy(journal(&swapped, "beta", 1), journal(&swapped, "alpha", 1)).expect("swap");
+    let error = eval::reprice(&swapped, haiku()).expect_err("swapped");
+    assert!(
+        error
+            .to_string()
+            .contains("task alpha trial 1: the journal is session"),
+        "{error}"
+    );
+
+    // Result lines naming a path outside the runs, an unlisted task, a
+    // trial the manifest did not run, or a run twice.
+    for (name, edit) in [
+        ("escape", r#""task":"../../x""#),
+        ("unlisted", r#""task":"gamma""#),
+        ("trial", r#""trial":3"#),
+    ] {
+        let dir = copy(name);
+        let path = dir.join("results.jsonl");
+        let text = std::fs::read_to_string(&path).expect("results");
+        let first = text.lines().next().expect("a line");
+        let edited = first
+            .replacen(
+                r#""task":"alpha""#,
+                edit,
+                usize::from(edit.starts_with(r#""task""#)),
+            )
+            .replacen(
+                r#""trial":1"#,
+                edit,
+                usize::from(edit.starts_with(r#""trial""#)),
+            );
+        assert_ne!(edited, first, "{name}");
+        std::fs::write(&path, text.replacen(first, &edited, 1)).expect("edit");
+        let error = eval::reprice(&dir, haiku()).expect_err(name);
+        assert!(
+            error.to_string().contains("results.jsonl: line 1: "),
+            "{name}: {error}"
+        );
+    }
+    let twice = copy("twice");
+    let path = twice.join("results.jsonl");
+    let text = std::fs::read_to_string(&path).expect("results");
+    let first = text.lines().next().expect("a line").to_string();
+    std::fs::write(&path, format!("{text}{first}\n")).expect("append");
+    let error = eval::reprice(&twice, haiku()).expect_err("twice");
+    assert!(error.to_string().contains("line 5: task "), "{error}");
+    assert!(error.to_string().contains("appears twice"), "{error}");
+}
+
+#[test]
+fn eval_cost_refuses_a_run_without_a_price_table_and_needs_no_kilnd() {
+    let temp = common::private_tempdir().expect("tempdir");
+    for (name, provider, model, needle) in [
+        (
+            "compat",
+            "openai-compat",
+            "claude-haiku-5-5",
+            "openai-compat has no price table",
+        ),
+        (
+            "unlisted",
+            "anthropic",
+            "claude-haiku-4-5",
+            "no price table for claude-haiku-4-5",
+        ),
+    ] {
+        let dir = temp.path().join(name);
+        let manifest = Manifest {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            ..manifest(&["a"], 1)
+        };
+        write(
+            &dir.join("manifest.json"),
+            &serde_json::to_vec(&manifest).expect("manifest"),
+        );
+        let output = cli(&[
+            "--socket",
+            temp.path().join("no.sock").to_str().expect("utf-8"),
+            "eval",
+            "cost",
+            dir.to_str().expect("utf-8"),
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains(needle), "{stderr}");
+        assert!(!stderr.contains("no.sock"), "{stderr}");
+        assert!(output.stdout.is_empty());
     }
 }

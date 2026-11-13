@@ -1380,3 +1380,35 @@ limit. The manifest records the base
 URL's host only, never a key, user, port, path or query. `eval selftest`
 runs a bare and a solved session per task with scripted providers and fails
 closed the same way.
+
+### Pricing
+
+`src/pricing.rs` holds each priced model's context window, output limit and
+list prices, with the date they were taken from the pricing page. The CLI
+decides whether a suite is priced: only for `--provider anthropic` with a
+model in the table and without `--fallbacks`, since a fallback turn may be
+served, and billed, by another model. Otherwise the suite is unpriced and the
+manifest and report record why. A priced manifest pins the table's version
+and the rates used, so a report can be checked later without trusting a
+newer table.
+
+Money is integers: rates are US micro-dollars per million tokens, so tokens
+times a rate is picodollars, summed in `u128` with saturation and rounded
+half up to micro-dollars only when a run's total is stored; floats appear
+only in means and ratios for display. The runner prices each
+`model_responded` record of the run's verified journal on its own rate card,
+because Claude Haiku 5.5 bills a request whose prompt (uncached input, cache
+reads and cache writes together) is over 100,000 tokens at higher rates on
+every category; a run's total usage would hide which requests crossed it.
+Cache writes are priced at the 5-minute rate: the harness only sends the
+top-level `cache_control: {"type": "ephemeral"}`. A task's or the suite's
+cost exists only when every run in it is priced. `eval cost` reads the same
+journals, verified with the journal loader, and prices them with the current
+table; it fails as a whole on any missing or invalid journal.
+
+Cost is an estimate from reported usage, not billing, and never a limit:
+the session's token, byte and time budgets stay the controls, and pricing
+reads usage only, so requests are byte-for-byte unchanged. The one use of
+the model metadata outside reports is that `run` and `eval run` refuse a
+`--max-output-tokens` above a listed model's output limit before anything
+runs; the context window is shown in `report.md`, not enforced.
