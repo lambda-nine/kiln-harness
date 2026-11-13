@@ -121,6 +121,13 @@ sudo env KILND_INTEGRATION=1 "$test_bin" \
 
 assert_clean
 
+# Eight eval runs at once stream their commands side by side.
+sudo env KILND_INTEGRATION=1 "$test_bin" \
+    --exact concurrent_eval_runs_stream_side_by_side_through_installed_kilnd \
+    --nocapture
+
+assert_clean
+
 # The CLI records, verifies, and reproduces one session.
 bin=$(cargo build --locked --bin kiln-harness --message-format=json | \
     python3 -c '

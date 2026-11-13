@@ -11,7 +11,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::{DeleteBehavior, FakeApi, ShAnswer, ShHandler, api_error, short_lifecycle_config};
-use kiln_harness::api::ExecutionState;
+use kiln_harness::api::{
+    ApiError, Deleted, Execution, ExecutionState, FinalCheck, Health, Reconnect, Sandbox,
+    SandboxApi, SandboxExec, SandboxRequest, StreamObserver, StreamedExec,
+};
 use kiln_harness::audit::{AuditError, AuditEvent, AuditSink, MemoryAudit};
 use kiln_harness::engine::{
     CheckOutcome, Harness, HarnessConfig, HarnessError, SeedFile, SessionTask, TaskCheck,
@@ -20,7 +23,8 @@ use kiln_harness::eval::{
     self, EvalError, EvalTask, Manifest, Report, RunResult, Stat, SuiteOptions, load_tasks,
 };
 use kiln_harness::journal::{
-    JournalEvent, LoadedJournal, MemoryJournal, RecordedSeedFile, read_journal,
+    JournalEvent, LoadedJournal, MAX_JOURNAL_LINE_BYTES, MemoryJournal, RecordedSeedFile,
+    read_journal,
 };
 use kiln_harness::provider::{
     ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, ToolCall,
@@ -2041,6 +2045,7 @@ fn options(out: &Path, trials: u32, replay: bool) -> SuiteOptions {
     SuiteOptions {
         out: out.to_path_buf(),
         trials,
+        concurrency: 1,
         replay,
         label: Some("test | run".to_string()),
         base_config: config(),
@@ -2092,7 +2097,10 @@ async fn the_runner_writes_results_reports_and_a_manifest() {
             Ok(Observing::new(&api, &seen, responses))
         },
         &CancellationToken::new(),
-        &mut |result| progress.push(result.clone()),
+        &mut |result| {
+            progress.push(result.clone());
+            Ok(())
+        },
     )
     .await
     .expect("the suite runs");
@@ -2147,11 +2155,18 @@ async fn the_runner_writes_results_reports_and_a_manifest() {
         Some("models.example.com")
     );
     assert_eq!(manifest.stopped, None);
+    assert_eq!(manifest.concurrency, 1);
+    assert_eq!(
+        api.state().reconnects,
+        0,
+        "one run at a time needs one connection"
+    );
     let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
     assert!(
         markdown.contains("| alpha | 2 | 2 | 100.0% |"),
         "{markdown}"
     );
+    assert!(markdown.contains("- Runs at a time: 1"), "{markdown}");
     assert!(markdown.contains("| beta | 2 | 0 | 0.0% |"), "{markdown}");
     assert!(markdown.contains("Label: test \\| run"), "{markdown}");
 
@@ -2191,7 +2206,7 @@ async fn neither_script_reaches_the_provider_in_a_suite_run() {
             ))
         },
         &CancellationToken::new(),
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
     .await
     .expect("the suite runs");
@@ -2261,7 +2276,7 @@ async fn results_carry_truncation_recoveries_and_replay_them() {
             Ok(Observing::new(&api, &seen, responses))
         },
         &CancellationToken::new(),
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
     .await
     .expect("the suite runs");
@@ -2314,7 +2329,7 @@ async fn replay_in_the_runner_matches_or_diverges_at_the_check() {
             ))
         },
         &CancellationToken::new(),
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
     .await
     .expect("the suite runs");
@@ -2345,7 +2360,7 @@ async fn replay_in_the_runner_matches_or_diverges_at_the_check() {
             ))
         },
         &CancellationToken::new(),
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
     .await
     .expect("the suite runs");
@@ -2367,7 +2382,7 @@ async fn an_existing_out_is_refused_before_any_run() {
         &options(&out, 1, false),
         || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
         &CancellationToken::new(),
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
     .await
     .expect_err("refused");
@@ -2394,7 +2409,7 @@ async fn an_unconfirmed_cleanup_stops_the_suite_with_a_partial_report() {
         &options(&out, 2, false),
         || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
         &CancellationToken::new(),
-        &mut |_| {},
+        &mut |_| Ok(()),
     )
     .await
     .expect("the suite stops cleanly");
@@ -2441,7 +2456,10 @@ async fn cancellation_stops_after_the_current_run() {
         &options(&out, 2, false),
         || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
         &cancel,
-        &mut |_| cancel.cancel(),
+        &mut |_| {
+            cancel.cancel();
+            Ok(())
+        },
     )
     .await
     .expect("stops");
@@ -2458,6 +2476,735 @@ fn the_runner_options_are_checked() {
     assert!(eval::validate_trials_and_label(100, Some(&"x".repeat(128))).is_ok());
     assert!(eval::validate_trials_and_label(1, Some(&"x".repeat(129))).is_err());
     assert!(eval::validate_trials_and_label(1, Some("a\nb")).is_err());
+    for refused in [0, 9] {
+        let error = eval::validate_concurrency(refused).expect_err("out of range");
+        assert_eq!(error.to_string(), "--concurrency must be between 1 and 8");
+    }
+    for accepted in [1, 8] {
+        eval::validate_concurrency(accepted).expect("in range");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runs side by side
+
+/// How long a concurrent suite may take before the test fails instead of
+/// hanging on a scheduling bug.
+const SUITE_LIMIT: Duration = Duration::from_secs(30);
+
+/// A daemon of many sandboxes, for runs side by side: each create gets a
+/// fake of its own under an ID of its own, so sessions share neither a
+/// workspace nor a listing. Calls that name a sandbox go to its fake;
+/// `GetExecution`, which names none, goes to the sandbox this connection
+/// created last, since a connection serves one run at a time.
+#[derive(Clone)]
+struct Fleet {
+    shared: Arc<Mutex<FleetState>>,
+    /// The sandbox this connection created last.
+    current: Arc<Mutex<Option<FakeApi>>>,
+}
+
+struct FleetState {
+    /// `/bin/sh` in every sandbox.
+    handler: ShHandler,
+    /// Every sandbox's ID and fake, in creation order.
+    sandboxes: Vec<(String, FakeApi)>,
+    reconnects: u32,
+    /// The first this many sandboxes asked to be deleted only acknowledge
+    /// it, so their absence is never confirmed.
+    unconfirmed_deletes: u32,
+    /// The sandboxes left unconfirmed.
+    unconfirmed: Vec<String>,
+    /// Like kilnd's Health lane: at most this many Health calls at once,
+    /// each taking `health_delay`; more are refused `RESOURCE_EXHAUSTED`.
+    health_cap: Option<u32>,
+    health_delay: Duration,
+    health_in_flight: u32,
+    health_refused: u32,
+}
+
+impl Fleet {
+    fn new(handler: ShHandler) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(FleetState {
+                handler,
+                sandboxes: Vec::new(),
+                reconnects: 0,
+                unconfirmed_deletes: 0,
+                unconfirmed: Vec::new(),
+                health_cap: None,
+                health_delay: Duration::ZERO,
+                health_in_flight: 0,
+                health_refused: 0,
+            })),
+            current: Arc::default(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, FleetState> {
+        self.shared.lock().expect("fleet lock")
+    }
+
+    fn sandbox(&self, id: &str) -> FakeApi {
+        self.state()
+            .sandboxes
+            .iter()
+            .find(|(known, _)| known == id)
+            .map(|(_, api)| api.clone())
+            .expect("a sandbox this fleet created")
+    }
+
+    /// Each sandbox's rows created and deletions confirmed, in creation
+    /// order.
+    fn lifecycles(&self) -> Vec<(usize, usize)> {
+        self.state()
+            .sandboxes
+            .iter()
+            .map(|(_, api)| {
+                let state = api.state();
+                (state.creates.len(), state.deleted.len())
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl SandboxApi for Fleet {
+    async fn health(&self) -> Result<Health, ApiError> {
+        let delay = {
+            let mut state = self.state();
+            if state
+                .health_cap
+                .is_some_and(|cap| state.health_in_flight >= cap)
+            {
+                state.health_refused += 1;
+                return Err(api_error(
+                    tonic::Code::ResourceExhausted,
+                    "Health RPC capacity reached",
+                ));
+            }
+            state.health_in_flight += 1;
+            state.health_delay
+        };
+        tokio::time::sleep(delay).await;
+        self.state().health_in_flight -= 1;
+        FakeApi::default().health().await
+    }
+
+    async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
+        let api = FakeApi::default();
+        let id = {
+            let mut state = self.state();
+            api.state().sh_handler = Some(state.handler.clone());
+            let id = format!("sb-{:016x}", state.sandboxes.len() + 1);
+            state.sandboxes.push((id.clone(), api.clone()));
+            id
+        };
+        *self.current.lock().expect("connection lock") = Some(api.clone());
+        let mut sandbox = api.create(request).await?;
+        sandbox.id = id;
+        Ok(sandbox)
+    }
+
+    async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
+        self.sandbox(&request.sandbox_id).exec(request).await
+    }
+
+    async fn exec_stream(
+        &self,
+        request: SandboxExec,
+        observer: &mut (dyn StreamObserver + Send),
+    ) -> Result<StreamedExec, ApiError> {
+        self.sandbox(&request.sandbox_id)
+            .exec_stream(request, observer)
+            .await
+    }
+
+    async fn recent_executions(&self, sandbox_id: &str) -> Result<Vec<Execution>, ApiError> {
+        self.sandbox(sandbox_id).recent_executions(sandbox_id).await
+    }
+
+    async fn delete(
+        &self,
+        sandbox_id: &str,
+        release_request_id: bool,
+    ) -> Result<Deleted, ApiError> {
+        let api = self.sandbox(sandbox_id);
+        {
+            let mut state = self.state();
+            if state.unconfirmed_deletes > 0 && !state.unconfirmed.iter().any(|id| id == sandbox_id)
+            {
+                state.unconfirmed_deletes -= 1;
+                state.unconfirmed.push(sandbox_id.to_string());
+                api.state().delete_behavior = DeleteBehavior::AcknowledgeOnly;
+            }
+        }
+        api.delete(sandbox_id, release_request_id).await
+    }
+
+    async fn renew(&self, sandbox_id: &str) -> Result<(), ApiError> {
+        self.sandbox(sandbox_id).renew(sandbox_id).await
+    }
+
+    async fn get_execution(&self, execution_id: &str) -> Result<Execution, ApiError> {
+        let current = self
+            .current
+            .lock()
+            .expect("connection lock")
+            .clone()
+            .expect("a sandbox created on this connection");
+        current.get_execution(execution_id).await
+    }
+
+    async fn final_check(&self, sandbox_id: &str) -> Result<FinalCheck, ApiError> {
+        self.sandbox(sandbox_id).final_check(sandbox_id).await
+    }
+
+    async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError> {
+        let sandboxes = self.state().sandboxes.clone();
+        let mut listed = Vec::new();
+        for (id, api) in sandboxes {
+            for mut sandbox in api.non_deleted_sandboxes().await? {
+                sandbox.id.clone_from(&id);
+                listed.push(sandbox);
+            }
+        }
+        Ok(listed)
+    }
+}
+
+/// A new connection shares the fleet but not the last sandbox created.
+#[async_trait]
+impl Reconnect for Fleet {
+    async fn reconnect(&self) -> Result<Self, ApiError> {
+        self.state().reconnects += 1;
+        Ok(Self {
+            shared: self.shared.clone(),
+            current: Arc::default(),
+        })
+    }
+}
+
+/// A scripted model for runs side by side. With a `gate`, its first
+/// request waits there for the other gated sessions; with `entered`, it
+/// says so and then never answers, until its session is canceled.
+struct SideBySide {
+    inner: ScriptedProvider,
+    gate: Option<Arc<tokio::sync::Barrier>>,
+    entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+}
+
+impl SideBySide {
+    fn answering(responses: Vec<ModelResponse>) -> Self {
+        Self {
+            inner: ScriptedProvider::new(responses),
+            gate: None,
+            entered: None,
+        }
+    }
+
+    fn gated(responses: Vec<ModelResponse>, gate: &Arc<tokio::sync::Barrier>) -> Self {
+        Self {
+            gate: Some(gate.clone()),
+            ..Self::answering(responses)
+        }
+    }
+
+    fn holding(entered: &tokio::sync::mpsc::UnboundedSender<()>) -> Self {
+        Self {
+            entered: Some(entered.clone()),
+            ..Self::answering(Vec::new())
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for SideBySide {
+    fn info(&self) -> ProviderInfo {
+        ProviderInfo {
+            name: "scripted".to_string(),
+            model: "observing".to_string(),
+        }
+    }
+
+    async fn complete(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<ModelResponse, ProviderError> {
+        // Announced before the gate, so a peer that the gate releases and
+        // the suite then cancels has still been seen to enter.
+        if let Some(entered) = &self.entered {
+            entered.send(()).expect("the test listens");
+        }
+        if let Some(gate) = self.gate.take() {
+            gate.wait().await;
+        }
+        if self.entered.is_some() {
+            std::future::pending::<()>().await;
+        }
+        self.inner.complete(request).await
+    }
+}
+
+fn at(out: &Path, trials: u32, concurrency: u32) -> SuiteOptions {
+    SuiteOptions {
+        concurrency,
+        ..options(out, trials, false)
+    }
+}
+
+fn one_task(root: &Path) -> Vec<EvalTask> {
+    make_task(root, "alpha", &task_json("alpha"), &[]);
+    load_tasks(root, &[], &config()).expect("loads")
+}
+
+fn read_manifest(out: &Path) -> Manifest {
+    serde_json::from_slice(&std::fs::read(out.join("manifest.json")).expect("manifest"))
+        .expect("manifest JSON")
+}
+
+fn by_task_and_trial(results: &[RunResult]) -> Vec<RunResult> {
+    let mut sorted = results.to_vec();
+    sorted.sort_by(|left, right| (&left.task, left.trial).cmp(&(&right.task, right.trial)));
+    sorted
+}
+
+#[tokio::test]
+async fn concurrent_runs_overlap_and_report_in_canonical_order() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = two_tasks(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    // The first four sessions' first requests meet here, which opens only
+    // when four run at once.
+    let gate = Arc::new(tokio::sync::Barrier::new(4));
+    let mut runs = 0;
+    let mut progress = Vec::new();
+    // alpha's three runs write out.txt and pass; beta's answer at once and fail.
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &at(&out, 3, 4),
+            || {
+                runs += 1;
+                let responses = if runs <= 3 {
+                    vec![write_out(), ModelResponse::final_text("done")]
+                } else {
+                    vec![ModelResponse::final_text("done")]
+                };
+                Ok(if runs <= 4 {
+                    SideBySide::gated(responses, &gate)
+                } else {
+                    SideBySide::answering(responses)
+                })
+            },
+            &CancellationToken::new(),
+            &mut |result| {
+                progress.push(result.clone());
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .expect("four sessions ran at once")
+    .expect("the suite runs");
+
+    assert_eq!(summary.stopped, None);
+    assert_eq!(
+        summary
+            .results
+            .iter()
+            .map(|result| (result.task.as_str(), result.trial, result.check.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("alpha", 1, Some("passed")),
+            ("alpha", 2, Some("passed")),
+            ("alpha", 3, Some("passed")),
+            ("beta", 1, Some("failed")),
+            ("beta", 2, Some("failed")),
+            ("beta", 3, Some("failed")),
+        ]
+    );
+    // Lines are written as runs end, and progress sees them in that order.
+    let lines = read_lines(&out.join("results.jsonl"));
+    assert_eq!(lines, progress);
+    assert_eq!(by_task_and_trial(&lines), summary.results);
+    for result in &summary.results {
+        assert_eq!(result.outcome, "completed");
+        assert_eq!(result.error, None);
+        let run = out
+            .join("runs")
+            .join(&result.task)
+            .join(result.trial.to_string());
+        read_journal(&run.join("journal.jsonl")).expect("each journal verifies");
+    }
+    // Every sandbox was its own and every deletion was confirmed.
+    assert_eq!(api.lifecycles(), vec![(1, 1); 6]);
+    // Four connections at most: the suite's and three more, reused.
+    assert_eq!(api.state().reconnects, 3);
+
+    let report = eval::read_report(&out).expect("report");
+    assert_eq!(report, summary.report);
+    assert_eq!(report.concurrency, 4);
+    assert_eq!((report.tasks[0].runs, report.tasks[0].passed), (3, 3));
+    assert_eq!((report.tasks[1].runs, report.tasks[1].passed), (3, 0));
+    assert_eq!(read_manifest(&out).concurrency, 4);
+    let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
+    assert!(
+        markdown.contains("- Trials per task: 3\n- Runs at a time: 4\n"),
+        "{markdown}"
+    );
+}
+
+#[tokio::test]
+async fn an_unconfirmed_cleanup_cancels_and_drains_the_other_runs() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    api.state().unconfirmed_deletes = 1;
+    let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+    let mut runs = 0;
+    // Trial 1 answers at once and its deletion is never confirmed; trials
+    // 2 and 3 wait for their model until they are canceled.
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &at(&out, 5, 3),
+            || {
+                runs += 1;
+                Ok(if runs == 1 {
+                    SideBySide::answering(vec![ModelResponse::final_text("done")])
+                } else {
+                    SideBySide::holding(&entered)
+                })
+            },
+            &CancellationToken::new(),
+            &mut |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("the suite drains")
+    .expect("the suite stops cleanly");
+
+    assert_eq!(
+        summary.stopped.as_deref(),
+        Some("task alpha trial 1: sandbox deletion was not confirmed")
+    );
+    assert_eq!(runs, 3, "trials 4 and 5 never start");
+    let mut waited = 0;
+    while entries.try_recv().is_ok() {
+        waited += 1;
+    }
+    assert_eq!(waited, 2);
+    let lines = by_task_and_trial(&read_lines(&out.join("results.jsonl")));
+    assert_eq!(
+        lines
+            .iter()
+            .map(|result| (result.trial, result.outcome.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "cleanup_failed"), (2, "canceled"), (3, "canceled")]
+    );
+    assert_eq!(lines, summary.results);
+    // Trial 1's sandbox was left; the canceled runs cleaned up their own.
+    let mut lifecycles = api.lifecycles();
+    lifecycles.sort_unstable();
+    assert_eq!(lifecycles, [(1, 0), (1, 1), (1, 1)]);
+    assert_eq!(api.state().unconfirmed.len(), 1);
+    assert_eq!(read_manifest(&out).stopped, summary.stopped);
+    let report = eval::read_report(&out).expect("partial report");
+    assert_eq!(report.overall.runs, 3);
+    assert_eq!(report.stopped, summary.stopped);
+}
+
+#[tokio::test]
+async fn cancellation_reaches_every_in_flight_run() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    let cancel = CancellationToken::new();
+    let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+    let options = at(&out, 6, 3);
+    let mut progress = |_: &RunResult| Ok(());
+    let suite = eval::run_suite(
+        &api,
+        &tasks,
+        &options,
+        || Ok(SideBySide::holding(&entered)),
+        &cancel,
+        &mut progress,
+    );
+    // Cancel once three sessions wait for their model at once.
+    let canceller = async {
+        for _ in 0..3 {
+            entries.recv().await.expect("a session waits");
+        }
+        cancel.cancel();
+    };
+    let (summary, ()) = tokio::time::timeout(SUITE_LIMIT, async { tokio::join!(suite, canceller) })
+        .await
+        .expect("the suite drains");
+    let summary = summary.expect("the suite stops cleanly");
+
+    assert_eq!(summary.stopped.as_deref(), Some("canceled"));
+    let lines = read_lines(&out.join("results.jsonl"));
+    assert_eq!(lines.len(), 3);
+    assert!(
+        lines.iter().all(|result| result.outcome == "canceled"),
+        "{lines:?}"
+    );
+    assert_eq!(by_task_and_trial(&lines), summary.results);
+    assert_eq!(
+        summary
+            .results
+            .iter()
+            .map(|result| result.trial)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(api.lifecycles(), vec![(1, 1); 3]);
+    assert_eq!(eval::read_report(&out).expect("report").overall.runs, 3);
+}
+
+#[tokio::test]
+async fn a_failed_progress_output_stops_the_suite_and_drains_the_other_runs() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+    let mut runs = 0;
+    let mut calls = 0;
+    // Trial 1 answers once trials 2 and 3 wait for their model; its
+    // progress line cannot be written.
+    let gate = Arc::new(tokio::sync::Barrier::new(3));
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &at(&out, 5, 3),
+            || {
+                runs += 1;
+                Ok(if runs == 1 {
+                    SideBySide::gated(vec![ModelResponse::final_text("done")], &gate)
+                } else {
+                    SideBySide {
+                        gate: Some(gate.clone()),
+                        ..SideBySide::holding(&entered)
+                    }
+                })
+            },
+            &CancellationToken::new(),
+            &mut |_| {
+                calls += 1;
+                Err("closed".to_string())
+            },
+        ),
+    )
+    .await
+    .expect("the suite drains")
+    .expect("the suite stops cleanly");
+
+    assert_eq!(summary.stopped.as_deref(), Some("progress output: closed"));
+    assert_eq!(calls, 1, "progress is not called after it failed");
+    assert_eq!(runs, 3, "trials 4 and 5 never start");
+    let mut waited = 0;
+    while entries.try_recv().is_ok() {
+        waited += 1;
+    }
+    assert_eq!(waited, 2);
+    // Every line is still written, and every sandbox cleaned up.
+    let lines = by_task_and_trial(&read_lines(&out.join("results.jsonl")));
+    assert_eq!(
+        lines
+            .iter()
+            .map(|result| (result.trial, result.outcome.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "completed"), (2, "canceled"), (3, "canceled")]
+    );
+    assert_eq!(lines, summary.results);
+    assert_eq!(api.lifecycles(), vec![(1, 1); 3]);
+    assert_eq!(
+        eval::read_report(&out).expect("report").stopped,
+        summary.stopped
+    );
+}
+
+#[tokio::test]
+async fn a_journal_failure_stops_the_suite_and_drains_the_other_runs() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    let (entered, _entries) = tokio::sync::mpsc::unbounded_channel();
+    let mut runs = 0;
+    // Trial 1's model answers with more than one journal line may hold, so
+    // its journal refuses the record mid-run, once trials 2 and 3 wait.
+    let gate = Arc::new(tokio::sync::Barrier::new(3));
+    let huge = "x".repeat(MAX_JOURNAL_LINE_BYTES + 1);
+    let mut options = at(&out, 5, 3);
+    options.replay = true;
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &options,
+            || {
+                runs += 1;
+                Ok(if runs == 1 {
+                    SideBySide::gated(vec![ModelResponse::final_text(huge.clone())], &gate)
+                } else {
+                    SideBySide {
+                        gate: Some(gate.clone()),
+                        ..SideBySide::holding(&entered)
+                    }
+                })
+            },
+            &CancellationToken::new(),
+            &mut |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("the suite drains")
+    .expect("the suite stops cleanly");
+
+    let stopped = summary.stopped.expect("stopped");
+    assert!(
+        stopped.starts_with("task alpha trial 1: run outputs: journal line ")
+            && stopped.contains("exceeds"),
+        "{stopped}"
+    );
+    assert_eq!(runs, 3, "trials 4 and 5 never start");
+    let lines = by_task_and_trial(&read_lines(&out.join("results.jsonl")));
+    assert_eq!(
+        lines
+            .iter()
+            .map(|result| (
+                result.trial,
+                result.outcome.as_str(),
+                result.replay.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (1, "failed", None),
+            (2, "canceled", None),
+            (3, "canceled", None)
+        ]
+    );
+    assert!(
+        lines[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("exceeds")),
+        "{:?}",
+        lines[0].error
+    );
+    // No replay ran: three sandboxes, each cleaned up.
+    assert_eq!(api.lifecycles(), vec![(1, 1); 3]);
+}
+
+/// Eight runs that start together meet kilnd's Health lane, which takes 4
+/// calls at once; their discovery waits for it instead of failing, and a
+/// second wave does the same.
+#[tokio::test]
+async fn runs_that_meet_the_health_lane_wait_for_it() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    {
+        let mut state = api.state();
+        state.health_cap = Some(4);
+        state.health_delay = Duration::from_millis(20);
+    }
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &at(&out, 16, 8),
+            || {
+                Ok(SideBySide::answering(vec![
+                    write_out(),
+                    ModelResponse::final_text("done"),
+                ]))
+            },
+            &CancellationToken::new(),
+            &mut |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("the suite finishes")
+    .expect("the suite runs");
+
+    assert_eq!(summary.stopped, None);
+    assert_eq!(summary.results.len(), 16);
+    assert!(
+        summary.results.iter().all(RunResult::passed),
+        "{:?}",
+        summary.results
+    );
+    assert!(api.state().health_refused > 0, "the lane was full");
+    assert_eq!(api.lifecycles(), vec![(1, 1); 16]);
+}
+
+#[tokio::test]
+async fn a_failed_connection_stops_the_suite_without_a_line() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().reconnect_error = Some(api_error(tonic::Code::Unavailable, "no route to kilnd"));
+    let (entered, _entries) = tokio::sync::mpsc::unbounded_channel();
+    let mut runs = 0;
+    // Trial 1 runs on the suite's own connection and waits for its model;
+    // trial 2 needs a new connection, which fails.
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &at(&out, 3, 2),
+            || {
+                runs += 1;
+                Ok(SideBySide::holding(&entered))
+            },
+            &CancellationToken::new(),
+            &mut |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("the suite drains")
+    .expect("the suite stops cleanly");
+
+    let stopped = summary.stopped.expect("stopped");
+    assert!(
+        stopped.starts_with("task alpha trial 2: connect: ")
+            && stopped.contains("no route to kilnd"),
+        "{stopped}"
+    );
+    assert_eq!(runs, 2, "trial 3 never starts");
+    let lines = read_lines(&out.join("results.jsonl"));
+    assert_eq!(
+        lines
+            .iter()
+            .map(|result| (result.trial, result.outcome.as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "canceled")]
+    );
+    assert!(!out.join("runs/alpha/2").exists());
+    let state = api.state();
+    assert_eq!(state.reconnects, 1);
+    assert_eq!(state.creates.len(), 1);
+    assert_eq!(state.deleted.len(), 1);
+    assert!(out.join("report.json").is_file());
 }
 
 // ---------------------------------------------------------------------------
@@ -2505,6 +3252,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         base_url_host: Some("192.168.1.20".to_string()),
         tasks: strings(tasks),
         trials,
+        concurrency: 1,
         replay: true,
         started_unix_ms: 1,
         ended_unix_ms: 2,
@@ -2664,6 +3412,60 @@ fn cli(args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn reports_without_concurrency_read_as_one() {
+    let one = manifest(&["a"], 1);
+    let mut four = manifest(&["a"], 1);
+    four.concurrency = 4;
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let base = eval::report(&runs, &one);
+    let new = eval::report(&runs, &four);
+    assert_eq!((base.concurrency, new.concurrency), (1, 4));
+
+    // A manifest and a report written before the field existed.
+    let mut older = serde_json::to_value(&four).expect("manifest JSON");
+    older
+        .as_object_mut()
+        .expect("object")
+        .remove("concurrency")
+        .expect("listed");
+    let older: Manifest = serde_json::from_value(older).expect("an older manifest parses");
+    assert_eq!(older.concurrency, 1);
+    let temp = common::private_tempdir().expect("tempdir");
+    let mut older = serde_json::to_value(&new).expect("report JSON");
+    older
+        .as_object_mut()
+        .expect("object")
+        .remove("concurrency")
+        .expect("listed");
+    write(
+        &temp.path().join("report.json"),
+        older.to_string().as_bytes(),
+    );
+    assert_eq!(
+        eval::read_report(temp.path())
+            .expect("an older report reads")
+            .concurrency,
+        1
+    );
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown.contains("- Trials per task: 1\n- Runs at a time: 4\n"),
+        "{markdown}"
+    );
+    let differing = eval::compare(&base, &new);
+    assert!(
+        differing.ends_with(
+            ").\n\nRuns at a time differ (1 → 4); wall times are not directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    for same in [eval::compare(&base, &base), eval::compare(&new, &new)] {
+        assert!(!same.contains("Runs at a time"), "{same}");
+    }
+}
+
+#[test]
 fn eval_run_help_lists_the_shared_flags() {
     let output = cli(&["eval", "run", "--help"]);
     assert!(output.status.success());
@@ -2692,6 +3494,7 @@ fn eval_run_help_lists_the_shared_flags() {
         "--tasks",
         "--task",
         "--trials",
+        "--concurrency",
         "--out",
         "--label",
         "--replay",
@@ -2705,6 +3508,41 @@ fn eval_run_help_lists_the_shared_flags() {
         &["eval", "compare", "--help"],
     ] {
         assert!(cli(command).status.success(), "{command:?}");
+    }
+}
+
+#[test]
+fn eval_run_refuses_an_out_of_range_concurrency_before_contacting_anything() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tasks");
+    let out = temp.path().join("out");
+    for concurrency in ["0", "9"] {
+        let output = cli(&[
+            "--socket",
+            temp.path().join("no.sock").to_str().expect("utf-8"),
+            "eval",
+            "run",
+            "--provider",
+            "openai-compat",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--model",
+            "m",
+            "--tasks",
+            tasks.to_str().expect("utf-8"),
+            "--concurrency",
+            concurrency,
+            "--out",
+            out.to_str().expect("utf-8"),
+        ]);
+        assert!(!output.status.success(), "{concurrency}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--concurrency must be between 1 and 8"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("no.sock"), "{stderr}");
+        assert!(!out.exists());
     }
 }
 

@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::Write as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
@@ -257,6 +258,10 @@ struct EvalRunArgs {
     /// Runs per task, 1 to 100.
     #[arg(long, default_value_t = 1)]
     trials: u32,
+    /// Runs at a time, 1 to 8: each holds its own kilnd connection and at
+    /// most one command stream, within kilnd's default of 8 streams per user.
+    #[arg(long, default_value_t = 1)]
+    concurrency: u32,
     /// New directory for every run's audit and journal, the results and
     /// the report; must not exist.
     #[arg(long)]
@@ -1055,6 +1060,7 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
     // any output is made or kilnd is contacted.
     let config = model_config(&args.model)?;
     eval::validate_trials_and_label(args.trials, args.label.as_deref())?;
+    eval::validate_concurrency(args.concurrency)?;
     let tasks = eval::load_tasks(&args.tasks, &args.only, &config)?;
     if tasks.is_empty() {
         bail!("{} holds no tasks", args.tasks.display());
@@ -1065,20 +1071,23 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
     let options = eval::SuiteOptions {
         out: args.out.clone(),
         trials: args.trials,
+        concurrency: args.concurrency,
         replay: args.replay,
         label: args.label.clone(),
         base_config: config,
         provider,
         base_url_host: base_url_host(&args.model),
     };
+    let cancel = interrupt();
+    let printer = ProgressPrinter::start(cancel.clone());
     let summary = eval::run_suite(
         &api,
         &tasks,
         &options,
         || build_provider(&args.model).map_err(|error| error.to_string()),
-        &interrupt(),
+        &cancel,
         &mut |result| {
-            println!(
+            printer.print(format!(
                 "{} #{}: {} (check {}){}",
                 result.task,
                 result.trial,
@@ -1088,13 +1097,19 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
                     .replay
                     .as_deref()
                     .map_or_else(String::new, |replay| format!(", replay {replay}"))
-            );
+            ))
         },
     )
-    .await?;
+    .await;
+    // Every progress line is out, or failed, before the summary follows.
+    let printer_error = printer.finish();
+    let summary = summary?;
     warn_if_unhealthy(&api, options.base_config.lifecycle_timeout).await;
+    // No run is in flight now; a closed stdout or stderr only loses text.
     let overall = &summary.report.overall;
-    println!(
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(
+        stdout,
         "passed {} of {} runs; macro pass rate {}",
         overall.passed,
         overall.runs,
@@ -1102,12 +1117,85 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
             .macro_pass_rate
             .map_or_else(|| "n/a".to_string(), |rate| format!("{:.1}%", rate * 100.0))
     );
-    println!("report: {}", args.out.join("report.md").display());
+    let _ = writeln!(stdout, "report: {}", args.out.join("report.md").display());
+    // Both are shown: a printer failure can be what canceled the suite,
+    // and its stop reason may then read only `canceled`.
+    let mut stderr = std::io::stderr();
+    if let Some(error) = &printer_error {
+        let _ = writeln!(stderr, "progress output: {error}");
+    }
     if let Some(stopped) = &summary.stopped {
-        eprintln!("stopped early: {stopped}");
+        let _ = writeln!(stderr, "stopped early: {stopped}");
+    }
+    if summary.stopped.is_some() || printer_error.is_some() {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Prints `eval run`'s progress lines on a thread of its own, so the
+/// runtime thread never writes to stdout while runs are in flight: a slow
+/// stdout cannot stall them and a closed one cannot panic past their
+/// cleanup. The first write error is kept, cancels the suite, and is the
+/// answer to every later line.
+struct ProgressPrinter {
+    lines: Option<std::sync::mpsc::Sender<String>>,
+    error: Arc<std::sync::Mutex<Option<String>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPrinter {
+    fn start(cancel: CancellationToken) -> Self {
+        let (lines, received) = std::sync::mpsc::channel::<String>();
+        let error = Arc::new(std::sync::Mutex::new(None));
+        let failed = Arc::clone(&error);
+        let thread = std::thread::spawn(move || {
+            for line in received {
+                let mut stdout = std::io::stdout().lock();
+                if let Err(written) = writeln!(stdout, "{line}").and_then(|()| stdout.flush()) {
+                    *failed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(written.to_string());
+                    cancel.cancel();
+                    return;
+                }
+            }
+        });
+        Self {
+            lines: Some(lines),
+            error,
+            thread: Some(thread),
+        }
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Queue `line`, or say why stdout can take no more.
+    fn print(&self, line: String) -> Result<(), String> {
+        if let Some(error) = self.error() {
+            return Err(error);
+        }
+        let sent = self.lines.as_ref().map(|lines| lines.send(line));
+        match sent {
+            Some(Ok(())) => Ok(()),
+            _ => Err(self.error().unwrap_or_else(|| "stdout closed".to_string())),
+        }
+    }
+
+    /// Wait for every queued line, and return the write error, if any.
+    fn finish(mut self) -> Option<String> {
+        drop(self.lines.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.error()
+    }
 }
 
 fn eval_compare(base: &Path, new: &Path) -> Result<ExitCode> {

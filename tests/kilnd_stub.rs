@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use common::http::{FakeHttp, Reply};
-use kiln_harness::api::{ExpiryReason, SandboxApi as _, TonicKilnd};
+use kiln_harness::api::{ExpiryReason, Reconnect as _, SandboxApi as _, TonicKilnd};
 use kiln_harness::audit::{AuditEvent, MemoryAudit};
 use kiln_harness::engine::{Harness, HarnessConfig, HarnessError, SessionTask};
 use kiln_harness::journal::{JournalEvent, MemoryJournal};
@@ -602,6 +602,42 @@ fn serve(stub: Stub, socket: &Path) -> tokio::sync::oneshot::Sender<()> {
             .expect("serve");
     });
     shutdown_tx
+}
+
+/// `reconnect` dials the socket again for a connection of its own: both
+/// connections answer, and once the socket is gone a reconnect fails while
+/// the connections already open still work.
+#[tokio::test]
+async fn reconnect_opens_a_new_connection_to_the_same_socket() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let socket = temp.path().join("kilnd.sock");
+    let shutdown = serve(
+        Stub {
+            health_answers: u32::MAX,
+            current: true,
+            ..Stub::default()
+        },
+        &socket,
+    );
+    let api = TonicKilnd::connect(socket.clone()).await.expect("connect");
+    let other = api.reconnect().await.expect("reconnect");
+    assert!(api.health().await.expect("health").serving);
+    assert!(other.health().await.expect("health on the new one").serving);
+
+    std::fs::remove_file(&socket).expect("unlink the socket");
+    let Err(error) = api.reconnect().await else {
+        panic!("a reconnect without a socket succeeded");
+    };
+    assert!(error.to_string().contains("connect to"), "{error}");
+    for open in [&api, &other] {
+        assert!(
+            open.health()
+                .await
+                .expect("an open one still answers")
+                .serving
+        );
+    }
+    let _ = shutdown.send(());
 }
 
 #[tokio::test]
@@ -1510,4 +1546,100 @@ fn the_cli_prints_live_output_sanitized_only_with_live() {
         let journal = std::fs::read_to_string(temp.path().join("out/run.jsonl")).expect("journal");
         assert!(journal.contains("\"exec_context\":\"workspace_stream_v1\""));
     }
+}
+
+/// `eval run` with a stdout nobody reads: the first progress line fails,
+/// the suite stops, and the runs still in flight are canceled and clean up,
+/// so every run that started has its line, and nothing panics.
+#[test]
+fn eval_run_with_a_closed_stdout_stops_and_cleans_up_every_run() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let task = temp.path().join("tasks/closed-stdout");
+    std::fs::create_dir_all(&task).expect("task directory");
+    for (path, contents) in [
+        (
+            "task.json",
+            r#"{"schema": 1, "id": "closed-stdout", "description": "a closed stdout", "check_timeout_secs": 10}"#,
+        ),
+        ("prompt.md", "Say done.\n"),
+        ("check.sh", "exit 0\n"),
+        ("solution.sh", "true\n"),
+    ] {
+        std::fs::write(task.join(path), contents).expect("task file");
+    }
+    let stub = Stub {
+        health_answers: u32::MAX,
+        ..Stub::default()
+    };
+    let creates = Arc::clone(&stub.create_requests);
+    let deleted = Arc::clone(&stub.deleted);
+    let completion = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "done"},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    });
+    // One session answers; the other two wait for a model that never does.
+    let servers = Servers::start(
+        temp.path(),
+        stub,
+        vec![Reply::json(200, &completion), Reply::Hang, Reply::Hang],
+    );
+    let out = temp.path().join("out/eval");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+        .arg("--socket")
+        .arg(&servers.socket)
+        .args(["eval", "run", "--provider", "openai-compat"])
+        .args(["--base-url", &servers.base_url, "--model", "test-model"])
+        .arg("--tasks")
+        .arg(temp.path().join("tasks"))
+        .args(["--trials", "3", "--concurrency", "3", "--out"])
+        .arg(&out)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the CLI");
+    // Nobody reads stdout: its first write fails.
+    drop(child.stdout.take());
+    let output = exit_within(child, Duration::from_secs(60)).expect("the CLI exits");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        stderr.contains("stopped early: progress output: "),
+        "{stderr}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("report.json")).expect("report"))
+            .expect("report JSON");
+    let stopped = report["stopped"].as_str().expect("stopped");
+    assert!(stopped.starts_with("progress output: "), "{stopped}");
+    let lines = std::fs::read_to_string(out.join("results.jsonl")).expect("results");
+    let outcomes = lines
+        .lines()
+        .map(|line| {
+            let line: serde_json::Value = serde_json::from_str(line).expect("result line");
+            line["outcome"].as_str().expect("outcome").to_string()
+        })
+        .collect::<Vec<_>>();
+    // Every run that started has its line; the two that waited were
+    // canceled and none was left without cleanup.
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| *outcome == "canceled")
+            .count(),
+        2,
+        "{outcomes:?}"
+    );
+    assert!(!outcomes.iter().any(|outcome| outcome == "cleanup_failed"));
+    assert_eq!(creates.lock().expect("creates").len(), 3);
+    assert!(deleted.load(Ordering::SeqCst) >= 3);
 }

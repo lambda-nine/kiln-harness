@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use kiln_harness::api::{
     ApiError, ApiLimits, CancelReason, Capabilities, CapturedOutput, Deleted, EnvVar, Execution,
     ExecutionMode, ExecutionState, ExpiryReason, ExpiryStatus, Feature, FinalCheck, Health,
-    LiveDelivery, LiveStream, NodeReservations, Sandbox, SandboxApi, SandboxExec, SandboxRequest,
-    SandboxState, StreamObserver, StreamedExec, env_names, env_sha256,
+    LiveDelivery, LiveStream, NodeReservations, Reconnect, Sandbox, SandboxApi, SandboxExec,
+    SandboxRequest, SandboxState, StreamObserver, StreamedExec, env_names, env_sha256,
 };
 use kiln_harness::engine::HarnessConfig;
 use tonic::Code;
@@ -289,6 +289,13 @@ pub struct FakeState {
     /// reads (`u32::MAX`: for ever) before it settles; `None` settles it at
     /// once.
     pub stopped_settles_after: Option<u32>,
+    /// Every `reconnect`, failed ones included.
+    pub reconnects: u32,
+    /// Every `reconnect` fails with this error.
+    pub reconnect_error: Option<ApiError>,
+    /// Refuse this many Health calls with `RESOURCE_EXHAUSTED`, as kilnd's
+    /// Health lane does when it is full, before answering again.
+    pub health_refusals: u32,
 }
 
 impl FakeApi {
@@ -684,6 +691,13 @@ impl SandboxApi for FakeApi {
         let script = {
             let mut state = self.state();
             state.health_calls += 1;
+            if state.health_refusals > 0 {
+                state.health_refusals -= 1;
+                return Err(api_error(
+                    Code::ResourceExhausted,
+                    "Health RPC capacity reached",
+                ));
+            }
             state.health_script.pop_front()
         };
         let mut features = None;
@@ -1104,6 +1118,19 @@ impl SandboxApi for FakeApi {
                 Vec::new()
             },
         )
+    }
+}
+
+/// A new connection is a clone: it shares this fake's state.
+#[async_trait]
+impl Reconnect for FakeApi {
+    async fn reconnect(&self) -> Result<Self, ApiError> {
+        let mut state = self.state();
+        state.reconnects += 1;
+        match &state.reconnect_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.clone()),
+        }
     }
 }
 

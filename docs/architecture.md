@@ -1302,18 +1302,38 @@ Model-turn divergence is unchanged.
 `eval run` loads and validates every task before anything runs, refuses an
 existing `--out`, reads kilnd's Health once for the manifest's feature list,
 then creates `--out` with mode 0700 through the same descriptor walk as the
-journal. Runs are sequential, one sandbox at a time, tasks in ID order and
-trials 1 to N, each with a fresh provider. Each run's results line is built
-from its journal (session ID, outcome, steps, tool calls, usage, check,
-truncation recoveries) and appended to `results.jsonl` before the next run
-starts. `truncation_recoveries` is always written, and a line without it
-reads as 0. With `--replay`, a
-completed run is replayed against a fresh sandbox right after it. The suite
-fails closed: after a run or replay whose sandbox deletion was not confirmed
-(`cleanup_failed`, `Cleanup` or `CreateUncertain`), or replay outputs that
-cannot be opened, it stops, writes `manifest.json`, `report.json` and
-`report.md` for the runs so far, and exits non-zero. Cancellation stops it
-after the current run's cleanup the same way. The manifest records the base
+journal. Runs start in task ID order and trials 1 to N, each with a fresh
+provider and its own sandbox, up to `--concurrency` (1 to 8, default 1) at
+once, all polled within the suite's own task. Each running run holds its own
+kilnd connection: kilnd caps every connection's HTTP/2 streams, and an
+`ExecStream` holds one for its whole life, so eight runs on one connection
+would sit at that cap. Connections are pooled and reused, and one is opened
+only when none is idle, so one run at a time never opens a second. Each run
+holds at most one command stream, which keeps 8 within kilnd's default
+per-user stream cap. Each run's results line is built from its journal
+(session ID, outcome, steps, tool calls, usage, check, truncation
+recoveries) and appended to `results.jsonl` as soon as the run ends, in
+completion order; the summary and reports are in task and trial order, and
+the manifest and report record `concurrency` (a file without it reads as 1).
+`truncation_recoveries` is always written, and a line without it reads as 0.
+With `--replay`, a completed run is replayed against a fresh sandbox right
+after it, on the same connection. The suite fails closed: a run or replay
+whose sandbox deletion was not confirmed (`cleanup_failed`, `Cleanup` or
+`CreateUncertain`), run or replay outputs (audit, journal or result line)
+that cannot be opened, written or read back, progress output that fails, a
+provider that cannot be built, a connection that cannot be opened, or
+cancellation stops it; a run that must stop the suite is not replayed. No new run starts, the runs in flight are canceled, and the suite
+waits for each to finish its cleanup: no run in flight is ever dropped. It
+then writes `manifest.json`, `report.json` and `report.md` for the runs so
+far, with every stop reason in order, and exits non-zero. Result lines,
+journals and audits are written synchronously on the runtime thread, so a
+stalled output volume stalls every run in flight; keep `--out` on local
+storage. The CLI prints progress lines from a thread of its own, so a slow
+or closed stdout neither stalls the runs nor ends them without cleanup. Each
+session's discovery retries kilnd's Health admission refusals
+(`RESOURCE_EXHAUSTED`, from its reserved Health lane) with backoff within
+the session deadline, since runs that start together can meet that lane's
+limit. The manifest records the base
 URL's host only, never a key, user, port, path or query. `eval selftest`
 runs a bare and a solved session per task with scripted providers and fails
 closed the same way.

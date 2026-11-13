@@ -6,6 +6,19 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `eval run --concurrency N` (1 to 8, default 1) runs up to N runs at once,
+  each with its own sandbox and its own kilnd connection, and starts the
+  next as soon as one ends; one at a time behaves as before. Lines in
+  `results.jsonl` are written in completion order while the report keeps
+  task and trial order, and any stop cancels the other runs in flight and
+  waits for their cleanup before the report is written; audit, journal and
+  progress output failures stop it too, and a run that stops it is not
+  replayed. Session discovery retries kilnd's Health admission refusals
+  within the session deadline. `manifest.json` and
+  `report.json` gain `concurrency` (a file without it reads as 1),
+  `report.md` prints the runs at a time, and `eval compare` notes when two
+  reports differ in it, since their wall times are then not directly
+  comparable.
 - Eval prompts match the execution context: the 13 task prompts that said
   commands start in `/` (every `evals/hard` task and `fix-failing-test`) now
   say they start in `/workspace`, with examples that use relative paths.

@@ -1,5 +1,6 @@
 //! The eval suite: tasks made of a seeded workspace, a prompt and a check
-//! script; a sequential runner that journals every run and can replay it;
+//! script; a runner that runs up to `--concurrency` runs at once, journals
+//! every run and can replay it;
 //! a per-model report; a comparison of two reports; and a self-test that
 //! proves each task's check against its reference solution.
 //!
@@ -14,13 +15,15 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::SandboxApi;
+use crate::api::{Reconnect, SandboxApi};
 use crate::audit::JsonlAudit;
 use crate::engine::{
     CheckOutcome, Harness, HarnessConfig, HarnessError, MAX_SEED_BYTES, MAX_SEED_FILES,
@@ -45,6 +48,11 @@ pub const MIN_CHECK_TIMEOUT_SECS: u64 = 1;
 pub const MAX_CHECK_TIMEOUT_SECS: u64 = 600;
 /// Bounds for `--trials`.
 pub const MAX_TRIALS: u32 = 100;
+/// Bounds for `--concurrency`. kilnd's default cap on command streams per
+/// user is 8 and Health does not report it; each run holds at most one
+/// `ExecStream` at a time, since the model's `exec` is its only streamed
+/// call (seeding, file tools and the check are unary).
+pub const MAX_CONCURRENCY: u32 = 8;
 /// Longest `--label`.
 pub const MAX_LABEL_BYTES: usize = 128;
 /// Largest `task.json`.
@@ -526,6 +534,9 @@ pub struct Manifest {
     pub base_url_host: Option<String>,
     pub tasks: Vec<String>,
     pub trials: u32,
+    /// Runs at a time; missing in older manifests, which ran one.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     pub replay: bool,
     pub started_unix_ms: u64,
     pub ended_unix_ms: u64,
@@ -633,9 +644,17 @@ pub struct Report {
     pub provider: String,
     pub model: String,
     pub trials: u32,
+    /// Runs at a time; missing in older reports, which ran one.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     pub stopped: Option<String>,
     pub tasks: Vec<TaskReport>,
     pub overall: OverallReport,
+}
+
+/// What a manifest or report without `concurrency` ran at.
+fn default_concurrency() -> u32 {
+    1
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -715,6 +734,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         provider: manifest.provider.clone(),
         model: manifest.model.clone(),
         trials: manifest.trials,
+        concurrency: manifest.concurrency,
         stopped: manifest.stopped.clone(),
         overall: OverallReport {
             tasks: u32::try_from(tasks.len()).unwrap_or(u32::MAX),
@@ -774,6 +794,7 @@ pub fn report_markdown(report: &Report) -> String {
         let _ = writeln!(text, "- Label: {}", cell(label));
     }
     let _ = writeln!(text, "- Trials per task: {}", report.trials);
+    let _ = writeln!(text, "- Runs at a time: {}", report.concurrency);
     if let Some(stopped) = &report.stopped {
         let _ = writeln!(text, "- Stopped early: {}", cell(stopped));
     }
@@ -858,7 +879,8 @@ fn mean_tokens(task: &TaskReport) -> Option<f64> {
 /// Markdown comparing two reports, such as two models or a harness change:
 /// per task (the union, sorted by ID) the pass rate, mean steps and mean
 /// total tokens from `base` to `new` with deltas, tasks present on one side
-/// only marked, then an overall line.
+/// only marked, then an overall line, and a note when the two ran a
+/// different number of runs at a time.
 #[must_use]
 pub fn compare(base: &Report, new: &Report) -> String {
     let mut text = String::new();
@@ -934,6 +956,13 @@ pub fn compare(base: &Report, new: &Report) -> String {
         number(total_tokens(new)),
         delta(total_tokens(base), total_tokens(new), 1.0, ""),
     );
+    if base.concurrency != new.concurrency {
+        let _ = writeln!(
+            text,
+            "\nRuns at a time differ ({} → {}); wall times are not directly comparable.",
+            base.concurrency, new.concurrency
+        );
+    }
     text
 }
 
@@ -965,6 +994,8 @@ pub struct SuiteOptions {
     /// Must not exist; created 0700.
     pub out: PathBuf,
     pub trials: u32,
+    /// Runs at a time, 1 to [`MAX_CONCURRENCY`].
+    pub concurrency: u32,
     pub replay: bool,
     pub label: Option<String>,
     /// The run limits before each task's overrides.
@@ -976,13 +1007,29 @@ pub struct SuiteOptions {
 }
 
 impl SuiteOptions {
-    /// Check the trial count and label.
+    /// Check the trial count, concurrency and label.
     ///
     /// # Errors
     ///
     /// Returns [`EvalError::Options`] naming the flag.
     pub fn validate(&self) -> Result<(), EvalError> {
-        validate_trials_and_label(self.trials, self.label.as_deref())
+        validate_trials_and_label(self.trials, self.label.as_deref())?;
+        validate_concurrency(self.concurrency)
+    }
+}
+
+/// `--concurrency` must be 1 to [`MAX_CONCURRENCY`].
+///
+/// # Errors
+///
+/// Returns [`EvalError::Options`] naming the flag.
+pub fn validate_concurrency(concurrency: u32) -> Result<(), EvalError> {
+    if (1..=MAX_CONCURRENCY).contains(&concurrency) {
+        Ok(())
+    } else {
+        Err(EvalError::Options(format!(
+            "--concurrency must be between 1 and {MAX_CONCURRENCY}"
+        )))
     }
 }
 
@@ -1120,33 +1167,53 @@ fn recorded(journal: Option<&LoadedJournal>) -> Recorded {
     recorded
 }
 
-/// Run every task `trials` times, sequentially, one sandbox at a time, in
-/// task order, against providers from `provider`. Each run writes
-/// `OUT/runs/<id>/<trial>/audit.jsonl` and `journal.jsonl` (with
-/// `replay`, a replay of that journal against a fresh sandbox writes
-/// `replay-audit.jsonl` and `replay-journal.jsonl` beside them) and appends
-/// its line to `OUT/results.jsonl`; `progress` sees each line.
+/// Run every task `trials` times against providers from `provider`, up to
+/// `options.concurrency` runs at once, each in its own sandbox. Runs start
+/// in task order and trials 1 to N, and a new one starts as soon as one
+/// finishes. Each running run holds its own kilnd connection: kilnd caps
+/// every connection's HTTP/2 streams and an `ExecStream` holds one for its
+/// whole life, so connections are pooled, reused by later runs, and opened
+/// only when none is idle; one run at a time never opens a second.
 ///
-/// The suite fails closed: after a run whose sandbox deletion was not
-/// confirmed (outcome `cleanup_failed`, or a `Cleanup` or `CreateUncertain`
-/// error, its replay's included) it stops. Cancellation stops it after the
-/// current run's cleanup. Either way `manifest.json`, `report.json` and
-/// `report.md` are written for the runs so far.
+/// Each run writes `OUT/runs/<id>/<trial>/audit.jsonl` and `journal.jsonl`
+/// (with `replay`, a replay of that journal against a fresh sandbox writes
+/// `replay-audit.jsonl` and `replay-journal.jsonl` beside them) and appends
+/// its line to `OUT/results.jsonl` as soon as it ends, so those lines are
+/// in completion order; `progress` sees each line in the same order, and
+/// an `Err` from it stops the suite like any other output failure, after
+/// which it is not called again. [`SuiteSummary::results`], `report.json`
+/// and `report.md` are in task and trial order. Result lines, journals and
+/// audits are written synchronously on the runtime thread, so a stalled
+/// output volume stalls every run in flight; keep `--out` on local storage.
+///
+/// The suite fails closed. A run whose sandbox deletion was not confirmed
+/// (outcome `cleanup_failed`, or a `Cleanup` or `CreateUncertain` error,
+/// its replay's included), a run's or replay's outputs that cannot be
+/// opened, written or read back, progress output that fails, a provider
+/// that cannot be built, a connection that cannot be opened, or
+/// cancellation stops it: no new run starts, the runs in flight
+/// are canceled, and the suite waits for each of them to finish its own
+/// cleanup and writes their lines. No run in flight is ever dropped. Every
+/// stop reason is kept, in the order seen, in `stopped`; `canceled` only
+/// when cancellation was the only one. Unless `results.jsonl` itself could
+/// not be written, `manifest.json`, `report.json` and `report.md` are
+/// written for the runs that finished.
 ///
 /// # Errors
 ///
 /// Returns an error when an option is invalid, `OUT` exists, kilnd's Health
 /// fails before the first run, or an output cannot be written.
+#[allow(clippy::too_many_lines)]
 pub async fn run_suite<A, P, F>(
     api: &A,
     tasks: &[EvalTask],
     options: &SuiteOptions,
     mut provider: F,
     cancel: &CancellationToken,
-    progress: &mut dyn FnMut(&RunResult),
+    progress: &mut dyn FnMut(&RunResult) -> Result<(), String>,
 ) -> Result<SuiteSummary, EvalError>
 where
-    A: SandboxApi + Clone,
+    A: Reconnect,
     P: Provider,
     F: FnMut() -> Result<P, String>,
 {
@@ -1168,58 +1235,113 @@ where
     let results_path = options.out.join("results.jsonl");
     let mut results_file = crate::outputs::create_new_file(&results_path)
         .map_err(|error| output_error(&results_path, error))?;
-    let mut results = Vec::new();
-    let mut stopped = None;
-    'suite: for task in tasks {
-        for trial in 1..=options.trials {
-            if cancel.is_cancelled() {
-                stopped = Some("canceled".to_string());
-                break 'suite;
-            }
+    // Every stop cancels this token, never the caller's, so the runs in
+    // flight stop and clean up while the suite tells the stops apart.
+    let runs_cancel = cancel.child_token();
+    let mut queue = tasks
+        .iter()
+        .enumerate()
+        .flat_map(|(index, task)| (1..=options.trials).map(move |trial| (index, task, trial)));
+    let mut idle: Vec<A> = vec![api.clone()];
+    let mut running = FuturesUnordered::new();
+    let mut finished: Vec<(usize, u32, RunResult)> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    let mut write_error: Option<EvalError> = None;
+    let mut progress_failed = false;
+    let width = usize::try_from(options.concurrency).unwrap_or(1);
+    // No `?`, `return` or `break` leaves this loop while a run is in
+    // flight: it ends only when `running` is empty.
+    loop {
+        while running.len() < width && !runs_cancel.is_cancelled() {
+            let Some((index, task, trial)) = queue.next() else {
+                break;
+            };
+            // Nothing has run for this trial when this fails.
+            let session_provider = match provider() {
+                Ok(session_provider) => session_provider,
+                Err(message) => {
+                    reasons.push(format!(
+                        "task {} trial {trial}: provider: {message}",
+                        task.id
+                    ));
+                    runs_cancel.cancel();
+                    break;
+                }
+            };
             let dir = options
                 .out
                 .join("runs")
                 .join(&task.id)
                 .join(trial.to_string());
-            // Nothing has run for this trial when either fails; stop with
-            // the report so far.
-            let session_provider = match provider() {
-                Ok(session_provider) => session_provider,
-                Err(message) => {
-                    stopped = Some(format!(
-                        "task {} trial {trial}: provider: {message}",
-                        task.id
-                    ));
-                    break 'suite;
-                }
-            };
-            let (result, stop) =
-                match run_one(api, task, trial, options, session_provider, &dir, cancel).await {
-                    Ok(run) => run,
-                    Err(error) => {
-                        stopped = Some(format!("task {} trial {trial}: {error}", task.id));
-                        break 'suite;
-                    }
-                };
-            let mut line =
-                serde_json::to_vec(&result).map_err(|error| output_error(&results_path, error))?;
-            line.push(b'\n');
-            results_file
-                .write_all(&line)
-                .and_then(|()| results_file.sync_data())
-                .map_err(|error| output_error(&results_path, error))?;
-            progress(&result);
-            results.push(result);
-            if let Some(stop) = stop {
-                stopped = Some(format!("task {} trial {trial}: {stop}", task.id));
-                break 'suite;
+            running.push(scheduled_run(
+                api,
+                idle.pop(),
+                index,
+                task,
+                trial,
+                options,
+                session_provider,
+                dir,
+                &runs_cancel,
+            ));
+        }
+        let Some(done) = running.next().await else {
+            break;
+        };
+        if let Some(connection) = done.connection {
+            idle.push(connection);
+        }
+        let task_id = &tasks[done.index].id;
+        match done.outcome {
+            Launched::NotStarted(None) => {}
+            Launched::NotStarted(Some(why)) => {
+                reasons.push(format!("task {task_id} trial {}: {why}", done.trial));
+                runs_cancel.cancel();
             }
-            if cancel.is_cancelled() {
-                stopped = Some("canceled".to_string());
-                break 'suite;
+            Launched::Ran(Err(error)) => {
+                reasons.push(format!("task {task_id} trial {}: {error}", done.trial));
+                runs_cancel.cancel();
+            }
+            Launched::Ran(Ok((result, stop))) => {
+                // The stop is known, and the runs in flight told, before
+                // any output work.
+                if let Some(stop) = stop {
+                    reasons.push(format!("task {task_id} trial {}: {stop}", done.trial));
+                    runs_cancel.cancel();
+                }
+                if write_error.is_none() {
+                    if let Err(error) = append_line(&mut results_file, &results_path, &result) {
+                        write_error = Some(error);
+                        runs_cancel.cancel();
+                    }
+                }
+                // Even after a failed write, so a later `cleanup_failed`
+                // run still reaches the operator; never after progress
+                // itself failed.
+                if !progress_failed {
+                    if let Err(message) = progress(&result) {
+                        progress_failed = true;
+                        reasons.push(format!("progress output: {message}"));
+                        runs_cancel.cancel();
+                    }
+                }
+                finished.push((done.index, done.trial, result));
             }
         }
     }
+    // `running` is empty: every run that started has finished its cleanup.
+    if let Some(error) = write_error {
+        return Err(error);
+    }
+    finished.sort_by_key(|(index, trial, _)| (*index, *trial));
+    let results: Vec<RunResult> = finished.into_iter().map(|(_, _, result)| result).collect();
+    let stopped = if !reasons.is_empty() {
+        Some(reasons.join("; "))
+    } else if cancel.is_cancelled() {
+        Some("canceled".to_string())
+    } else {
+        None
+    };
     let manifest = Manifest {
         schema: REPORT_SCHEMA,
         harness_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1229,6 +1351,7 @@ where
         base_url_host: options.base_url_host.clone(),
         tasks: tasks.iter().map(|task| task.id.clone()).collect(),
         trials: options.trials,
+        concurrency: options.concurrency,
         replay: options.replay,
         started_unix_ms,
         ended_unix_ms: unix_ms(),
@@ -1247,6 +1370,83 @@ where
         report,
         stopped,
     })
+}
+
+/// What one scheduled run came back with.
+struct Finished<A> {
+    /// Index of the task in `tasks`, for canonical ordering.
+    index: usize,
+    trial: u32,
+    /// The run's connection, back to the pool; `None` when none was opened.
+    connection: Option<A>,
+    outcome: Launched,
+}
+
+// One per run, moved once from the run's future to the suite: boxing the
+// larger variant would buy nothing.
+#[allow(clippy::large_enum_variant)]
+enum Launched {
+    /// No session started: the connection could not be opened (`Some`, why),
+    /// or the suite stopped first (`None`).
+    NotStarted(Option<String>),
+    Ran(Result<(RunResult, Option<String>), EvalError>),
+}
+
+/// Open a connection if none was handed over, then run `run_one`.
+#[allow(clippy::too_many_arguments)]
+async fn scheduled_run<A: Reconnect, P: Provider>(
+    api: &A,
+    connection: Option<A>,
+    index: usize,
+    task: &EvalTask,
+    trial: u32,
+    options: &SuiteOptions,
+    provider: P,
+    dir: PathBuf,
+    cancel: &CancellationToken,
+) -> Finished<A> {
+    let not_started = |why: Option<String>| Finished {
+        index,
+        trial,
+        connection: None,
+        outcome: Launched::NotStarted(why),
+    };
+    let connection = if let Some(connection) = connection {
+        connection
+    } else {
+        let window = options.base_config.lifecycle_timeout;
+        let opened = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return not_started(None),
+            opened = tokio::time::timeout(window, api.reconnect()) => opened,
+        };
+        match opened {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => return not_started(Some(format!("connect: {error}"))),
+            Err(_) => {
+                return not_started(Some(format!(
+                    "connect: no answer within {} ms",
+                    window.as_millis()
+                )));
+            }
+        }
+    };
+    let ran = run_one(&connection, task, trial, options, provider, &dir, cancel).await;
+    Finished {
+        index,
+        trial,
+        connection: Some(connection),
+        outcome: Launched::Ran(ran),
+    }
+}
+
+/// Append `result` to `results.jsonl` and make it durable.
+fn append_line(file: &mut std::fs::File, path: &Path, result: &RunResult) -> Result<(), EvalError> {
+    let mut line = serde_json::to_vec(result).map_err(|error| output_error(path, error))?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .and_then(|()| file.sync_data())
+        .map_err(|error| output_error(path, error))
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), EvalError> {
@@ -1276,7 +1476,8 @@ fn open_outputs(
 
 /// One run, and its replay when asked for. Returns its result line and,
 /// when the suite must stop after it, why: a sandbox whose deletion was not
-/// confirmed, or replay outputs that could not be opened.
+/// confirmed, or run or replay outputs that could not be written, opened or
+/// read back. A run that must stop the suite is not replayed.
 async fn run_one<A, P>(
     api: &A,
     task: &EvalTask,
@@ -1298,7 +1499,15 @@ where
     let outcome = harness.run(&session, cancel.clone()).await;
     let wall_ms = elapsed_ms(started);
     drop(harness);
-    let loaded = read_journal(&journal_path).ok();
+    let read_back = read_journal(&journal_path);
+    // A journal known to be empty means the session wrote nothing, which
+    // its result already says. Anything else must read back: a journal
+    // that is missing, or whose length cannot be read, is a failure too.
+    let unreadable = match &read_back {
+        Err(error) if !known_empty(&journal_path) => Some(error.to_string()),
+        _ => None,
+    };
+    let loaded = read_back.ok();
     let recorded = recorded(loaded.as_ref());
     let (outcome_name, work_outcome) = recorded.outcome.clone().unwrap_or_else(|| {
         let outcome = match &outcome {
@@ -1313,7 +1522,7 @@ where
     });
     let unconfirmed =
         outcome_name == "cleanup_failed" || outcome.as_ref().is_err_and(cleanup_unconfirmed);
-    let mut stop = unconfirmed.then(|| "sandbox deletion was not confirmed".to_string());
+    let mut stop = run_stop(unconfirmed, &outcome, unreadable.as_deref());
     let check = outcome
         .as_ref()
         .ok()
@@ -1342,16 +1551,23 @@ where
         error: outcome.as_ref().err().map(ToString::to_string),
     };
     let completed = result.outcome == "completed";
-    if options.replay && completed && !unconfirmed && !cancel.is_cancelled() {
+    if replay_due(options.replay, completed, stop.as_deref(), cancel) {
         if let Some(loaded) = &loaded {
-            // Replay outputs that cannot be opened stop the suite, after
-            // this run's line is written.
+            // Replay outputs that cannot be opened or written stop the
+            // suite, after this run's line is written.
             match replay_run(api, loaded, &options.base_config, dir, cancel).await {
-                Ok((status, replay_unconfirmed)) => {
-                    result.replay = Some(status);
-                    if replay_unconfirmed {
-                        stop = Some("the replay's sandbox deletion was not confirmed".to_string());
+                Ok(replayed) => {
+                    let mut stops = Vec::new();
+                    if replayed.unconfirmed {
+                        stops.push("the replay's sandbox deletion was not confirmed".to_string());
                     }
+                    if let Some(error) = replayed.output_error {
+                        stops.push(format!("replay outputs: {error}"));
+                        result.replay = Some("failed".to_string());
+                    } else {
+                        result.replay = Some(replayed.status);
+                    }
+                    stop = (!stops.is_empty()).then(|| stops.join("; "));
                 }
                 Err(error) => {
                     result.replay = Some("failed".to_string());
@@ -1365,18 +1581,76 @@ where
     Ok((result, stop))
 }
 
-/// Replay a recorded run against a fresh sandbox and say how it went:
-/// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`, and
-/// whether the replay left a sandbox's deletion unconfirmed.
+/// Whether a run is replayed: asked for, completed, and with no reason to
+/// stop the suite, which is decided before this, and not canceled.
+fn replay_due(
+    replay: bool,
+    completed: bool,
+    stop: Option<&str>,
+    cancel: &CancellationToken,
+) -> bool {
+    replay && completed && stop.is_none() && !cancel.is_cancelled()
+}
+
+/// Why the suite must stop after a run, if it must: its sandbox deletion
+/// was not confirmed, its audit or journal could not be written, or its
+/// journal, which holds something, could not be read back.
+fn run_stop<T>(
+    unconfirmed: bool,
+    outcome: &Result<T, HarnessError>,
+    unreadable: Option<&str>,
+) -> Option<String> {
+    let mut stops = Vec::new();
+    if unconfirmed {
+        stops.push("sandbox deletion was not confirmed".to_string());
+    }
+    if let Some(error) = sink_error(outcome) {
+        stops.push(format!("run outputs: {error}"));
+    }
+    if let Some(error) = unreadable {
+        stops.push(format!("run journal could not be read back: {error}"));
+    }
+    (!stops.is_empty()).then(|| stops.join("; "))
+}
+
+/// The session's audit or journal error, if that is how it failed.
+fn sink_error<T>(outcome: &Result<T, HarnessError>) -> Option<String> {
+    match outcome {
+        Err(error @ (HarnessError::Audit(_) | HarnessError::Journal(_))) => Some(error.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `path` is a file whose length reads as 0. A length that cannot
+/// be read is never taken for empty.
+fn known_empty(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0)
+}
+
+/// How a replay went.
+struct Replayed {
+    /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`.
+    status: String,
+    /// The replay left a sandbox's deletion unconfirmed.
+    unconfirmed: bool,
+    /// The replay's audit or journal could not be written.
+    output_error: Option<String>,
+}
+
+/// Replay a recorded run against a fresh sandbox and say how it went.
 async fn replay_run<A: SandboxApi + Clone>(
     api: &A,
     recorded: &LoadedJournal,
     base: &HarnessConfig,
     dir: &Path,
     cancel: &CancellationToken,
-) -> Result<(String, bool), EvalError> {
+) -> Result<Replayed, EvalError> {
     let Ok(provider) = ReplayProvider::from_journal(recorded) else {
-        return Ok(("failed".to_string(), false));
+        return Ok(Replayed {
+            status: "failed".to_string(),
+            unconfirmed: false,
+            output_error: None,
+        });
     };
     let expected = provider.recorded_final_answer().map(str::to_string);
     let config = provider.replay_config(base.clone());
@@ -1400,8 +1674,11 @@ async fn replay_run<A: SandboxApi + Clone>(
             _ => "failed".to_string(),
         }
     };
-    let unconfirmed = result.as_ref().is_err_and(cleanup_unconfirmed);
-    Ok((status, unconfirmed))
+    Ok(Replayed {
+        status,
+        unconfirmed: result.as_ref().is_err_and(cleanup_unconfirmed),
+        output_error: sink_error(&result),
+    })
 }
 
 /// The limits the self-test runs under before each task's overrides: the
@@ -1548,4 +1825,96 @@ pub async fn selftest<A: SandboxApi + Clone>(
         results,
         stopped: cancel.is_cancelled().then(|| "canceled".to_string()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::AuditError;
+    use crate::journal::JournalError;
+
+    fn audit_failed() -> Result<(), HarnessError> {
+        Err(HarnessError::Audit(AuditError::Io(std::io::Error::other(
+            "disk gone",
+        ))))
+    }
+
+    #[test]
+    fn only_a_journal_read_as_empty_counts_as_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiln-harness-known-empty-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        std::fs::create_dir(&dir).expect("temporary directory");
+        let empty = dir.join("empty.jsonl");
+        let written = dir.join("written.jsonl");
+        std::fs::write(&empty, b"").expect("empty file");
+        std::fs::write(&written, b"{}\n").expect("written file");
+        assert!(known_empty(&empty));
+        assert!(!known_empty(&written));
+        // Missing, or not a file: its length is unknown, never empty.
+        assert!(!known_empty(&dir.join("missing.jsonl")));
+        assert!(!known_empty(&dir));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn audit_and_journal_errors_stop_the_suite_and_others_do_not() {
+        // An audit that fails after the work and the journal succeeded.
+        assert_eq!(
+            run_stop(false, &audit_failed(), None).as_deref(),
+            Some("run outputs: audit I/O failed: disk gone")
+        );
+        let journal: Result<(), HarnessError> = Err(HarnessError::Journal(JournalError::Io(
+            std::io::Error::other("disk gone"),
+        )));
+        assert_eq!(
+            run_stop(false, &journal, None).as_deref(),
+            Some("run outputs: journal I/O failed: disk gone")
+        );
+        // A replay's sink error is classified the same way.
+        assert_eq!(
+            sink_error(&journal).as_deref(),
+            Some("journal I/O failed: disk gone")
+        );
+        for other in [
+            Ok(()),
+            Err(HarnessError::Canceled),
+            Err(HarnessError::Deadline),
+            Err(HarnessError::Seed("no space".to_string())),
+        ] {
+            assert_eq!(sink_error(&other), None);
+            assert_eq!(run_stop(false, &other, None), None);
+        }
+    }
+
+    #[test]
+    fn a_run_that_stops_the_suite_is_not_replayed() {
+        let live = CancellationToken::new();
+        assert!(replay_due(true, true, None, &live));
+        // An audit that failed after a completed session.
+        let stop = run_stop(false, &audit_failed(), None);
+        assert!(!replay_due(true, true, stop.as_deref(), &live));
+        assert!(!replay_due(false, true, None, &live));
+        assert!(!replay_due(true, false, None, &live));
+        let canceled = CancellationToken::new();
+        canceled.cancel();
+        assert!(!replay_due(true, true, None, &canceled));
+    }
+
+    #[test]
+    fn every_stop_reason_is_kept_in_order() {
+        assert_eq!(
+            run_stop(true, &audit_failed(), Some("journal line 3 is empty")).as_deref(),
+            Some(
+                "sandbox deletion was not confirmed; run outputs: audit I/O failed: disk gone; \
+                 run journal could not be read back: journal line 3 is empty"
+            )
+        );
+        assert_eq!(
+            run_stop(true, &Ok(()), None).as_deref(),
+            Some("sandbox deletion was not confirmed")
+        );
+    }
 }

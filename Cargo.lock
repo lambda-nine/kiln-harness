@@ -719,6 +719,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "futures-util",
  "hyper-util",
  "prost",
  "reqwest",

@@ -605,3 +605,168 @@ async fn eval_selftest_proves_two_starter_tasks_against_installed_kilnd() {
     assert_eq!(after.reservations, before.reservations);
     assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
 }
+
+/// Eight eval runs at once against installed kilnd: each holds its own
+/// connection and sandbox and streams one command that sleeps, and their
+/// commands overlap in time. Nothing is left behind.
+#[tokio::test]
+async fn concurrent_eval_runs_stream_side_by_side_through_installed_kilnd() {
+    if std::env::var_os("KILND_INTEGRATION").is_none() {
+        return;
+    }
+    let socket = std::env::var_os("KILND_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/kilnd/kilnd.sock"), PathBuf::from);
+    let api = TonicKilnd::connect(socket)
+        .await
+        .expect("connect to installed kilnd");
+    let before = api.health().await.expect("health before");
+    assert!(before.serving, "kilnd unhealthy: {}", before.detail);
+    assert_eq!(
+        before.active_sandboxes, 0,
+        "integration baseline is not empty"
+    );
+    assert_eq!(before.running_executions, 0);
+    assert!(before.capabilities.supports(Feature::ExecStream));
+    let sandboxes_before = non_deleted_ids(&api).await;
+
+    let temp = common::private_tempdir().expect("temporary directory");
+    write_side_by_side_task(&temp.path().join("tasks"));
+    let config = kiln_harness::eval::selftest_config();
+    let tasks = kiln_harness::eval::load_tasks(&temp.path().join("tasks"), &[], &config)
+        .expect("the task loads");
+    let out = temp.path().join("out");
+    let options = kiln_harness::eval::SuiteOptions {
+        out: out.clone(),
+        trials: 8,
+        concurrency: 8,
+        replay: false,
+        label: None,
+        base_config: config,
+        provider: kiln_harness::provider::ProviderInfo {
+            name: "scripted".to_string(),
+            model: "scripted".to_string(),
+        },
+        base_url_host: None,
+    };
+    // Each run's one command prints when it started and ended, around a
+    // sleep long enough for the eight to overlap.
+    let script = "date +%s%N; sleep 6; echo done > out.txt; date +%s%N";
+    let summary = kiln_harness::eval::run_suite(
+        &api,
+        &tasks,
+        &options,
+        || {
+            Ok(ScriptedProvider::new([
+                ModelResponse::tool_use([ToolCall::new(
+                    "call-1",
+                    "exec",
+                    json!({"argv": ["/bin/sh", "-c", script]}),
+                )]),
+                ModelResponse::final_text("done"),
+            ]))
+        },
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite runs");
+    assert_eq!(summary.stopped, None);
+    assert_eq!(summary.results.len(), 8);
+    let mut spans = Vec::new();
+    for result in &summary.results {
+        assert_eq!(result.outcome, "completed", "{result:?}");
+        assert!(result.passed(), "{result:?}");
+        let journal = read_journal(
+            &out.join("runs")
+                .join(&result.task)
+                .join(result.trial.to_string())
+                .join("journal.jsonl"),
+        )
+        .expect("each journal verifies");
+        assert!(journal.complete);
+        spans.push(exec_span(&journal));
+    }
+    let peak = peak_overlap(&spans);
+    eprintln!("peak overlap of the eight commands: {peak}");
+    assert!(peak >= 4, "only {peak} commands overlapped: {spans:?}");
+
+    let after = api.health().await.expect("health after");
+    assert!(after.serving, "kilnd unhealthy: {}", after.detail);
+    assert_eq!(after.active_sandboxes, 0);
+    assert_eq!(after.running_executions, 0);
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
+}
+
+/// One task under `root` whose check passes once `out.txt` exists.
+fn write_side_by_side_task(root: &std::path::Path) {
+    let task = root.join("side-by-side");
+    std::fs::create_dir_all(task.join("seed")).expect("task directory");
+    let files: [(&str, &str); 5] = [
+        (
+            "task.json",
+            r#"{"schema": 1, "id": "side-by-side", "description": "runs side by side", "check_timeout_secs": 30}"#,
+        ),
+        ("prompt.md", "Write out.txt.\n"),
+        ("check.sh", "cd /workspace || exit 2\ntest -f out.txt\n"),
+        ("solution.sh", "echo done > /workspace/out.txt\n"),
+        ("seed/in.txt", "input\n"),
+    ];
+    for (path, contents) in files {
+        std::fs::write(task.join(path), contents).expect("task file");
+    }
+}
+
+/// When the run's one command started and ended, from the two timestamps
+/// it printed.
+fn exec_span(journal: &kiln_harness::journal::LoadedJournal) -> (u128, u128) {
+    let stdout = journal
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::ToolExecuted { call, result, .. } if call.tool == "exec" => result
+                .get("stdout")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .expect("the exec result");
+    let stamps = stdout.lines().map(nanos).collect::<Vec<_>>();
+    assert_eq!(stamps.len(), 2, "{stdout:?}");
+    assert!(stamps[0] <= stamps[1], "{stdout:?}");
+    (stamps[0], stamps[1])
+}
+
+/// A `date +%s%N` line in nanoseconds. A `date` without `%N` leaves seconds
+/// and the unexpanded rest, which still orders whole seconds.
+fn nanos(line: &str) -> u128 {
+    let digits = line
+        .trim()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let value: u128 = digits
+        .parse()
+        .unwrap_or_else(|_| panic!("not a timestamp: {line:?}"));
+    if digits.len() <= 10 {
+        value * 1_000_000_000
+    } else {
+        value
+    }
+}
+
+/// The most closed `[start, end]` spans that hold one instant.
+fn peak_overlap(spans: &[(u128, u128)]) -> usize {
+    let mut edges = spans
+        .iter()
+        .flat_map(|&(start, end)| [(start, 0, 1_i64), (end, 1, -1)])
+        .collect::<Vec<_>>();
+    // At one instant a span that starts counts before one that ends.
+    edges.sort_unstable();
+    let (mut open, mut peak) = (0_i64, 0_i64);
+    for (_, _, change) in edges {
+        open += change;
+        peak = peak.max(open);
+    }
+    usize::try_from(peak).unwrap_or(0)
+}

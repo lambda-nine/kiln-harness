@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{
     ApiError, ApiLimits, Capabilities, Execution, ExecutionState, ExpiryPolicy, ExpiryReason,
-    Feature, FinalCheck, Sandbox, SandboxApi, SandboxRequest, SandboxState, UnusableReason,
+    Feature, FinalCheck, Health, Sandbox, SandboxApi, SandboxRequest, SandboxState, UnusableReason,
     backend_unsupported_feature, request_id_is_valid, sandbox_unusable_refusal,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
@@ -553,20 +553,14 @@ where
         // Discovery comes before any use: an older daemon ignores fields it
         // does not know, so expiry is sent and reasons are read only when a
         // serving daemon lists them. Nothing exists yet if this fails.
-        let capabilities = tokio::select! {
-            () = cancel.cancelled() => return Err(HarnessError::Canceled),
-            health = timeout_at(deadline, self.api.health()) => match health {
-                Ok(Ok(health)) if health.serving => health.capabilities,
-                Ok(Ok(health)) => {
-                    return Err(HarnessError::Api(ApiError::new(
-                        tonic::Code::Unavailable,
-                        format!("kilnd is not serving: {}", health.detail),
-                    )));
-                }
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) => return Err(HarnessError::Deadline),
-            },
-        };
+        let health = discover_health(&self.api, deadline, &cancel).await?;
+        if !health.serving {
+            return Err(HarnessError::Api(ApiError::new(
+                tonic::Code::Unavailable,
+                format!("kilnd is not serving: {}", health.detail),
+            )));
+        }
+        let capabilities = health.capabilities;
         // Every live execution runs in /workspace with a fixed environment,
         // so a daemon whose backend has not proven both options, or whose
         // limits leave no room for them, cannot serve the session. A legacy
@@ -2754,6 +2748,47 @@ async fn recover_session_sandboxes<A: SandboxApi>(
             continue;
         }
         sleep(retry_delay.min(remaining)).await;
+    }
+}
+
+/// The session's discovery `Health`, retrying admission refusals.
+///
+/// kilnd answers Health through a reserved lane (by default 4 calls at once,
+/// behind a 5 s cache of the last success) and refuses calls beyond it with
+/// `RESOURCE_EXHAUSTED`. Sessions that start together, such as an eval
+/// suite's concurrent runs, can meet that limit on an otherwise idle daemon.
+/// Nothing exists yet, so a refusal is always safe to retry: with backoff
+/// from 50 ms, doubling to at most 1 s, until `deadline`. Cancellation wins
+/// at any point; any other error, and the deadline, end discovery as before.
+async fn discover_health<A: SandboxApi>(
+    api: &A,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Health, HarnessError> {
+    const FIRST_DELAY: Duration = Duration::from_millis(50);
+    const MAX_DELAY: Duration = Duration::from_secs(1);
+    let mut delay = FIRST_DELAY;
+    loop {
+        let answer = tokio::select! {
+            () = cancel.cancelled() => return Err(HarnessError::Canceled),
+            health = timeout_at(deadline, api.health()) => health,
+        };
+        match answer {
+            Ok(Ok(health)) => return Ok(health),
+            Ok(Err(error)) if error.code == tonic::Code::ResourceExhausted => {
+                let wake = Instant::now() + delay;
+                if wake >= deadline {
+                    return Err(HarnessError::Deadline);
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => return Err(HarnessError::Canceled),
+                    () = sleep_until(wake) => {}
+                }
+                delay = (delay * 2).min(MAX_DELAY);
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(HarnessError::Deadline),
+        }
     }
 }
 

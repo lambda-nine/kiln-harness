@@ -2272,3 +2272,111 @@ async fn a_tool_use_stop_without_calls_fails_closed() {
             if work_outcome == "failed"
     ));
 }
+
+fn discovery_session(
+    api: &FakeApi,
+    config: HarnessConfig,
+) -> Harness<FakeApi, ScriptedProvider, MemoryAudit, MemoryJournal> {
+    Harness::new(
+        api.clone(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    )
+}
+
+/// kilnd's Health lane refuses calls beyond its limit with
+/// `RESOURCE_EXHAUSTED`; discovery waits and asks again.
+#[tokio::test(start_paused = true)]
+async fn discovery_retries_health_admission_refusals() {
+    let api = FakeApi::default();
+    api.state().health_refusals = 3;
+    let started = tokio::time::Instant::now();
+    discovery_session(&api, HarnessConfig::default())
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("the session runs once Health answers");
+    // 50 + 100 + 200 ms of backoff before the fourth call.
+    assert!(started.elapsed() >= Duration::from_millis(350));
+    let state = api.state();
+    assert_eq!(state.health_refusals, 0);
+    assert_eq!(state.creates.len(), 1);
+    assert_eq!(state.deleted.len(), 1);
+}
+
+/// The backoff doubles from 50 ms and stops growing at 1 s.
+#[tokio::test(start_paused = true)]
+async fn the_health_backoff_is_capped_at_one_second() {
+    let api = FakeApi::default();
+    api.state().health_refusals = 10;
+    let started = tokio::time::Instant::now();
+    discovery_session(&api, HarnessConfig::default())
+        .run(&task(), CancellationToken::new())
+        .await
+        .expect("the session runs once Health answers");
+    // 50 + 100 + 200 + 400 + 800 ms, then five 1 s waits.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(6_550) && elapsed < Duration::from_millis(6_650),
+        "{elapsed:?}"
+    );
+    assert_eq!(api.state().health_refusals, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_during_the_health_backoff_creates_nothing() {
+    let api = FakeApi::default();
+    api.state().health_refusals = u32::MAX;
+    let cancel = CancellationToken::new();
+    let mut harness = discovery_session(&api, HarnessConfig::default());
+    let session = task();
+    let (result, ()) = tokio::join!(harness.run(&session, cancel.clone()), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+    });
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    let state = api.state();
+    assert!(state.health_calls > 1, "the refusal was retried");
+    assert!(state.create_requests.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_health_refusal_that_outlasts_the_deadline_ends_at_the_deadline() {
+    let api = FakeApi::default();
+    api.state().health_refusals = u32::MAX;
+    let config = HarnessConfig {
+        session_timeout: Duration::from_secs(3),
+        ..HarnessConfig::default()
+    };
+    let started = tokio::time::Instant::now();
+    let result = discovery_session(&api, config)
+        .run(&task(), CancellationToken::new())
+        .await;
+    assert!(matches!(result, Err(HarnessError::Deadline)), "{result:?}");
+    assert!(started.elapsed() <= Duration::from_secs(3));
+    let state = api.state();
+    assert!(state.health_calls > 3, "the refusal was retried");
+    assert!(state.create_requests.is_empty());
+}
+
+#[tokio::test]
+async fn any_other_health_error_still_ends_discovery_at_once() {
+    let api = FakeApi::default();
+    api.state()
+        .health_script
+        .push_back(common::HealthScript::Err(common::api_error(
+            Code::Unavailable,
+            "kilnd went away",
+        )));
+    let result = discovery_session(&api, HarnessConfig::default())
+        .run(&task(), CancellationToken::new())
+        .await;
+    assert!(
+        matches!(&result, Err(HarnessError::Api(error)) if error.code == Code::Unavailable),
+        "{result:?}"
+    );
+    let state = api.state();
+    assert_eq!(state.health_calls, 1);
+    assert!(state.create_requests.is_empty());
+}

@@ -831,9 +831,24 @@ pub trait SandboxApi: Send + Sync {
     async fn non_deleted_sandboxes(&self) -> Result<Vec<Sandbox>, ApiError>;
 }
 
+/// A client that can open another connection to the same daemon. The eval
+/// runner gives each concurrently running run its own: kilnd caps every
+/// connection's HTTP/2 streams, and an `ExecStream` holds one for its whole
+/// life.
+#[async_trait]
+pub trait Reconnect: SandboxApi + Clone + Sized {
+    /// A client on a new connection. The default shares this one, for
+    /// clients without a connection of their own.
+    async fn reconnect(&self) -> Result<Self, ApiError> {
+        Ok(self.clone())
+    }
+}
+
 #[derive(Clone)]
 pub struct TonicKilnd {
     client: KilndServiceClient<Channel>,
+    /// The socket `connect` opened, for [`Reconnect`].
+    socket: PathBuf,
 }
 
 impl TonicKilnd {
@@ -844,6 +859,7 @@ impl TonicKilnd {
     /// Returns an error if the endpoint cannot be configured or connected.
     pub async fn connect(path: PathBuf) -> Result<Self, ApiError> {
         let shown = path.display().to_string();
+        let socket = path.clone();
         let channel = Endpoint::try_from("http://kilnd.invalid")
             .map_err(|error| ApiError::local(error.to_string()))?
             .connect_with_connector(service_fn(move |_: Uri| {
@@ -859,6 +875,7 @@ impl TonicKilnd {
             .map_err(|error| ApiError::local(format!("connect to {shown}: {error}")))?;
         Ok(Self {
             client: KilndServiceClient::new(channel).max_decoding_message_size(4 << 20),
+            socket,
         })
     }
 
@@ -885,6 +902,13 @@ impl TonicKilnd {
             .map_err(ApiError::from)?
             .into_inner();
         Self::sandbox(response.sandbox)
+    }
+}
+
+#[async_trait]
+impl Reconnect for TonicKilnd {
+    async fn reconnect(&self) -> Result<Self, ApiError> {
+        Self::connect(self.socket.clone()).await
     }
 }
 

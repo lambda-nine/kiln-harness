@@ -10,6 +10,7 @@ publish = false
 anyhow = "1.0.100"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "http2"] }

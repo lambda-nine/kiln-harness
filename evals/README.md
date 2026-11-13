@@ -90,6 +90,7 @@ Audits and journals go under `--out`, which must not exist.
 | `--tasks DIR` | the suite, `evals/tasks` by default |
 | `--task ID` | run only this task; repeatable; an unknown ID is an error |
 | `--trials N` | runs per task, 1 to 100, default 1 |
+| `--concurrency N` | runs at a time, 1 to 8, default 1 |
 | `--out DIR` | required; must not exist; created with mode 0700 |
 | `--label TEXT` | free text for the report, at most 128 bytes |
 | `--replay` | replay each completed run's journal against a fresh sandbox |
@@ -115,10 +116,21 @@ the effective user is root, a path inside another user's home directory is
 refused; use a root-owned private directory instead, such as one made by
 `sudo mktemp -d`.
 
-Runs are sequential, one sandbox at a time, tasks in ID order and trials 1 to
-N. Each run writes `OUT/runs/<id>/<trial>/audit.jsonl` and `journal.jsonl`
+Runs start in task ID order and trials 1 to N, up to `--concurrency` at
+once, each with its own sandbox and its own kilnd connection; a new run
+starts as soon as one ends. Lines in `results.jsonl` are in completion
+order, while the report lists tasks and trials in order. Each run holds at
+most one command stream at a time, so 8 stays within kilnd's default cap on
+streams per user; other harness sessions running as the same user at the
+same time can make commands wait for a stream. A run's `wall_ms` includes
+any wait for shared capacity, such as kilnd's or a provider's rate limits,
+so compare wall times only between suites run at the same concurrency. Result
+lines, journals and audits are written synchronously, so a stalled output
+volume stalls every run in flight; keep `--out` on local storage.
+
+Each run writes `OUT/runs/<id>/<trial>/audit.jsonl` and `journal.jsonl`
 (and, with `--replay`, `replay-audit.jsonl` and `replay-journal.jsonl`), and
-appends one line to `OUT/results.jsonl`:
+appends one line to `OUT/results.jsonl` as soon as it ends:
 
 ```json
 {"task": "hello-file", "trial": 1, "session_id": "hs-…", "outcome": "completed",
@@ -135,8 +147,8 @@ prompt cache, and `cache_write_tokens` when some was written to one. `replay` is
 `failed`, or `null` without `--replay` or for a run that did not complete.
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
-kind and model, the base URL's host only, tasks, trials, start and end times,
-and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
+kind and model, the base URL's host only, tasks, trials, runs at a time,
+start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
 task the runs, passes, pass rate, outcome counts, mean and median steps, tool
 calls and wall time, mean tokens, and replay counts; overall the macro pass
 rate (the mean of the task pass rates), pass@1 with the number of trials, and
@@ -144,10 +156,16 @@ totals and means.
 
 The suite fails closed. After a run whose sandbox deletion was not confirmed
 (outcome `cleanup_failed`, or a `Cleanup` or `CreateUncertain` error,
-including its replay's) it stops, writes the report for the runs so far, and
-exits non-zero. Ctrl-C stops it after the current run's cleanup, with the same
-partial report and a non-zero exit. Otherwise it exits 0 whatever the pass
-rate.
+including its replay's) it stops: no new run starts, the other runs in flight
+are canceled, and it waits for each of them to finish its own cleanup and
+write its line (usually with outcome `canceled`). It then writes the report
+for the runs so far and exits non-zero. A provider that cannot be built, a
+connection that cannot be opened, a run's or replay's audit, journal or
+result line that cannot be written (a run that stops the suite is not
+replayed), or progress output that fails, such as a closed stdout pipe, stop
+it the same way, and Ctrl-C does too, with the same partial report and a
+non-zero exit. Every reason is kept, in the order seen. Otherwise it exits 0
+whatever the pass rate.
 
 ## Comparing runs
 
