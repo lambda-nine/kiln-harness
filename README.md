@@ -281,10 +281,15 @@ sends them without the bounds strict mode refuses (`maxItems`, `minimum`,
 and `minItems` above 1); the harness still enforces those bounds itself. A
 schema construct strict mode does not support and the harness would not
 enforce, such as `pattern` or `multipleOf`, is refused before the session
-starts rather than dropped. It is off by default. An API key must be at
+starts rather than dropped. It is off by default. `--clear-thinking N`
+(1 to 1000, off by default) has the API clear thinking from all but the
+last N model turns before each request is served, which keeps long tool
+loops within the input budget; the harness still sends the full history,
+and each tool-results message ends with a short `Continue.` text block so
+the API can tell turns apart. An API key must be at
 least 20 bytes. `--temperature` and `--seed` are
-refused for this provider, and `--effort`, `--strict-tools`, and
-`--fallbacks` for openai-compat. `--base-url` defaults to
+refused for this provider, and `--effort`, `--strict-tools`,
+`--fallbacks`, and `--clear-thinking` for openai-compat. `--base-url` defaults to
 `https://api.anthropic.com` and must be `https` unless its host is a
 loopback address. The budget flags and defaults are the same as above.
 

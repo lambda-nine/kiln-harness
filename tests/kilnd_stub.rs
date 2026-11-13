@@ -1618,8 +1618,10 @@ fn eval_run_with_a_closed_stdout_stops_and_cleans_up_every_run() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("report.json")).expect("report"))
             .expect("report JSON");
-    // openai-compat has no effort; the output limit is the default.
+    // openai-compat has no effort or thinking clearing; the output limit
+    // is the default.
     assert!(report.get("effort").is_none(), "{report}");
+    assert!(report.get("clear_thinking").is_none(), "{report}");
     assert_eq!(report["max_output_tokens"], 16_384, "{report}");
     let stopped = report["stopped"].as_str().expect("stopped");
     assert!(stopped.starts_with("progress output: "), "{stopped}");
@@ -1647,72 +1649,80 @@ fn eval_run_with_a_closed_stdout_stops_and_cleans_up_every_run() {
     assert!(deleted.load(Ordering::SeqCst) >= 3);
 }
 
-/// `eval run --provider anthropic` records the effort it sent and the
-/// output limit per response in the manifest and both reports.
+/// `eval run --provider anthropic` records the effort it sent, its thinking
+/// clearing, and the output limit per response in the manifest and both
+/// reports.
 #[test]
-fn eval_run_records_the_effort_and_output_limit() {
-    let temp = common::private_tempdir().expect("tempdir");
-    let task = temp.path().join("tasks/say-done");
-    std::fs::create_dir_all(&task).expect("task directory");
-    for (path, contents) in [
-        (
-            "task.json",
-            r#"{"schema": 1, "id": "say-done", "description": "say done", "check_timeout_secs": 10}"#,
-        ),
-        ("prompt.md", "Say done.\n"),
-        ("check.sh", "exit 0\n"),
-        ("solution.sh", "true\n"),
-    ] {
-        std::fs::write(task.join(path), contents).expect("task file");
-    }
-    let stub = Stub {
-        health_answers: u32::MAX,
-        ..Stub::default()
-    };
-    let message = json!({
-        "id": "msg_01",
-        "type": "message",
-        "role": "assistant",
-        "model": "claude-haiku-5-5",
-        "content": [{"type": "text", "text": "done"}],
-        "stop_reason": "end_turn",
-        "stop_details": null,
-        "usage": common::anthropic::live_usage(100, 20, 0, 0),
-    });
-    let servers = Servers::start(temp.path(), stub, vec![Reply::json(200, &message)]);
-    let out = temp.path().join("out/eval");
-    let child = Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
-        .arg("--socket")
-        .arg(&servers.socket)
-        .args(["eval", "run", "--provider", "anthropic"])
-        .args([
-            "--base-url",
-            &servers.base_url,
-            "--model",
-            "claude-haiku-5-5",
-        ])
-        .args(["--effort", "low", "--max-output-tokens", "2048"])
-        .arg("--tasks")
-        .arg(temp.path().join("tasks"))
-        .arg("--out")
-        .arg(&out)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start the CLI");
-    let output = exit_within(child, Duration::from_secs(60)).expect("the CLI exits");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
+fn eval_run_records_the_effort_clearing_and_output_limit() {
+    for (clearing, recorded) in [(&[][..], "off"), (&["--clear-thinking", "2"][..], "keep 2")] {
+        let temp = common::private_tempdir().expect("tempdir");
+        let task = temp.path().join("tasks/say-done");
+        std::fs::create_dir_all(&task).expect("task directory");
+        for (path, contents) in [
+            (
+                "task.json",
+                r#"{"schema": 1, "id": "say-done", "description": "say done", "check_timeout_secs": 10}"#,
+            ),
+            ("prompt.md", "Say done.\n"),
+            ("check.sh", "exit 0\n"),
+            ("solution.sh", "true\n"),
+        ] {
+            std::fs::write(task.join(path), contents).expect("task file");
+        }
+        let stub = Stub {
+            health_answers: u32::MAX,
+            ..Stub::default()
+        };
+        let message = json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-haiku-5-5",
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+            "stop_details": null,
+            "usage": common::anthropic::live_usage(100, 20, 0, 0),
+        });
+        let servers = Servers::start(temp.path(), stub, vec![Reply::json(200, &message)]);
+        let out = temp.path().join("out/eval");
+        let child = Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+            .arg("--socket")
+            .arg(&servers.socket)
+            .args(["eval", "run", "--provider", "anthropic"])
+            .args([
+                "--base-url",
+                &servers.base_url,
+                "--model",
+                "claude-haiku-5-5",
+            ])
+            .args(["--effort", "low", "--max-output-tokens", "2048"])
+            .args(clearing)
+            .arg("--tasks")
+            .arg(temp.path().join("tasks"))
+            .arg("--out")
+            .arg(&out)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the CLI");
+        let output = exit_within(child, Duration::from_secs(60)).expect("the CLI exits");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
 
-    for file in ["manifest.json", "report.json"] {
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(out.join(file)).expect(file)).expect(file);
-        assert_eq!(value["effort"], "low", "{file}: {value}");
-        assert_eq!(value["max_output_tokens"], 2048, "{file}: {value}");
+        for file in ["manifest.json", "report.json"] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(out.join(file)).expect(file)).expect(file);
+            assert_eq!(value["effort"], "low", "{file}: {value}");
+            assert_eq!(value["clear_thinking"], recorded, "{file}: {value}");
+            assert_eq!(value["max_output_tokens"], 2048, "{file}: {value}");
+        }
+        let markdown = std::fs::read_to_string(out.join("report.md")).expect("report.md");
+        assert!(
+            markdown.contains(&format!(
+                "- Effort: low\n- Clear thinking: {recorded}\n- Output limit per response: 2048 \
+                 tokens\n"
+            )),
+            "{markdown}"
+        );
     }
-    let markdown = std::fs::read_to_string(out.join("report.md")).expect("report.md");
-    assert!(
-        markdown.contains("- Effort: low\n- Output limit per response: 2048 tokens\n"),
-        "{markdown}"
-    );
 }

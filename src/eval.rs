@@ -555,6 +555,11 @@ pub struct Manifest {
     /// without one and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Thinking clearing (`--clear-thinking`): `"off"`, or `"keep N"` for
+    /// the last N assistant turns; missing for providers without it and in
+    /// older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_thinking: Option<String>,
     /// The output token limit per model response (`--max-output-tokens`);
     /// missing in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,6 +680,9 @@ pub struct Report {
     /// As in [`Manifest::effort`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// As in [`Manifest::clear_thinking`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_thinking: Option<String>,
     /// As in [`Manifest::max_output_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
@@ -768,6 +776,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         concurrency: manifest.concurrency,
         max_run_secs: manifest.max_run_secs,
         effort: manifest.effort.clone(),
+        clear_thinking: manifest.clear_thinking.clone(),
         max_output_tokens: manifest.max_output_tokens,
         stopped: manifest.stopped.clone(),
         overall: OverallReport {
@@ -834,6 +843,9 @@ pub fn report_markdown(report: &Report) -> String {
     }
     if let Some(effort) = &report.effort {
         let _ = writeln!(text, "- Effort: {}", cell(effort));
+    }
+    if let Some(clear_thinking) = &report.clear_thinking {
+        let _ = writeln!(text, "- Clear thinking: {}", cell(clear_thinking));
     }
     if let Some(tokens) = report.max_output_tokens {
         let _ = writeln!(text, "- Output limit per response: {tokens} tokens");
@@ -1024,7 +1036,7 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
             secs(new.max_run_secs)
         );
     }
-    // Reports written before these were recorded carry neither, and an
+    // Reports written before these were recorded carry none of them, and an
     // unknown setting is not a known difference.
     if let (Some(base_effort), Some(new_effort)) = (&base.effort, &new.effort)
         && base_effort != new_effort
@@ -1035,6 +1047,17 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
              comparable.",
             cell(base_effort),
             cell(new_effort)
+        );
+    }
+    if let (Some(base_clear), Some(new_clear)) = (&base.clear_thinking, &new.clear_thinking)
+        && base_clear != new_clear
+    {
+        let _ = writeln!(
+            text,
+            "\nThinking clearing differs ({} → {}); pass rates, tokens and wall times are not \
+             directly comparable.",
+            cell(base_clear),
+            cell(new_clear)
         );
     }
     if let (Some(base_tokens), Some(new_tokens)) = (base.max_output_tokens, new.max_output_tokens)
@@ -1085,6 +1108,9 @@ pub struct SuiteOptions {
     /// The provider's reasoning effort, for the manifest; `None` for a
     /// provider without one.
     pub effort: Option<String>,
+    /// The provider's thinking clearing (`"off"` or `"keep N"`), for the
+    /// manifest; `None` for a provider without it.
+    pub clear_thinking: Option<String>,
     pub replay: bool,
     pub label: Option<String>,
     /// The run limits before each task's overrides.
@@ -1490,6 +1516,7 @@ where
         concurrency: options.concurrency,
         max_run_secs: options.max_run_secs,
         effort: options.effort.clone(),
+        clear_thinking: options.clear_thinking.clone(),
         max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
         replay: options.replay,
         started_unix_ms,

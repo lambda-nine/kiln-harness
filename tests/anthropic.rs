@@ -13,7 +13,8 @@ use kiln_harness::provider::{
     ProviderErrorKind, StopReason, ToolCall, ToolDefinition, ToolResult, Usage,
 };
 use kiln_harness::providers::anthropic::{
-    API_VERSION, FALLBACK_BETA, parse_response, request_body,
+    API_VERSION, CONTEXT_MANAGEMENT_BETA, FALLBACK_BETA, TURN_BOUNDARY_TEXT, parse_response,
+    request_body,
 };
 use kiln_harness::providers::{AnthropicConfig, AnthropicProvider, Effort, SecretString};
 use kiln_harness::replay::ReplayProvider;
@@ -209,7 +210,8 @@ fn request_body_matches_the_golden_json() {
         serde_json::to_string(&body["messages"][1]["content"]).expect("encode"),
         serde_json::to_string(&blocks).expect("encode")
     );
-    // Fallbacks are off by default, so the request carries none.
+    // Fallbacks and thinking clearing are off by default, so the request
+    // carries neither.
     for absent in [
         "temperature",
         "top_p",
@@ -217,6 +219,7 @@ fn request_body_matches_the_golden_json() {
         "thinking",
         "stream",
         "fallbacks",
+        "context_management",
     ] {
         assert!(body.get(absent).is_none(), "{absent} must not be sent");
     }
@@ -263,6 +266,151 @@ fn optional_fields_follow_the_configuration() {
             .iter()
             .all(|tool| tool.get("strict").is_none())
     );
+}
+
+/// A task, then `turns` rounds of one tool call and its result.
+fn tool_loop(turns: usize) -> Vec<Message> {
+    let mut messages = vec![Message::User {
+        text: "Make a file.".to_string(),
+    }];
+    for turn in 0..turns {
+        let id = format!("toolu_{turn:02}");
+        let blocks = json!([
+            thinking(""),
+            tool_use(&id, "list_dir", &json!({"path": "."}))
+        ]);
+        messages.push(Message::Assistant {
+            text: None,
+            tool_calls: vec![ToolCall::new(&id, "list_dir", json!({"path": "."}))],
+            provider_content: Some(anthropic_content(blocks)),
+        });
+        messages.push(Message::ToolResults {
+            results: vec![ToolResult {
+                call_id: id,
+                tool: "list_dir".to_string(),
+                result: json!({"ok": true}),
+            }],
+        });
+    }
+    messages
+}
+
+fn body_for(config: &AnthropicConfig, messages: &[Message]) -> Value {
+    request_body(
+        config,
+        &ModelRequest {
+            session_id: "hs-test",
+            turn: 2,
+            system: "",
+            tools: &[],
+            messages,
+            max_output_tokens: 16_384,
+        },
+    )
+    .expect("body")
+}
+
+#[test]
+fn clear_thinking_sends_context_management_and_turn_boundaries() {
+    let mut config = config("https://api.anthropic.com");
+    let history = tool_loop(2);
+    let off = body_for(&config, &history);
+    assert!(off.get("context_management").is_none(), "{off}");
+    for index in [2, 4] {
+        let content = off["messages"][index]["content"]
+            .as_array()
+            .expect("blocks");
+        assert!(
+            content.iter().all(|block| block["type"] == "tool_result"),
+            "{off}"
+        );
+    }
+
+    config.clear_thinking = Some(3);
+    let on = body_for(&config, &history);
+    assert_eq!(
+        on["context_management"],
+        json!({"edits": [{
+            "type": "clear_thinking_20251015",
+            "keep": {"type": "thinking_turns", "value": 3}
+        }]})
+    );
+    // Keys are sorted (no `preserve_order`), so the encoding is the same
+    // every time.
+    assert_eq!(
+        serde_json::to_string(&on).expect("encode"),
+        serde_json::to_string(&body_for(&config, &history)).expect("encode")
+    );
+    // The task is unchanged; every tool-results message ends with the
+    // boundary, after its tool_result blocks.
+    assert_eq!(on["messages"][0], off["messages"][0]);
+    assert_eq!(on["messages"][0]["content"], "Make a file.");
+    for index in [2, 4] {
+        assert_eq!(
+            on["messages"][index]["content"],
+            json!([
+                {"type": "tool_result", "tool_use_id": format!("toolu_{:02}", index / 2 - 1),
+                 "content": "{\"ok\":true}", "is_error": false},
+                {"type": "text", "text": TURN_BOUNDARY_TEXT}
+            ])
+        );
+    }
+    // Everything else matches the request without the flag.
+    let mut stripped = on.clone();
+    let object = stripped.as_object_mut().expect("object");
+    object.remove("context_management");
+    for index in [2, 4] {
+        object["messages"][index]["content"]
+            .as_array_mut()
+            .expect("blocks")
+            .pop();
+    }
+    assert_eq!(stripped, off);
+
+    // A truncation note joins after the boundary.
+    let note = kiln_harness::engine::truncation_note(16_384);
+    let mut noted = history.clone();
+    noted.push(Message::User { text: note.clone() });
+    let with_note = body_for(&config, &noted);
+    assert_eq!(
+        with_note["messages"][4]["content"],
+        json!([
+            {"type": "tool_result", "tool_use_id": "toolu_01",
+             "content": "{\"ok\":true}", "is_error": false},
+            {"type": "text", "text": TURN_BOUNDARY_TEXT},
+            {"type": "text", "text": note}
+        ])
+    );
+    assert_eq!(with_note["messages"].as_array().map(Vec::len), Some(5));
+
+    // A task followed by a note, with no tool results, gets no boundary.
+    let prompt_only = body_for(&config, &[noted[0].clone(), noted[5].clone()]);
+    assert_eq!(
+        prompt_only["messages"],
+        json!([{"role": "user", "content": [
+            {"type": "text", "text": "Make a file."},
+            {"type": "text", "text": note}
+        ]}])
+    );
+}
+
+#[test]
+fn clear_thinking_keeps_the_history_append_only() {
+    let mut config = config("https://api.anthropic.com");
+    config.clear_thinking = Some(1);
+    let encode = |value: &Value| serde_json::to_string(value).expect("encode");
+    for turns in 0..4 {
+        let shorter = body_for(&config, &tool_loop(turns));
+        let longer = body_for(&config, &tool_loop(turns + 1));
+        let (shorter, longer) = (
+            shorter["messages"].as_array().expect("messages"),
+            longer["messages"].as_array().expect("messages"),
+        );
+        assert_eq!(longer.len(), shorter.len() + 2);
+        for (old, new) in shorter.iter().zip(longer) {
+            assert_eq!(encode(old), encode(new), "{turns} turns");
+        }
+    }
 }
 
 #[test]
@@ -347,6 +495,26 @@ async fn the_request_carries_the_api_headers_and_the_key_only_in_x_api_key() {
     let request = &server.requests()[0];
     assert_eq!(request.header("anthropic-beta"), Some(FALLBACK_BETA));
     assert_eq!(request.json()["fallbacks"], "default");
+    assert!(request.json().get("context_management").is_none());
+
+    // Thinking clearing alone sends only its beta; with fallbacks, one
+    // header lists both, fallbacks first.
+    for (fallbacks, betas) in [
+        (false, CONTEXT_MANAGEMENT_BETA.to_string()),
+        (true, format!("{FALLBACK_BETA},{CONTEXT_MANAGEMENT_BETA}")),
+    ] {
+        let server = FakeHttp::start([ok(&json!([text("hi")]), "end_turn")]).await;
+        let mut clearing = config(&base(&server));
+        clearing.fallbacks = fallbacks;
+        clearing.clear_thinking = Some(2);
+        complete_with(clearing).await.expect("response");
+        let request = &server.requests()[0];
+        assert_eq!(request.header("anthropic-beta"), Some(betas.as_str()));
+        assert_eq!(
+            request.json()["context_management"]["edits"][0]["keep"]["value"],
+            2
+        );
+    }
 }
 
 #[tokio::test]
@@ -368,6 +536,19 @@ fn parsed(content: &Value, stop_reason: &str) -> ModelResponse {
         true,
     )
     .expect("valid response")
+}
+
+#[test]
+fn a_context_management_report_is_accepted_and_ignored() {
+    let mut body = message(&json!([text("done")]), "end_turn", &usage(100, 400));
+    let plain = parse_response(&body, "claude-opus-5-5", false).expect("plain");
+    body["context_management"] = json!({"applied_edits": [{
+        "type": "clear_thinking_20251015",
+        "cleared_thinking_turns": 2,
+        "cleared_input_tokens": 1500
+    }]});
+    let reported = parse_response(&body, "claude-opus-5-5", false).expect("with a report");
+    assert_eq!(reported, plain);
 }
 
 #[test]

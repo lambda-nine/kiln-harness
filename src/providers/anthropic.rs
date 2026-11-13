@@ -8,11 +8,13 @@
 //!
 //! One [`ModelRequest`] becomes one non-streaming request:
 //! `{"model", "max_tokens", "system"?, "messages", "tools"?, "tool_choice"?,
-//! "output_config": {"effort"}, "cache_control": {"type": "ephemeral"},
-//! "fallbacks"?}` with the `x-api-key` (sensitive) and `anthropic-version`
-//! headers. `temperature`, `top_p`, `top_k`, `thinking`, and `stream` are
-//! never sent: sampling parameters are refused on this API version, and
-//! without `thinking` current models think adaptively.
+//! "output_config": {"effort"}, "context_management"?,
+//! "cache_control": {"type": "ephemeral"}, "fallbacks"?}` with the
+//! `x-api-key` (sensitive) and `anthropic-version` headers, and an
+//! `anthropic-beta` header listing the betas the options need, if any.
+//! `temperature`, `top_p`, `top_k`, `thinking`, and `stream` are never
+//! sent: sampling parameters are refused on this API version, and without
+//! `thinking` current models think adaptively.
 //!
 //! - A user turn is `{"role": "user", "content": text}`.
 //! - An assistant turn this adapter produced is sent back as its recorded
@@ -28,10 +30,13 @@
 //!   `{}` when the sanitized arguments are not an object.
 //! - One turn's tool results are one user message of `tool_result` blocks,
 //!   in order: the result's compact JSON as `content`, and `is_error` unless
-//!   the result says `"ok": true`.
+//!   the result says `"ok": true`. With `clear_thinking` set, the message
+//!   ends with a `{"type": "text", "text": TURN_BOUNDARY_TEXT}` block after
+//!   the `tool_result` blocks (see [`TURN_BOUNDARY_TEXT`]).
 //! - A user turn right after tool results or another user turn (the
 //!   engine's truncation note) joins that user message as a trailing
-//!   `{"type": "text"}` block, after any `tool_result` blocks; a string
+//!   `{"type": "text"}` block, after any `tool_result` blocks and any turn
+//!   boundary block; a string
 //!   `content` becomes an array of text blocks first. Every other request
 //!   is unchanged.
 //!
@@ -127,7 +132,7 @@
 //!   evaluate specific models; a refusal the server silently reroutes to a
 //!   different model breaks model attribution and per-model comparisons.
 //!   So by default a refusal is an honest `Refusal`, and the request carries
-//!   no `fallbacks` field and no beta header. With `fallbacks` set it
+//!   no `fallbacks` field and no fallback beta. With `fallbacks` set it
 //!   carries `fallbacks: "default"` and the `server-side-fallback-2026-07-01`
 //!   beta; on a safety decline the API reruns the request on a suitable
 //!   model in the same call and returns `fallback` blocks and the serving
@@ -139,6 +144,15 @@
 //!   no `fallback_message` entry), on either path, the response's `model`
 //!   and every named `message` iteration must be exactly the requested
 //!   model: an unmarked switch is `InvalidResponse`.
+//! - **Thinking clearing off by default.** With `clear_thinking: Some(n)`,
+//!   the request carries `"context_management": {"edits": [{"type":
+//!   "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value":
+//!   n}}]}` and the [`CONTEXT_MANAGEMENT_BETA`] beta, and the API drops the
+//!   thinking of all but the last `n` assistant turns server-side. The
+//!   client still sends the full, unchanged history, so preserved thinking's
+//!   checks are unaffected; the API documents that clearing invalidates the
+//!   prompt cache from the first cleared block on. A response's top-level
+//!   `context_management` report is ignored.
 //! - **Strict tools off by default.** Strict mode refuses `maxItems` and
 //!   similar bounds, which the harness's schemas use. With `strict_tools`,
 //!   each schema is sent through [`strict_input_schema`]: supported keywords
@@ -213,6 +227,18 @@ pub const PROVIDER_NAME: &str = "anthropic";
 pub const API_VERSION: &str = "2026-10-21";
 /// The beta that enables `fallbacks: "default"`.
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+/// The beta that enables `context_management`.
+pub const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+/// The context editing strategy that clears older thinking server-side.
+pub const CLEAR_THINKING_EDIT: &str = "clear_thinking_20251015";
+/// The text block that ends every tool-results message when thinking
+/// clearing is on. The API counts `keep` in turns, and a user message of
+/// only `tool_result` blocks continues the turn in progress: without a
+/// non-`tool_result` block, the whole tool loop is one turn and `keep`
+/// clears nothing.
+pub const TURN_BOUNDARY_TEXT: &str = "Continue.";
+/// The largest `clear_thinking` value accepted.
+pub const MAX_CLEAR_THINKING_TURNS: u32 = 1000;
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 /// Documented `usage.iterations` entry types: a requested-model attempt and
@@ -299,6 +325,9 @@ pub struct AnthropicConfig {
     pub fallbacks: bool,
     /// Mark every tool `"strict": true`.
     pub strict_tools: bool,
+    /// Keep thinking only for the last N assistant turns (server-side
+    /// context editing); `None` sends no `context_management`.
+    pub clear_thinking: Option<u32>,
     pub connect_timeout: Duration,
     pub max_response_bytes: usize,
     pub max_request_bytes: usize,
@@ -329,6 +358,7 @@ impl AnthropicConfig {
             effort: Effort::default(),
             fallbacks: false,
             strict_tools: false,
+            clear_thinking: None,
             connect_timeout: Duration::from_secs(10),
             max_response_bytes: 4 << 20,
             max_request_bytes: 8 << 20,
@@ -346,7 +376,8 @@ impl AnthropicConfig {
     /// with a host, a key over plain `http` to anything but a loopback IP
     /// literal, no key with `api.anthropic.com` as the host, a model name
     /// that is not 1..=256 printable ASCII bytes, an empty or non-printable
-    /// key, or a bound or retry value out of range.
+    /// key, a `clear_thinking` outside 1..=[`MAX_CLEAR_THINKING_TURNS`], or
+    /// a bound or retry value out of range.
     pub fn validate(&self) -> Result<(), AnthropicError> {
         let https = http::check_base_url(&self.base_url).map_err(AnthropicError)?;
         http::check_model(&self.model).map_err(AnthropicError)?;
@@ -369,6 +400,13 @@ impl AnthropicConfig {
                 ));
             }
             None => {}
+        }
+        if let Some(turns) = self.clear_thinking
+            && !(1..=MAX_CLEAR_THINKING_TURNS).contains(&turns)
+        {
+            return Err(AnthropicError(format!(
+                "clear_thinking must keep 1 to {MAX_CLEAR_THINKING_TURNS} turns, not {turns}"
+            )));
         }
         self.transport().check().map_err(AnthropicError)
     }
@@ -454,11 +492,17 @@ impl AnthropicProvider {
             HeaderName::from_static("anthropic-version"),
             HeaderValue::from_static(API_VERSION),
         );
-        if config.fallbacks {
-            headers.insert(
-                HeaderName::from_static("anthropic-beta"),
-                HeaderValue::from_static(FALLBACK_BETA),
-            );
+        let betas = [
+            (config.fallbacks, FALLBACK_BETA),
+            (config.clear_thinking.is_some(), CONTEXT_MANAGEMENT_BETA),
+        ]
+        .into_iter()
+        .filter_map(|(on, beta)| on.then_some(beta))
+        .collect::<Vec<_>>();
+        if !betas.is_empty() {
+            let betas = HeaderValue::try_from(betas.join(","))
+                .map_err(|_| AnthropicError("beta list is not a valid header value".to_string()))?;
+            headers.insert(HeaderName::from_static("anthropic-beta"), betas);
         }
         if config.strict_tools {
             // The harness's own tools must survive the strict transform, so
@@ -583,7 +627,7 @@ pub fn request_body(
     config: &AnthropicConfig,
     request: &ModelRequest<'_>,
 ) -> Result<Value, ProviderError> {
-    let messages = messages(request.messages);
+    let messages = messages(request.messages, config.clear_thinking.is_some());
     let mut body = Map::new();
     body.insert("model".to_string(), json!(config.model));
     body.insert("max_tokens".to_string(), json!(request.max_output_tokens));
@@ -623,6 +667,15 @@ pub fn request_body(
         "output_config".to_string(),
         json!({"effort": config.effort.as_str()}),
     );
+    if let Some(turns) = config.clear_thinking {
+        body.insert(
+            "context_management".to_string(),
+            json!({"edits": [{
+                "type": CLEAR_THINKING_EDIT,
+                "keep": {"type": "thinking_turns", "value": turns},
+            }]}),
+        );
+    }
     // Automatic caching: the breakpoint goes on the last cacheable block.
     body.insert("cache_control".to_string(), json!({"type": "ephemeral"}));
     if config.fallbacks {
@@ -632,7 +685,9 @@ pub fn request_body(
 }
 
 /// The `messages` array for `history`, in order. See the module docs.
-fn messages(history: &[Message]) -> Vec<Value> {
+/// With `turn_boundaries`, every tool-results message ends with a
+/// [`TURN_BOUNDARY_TEXT`] block.
+fn messages(history: &[Message], turn_boundaries: bool) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::with_capacity(history.len());
     // Whether the last message pushed is user-role: a user turn or tool
     // results. The API wants roles to alternate, so a user turn right after
@@ -687,7 +742,7 @@ fn messages(history: &[Message]) -> Vec<Value> {
             }
             Message::ToolResults { results } => {
                 // All of a turn's results go in one user message.
-                let content = results
+                let mut content = results
                     .iter()
                     .map(|result| {
                         let ok = result.result.get("ok").and_then(Value::as_bool) == Some(true);
@@ -699,6 +754,12 @@ fn messages(history: &[Message]) -> Vec<Value> {
                         })
                     })
                     .collect::<Vec<_>>();
+                if turn_boundaries {
+                    // A non-tool_result block makes this message start a
+                    // new turn, so clear_thinking's `keep` has turns to
+                    // count. A truncation note joins after it.
+                    content.push(json!({"type": "text", "text": TURN_BOUNDARY_TEXT}));
+                }
                 messages.push(json!({"role": "user", "content": content}));
             }
         }
@@ -1396,7 +1457,25 @@ mod tests {
         assert_eq!(config.effort, Effort::High);
         assert!(!config.fallbacks, "fallbacks are opt-in");
         assert!(!config.strict_tools);
+        assert_eq!(config.clear_thinking, None, "thinking clearing is opt-in");
         assert_eq!(config.model, "claude-opus-5-5");
+    }
+
+    #[test]
+    fn clear_thinking_keeps_one_to_the_maximum_turns() {
+        let mut config = config(DEFAULT_BASE_URL);
+        for turns in [1, MAX_CLEAR_THINKING_TURNS] {
+            config.clear_thinking = Some(turns);
+            config.validate().expect("in range");
+        }
+        for turns in [0, MAX_CLEAR_THINKING_TURNS + 1] {
+            config.clear_thinking = Some(turns);
+            assert_eq!(
+                config.validate().expect_err("out of range").0,
+                format!("clear_thinking must keep 1 to 1000 turns, not {turns}")
+            );
+            assert!(AnthropicProvider::new(config.clone()).is_err());
+        }
     }
 
     #[test]

@@ -395,6 +395,7 @@ fn provider_specific_flags_are_refused_for_the_other_provider() {
         ("--effort", Some("high")),
         ("--strict-tools", None),
         ("--fallbacks", None),
+        ("--clear-thinking", Some("1")),
     ] {
         let run = Run::new(dir).arg("--prompt", "hi");
         let run = match value {
@@ -443,6 +444,18 @@ fn anthropic_needs_a_key_or_a_proxy_and_a_valid_effort() {
         .output();
     assert_eq!(bad_effort.status.code(), Some(2), "{}", stderr(&bad_effort));
     assert!(stderr(&bad_effort).contains("effort must be low, medium, high, xhigh, or max"));
+    for turns in ["0", "1001"] {
+        let bad_clear = Run::anthropic(dir)
+            .env("KILN_TEST_KEY", SENTINEL_KEY)
+            .arg("--prompt", "hi")
+            .arg("--clear-thinking", turns)
+            .output();
+        refused(
+            dir,
+            &bad_clear,
+            &format!("clear_thinking must keep 1 to 1000 turns, not {turns}"),
+        );
+    }
 
     // A key over plain http to a remote host is refused like openai-compat.
     let cleartext = Run::anthropic(dir)

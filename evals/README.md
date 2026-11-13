@@ -154,7 +154,8 @@ prompt cache, and `cache_write_tokens` when some was written to one. `replay` is
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
 kind and model, the base URL's host only, tasks, trials, runs at a time,
-the run cap when set, the effort sent (Anthropic only), the output limit per
+the run cap when set, the effort sent and the thinking clearing (`off` or
+`keep N`, Anthropic only), the output limit per
 response, start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
 task the runs, passes, pass rate, outcome counts, mean and median steps, tool
 calls and wall time, mean tokens, and replay counts; overall the macro pass
@@ -183,9 +184,9 @@ cargo run --locked -- eval compare evals-out/qwen-baseline evals-out/qwen-new-pr
 prints Markdown: for every task in either report, sorted, the pass rate, mean
 steps and mean total tokens from base to new with their deltas, tasks present
 on one side only marked as such, and an overall line. It adds a note when
-the two reports ran at different concurrency, run caps, effort or output
-limits per response; reports written before effort and the output limit were
-recorded carry neither, and an unknown setting is not reported as a
+the two reports ran at different concurrency, run caps, effort, thinking
+clearing or output limits per response; reports written before these were
+recorded carry none of them, and an unknown setting is not reported as a
 difference.
 
 ## The starter suite

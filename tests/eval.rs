@@ -2048,6 +2048,7 @@ fn options(out: &Path, trials: u32, replay: bool) -> SuiteOptions {
         concurrency: 1,
         max_run_secs: None,
         effort: None,
+        clear_thinking: None,
         replay,
         label: Some("test | run".to_string()),
         base_config: config(),
@@ -3257,6 +3258,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         concurrency: 1,
         max_run_secs: None,
         effort: None,
+        clear_thinking: None,
         max_output_tokens: None,
         replay: true,
         started_unix_ms: 1,
@@ -4041,6 +4043,58 @@ fn effort_and_output_limit_reach_the_manifest_report_and_comparison() {
     assert!(eval::report_markdown(&odd).contains("- Effort: x\\|y z\n"));
 }
 
+#[test]
+fn clear_thinking_reaches_the_manifest_report_and_comparison() {
+    let mut kept = manifest(&["a"], 1);
+    kept.clear_thinking = Some("keep 2".to_string());
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let older = eval::report(&runs, &manifest(&["a"], 1));
+    let new = eval::report(&runs, &kept);
+    assert_eq!(new.clear_thinking.as_deref(), Some("keep 2"));
+
+    let json = serde_json::to_value(&kept).expect("manifest JSON");
+    assert_eq!(json["clear_thinking"], "keep 2");
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, kept);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    assert_eq!(json["clear_thinking"], "keep 2");
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+
+    // Unset, and in files written before the field existed: no key.
+    let unset = serde_json::to_value(&older).expect("report JSON");
+    assert!(unset.get("clear_thinking").is_none(), "{unset}");
+    let parsed: Report = serde_json::from_value(unset).expect("an older report parses");
+    assert_eq!(parsed.clear_thinking, None);
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown.contains("- Clear thinking: keep 2\n"),
+        "{markdown}"
+    );
+    assert!(!eval::report_markdown(&older).contains("Clear thinking"));
+
+    let mut off = new.clone();
+    off.clear_thinking = Some("off".to_string());
+    let differing = eval::compare(&off, &new);
+    assert!(
+        differing.ends_with(
+            ").\n\nThinking clearing differs (off → keep 2); pass rates, tokens and wall \
+             times are not directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    // Recorded on one side only: unknown is not a difference.
+    for same in [
+        eval::compare(&new, &new),
+        eval::compare(&older, &new),
+        eval::compare(&new, &older),
+        eval::compare(&older, &off),
+    ] {
+        assert!(!same.contains("Thinking clearing"), "{same}");
+    }
+}
+
 #[tokio::test]
 async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
     let temp = common::private_tempdir().expect("tempdir");
@@ -4094,13 +4148,14 @@ async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
     assert_eq!(report_tasks, ["a", "b", "c"]);
     assert_eq!(read_manifest(&out).tasks, ["a", "b", "c"]);
     assert_eq!(read_manifest(&out).max_run_secs, None);
-    // The suite records the output limit it ran with, and the effort it
-    // was given (none for this provider).
+    // The suite records the output limit it ran with, and the effort and
+    // thinking clearing it was given (none for this provider).
     assert_eq!(
         read_manifest(&out).max_output_tokens,
         Some(config().max_output_tokens_per_request)
     );
     assert_eq!(read_manifest(&out).effort, None);
+    assert_eq!(read_manifest(&out).clear_thinking, None);
     let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
     let rows = markdown
         .lines()

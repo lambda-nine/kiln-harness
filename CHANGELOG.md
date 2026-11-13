@@ -6,6 +6,17 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `--clear-thinking N` (1 to 1000, `--provider anthropic` only, off by
+  default) sends the `clear_thinking_20251015` context edit with the
+  `context-management-2025-06-27` beta, so the API clears thinking from all
+  but the last N assistant turns server-side; the harness still sends the
+  full, unchanged history. Each tool-results message then ends with a
+  `Continue.` text block, without which the API counts a whole tool loop as
+  one turn and clears nothing. With `--fallbacks` too, both betas go in one
+  header. Requests without the flag are unchanged. `manifest.json` and
+  `report.json` record `clear_thinking` (`"off"` or `"keep N"`, anthropic
+  only), `report.md` prints it, and `eval compare` notes when two reports
+  differ in it; it is absent in older files.
 - `manifest.json` and `report.json` record `effort` (the reasoning effort
   sent, `--provider anthropic` only) and `max_output_tokens` (the output
   limit per response), `report.md` prints both, and `eval compare` notes

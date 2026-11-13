@@ -139,6 +139,11 @@ struct ModelArgs {
     /// Mark every tool schema `strict` (anthropic).
     #[arg(long)]
     strict_tools: bool,
+    /// Keep thinking only for the last N assistant turns, clearing older
+    /// thinking server-side (anthropic; off by default). Each tool-results
+    /// message then ends with a short text block so the API can count turns.
+    #[arg(long, value_name = "N")]
+    clear_thinking: Option<u32>,
     /// Model turns per session.
     #[arg(long, default_value_t = 40)]
     max_steps: u32,
@@ -574,6 +579,7 @@ fn build_provider(args: &ModelArgs) -> Result<RunProvider> {
             provider_config.effort = args.effort.unwrap_or_default();
             provider_config.fallbacks = args.fallbacks;
             provider_config.strict_tools = args.strict_tools;
+            provider_config.clear_thinking = args.clear_thinking;
             RunProvider::Anthropic(AnthropicProvider::new(provider_config)?)
         }
     })
@@ -589,6 +595,7 @@ fn check_provider_flags(args: &ModelArgs) -> Result<()> {
                 ("--effort", args.effort.is_some()),
                 ("--strict-tools", args.strict_tools),
                 ("--fallbacks", args.fallbacks),
+                ("--clear-thinking", args.clear_thinking.is_some()),
             ],
         ),
         ProviderKind::Anthropic => (
@@ -1082,6 +1089,14 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
         max_run_secs: args.max_run_secs,
         effort: match args.model.provider {
             ProviderKind::Anthropic => Some(args.model.effort.unwrap_or_default().to_string()),
+            ProviderKind::OpenAiCompat => None,
+        },
+        clear_thinking: match args.model.provider {
+            ProviderKind::Anthropic => Some(
+                args.model
+                    .clear_thinking
+                    .map_or_else(|| "off".to_string(), |turns| format!("keep {turns}")),
+            ),
             ProviderKind::OpenAiCompat => None,
         },
         replay: args.replay,

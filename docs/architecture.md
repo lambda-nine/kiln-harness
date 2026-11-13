@@ -670,11 +670,13 @@ model name. Replay answers from the journal and never contacts the server.
 
 `anthropic` posts to `<base_url>/v1/messages` (default
 `https://api.anthropic.com`) with `x-api-key` (marked sensitive),
-`anthropic-version: 2026-10-21`, and, only with `--fallbacks`,
-`anthropic-beta: server-side-fallback-2026-07-01`. The body is
+`anthropic-version: 2026-10-21`, and an `anthropic-beta` header only when
+an option needs a beta: `server-side-fallback-2026-07-01` with
+`--fallbacks`, `context-management-2025-06-27` with `--clear-thinking`, and
+both, comma-separated in that order, with both. The body is
 `{"model", "max_tokens", "system"?, "messages", "tools"?, "tool_choice":
-{"type": "auto"}?, "output_config": {"effort"}, "cache_control": {"type":
-"ephemeral"}, "fallbacks": "default"?}`. It never carries `temperature`,
+{"type": "auto"}?, "output_config": {"effort"}, "context_management"?,
+"cache_control": {"type": "ephemeral"}, "fallbacks": "default"?}`. It never carries `temperature`,
 `top_p`, `top_k`, `thinking`, or `stream`: sampling parameters are refused
 on this API version, and without `thinking` current models think
 adaptively. Tools are `{"name", "description", "input_schema"}`. With
@@ -707,9 +709,12 @@ the sanitized arguments are not an object. A turn's tool results are one
 user message of `tool_result` blocks, in order, each with the result's
 compact JSON and `is_error` unless the result says `"ok": true`; splitting
 them across messages would teach the model to stop calling tools in
-parallel. A user turn right after tool results or another user turn, which
+parallel. With `--clear-thinking`, that message ends with a
+`{"type": "text", "text": "Continue."}` turn boundary block (see below). A
+user turn right after tool results or another user turn, which
 only the engine's truncation note makes, joins that user message as a
-trailing `{"type": "text"}` block, after the `tool_result` blocks; a string
+trailing `{"type": "text"}` block, after the `tool_result` blocks and any
+turn boundary; a string
 `content` becomes an array of text blocks first. The API wants roles to
 alternate, and every request without a note is byte-identical to before.
 The openai-compat adapter sends the note as its own user message, which
@@ -839,7 +844,7 @@ exactly.
 Fallbacks are opt-in (`--fallbacks`). The harness exists to record, replay,
 and evaluate specific models; a refusal the server silently reroutes to a
 different model breaks model attribution and per-model comparisons, so by
-default the request carries no `fallbacks` field and no beta header, and a
+default the request carries no `fallbacks` field and no fallback beta, and a
 refusal ends the session as `ModelRefused`. Without fallbacks, a `fallback`
 block or `fallback_message` iteration is `InvalidResponse`, and
 `usage.iterations`, when present, must be `message` entries whose last one
@@ -858,6 +863,30 @@ verbatim, and `served_model` records the model in the audit. A non-streaming
 response omits a declined partial, so no thinking block precedes a
 `fallback` block and the verbatim echo is what the API expects. Streaming,
 where it does not, is a later piece.
+
+Thinking clearing is opt-in (`--clear-thinking N`, 1 to 1000). Current
+models keep every earlier turn's thinking in the prompt, so a long tool
+loop at high effort can exhaust the session's input budget on thinking it
+no longer needs. With the flag, the request carries
+`"context_management": {"edits": [{"type": "clear_thinking_20251015",
+"keep": {"type": "thinking_turns", "value": N}}]}` and the
+`context-management-2025-06-27` beta, and the API drops the thinking of
+all but the last N assistant turns before the model sees the prompt. The
+clearing is server-side: the harness still sends the full history,
+thinking blocks and signatures included, unchanged, so preserved thinking's
+checks hold and each request still starts with the previous one, byte for
+byte. `keep` counts turns, and the API treats a user message of only
+`tool_result` blocks as continuing the turn in progress, so in a tool loop
+the whole session would be one turn and nothing would be cleared. Each
+tool-results message therefore ends with a fixed `{"type": "text", "text":
+"Continue."}` block, which makes the next assistant reply a new turn; it is
+written deterministically, so the history stays append-only. The first
+user message, the task, is unchanged. A response's top-level
+`context_management` report (`applied_edits`) is accepted and ignored.
+Clearing does cost cache reuse: the API documents that the prompt cache is
+invalidated from the first cleared block on, so each newly cleared turn
+writes the rest of the prompt to the cache again. Without the flag nothing changes: no beta, no field, no boundary blocks.
+The flag is refused for openai-compat.
 
 ## Tool mapping
 
@@ -1325,9 +1354,10 @@ recoveries) and appended to `results.jsonl` as soon as the run ends, in
 completion order; the summary and reports are in task and trial order, and
 the manifest and report record `concurrency` (a file without it reads as 1),
 `max_run_secs` (absent when unset), `effort` (the reasoning effort sent;
-absent for providers without one) and `max_output_tokens` (the output limit
-per response), the last two absent in older files; `eval compare` notes a
-difference in either only when both reports recorded it.
+absent for providers without one), `clear_thinking` (`"off"` or `"keep N"`;
+absent for providers without it) and `max_output_tokens` (the output limit
+per response), the last three absent in older files; `eval compare` notes a
+difference in any of them only when both reports recorded it.
 `truncation_recoveries` is always written, and a line without it reads as 0.
 With `--replay`, a completed run is replayed against a fresh sandbox right
 after it, on the same connection. The suite fails closed: a run or replay
