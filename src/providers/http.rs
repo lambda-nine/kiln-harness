@@ -26,7 +26,7 @@ use reqwest::{Client, StatusCode, Url};
 use serde_json::Value;
 
 use super::SecretString;
-use crate::provider::{ModelResponse, ProviderError, ProviderErrorKind};
+use crate::provider::{CompactionResponse, ModelResponse, ProviderError, ProviderErrorKind};
 
 /// Ceiling for `max_response_bytes` and `max_request_bytes`.
 pub const MAX_BODY_BYTES: usize = 64 << 20;
@@ -183,15 +183,15 @@ impl Transport {
     /// `max_attempts` run out, sleeping [`retry_delay`] between attempts.
     /// Dropping the returned future drops the attempt in flight and any
     /// backoff sleep.
-    pub(crate) async fn with_retries<F, Fut>(
+    pub(crate) async fn with_retries<T, F, Fut>(
         &self,
         session_id: &str,
         turn: u32,
         mut attempt: F,
-    ) -> Result<ModelResponse, ProviderError>
+    ) -> Result<T, ProviderError>
     where
         F: FnMut() -> Fut,
-        Fut: Future<Output = Result<ModelResponse, Failure>>,
+        Fut: Future<Output = Result<T, Failure>>,
     {
         let mut jitter = Jitter::new(session_id, turn);
         let mut number = 1;
@@ -360,6 +360,29 @@ impl<'a> Credential<'a> {
                         if serde_json::from_str::<Value>(raw)
                             .is_ok_and(|decoded| self.in_value(&decoded)))
             })
+            || response.provider_content.as_ref().is_some_and(|content| {
+                content
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| self.in_text(model))
+                    || self.in_value(&content.blocks)
+                    || content
+                        .stop_details
+                        .as_ref()
+                        .is_some_and(|details| self.in_value(details))
+            })
+    }
+}
+
+impl Credential<'_> {
+    /// Anything kept from a compaction response: its stop reason, its
+    /// summary, and its opaque content.
+    pub(crate) fn in_compaction(&self, response: &CompactionResponse) -> bool {
+        self.in_text(&response.stop_reason)
+            || response
+                .summary
+                .as_ref()
+                .is_some_and(|summary| self.in_text(summary))
             || response.provider_content.as_ref().is_some_and(|content| {
                 content
                     .model

@@ -4,6 +4,11 @@
 //! in a journal, after checking that the request is byte-for-byte the one the
 //! recording saw. A mismatch means the sandbox produced different tool
 //! results than it did during the recording.
+//!
+//! Model turns and compactions are answered from one queue in recorded
+//! order, so a compaction the replay asks for where the recording made a
+//! model request, or the other way round, diverges. A recorded summary is
+//! returned as recorded; no model is asked to write it again.
 
 use std::collections::VecDeque;
 
@@ -12,13 +17,16 @@ use thiserror::Error;
 
 use crate::api::SandboxApi;
 use crate::audit::AuditSink;
+use crate::compaction::CompactionPolicy;
 use crate::engine::{CheckOutcome, Harness, HarnessError, SessionOutcome, SessionTask};
 use crate::journal::JournalSink;
 use crate::journal::{
-    Grammar, JournalEvent, LoadedJournal, RecordedSeedFile, SessionLimits, request_sha256,
+    Grammar, JournalEvent, LoadedJournal, RecordedSeedFile, SessionLimits,
+    compaction_request_sha256, request_sha256,
 };
 use crate::provider::{
-    ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind, ProviderInfo, ToolCall,
+    CompactionResponse, ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind,
+    ProviderInfo, ToolCall,
 };
 use crate::tools::ExecContext;
 use serde_json::Value;
@@ -37,6 +45,7 @@ pub enum ReplayError {
 #[derive(Debug, Clone)]
 enum RecordedOutcome {
     Responded(ModelResponse),
+    Compacted(CompactionResponse),
     Failed {
         kind: ProviderErrorKind,
         message: String,
@@ -49,6 +58,8 @@ enum RecordedOutcome {
 #[derive(Debug, Clone)]
 struct RecordedTurn {
     turn: u32,
+    /// A compaction request rather than a model request.
+    compaction: bool,
     request_sha256: String,
     outcome: RecordedOutcome,
 }
@@ -61,8 +72,11 @@ pub struct ReplayProvider {
     /// them there again.
     exec_context: ExecContext,
     limits: SessionLimits,
+    /// The recorded compaction policy, restored for the replay.
+    compaction: Option<CompactionPolicy>,
     /// The idle timeout the recorded session sent kilnd, if it used expiry.
     sandbox_idle_ms: Option<u64>,
+    /// Model requests and compactions, in recorded order.
     turns: VecDeque<RecordedTurn>,
     tools: VecDeque<RecordedTool>,
     final_answer: Option<String>,
@@ -96,6 +110,7 @@ impl ReplayProvider {
     ///
     /// Returns an error if the journal does not start a session or breaks
     /// the session grammar.
+    #[allow(clippy::too_many_lines)]
     pub fn from_journal(journal: &LoadedJournal) -> Result<Self, ReplayError> {
         // `LoadedJournal` fields are public, so check the grammar here too
         // rather than trusting that the records came from `read_journal`.
@@ -114,6 +129,7 @@ impl ReplayProvider {
             seed,
             check,
             exec_context,
+            compaction,
             ..
         }) = records.next().map(|record| &record.event)
         else {
@@ -140,6 +156,7 @@ impl ReplayProvider {
             },
             exec_context: recorded_exec_context(exec_context.as_deref())?,
             limits: *limits,
+            compaction: compaction.clone(),
             sandbox_idle_ms: None,
             turns: VecDeque::new(),
             tools: VecDeque::new(),
@@ -151,18 +168,36 @@ impl ReplayProvider {
             check_diverged: false,
         };
         // The grammar has paired every request with one answer in turn order.
-        let mut pending: Option<(u32, String)> = None;
+        let mut pending: Option<Pending> = None;
         for record in records {
             match &record.event {
                 JournalEvent::ModelRequested {
                     turn,
                     request_sha256,
                     ..
-                } => pending = Some((*turn, request_sha256.clone())),
+                }
+                | JournalEvent::CompactionRequested {
+                    turn,
+                    request_sha256,
+                    ..
+                } => {
+                    pending = Some(Pending {
+                        turn: *turn,
+                        compaction: matches!(
+                            record.event,
+                            JournalEvent::CompactionRequested { .. }
+                        ),
+                        request_sha256: request_sha256.clone(),
+                    });
+                }
                 JournalEvent::ModelResponded { response, .. } => {
                     replay.push_turn(&mut pending, RecordedOutcome::Responded(response.clone()));
                 }
-                JournalEvent::ModelFailed { kind, message, .. } => replay.push_turn(
+                JournalEvent::CompactionResponded { response, .. } => {
+                    replay.push_turn(&mut pending, RecordedOutcome::Compacted(response.clone()));
+                }
+                JournalEvent::ModelFailed { kind, message, .. }
+                | JournalEvent::CompactionFailed { kind, message, .. } => replay.push_turn(
                     &mut pending,
                     RecordedOutcome::Failed {
                         kind: *kind,
@@ -226,9 +261,34 @@ impl ReplayProvider {
         self.sandbox_idle_ms.map(std::time::Duration::from_millis)
     }
 
+    /// The recorded compaction policy, if the session could compact.
+    #[must_use]
+    pub fn compaction(&self) -> Option<&CompactionPolicy> {
+        self.compaction.as_ref()
+    }
+
+    /// Why this build cannot replay the recording's compactions, if it
+    /// cannot: they were requested with other instructions. The journal
+    /// still verifies; [`Harness::replay`] refuses it before any sandbox
+    /// exists.
+    #[must_use]
+    pub fn compaction_problem(&self) -> Option<String> {
+        self.compaction
+            .as_ref()
+            .filter(|policy| !policy.instructions_are_current())
+            .map(|policy| {
+                format!(
+                    "the recording compacted with instructions {} and this build sends {}; \
+                     replay it with the build that recorded it",
+                    policy.instructions_sha256,
+                    crate::compaction::instructions_sha256()
+                )
+            })
+    }
+
     /// The configuration that replays this recording: `base` with the
-    /// recorded limits, and the sandbox idle timeout from
-    /// [`crate::engine::HarnessConfig::fit_replay_idle_timeout`].
+    /// recorded limits and compaction policy, and the sandbox idle timeout
+    /// from [`crate::engine::HarnessConfig::fit_replay_idle_timeout`].
     #[must_use]
     pub fn replay_config(
         &self,
@@ -236,6 +296,7 @@ impl ReplayProvider {
     ) -> crate::engine::HarnessConfig {
         let mut config = base;
         config.apply_limits(&self.limits);
+        config.compaction.clone_from(&self.compaction);
         config.fit_replay_idle_timeout(self.recorded_sandbox_idle_timeout());
         config
     }
@@ -252,17 +313,24 @@ impl ReplayProvider {
         self.outcome.as_deref()
     }
 
-    fn push_turn(&mut self, pending: &mut Option<(u32, String)>, outcome: RecordedOutcome) {
-        if let Some((turn, request_sha256)) = pending.take() {
+    fn push_turn(&mut self, pending: &mut Option<Pending>, outcome: RecordedOutcome) {
+        if let Some(Pending {
+            turn,
+            compaction,
+            request_sha256,
+        }) = pending.take()
+        {
             self.turns.push_back(RecordedTurn {
                 turn,
+                compaction,
                 request_sha256,
                 outcome,
             });
         }
     }
 
-    /// True once every recorded model turn and tool call has been replayed.
+    /// True once every recorded model turn, compaction attempt (unanswered
+    /// ones included) and tool call has been replayed.
     #[must_use]
     pub fn exhausted(&self) -> bool {
         self.turns.is_empty() && self.tools.is_empty() && self.unexpected == 0
@@ -351,6 +419,16 @@ impl Provider for ReplayProvider {
                 format!("recording has no response for turn {}", request.turn),
             ));
         };
+        if recorded.compaction {
+            self.mark_unexpected(request.turn);
+            return Err(ProviderError::new(
+                ProviderErrorKind::ReplayDiverged,
+                format!(
+                    "turn {} requested a model turn where the recording compacted",
+                    request.turn
+                ),
+            ));
+        }
         if request.turn != recorded.turn || request_sha256(&request) != recorded.request_sha256 {
             self.mark_unexpected(request.turn);
             return Err(ProviderError::new(
@@ -362,12 +440,70 @@ impl Provider for ReplayProvider {
             RecordedOutcome::Responded(response) => Ok(response),
             RecordedOutcome::Failed { kind, message } => Err(ProviderError::new(kind, message)),
             // The request matched; the recording simply has no answer for it.
-            RecordedOutcome::Unanswered => Err(ProviderError::new(
+            RecordedOutcome::Unanswered | RecordedOutcome::Compacted(_) => Err(ProviderError::new(
                 ProviderErrorKind::Script,
                 format!("recording ends before turn {} was answered", request.turn),
             )),
         }
     }
+
+    async fn compact(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<CompactionResponse, ProviderError> {
+        let Some(recorded) = self.turns.pop_front() else {
+            self.mark_unexpected(request.turn);
+            return Err(ProviderError::new(
+                ProviderErrorKind::Script,
+                format!("recording has no compaction for turn {}", request.turn),
+            ));
+        };
+        if !recorded.compaction {
+            self.mark_unexpected(request.turn);
+            return Err(ProviderError::new(
+                ProviderErrorKind::ReplayDiverged,
+                format!(
+                    "turn {} compacted where the recording requested a model turn",
+                    request.turn
+                ),
+            ));
+        }
+        // replay_config restores the recorded policy; without one the
+        // engine never compacts, so nothing can match.
+        let matches = self.compaction.as_ref().is_some_and(|policy| {
+            request.turn == recorded.turn
+                && compaction_request_sha256(&request, &policy.instructions_sha256)
+                    == recorded.request_sha256
+        });
+        if !matches {
+            self.mark_unexpected(request.turn);
+            return Err(ProviderError::new(
+                ProviderErrorKind::ReplayDiverged,
+                format!(
+                    "turn {} compaction request differs from the recording",
+                    request.turn
+                ),
+            ));
+        }
+        match recorded.outcome {
+            RecordedOutcome::Compacted(response) => Ok(response),
+            RecordedOutcome::Failed { kind, message } => Err(ProviderError::new(kind, message)),
+            RecordedOutcome::Unanswered | RecordedOutcome::Responded(_) => Err(ProviderError::new(
+                ProviderErrorKind::Script,
+                format!(
+                    "recording ends before turn {}'s compaction was answered",
+                    request.turn
+                ),
+            )),
+        }
+    }
+}
+
+/// A recorded request waiting for its answer.
+struct Pending {
+    turn: u32,
+    compaction: bool,
+    request_sha256: String,
 }
 
 /// The recorded execution context; the grammar has already refused an
@@ -387,13 +523,30 @@ where
     /// with no cwd and no env, as it ran, and needs neither exec option;
     /// every other one runs as [`Harness::run`] does.
     ///
+    /// Construct the harness with [`ReplayProvider::replay_config`]: a
+    /// recording that could compact replays only under its recorded policy
+    /// and with this build's instructions, and anything else is refused
+    /// before a sandbox exists.
+    ///
     /// # Errors
     ///
-    /// As [`Harness::run`].
+    /// `InvalidTask` when the recording compacted with other instructions,
+    /// or the harness's compaction policy is not the recorded one; otherwise
+    /// as [`Harness::run`].
     pub async fn replay(
         &mut self,
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
+        if let Some(problem) = self.provider().compaction_problem() {
+            return Err(HarnessError::InvalidTask(problem));
+        }
+        if self.config().compaction.as_ref() != self.provider().compaction() {
+            return Err(HarnessError::InvalidTask(
+                "the compaction policy differs from the recording's; build the replay's \
+                 configuration with ReplayProvider::replay_config"
+                    .to_string(),
+            ));
+        }
         let task = self.provider().task();
         let exec_context = self.provider().exec_context;
         self.run_in_context(&task, exec_context, cancel).await

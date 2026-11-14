@@ -3246,6 +3246,7 @@ fn result(
         truncation_recoveries: 0,
         cost_micro_usd: None,
         long_prompt_requests: 0,
+        compactions: 0,
         replay: None,
         error: None,
     }
@@ -3265,6 +3266,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         max_run_secs: None,
         effort: None,
         clear_thinking: None,
+        compact_at: None,
         max_output_tokens: None,
         pricing: None,
         unpriced_reason: None,
@@ -4967,5 +4969,176 @@ fn eval_cost_refuses_a_run_without_a_price_table_and_needs_no_kilnd() {
         assert!(stderr.contains(needle), "{stderr}");
         assert!(!stderr.contains("no.sock"), "{stderr}");
         assert!(output.stdout.is_empty());
+    }
+}
+
+fn summarized(usage: Usage) -> kiln_harness::provider::CompactionResponse {
+    kiln_harness::provider::CompactionResponse {
+        stop_reason: "compaction".to_string(),
+        summary: Some("out.txt is written; answer next.".to_string()),
+        usage,
+        provider_content: Some(kiln_harness::provider::ProviderContent {
+            provider: "anthropic".to_string(),
+            model: Some("claude-haiku-5-5".to_string()),
+            blocks: json!([{"type": "compaction",
+                            "content": "out.txt is written; answer next.",
+                            "signature": "c2ln"}]),
+            stop_details: None,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn compaction_is_priced_counted_reported_and_repriced_alike() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = two_tasks(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(out_txt_handler());
+    let mut base_config = config();
+    base_config.compaction = Some(kiln_harness::compaction::CompactionPolicy::new(80_000));
+    let options = SuiteOptions {
+        pricing: Some(haiku()),
+        provider: ProviderInfo {
+            name: "anthropic".to_string(),
+            model: "claude-haiku-5-5".to_string(),
+        },
+        base_config,
+        ..options(&out, 1, true)
+    };
+    // Turn 1 reads a 90,000-token prompt (standard card) and makes the
+    // next one due; the summary reads 120,000 (long card); turn 2 is small.
+    let turn_one = ModelResponse {
+        usage: usage(1_000, 9_000, 80_000, 2_000),
+        ..write_out()
+    };
+    let summary = summarized(usage(2_000, 8_000, 110_000, 3_000));
+    let summary_usage = summary.usage;
+    let summary_ok = summary.clone();
+    let suite = eval::run_suite(
+        &api,
+        &tasks,
+        &options,
+        || {
+            Ok(
+                ScriptedProvider::new([turn_one.clone(), answer_with(usage(1_000, 0, 0, 2_000))])
+                    .with_compactions([Ok(summary_ok.clone())]),
+            )
+        },
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite runs");
+    assert_eq!(suite.stopped, None, "{suite:?}");
+    // 3,025 µ$ + 19,000 µ$ (long) + 1,000 × $0.10 + 2,000 × $0.50 = 1,100 µ$.
+    for result in &suite.results {
+        assert_eq!(result.compactions, 1, "{result:?}");
+        assert_eq!(result.cost_micro_usd, Some(3_025 + 19_000 + 1_100));
+        assert_eq!(result.long_prompt_requests, 1);
+        assert_eq!(
+            result.input_tokens,
+            90_000 + summary_usage.total_input_tokens() + 1_000
+        );
+        assert_eq!(result.steps, 2);
+        assert_eq!(result.replay.as_deref(), Some("matched"), "{result:?}");
+    }
+    let manifest = eval::read_manifest(&out).expect("manifest");
+    assert_eq!(manifest.compact_at, Some(80_000));
+    let report = eval::read_report(&out).expect("report");
+    assert_eq!(report.compact_at, Some(80_000));
+    assert_eq!(report.overall.totals.compactions, 2);
+    assert_eq!(report.overall.means.compactions, Some(1.0));
+    assert_eq!(
+        report.tasks[0].compactions.map(|stat| stat.mean),
+        Some(Some(1.0))
+    );
+    let markdown = std::fs::read_to_string(out.join("report.md")).expect("report.md");
+    assert!(
+        markdown.contains("- Compact at: 80000 tokens\n"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| Cost (mean) | Compactions (mean) | Wall ms"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("| $0.0231 | 1.0 | "), "{markdown}");
+
+    // eval cost reprices the same journals to the same totals.
+    let cost = eval::reprice(&out, haiku()).expect("reprices");
+    assert_eq!(cost.cost_micro_usd, 2 * (3_025 + 19_000 + 1_100));
+    assert_eq!(cost.long_prompt_requests, 2);
+    assert_eq!(
+        Some(cost.cost_micro_usd),
+        report.overall.totals.cost_micro_usd
+    );
+}
+
+#[test]
+fn compact_at_reaches_the_report_and_comparison_and_older_files_parse() {
+    let mut compacting = manifest(&["a"], 1);
+    compacting.compact_at = Some(80_000);
+    let plain = result("a", 1, Some("passed"), 2, (10, 1));
+    let mut run = plain.clone();
+    run.compactions = 3;
+    let older = eval::report(std::slice::from_ref(&plain), &manifest(&["a"], 1));
+    let new = eval::report(std::slice::from_ref(&run), &compacting);
+    assert_eq!(new.compact_at, Some(80_000));
+    assert_eq!(new.overall.means.compactions, Some(3.0));
+
+    let json = serde_json::to_value(&compacting).expect("manifest JSON");
+    assert_eq!(json["compact_at"], 80_000);
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, compacting);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    assert_eq!(json["compact_at"], 80_000);
+    assert_eq!(json["overall"]["totals"]["compactions"], 3);
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+    let line = serde_json::to_value(&run).expect("result JSON");
+    assert_eq!(line["compactions"], 3);
+
+    // Off, and in files written before the fields existed: no keys, and
+    // the report reads exactly as before.
+    let line = serde_json::to_value(&plain).expect("result JSON");
+    assert!(line.get("compactions").is_none(), "{line}");
+    let parsed: RunResult = serde_json::from_value(line).expect("an older line parses");
+    assert_eq!(parsed.compactions, 0);
+    let unset = serde_json::to_value(&older).expect("report JSON");
+    assert!(unset.get("compact_at").is_none(), "{unset}");
+    assert!(unset["overall"]["totals"].get("compactions").is_none());
+    assert!(unset["overall"]["means"].get("compactions").is_none());
+    assert!(unset["tasks"][0].get("compactions").is_none());
+    let parsed: Report = serde_json::from_value(unset).expect("an older report parses");
+    assert_eq!(parsed.compact_at, None);
+    let older_md = eval::report_markdown(&older);
+    assert!(!older_md.contains("Compact"), "{older_md}");
+    assert!(
+        older_md.contains("| Cost (mean) | Wall ms (mean / median) |"),
+        "{older_md}"
+    );
+    let new_md = eval::report_markdown(&new);
+    assert!(new_md.contains("- Compact at: 80000 tokens\n"), "{new_md}");
+    assert!(new_md.contains("| 3.0 | "), "{new_md}");
+
+    // Off is absent, so any difference is a known one.
+    for (base, new, note) in [
+        (&older, &new, "Compaction differs (off → 80000 tokens)"),
+        (&new, &older, "Compaction differs (80000 tokens → off)"),
+    ] {
+        let text = eval::compare(base, new);
+        assert!(
+            text.contains(&format!(
+                "\n\n{note}; pass rates, tokens, costs and wall times are not directly \
+                 comparable.\n"
+            )),
+            "{text}"
+        );
+    }
+    let mut other = new.clone();
+    other.compact_at = Some(100_000);
+    assert!(eval::compare(&new, &other).contains("(80000 tokens → 100000 tokens)"));
+    for same in [eval::compare(&new, &new), eval::compare(&older, &older)] {
+        assert!(!same.contains("Compaction differs"), "{same}");
     }
 }

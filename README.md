@@ -286,10 +286,19 @@ starts rather than dropped. It is off by default. `--clear-thinking N`
 last N model turns before each request is served, which keeps long tool
 loops within the input budget; the harness still sends the full history,
 and each tool-results message ends with a short `Continue.` text block so
-the API can tell turns apart. An API key must be at
+the API can tell turns apart. `--compact-at TOKENS` (20,000 to 1,000,000,
+off by default) has the model summarize the whole session, then go on from
+the summary and the task restated, before a turn whose prompt is estimated
+over TOKENS. The estimate is the last response's usage plus the tool
+results since, so it is a heuristic: it keeps no request under the context
+window or a price line. Each compaction is journaled, priced and counted
+against the token budgets, and replay reuses the recorded summary. It is
+refused with `--clear-thinking`, with `--fallbacks`, and when TOKENS, the
+output limit and 32,000 tokens of headroom exceed a listed model's context
+window. An API key must be at
 least 20 bytes. `--temperature` and `--seed` are
 refused for this provider, and `--effort`, `--strict-tools`,
-`--fallbacks`, and `--clear-thinking` for openai-compat. `--base-url` defaults to
+`--fallbacks`, `--clear-thinking`, and `--compact-at` for openai-compat. `--base-url` defaults to
 `https://api.anthropic.com` and must be `https` unless its host is a
 loopback address. The budget flags and defaults are the same as above.
 
@@ -341,7 +350,8 @@ order, each tool record against the model's sanitized call, each request's
 message count and hash against the history rebuilt from the records, and a
 terminal record consistent with the session. It then prints the session,
 record count, outcome, whether the sandbox was deleted, turns, tool calls,
-token usage, and, when the session had them, its seed and check result. A session whose sandbox deletion was not confirmed ends
+token usage (compaction included), and, when the session had them, its
+compactions, seed and check result. A session whose sandbox deletion was not confirmed ends
 `cleanup_failed`.
 
 `replay` reruns the recorded task under every recorded model-visible limit in
@@ -357,7 +367,10 @@ call consumed. Otherwise it prints `diverged at turn N`, the first turn where
 a tool result or a request differed because the sandbox answered differently,
 and exits non-zero. A recording with a task check reruns the check after the
 replayed final answer and prints `diverged at check` when its verdict
-differs.
+differs. A recording that compacted replays its recorded summaries in
+order, under the recorded compaction policy, and is refused before kilnd is
+contacted when this build's summarizer instructions differ from the
+recording's.
 
 Journal and audit directories follow ssh's `StrictModes`: the output's own
 directory must belong to you and be writable by no one else, and every

@@ -577,6 +577,64 @@ arguments are replaced in the history by an `omitted` marker and rejected the
 same way. One `tool_results` message carries every result of the turn under the
 provider's call IDs.
 
+### Compaction
+
+A long session's prompt grows with every turn. With a `CompactionPolicy`
+(`--compact-at TOKENS`, 20,000 to 1,000,000, Anthropic only, off by
+default), the engine can have the provider summarize the whole history and
+go on from the summary. The policy is recorded in `session_started`, so
+`journal verify` and replay use the recorded one, never flags: the
+threshold `compact_at`, at most `max_compactions` (16) summaries and
+`max_no_summary` (2) attempts without one per session, and
+`instructions_sha256`, the SHA-256 of the summarizer instructions this
+build sends (`COMPACTION_INSTRUCTIONS`, under 2 KiB of host text: keep the
+task and its constraints, every file created or changed with its path and
+purpose, the commands run and their decisive results, errors included, and
+the current state and remaining plan; write the summary only and call no
+tools).
+
+Compaction is decided only at the top of the loop for turn t >= 2, after
+the cancellation and deadline checks and before `model_requested` t, by one
+pure function the grammar shares, `compaction_due`. It estimates the next
+prompt as the last response's `total_input_tokens() + output_tokens`, plus
+the compact JSON bytes of the message pushed after it (the tool results or
+the truncation note) at a conservative 3 bytes per token, and compacts when
+that is over `compact_at`, while fewer than 16 summaries and fewer than 2
+attempts without one have happened. The estimate is a heuristic from
+reported usage, not a guarantee: it does not keep any request under the
+context window or under a price line such as Claude Haiku 5.5's 100,000-token
+long-prompt rate, and a single turn's tool results can push past either.
+
+The engine journals `compaction_requested` t (the compaction request hash
+and the history's message count), calls `Provider::compact` with the same
+`ModelRequest` a turn would send, under the same deadline, cancellation and
+renew heartbeat, and journals `compaction_responded` or, for a provider
+error, `compaction_failed`, which ends the session as `model_failed` does.
+A response that is not well formed (`compaction::response_problem`) is such
+an error. The response's usage and output bytes (its summary plus its
+opaque content) are counted before any fallible audit write, then audited
+as `context_compacted` (`compacted` or `no_summary:<stop>`, the messages
+summarized, usage and latency; never the summary), then checked against the
+token and byte budgets exactly as a model response is: over one, the
+session ends with `TokenBudget` or `OutputBytesBudget`. On a summary the
+history becomes two messages:
+
+```text
+[Compacted { summary, provider_content }, User { RESUME_NOTE + task }]
+```
+
+`RESUME_NOTE` is "The conversation so far is summarized above. Continue the
+task from where it stopped. The task, as first given:" and two newlines,
+and the task is the trusted, already bounded host prompt. The summary
+covers everything before it, earlier summaries included. A response
+without a summary (`max_tokens`, `tool_use`, `end_turn`, `refusal`,
+`model_context_window_exceeded`, or any other valid stop) leaves the
+history unchanged. Either way `model_requested` t follows with no second
+attempt in that turn. Compaction is not a step: `steps` stays t - 1 until
+`model_requested` t, and `--max-steps` counts model turns only.
+`session_ended` and the audit's `session_finished` carry `compactions`, the
+number of summaries, and the usage includes every compaction response.
+
 ## Provider adapters
 
 Network providers live under `src/providers/`, one module per wire API. Each
@@ -888,6 +946,38 @@ invalidated from the first cleared block on, so each newly cleared turn
 writes the rest of the prompt to the cache again. Without the flag nothing changes: no beta, no field, no boundary blocks.
 The flag is refused for openai-compat.
 
+Compaction (`--compact-at`, see [Compaction](#compaction)) uses the API's
+on-demand form. The compaction request is exactly the turn's request body
+without `context_management` and `fallbacks`, plus `"compaction": {"type":
+"summarize", "instructions": COMPACTION_INSTRUCTIONS}`, with only the
+`compact-2026-09-04` beta; `cache_control`, `system`, `tools`, effort and
+`max_tokens` are unchanged, so its prefix matches the previous request's.
+It goes through the same transport as a turn: timeouts, retries (529
+`compaction_unavailable` is `overloaded`), the response cap, the credential
+scan of the raw body and of every decoded string and key, and error
+scrubbing. A success that contains the key anywhere, the signature
+included, is refused whole as `InvalidResponse`: a signed block is never
+redacted. The response must name the requested model, have a `stop_reason`
+of 1 to 64 bytes of `[a-z0-9_]`, and `usage.iterations`: a non-empty array
+of `compaction` entries, naming no model or the requested one, whose sum is
+the usage. The top-level counters describe the reply a compaction does not
+generate, so they must be counts and may be zero. A `compaction` stop needs
+exactly one `compaction` block with a non-empty string `content` and a
+string `signature` (every number exact), nonzero input, and at least one
+output token per 64 bytes of summary; the block is kept whole as the opaque
+content and its `content` is the neutral summary. Any other stop needs an
+empty `content`, is a response without a summary, and may report zero
+usage; its `stop_details` is not kept. A `Compacted` message goes out as
+`{"role": "assistant", "content": <the blocks exactly>}`, and every request
+whose history holds one also sends the compaction beta, after the options'
+betas. Another provider's summary is refused, and so is a compacted history
+on openai-compat, where `--compact-at` is refused at the flag. So are
+`--compact-at` with `--clear-thinking` (the API cannot combine `compaction`
+and `context_management`) and with `--fallbacks` (another model could write
+or read the signed block, unpriced), and, for a model in the price table, a
+threshold over the context window less the output limit and 32,000 tokens
+of headroom. Without the flag, requests are byte for byte as before.
+
 ## Tool mapping
 
 | Tool | kilnd executions | Validation |
@@ -1151,7 +1241,11 @@ Each JSONL record has a contiguous `sequence` from 0, a timestamp, the single
 session ID, one event, and `prev_sha256`: the SHA-256 of the previous record's
 exact line bytes (64 zeros for the first). Events are `session_started`,
 `sandbox_ready`, `model_requested`, `model_responded`, `model_failed`,
-`tool_executed`, `check_completed`, and `session_ended`. `session_started` records every
+`compaction_requested`, `compaction_responded`, `compaction_failed`,
+`tool_executed`, `check_completed`, and `session_ended`. `session_started`
+carries `compaction`, the policy, and `session_ended` `compactions`, each
+omitted when off or 0, so journals without compaction are byte-identical to
+before. `session_started` records every
 model-visible limit (steps, calls, timeouts, token budgets, truncation
 recoveries, argument and final-answer bounds, and all tool limits);
 lifecycle windows are not recorded. `max_truncation_recoveries` in the
@@ -1271,6 +1365,33 @@ a tool turn. On the last allowed step the engine leaves the loop at once
 with the step budget, so the work outcome must be `failed`; the outcome may
 still be `cleanup_failed` when deletion was not confirmed.
 
+Compaction follows the same rules from the recorded policy. Wherever
+`model_requested` t with t >= 2 could come next (the previous turn's tool
+records complete, or a recovered truncation), the grammar extends its
+rebuilt history exactly as for a request and computes `compaction_due` from
+the last response's usage, the bytes of the message the history gained, and
+its own counts of summaries and attempts without one. When it is due the
+next record must be `compaction_requested` t or a `session_ended` that is
+not completed work; when it is not, `compaction_requested` is refused, and
+there is at most one per turn. `compaction_requested` t must carry that
+extended history's message count and its compaction hash, so a tool result
+summarized away is still bound to its record. It is answered by
+`compaction_responded` t or `compaction_failed` t, or left unanswered by a
+`session_ended` that is not completed work (cancellation, the deadline, a
+failed renew or audit write). `compaction_responded` adds its usage and
+output bytes to the totals and is checked against the budgets as a response
+is; over one, only a `session_ended` that is not completed work may follow.
+Its shape must be what the engine journals: a summary is exactly one
+anthropic `compaction` block whose string `content` equals the summary,
+with a string `signature`, and replaces the rebuilt history with the summary
+and the restated task, so the next `model_requested` t has message count 2;
+a response without one has neither and changes nothing. The signature is
+checked for shape only: it cannot be authenticated offline, and only the
+API can tell a forged one. After `compaction_failed` only a `session_ended`
+that is not completed work may follow, and `session_ended`'s `compactions`
+must be the number of summaries. A policy whose instructions hash differs
+from this build's still verifies; replay refuses it.
+
 The engine decides whether a response is recovered right after journaling
 it, from the response and the limits alone, and counts it before any audit
 append that could fail, so its `session_ended` count always agrees with the
@@ -1283,6 +1404,13 @@ separately.
 Its `Map` is a sorted `BTreeMap` because `preserve_order` is never enabled, and
 `float_roundtrip` is enabled so every float parses back to the same bits.
 Equal requests therefore hash equally before and after a journal round trip.
+A `Compacted` message is part of `messages`, so a swap that differs shows at
+the next request; the layout version is unchanged, since older journals hold
+no such message. `compaction_request_sha256` hashes the same layout under
+`"v": "compaction-1"` plus `"compaction"`: the policy's
+`instructions_sha256`. Binding the instructions' hash rather than their text
+lets a journal from a build with other instructions verify in full; the
+engine records the hash of exactly the text it sends.
 
 ## Replay
 
@@ -1316,6 +1444,17 @@ and the tool-budget check then apply as for any session, so a replay that
 cannot fit is refused before create. The largest recordable tool timeout,
 10 minutes, needs 902 seconds. Since the model side is fixed, a divergence means kilnd returned
 different tool results than during the recording.
+
+Model requests and compaction attempts are answered from one queue, in
+recorded order. `complete` diverges when the next recorded item is a
+compaction, and `compact` when it is a model request; `compact` also checks
+the turn and the compaction hash, then returns the recorded response or
+the recorded `compaction_failed` error. It never contacts a model: the
+recorded summary is the one sent on. An unanswered recorded compaction
+behaves as an unanswered request, and `exhausted()` counts every recorded
+attempt. Replay restores the compaction policy from `session_started`, and
+refuses, before kilnd is contacted, a policy whose instructions hash is not
+this build's: its summaries were written under other instructions.
 
 Replay rebuilds the whole task from `session_started`, seed, check and exec context
 included, seeds the fresh sandbox the same way, and reruns the check after
@@ -1357,7 +1496,12 @@ the manifest and report record `concurrency` (a file without it reads as 1),
 absent for providers without one), `clear_thinking` (`"off"` or `"keep N"`;
 absent for providers without it) and `max_output_tokens` (the output limit
 per response), the last three absent in older files; `eval compare` notes a
-difference in any of them only when both reports recorded it.
+difference in any of them only when both reports recorded it. They also
+record `compact_at`, the compaction threshold, absent when off and in older
+files, which could not compact, so `eval compare` notes any difference in
+it, off included. With it, each result line carries `compactions` (omitted
+when 0), and `report.md` adds a "Compactions (mean)" column; without it the
+report is unchanged.
 `truncation_recoveries` is always written, and a line without it reads as 0.
 With `--replay`, a completed run is replayed against a fresh sandbox right
 after it, on the same connection. The suite fails closed: a run or replay
@@ -1396,7 +1540,10 @@ Money is integers: rates are US micro-dollars per million tokens, so tokens
 times a rate is picodollars, summed in `u128` with saturation and rounded
 half up to micro-dollars only when a run's total is stored; floats appear
 only in means and ratios for display. The runner prices each
-`model_responded` record of the run's verified journal on its own rate card,
+`model_responded` and `compaction_responded` record of the run's verified
+journal on its own rate card (a compaction reads the whole history and is
+billed like a turn, so with a threshold over 100,000 tokens each Haiku
+compaction itself pays the long-prompt rate),
 because Claude Haiku 5.5 bills a request whose prompt (uncached input, cache
 reads and cache writes together) is over 100,000 tokens at higher rates on
 every category; a run's total usage would hide which requests crossed it.
@@ -1411,4 +1558,6 @@ the session's token, byte and time budgets stay the controls, and pricing
 reads usage only, so requests are byte-for-byte unchanged. The one use of
 the model metadata outside reports is that `run` and `eval run` refuse a
 `--max-output-tokens` above a listed model's output limit before anything
-runs; the context window is shown in `report.md`, not enforced.
+runs, and refuse a `--compact-at` that, with the output limit and 32,000
+tokens of headroom, would not fit a listed model's context window; the
+context window is otherwise shown in `report.md`, not enforced.

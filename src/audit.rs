@@ -139,6 +139,16 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
     },
+    /// Metadata for one compaction attempt before `turn`'s request:
+    /// `compacted`, or `no_summary:<stop_reason>`, how many messages it
+    /// summarized, and its usage. The summary goes only to the journal.
+    ContextCompacted {
+        turn: u32,
+        outcome: String,
+        messages_summarized: usize,
+        usage: Usage,
+        latency_ms: u64,
+    },
     ModelTurn {
         turn: u32,
         action: String,
@@ -203,7 +213,16 @@ pub enum AuditEvent {
         /// `sandbox_deleted` reports.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id_released: Option<bool>,
+        /// Compactions that returned a summary; skipped when 0, so records
+        /// without any are byte-identical to before.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        compactions: u32,
     },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -486,6 +505,7 @@ mod compatibility_test {
                 sandbox_deleted: true,
                 renews: 2,
                 request_id_released: None,
+                compactions: 0,
             }
         );
     }
@@ -498,9 +518,11 @@ mod compatibility_test {
             sandbox_deleted: true,
             renews: 0,
             request_id_released: None,
+            compactions: 0,
         })
         .expect("encode");
         assert!(line.get("request_id_released").is_none());
+        assert!(line.get("compactions").is_none());
         let line = serde_json::to_value(AuditEvent::SandboxCreated {
             backend_id: "b".to_string(),
             expiry_lifetime_ms: None,

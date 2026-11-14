@@ -6,6 +6,29 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `--compact-at TOKENS` (20,000 to 1,000,000, `--provider anthropic` only,
+  off by default) compacts the session's context, recorded. Before a turn
+  whose prompt is estimated over TOKENS (the last response's usage plus the
+  bytes appended since, a heuristic and not a guarantee), the harness asks
+  the API for a summary of the whole history with the
+  `compact-2026-09-04` beta and fixed host instructions, then goes on from
+  the signed summary block and the task restated. The journal gains
+  `compaction_requested`, `compaction_responded` and `compaction_failed`,
+  `session_started` records the policy (`compaction`, with the
+  instructions' SHA-256) and `session_ended` the number of summaries
+  (`compactions`); the grammar decides from the recorded policy when a
+  compaction is due and checks each one's history hash, shape, usage and
+  budgets. Replay answers compactions from the recording in order and
+  refuses a recording made with other instructions. Compaction usage counts
+  toward the token budgets and is priced per response, long-prompt rate
+  included; result lines, `manifest.json` and `report.json` record
+  `compactions` and `compact_at`, `report.md` adds a "Compactions (mean)"
+  column and `eval compare` notes a different threshold. At most 16
+  summaries and 2 attempts without one per session. Refused with
+  `--clear-thinking`, `--fallbacks`, or a threshold that with the output
+  limit and 32,000 tokens of headroom exceeds a listed model's context
+  window. Without the flag, requests, journals, audits and reports are
+  unchanged.
 - Eval reports estimate cost in US dollars from each model response's
   reported usage at Anthropic's list prices (table of 2026-11-13, pinned
   with its rates in `manifest.json` as `pricing`). Each response is priced

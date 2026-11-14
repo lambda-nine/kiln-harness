@@ -525,9 +525,13 @@ pub struct RunResult {
     /// that never reached the model; missing otherwise and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micro_usd: Option<u64>,
-    /// Of the run's model responses, those priced on a long-prompt card.
+    /// Of the run's model and compaction responses, those priced on a
+    /// long-prompt card.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub long_prompt_requests: u32,
+    /// Compactions that returned a summary, from the journal.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compactions: u32,
     /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`; `None`
     /// without `--replay` or for a run that did not complete.
     pub replay: Option<String>,
@@ -569,6 +573,10 @@ pub struct Manifest {
     /// older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_thinking: Option<String>,
+    /// The compaction threshold in tokens (`--compact-at`); missing when
+    /// off and in older files, which could not compact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u64>,
     /// The output token limit per model response (`--max-output-tokens`);
     /// missing in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -645,6 +653,10 @@ pub struct TaskReport {
     /// Responses priced on a long-prompt card, over every run.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub long_prompt_requests: u32,
+    /// Of the runs' compactions; missing unless the report has a
+    /// [`Report::compact_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<Stat>,
     pub replay_matched: u32,
     /// Diverged at a turn or at the check.
     pub replay_diverged: u32,
@@ -663,6 +675,9 @@ pub struct Totals {
     /// priced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micro_usd: Option<u64>,
+    /// Compactions; missing when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub compactions: u64,
 }
 
 /// Means over every run; `None` without runs.
@@ -676,6 +691,9 @@ pub struct Means {
     /// USD micro-dollars; `None` unless [`Totals::cost_micro_usd`] is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micro_usd: Option<f64>,
+    /// Compactions; `None` unless the report has a [`Report::compact_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compactions: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -720,6 +738,9 @@ pub struct Report {
     /// As in [`Manifest::clear_thinking`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clear_thinking: Option<String>,
+    /// As in [`Manifest::compact_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_at: Option<u64>,
     /// As in [`Manifest::max_output_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
@@ -752,6 +773,11 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn ratio(numerator: u32, denominator: u32) -> Option<f64> {
     (denominator > 0).then(|| f64::from(numerator) / f64::from(denominator))
@@ -763,8 +789,8 @@ fn mean_of(total: u64, count: u32) -> Option<f64> {
 }
 
 impl Means {
-    /// `totals` over `runs` runs.
-    fn of(totals: &Totals, runs: u32) -> Self {
+    /// `totals` over `runs` runs; with `compacting`, the compactions too.
+    fn of(totals: &Totals, runs: u32, compacting: bool) -> Self {
         Self {
             steps: mean_of(totals.steps, runs),
             tool_calls: mean_of(totals.tool_calls, runs),
@@ -772,6 +798,9 @@ impl Means {
             output_tokens: mean_of(totals.output_tokens, runs),
             wall_ms: mean_of(totals.wall_ms, runs),
             cost_micro_usd: totals.cost_micro_usd.and_then(|total| mean_of(total, runs)),
+            compactions: compacting
+                .then(|| mean_of(totals.compactions, runs))
+                .flatten(),
         }
     }
 }
@@ -786,8 +815,9 @@ fn run_costs(runs: &[&RunResult]) -> (Option<Vec<u64>>, u32) {
     (costs, long)
 }
 
-/// One task's report from its runs, each added to `totals`.
-fn task_report(id: &str, mine: &[&RunResult], totals: &mut Totals) -> TaskReport {
+/// One task's report from its runs, each added to `totals`; with
+/// `compacting`, the compactions' statistics too.
+fn task_report(id: &str, mine: &[&RunResult], totals: &mut Totals, compacting: bool) -> TaskReport {
     let count = u32::try_from(mine.len()).unwrap_or(u32::MAX);
     let task_passed =
         u32::try_from(mine.iter().filter(|result| result.passed()).count()).unwrap_or(0);
@@ -806,6 +836,9 @@ fn task_report(id: &str, mine: &[&RunResult], totals: &mut Totals) -> TaskReport
         totals.input_tokens = totals.input_tokens.saturating_add(result.input_tokens);
         totals.output_tokens = totals.output_tokens.saturating_add(result.output_tokens);
         totals.wall_ms = totals.wall_ms.saturating_add(result.wall_ms);
+        totals.compactions = totals
+            .compactions
+            .saturating_add(u64::from(result.compactions));
     }
     let column = |value: fn(&RunResult) -> u64| {
         Stat::of(&mine.iter().map(|result| value(result)).collect::<Vec<_>>())
@@ -826,6 +859,7 @@ fn task_report(id: &str, mine: &[&RunResult], totals: &mut Totals) -> TaskReport
             .filter(|costs| !costs.is_empty())
             .map(|costs| Stat::of(&costs)),
         long_prompt_requests,
+        compactions: compacting.then(|| column(|result| u64::from(result.compactions))),
         replay_matched: replay.0,
         replay_diverged: replay.1,
         replay_failed: replay.2,
@@ -850,7 +884,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
             .iter()
             .filter(|result| &result.task == id)
             .collect::<Vec<_>>();
-        let task = task_report(id, &mine, &mut totals);
+        let task = task_report(id, &mine, &mut totals, manifest.compact_at.is_some());
         runs += task.runs;
         passed += task.passed;
         tasks.push(task);
@@ -883,6 +917,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         max_run_secs: manifest.max_run_secs,
         effort: manifest.effort.clone(),
         clear_thinking: manifest.clear_thinking.clone(),
+        compact_at: manifest.compact_at,
         max_output_tokens: manifest.max_output_tokens,
         pricing_version: pricing.map(|pricing| pricing.version.clone()),
         unpriced_reason: manifest.unpriced_reason.clone(),
@@ -897,7 +932,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
             pass_at_1: macro_pass_rate,
             trials: manifest.trials,
             totals,
-            means: Means::of(&totals, runs),
+            means: Means::of(&totals, runs, manifest.compact_at.is_some()),
             cost_per_pass_micro_usd: totals
                 .cost_micro_usd
                 .and_then(|total| mean_of(total, passed)),
@@ -975,6 +1010,9 @@ fn write_report_header(text: &mut String, report: &Report) {
     if let Some(clear_thinking) = &report.clear_thinking {
         let _ = writeln!(text, "- Clear thinking: {}", cell(clear_thinking));
     }
+    if let Some(tokens) = report.compact_at {
+        let _ = writeln!(text, "- Compact at: {tokens} tokens");
+    }
     if let Some(tokens) = report.max_output_tokens {
         let _ = writeln!(text, "- Output limit per response: {tokens} tokens");
     }
@@ -1007,16 +1045,32 @@ fn write_pricing_line(text: &mut String, report: &Report) {
 pub fn report_markdown(report: &Report) -> String {
     let mut text = String::new();
     write_report_header(&mut text, report);
+    // The compactions column only for a run that could compact, so other
+    // reports are unchanged.
+    let compacting = report.compact_at.is_some();
     let _ = writeln!(
         text,
         "\n| Task | Runs | Passed | Pass rate | Outcomes | Steps (mean / median) | Tool calls \
-         (mean / median) | Input tokens (mean) | Output tokens (mean) | Cost (mean) | Wall ms \
-         (mean / median) | Replay matched / diverged / failed |"
+         (mean / median) | Input tokens (mean) | Output tokens (mean) | Cost (mean) | {}Wall ms \
+         (mean / median) | Replay matched / diverged / failed |",
+        if compacting {
+            "Compactions (mean) | "
+        } else {
+            ""
+        }
     );
     let _ = writeln!(
         text,
-        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|{}---:|---:|",
+        if compacting { "---:|" } else { "" }
     );
+    let compactions = |mean: Option<f64>| {
+        if compacting {
+            format!("{} | ", number(mean))
+        } else {
+            String::new()
+        }
+    };
     for task in &report.tasks {
         let outcomes = task
             .outcomes
@@ -1026,7 +1080,7 @@ pub fn report_markdown(report: &Report) -> String {
             .join(", ");
         let _ = writeln!(
             text,
-            "| {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} | {} / {} | {} / {} / {} |",
+            "| {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} | {}{} / {} | {} / {} / {} |",
             cell(&task.task),
             task.runs,
             task.passed,
@@ -1039,6 +1093,7 @@ pub fn report_markdown(report: &Report) -> String {
             number(task.input_tokens.mean),
             number(task.output_tokens.mean),
             mean_dollars(task.cost_micro_usd.and_then(|cost| cost.mean)),
+            compactions(task.compactions.and_then(|stat| stat.mean)),
             number(task.wall_ms.mean),
             number(task.wall_ms.median),
             task.replay_matched,
@@ -1049,7 +1104,7 @@ pub fn report_markdown(report: &Report) -> String {
     let overall = &report.overall;
     let _ = writeln!(
         text,
-        "| **Overall** | {} | {} | {} (macro) | | {} | {} | {} | {} | {} | {} | |",
+        "| **Overall** | {} | {} | {} (macro) | | {} | {} | {} | {} | {} | {}{} | |",
         overall.runs,
         overall.passed,
         percent(overall.macro_pass_rate),
@@ -1058,6 +1113,7 @@ pub fn report_markdown(report: &Report) -> String {
         number(overall.means.input_tokens),
         number(overall.means.output_tokens),
         mean_dollars(overall.means.cost_micro_usd),
+        compactions(overall.means.compactions),
         number(overall.means.wall_ms),
     );
     let _ = write!(
@@ -1245,6 +1301,20 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
              directly comparable.",
             cell(base_clear),
             cell(new_clear)
+        );
+    }
+    // Off is recorded as absent, and older reports could not compact, so
+    // absent on either side is off, a known setting.
+    if base.compact_at != new.compact_at {
+        let at = |tokens: Option<u64>| {
+            tokens.map_or_else(|| "off".to_string(), |tokens| format!("{tokens} tokens"))
+        };
+        let _ = writeln!(
+            text,
+            "\nCompaction differs ({} → {}); pass rates, tokens, costs and wall times are not \
+             directly comparable.",
+            at(base.compact_at),
+            at(new.compact_at)
         );
     }
     if let (Some(base_tokens), Some(new_tokens)) = (base.max_output_tokens, new.max_output_tokens)
@@ -1754,10 +1824,28 @@ struct Recorded {
     cost_picodollars: u128,
     /// Responses priced on a long-prompt card.
     long_prompt_requests: u32,
+    /// Compactions that returned a summary.
+    compactions: u32,
 }
 
-/// What `journal` says about its session, each model response priced at
-/// `pricing` when given.
+impl Recorded {
+    /// Add one response's cost at `pricing`, when given. Each response is
+    /// on its own card: a long prompt changes the rates of that request
+    /// only.
+    fn price(&mut self, pricing: Option<&ModelPricing>, usage: &crate::provider::Usage) {
+        if let Some(pricing) = pricing {
+            self.cost_picodollars = self
+                .cost_picodollars
+                .saturating_add(pricing.cost_picodollars(usage));
+            if pricing.is_long_prompt(usage) {
+                self.long_prompt_requests += 1;
+            }
+        }
+    }
+}
+
+/// What `journal` says about its session, each model and compaction
+/// response priced at `pricing` when given.
 fn recorded(journal: Option<&LoadedJournal>, pricing: Option<&ModelPricing>) -> Recorded {
     let mut recorded = Recorded::default();
     let Some(journal) = journal else {
@@ -1782,16 +1870,14 @@ fn recorded(journal: Option<&LoadedJournal>, pricing: Option<&ModelPricing>) -> 
             JournalEvent::ModelResponded { response, .. } => {
                 recorded.usage = recorded.usage + response.usage;
                 truncated = response.stop_reason == crate::provider::StopReason::MaxTokens;
-                // Each response on its own card: a long prompt changes the
-                // rates of that request only.
-                if let Some(pricing) = pricing {
-                    recorded.cost_picodollars = recorded
-                        .cost_picodollars
-                        .saturating_add(pricing.cost_picodollars(&response.usage));
-                    if pricing.is_long_prompt(&response.usage) {
-                        recorded.long_prompt_requests += 1;
-                    }
-                }
+                recorded.price(pricing, &response.usage);
+            }
+            // A compaction reads the whole history and is billed like any
+            // other request, on its own card.
+            JournalEvent::CompactionResponded { response, .. } => {
+                recorded.usage = recorded.usage + response.usage;
+                recorded.price(pricing, &response.usage);
+                recorded.compactions += u32::from(response.is_success());
             }
             JournalEvent::ToolExecuted { .. } => recorded.tool_calls += 1,
             JournalEvent::CheckCompleted { outcome, .. } => {
@@ -2011,6 +2097,11 @@ where
         max_run_secs: options.max_run_secs,
         effort: options.effort.clone(),
         clear_thinking: options.clear_thinking.clone(),
+        compact_at: options
+            .base_config
+            .compaction
+            .as_ref()
+            .map(|policy| policy.compact_at),
         max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
         pricing: options.pricing.map(PricingRecord::from),
         unpriced_reason: options.unpriced_reason.clone(),
@@ -2217,6 +2308,7 @@ where
             .filter(|_| unreadable.is_none() && sink_error(&outcome).is_none())
             .map(|_| picodollars_to_micro(recorded.cost_picodollars)),
         long_prompt_requests: recorded.long_prompt_requests,
+        compactions: recorded.compactions,
         replay: None,
         error: outcome.as_ref().err().map(ToString::to_string),
     };
@@ -2588,6 +2680,71 @@ mod tests {
                 latency_ms: 1,
             },
         }
+    }
+
+    #[test]
+    fn each_compaction_is_priced_on_its_own_card_and_counted() {
+        use crate::provider::{CompactionResponse, ProviderContent, Usage};
+        let compaction = |turn: u32, usage: Usage, summary: bool| crate::journal::JournalRecord {
+            sequence: u64::from(turn) + 10,
+            unix_ms: 1,
+            session_id: "hs-priced".to_string(),
+            prev_sha256: String::new(),
+            event: JournalEvent::CompactionResponded {
+                turn,
+                response: if summary {
+                    CompactionResponse {
+                        stop_reason: "compaction".to_string(),
+                        summary: Some("s".to_string()),
+                        usage,
+                        provider_content: Some(ProviderContent {
+                            provider: "anthropic".to_string(),
+                            model: None,
+                            blocks: serde_json::json!([
+                                {"type": "compaction", "content": "s", "signature": "x"}
+                            ]),
+                            stop_details: None,
+                        }),
+                    }
+                } else {
+                    CompactionResponse::no_summary("max_tokens", usage)
+                },
+                latency_ms: 1,
+            },
+        };
+        let short = Usage {
+            input_tokens: 1_000,
+            output_tokens: 2_000,
+            cache_read_input_tokens: 80_000,
+            cache_creation_input_tokens: 9_000,
+        };
+        let long = Usage {
+            input_tokens: 2_000,
+            output_tokens: 3_000,
+            cache_read_input_tokens: 110_000,
+            cache_creation_input_tokens: 8_000,
+        };
+        let journal = LoadedJournal {
+            records: vec![
+                responded(1, short),
+                // A summary of a 120,000-token history pays the long card.
+                compaction(2, long, true),
+                // An attempt without a summary is billed all the same.
+                compaction(3, short, false),
+            ],
+            complete: false,
+        };
+        let haiku = crate::pricing::lookup("claude-haiku-5-5").expect("haiku");
+        let priced = recorded(Some(&journal), Some(haiku));
+        // As in the test below: 3,025 µ$ on the standard card for `short`,
+        // 19,000 µ$ on the long card for `long`.
+        assert_eq!(
+            priced.cost_picodollars,
+            2 * 3_025_000_000u128 + 19_000_000_000
+        );
+        assert_eq!(priced.long_prompt_requests, 1);
+        assert_eq!(priced.compactions, 1, "only summaries count");
+        assert_eq!(priced.usage, short + long + short);
     }
 
     #[test]

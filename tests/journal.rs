@@ -97,6 +97,9 @@ fn event_names(journal: &LoadedJournal) -> Vec<&'static str> {
             JournalEvent::ModelRequested { .. } => "model_requested",
             JournalEvent::ModelResponded { .. } => "model_responded",
             JournalEvent::ModelFailed { .. } => "model_failed",
+            JournalEvent::CompactionRequested { .. } => "compaction_requested",
+            JournalEvent::CompactionResponded { .. } => "compaction_responded",
+            JournalEvent::CompactionFailed { .. } => "compaction_failed",
             JournalEvent::ToolExecuted { .. } => "tool_executed",
             JournalEvent::CheckCompleted { .. } => "check_completed",
             JournalEvent::SessionEnded { .. } => "session_ended",
@@ -472,6 +475,7 @@ fn unsupported_schema_is_rejected() {
             seed: Vec::new(),
             check: None,
             exec_context: None,
+            compaction: None,
         },
     };
     let temp = common::private_tempdir().expect("temp dir");
@@ -1048,6 +1052,7 @@ fn distinct_config() -> HarnessConfig {
         },
         sandbox_idle_timeout: Duration::from_secs(33),
         sandbox_lifetime_margin: Duration::from_secs(4),
+        compaction: None,
     }
 }
 
@@ -1797,6 +1802,7 @@ fn discarding_an_unwritten_output_removes_its_new_directories() {
                 seed: Vec::new(),
                 check: None,
                 exec_context: None,
+                compaction: None,
             },
         )
         .expect("first record");

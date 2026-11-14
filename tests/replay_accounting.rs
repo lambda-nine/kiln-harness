@@ -60,6 +60,7 @@ impl Fixture {
                 seed: Vec::new(),
                 check: None,
                 exec_context: None,
+                compaction: None,
             },
             JournalEvent::SandboxReady {
                 sandbox_id: "sb-1".to_string(),
@@ -101,6 +102,7 @@ fn ended(outcome: &str, final_answer: Option<&str>) -> JournalEvent {
         usage: Usage::default(),
         sandbox_deleted: true,
         truncation_recoveries: 0,
+        compactions: 0,
     }
 }
 

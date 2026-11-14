@@ -195,6 +195,25 @@ it is not a hostile multi-tenant boundary.
   accepted: an error body or an unknown stop never becomes a final answer.
   Strict tool schemas are a request-side transform only; every bound they
   drop is still enforced by the harness's own argument validation.
+- A compaction summary (`--compact-at`) is untrusted model output, like any
+  response: it may misstate the task, omit what was done, or carry text
+  steering the next turns, and the model acts on it in place of the history
+  it replaced. It never reaches a tool, the audit or the terminal; it goes
+  to the next requests and the journal. It is bounded by the response cap,
+  counted against `max_total_model_output_bytes` with its block, and
+  checked against the token budgets with its usage. The credential scan
+  covers the whole compaction response, raw body, every decoded string and
+  key, the summary and the signature included; one that contains the key is
+  refused whole as `InvalidResponse`, never redacted, since a signed block
+  cannot be edited. The signature is checked for shape only: neither the
+  harness nor `journal verify` can authenticate it offline, so a journal
+  whose summary block was forged with a re-computed chain verifies, and only
+  the API would refuse the block on the next live request. Replay sends no
+  request and so cannot catch that either; it reproduces what was recorded.
+  The task restated after a summary is the trusted, bounded host prompt from
+  `session_started`, not model text, and the summarizer instructions are
+  fixed host text whose SHA-256 is recorded and bound into every compaction
+  request hash.
 - In anthropic's credential-proxy mode the harness holds no key at all:
   without `--api-key-env` it sends no credential header, and a host-side
   proxy adds `x-api-key` and strips any client credential headers. A

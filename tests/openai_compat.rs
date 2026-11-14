@@ -148,7 +148,7 @@ fn request_body_matches_the_golden_json() {
         max_output_tokens: 512,
     };
 
-    let body = request_body(&config, &request);
+    let body = request_body(&config, &request).expect("body");
 
     let golden = json!({
         "model": "test-model",
@@ -222,7 +222,8 @@ fn request_body_matches_the_golden_json() {
             ..config
         },
         &no_system,
-    );
+    )
+    .expect("body");
     assert_eq!(
         body["messages"][0]["role"], "user",
         "an empty system is omitted"
@@ -252,7 +253,7 @@ async fn the_request_is_posted_as_json_to_chat_completions() {
     assert_eq!(sent.header("authorization"), None);
     assert_eq!(
         sent.json(),
-        request_body(provider.config(), &request(&messages, &tools))
+        request_body(provider.config(), &request(&messages, &tools)).expect("body")
     );
     assert_eq!(sent.json()["tools"].as_array().map(Vec::len), Some(5));
 }

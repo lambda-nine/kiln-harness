@@ -10,6 +10,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use kiln_harness::api::{SandboxApi, TonicKilnd};
 use kiln_harness::audit::JsonlAudit;
+use kiln_harness::compaction::{
+    COMPACTION_HEADROOM_TOKENS, CompactionPolicy, MAX_COMPACT_AT, MIN_COMPACT_AT,
+};
 use kiln_harness::engine::{
     CheckOutcome, Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST,
     MAX_SANDBOX_IDLE_TIMEOUT, MAX_SANDBOX_LIFETIME_MARGIN, MAX_SESSION_TIMEOUT, MAX_STEPS,
@@ -26,7 +29,8 @@ use kiln_harness::journal::{
 use kiln_harness::live::TerminalLive;
 use kiln_harness::pricing::{self, ModelPricing};
 use kiln_harness::provider::{
-    ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo, ScriptedProvider, Usage,
+    CompactionResponse, ModelRequest, ModelResponse, Provider, ProviderError, ProviderInfo,
+    ScriptedProvider, Usage,
 };
 use kiln_harness::providers::anthropic::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 use kiln_harness::providers::{
@@ -146,6 +150,13 @@ struct ModelArgs {
     /// message then ends with a short text block so the API can count turns.
     #[arg(long, value_name = "N")]
     clear_thinking: Option<u32>,
+    /// Summarize the whole history, then go on from the summary, before a
+    /// turn whose prompt is estimated over TOKENS (anthropic; 20000 to
+    /// 1000000; off by default). The estimate is the last response's usage
+    /// plus the tool results since, so it is a heuristic, not a guarantee.
+    /// Not with --clear-thinking or --fallbacks.
+    #[arg(long, value_name = "TOKENS")]
+    compact_at: Option<u64>,
     /// Model turns per session.
     #[arg(long, default_value_t = 40)]
     max_steps: u32,
@@ -411,6 +422,16 @@ impl Provider for RunProvider {
             Self::Anthropic(provider) => provider.complete(request).await,
         }
     }
+
+    async fn compact(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<CompactionResponse, ProviderError> {
+        match self {
+            Self::OpenAiCompat(provider) => provider.compact(request).await,
+            Self::Anthropic(provider) => provider.compact(request).await,
+        }
+    }
 }
 
 fn parse_effort(value: &str) -> Result<Effort, String> {
@@ -522,6 +543,10 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         args.max_total_output_bytes,
         MAX_TOTAL_MODEL_OUTPUT_BYTES,
     )?;
+    let compaction = args
+        .compact_at
+        .map(|compact_at| compaction_policy(args, compact_at))
+        .transpose()?;
     check_secs(
         "--sandbox-idle-timeout-secs",
         args.sandbox_idle_timeout_secs,
@@ -550,10 +575,44 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         },
         sandbox_idle_timeout: Duration::from_secs(args.sandbox_idle_timeout_secs),
         sandbox_lifetime_margin: Duration::from_secs(args.sandbox_lifetime_margin_secs),
+        compaction,
         ..HarnessConfig::default()
     };
     config.validate()?;
     Ok(config)
+}
+
+/// The policy `--compact-at` asks for, refused in range or in combination
+/// as [`check_provider_flags`] refuses foreign flags.
+fn compaction_policy(args: &ModelArgs, compact_at: u64) -> Result<CompactionPolicy> {
+    if !(MIN_COMPACT_AT..=MAX_COMPACT_AT).contains(&compact_at) {
+        bail!("--compact-at must be between {MIN_COMPACT_AT} and {MAX_COMPACT_AT}");
+    }
+    // The API cannot put compaction and context_management on one request,
+    // and summaries alongside thinking clearing are untested.
+    if args.clear_thinking.is_some() {
+        bail!("--compact-at does not apply with --clear-thinking");
+    }
+    // Another model could write or read the signed summary, unpriced.
+    if args.fallbacks {
+        bail!("--compact-at does not apply with --fallbacks");
+    }
+    if let Some(model) = model_metadata(args) {
+        let needed = compact_at
+            .saturating_add(u64::from(args.max_output_tokens))
+            .saturating_add(COMPACTION_HEADROOM_TOKENS);
+        if needed > model.context_window {
+            bail!(
+                "--compact-at {compact_at} plus --max-output-tokens {} and {} tokens of headroom \
+                 exceeds {}'s {}-token context window",
+                args.max_output_tokens,
+                COMPACTION_HEADROOM_TOKENS,
+                model.model,
+                model.context_window
+            );
+        }
+    }
+    Ok(CompactionPolicy::new(compact_at))
 }
 
 /// The table entry for the model the flags ask for: only Anthropic's
@@ -645,6 +704,7 @@ fn check_provider_flags(args: &ModelArgs) -> Result<()> {
                 ("--strict-tools", args.strict_tools),
                 ("--fallbacks", args.fallbacks),
                 ("--clear-thinking", args.clear_thinking.is_some()),
+                ("--compact-at", args.compact_at.is_some()),
             ],
         ),
         ProviderKind::Anthropic => (
@@ -762,6 +822,9 @@ async fn replay(
         .with_context(|| format!("read journal {}", from.display()))?;
     let provider = ReplayProvider::from_journal(&recorded)
         .with_context(|| format!("load recorded turns from {}", from.display()))?;
+    if let Some(problem) = provider.compaction_problem() {
+        bail!("cannot replay {}: {problem}", from.display());
+    }
     let recorded_outcome = provider.recorded_outcome().unwrap_or("incomplete");
     let (Some(expected), "completed") = (
         provider.recorded_final_answer().map(str::to_string),
@@ -927,6 +990,9 @@ fn verify(path: &Path) -> ExitCode {
     );
     println!("turns: {}", summary.turns);
     println!("tool calls: {}", summary.tool_calls);
+    if summary.compactions > 0 {
+        println!("compactions: {}", summary.compactions);
+    }
     if summary.seed_files > 0 {
         println!("seed: {} files", summary.seed_files);
     }
@@ -948,6 +1014,8 @@ struct Summary {
     sandbox_deleted: bool,
     turns: u32,
     tool_calls: u32,
+    /// Compactions that returned a summary.
+    compactions: u32,
     usage: Usage,
     seed_files: usize,
     check: Option<CheckOutcome>,
@@ -959,6 +1027,7 @@ fn summarize(journal: &LoadedJournal) -> Summary {
         sandbox_deleted: false,
         turns: 0,
         tool_calls: 0,
+        compactions: 0,
         usage: Usage::default(),
         seed_files: 0,
         check: None,
@@ -970,6 +1039,10 @@ fn summarize(journal: &LoadedJournal) -> Summary {
             JournalEvent::ModelRequested { .. } => summary.turns += 1,
             JournalEvent::ModelResponded { response, .. } => {
                 summary.usage = summary.usage + response.usage;
+            }
+            JournalEvent::CompactionResponded { response, .. } => {
+                summary.usage = summary.usage + response.usage;
+                summary.compactions += u32::from(response.is_success());
             }
             JournalEvent::ToolExecuted { .. } => summary.tool_calls += 1,
             JournalEvent::SessionEnded {

@@ -729,6 +729,7 @@ fn common_session_started() -> JournalEvent {
         seed: Vec::new(),
         check: None,
         exec_context: None,
+        compaction: None,
     }
 }
 

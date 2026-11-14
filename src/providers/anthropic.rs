@@ -153,6 +153,17 @@
 //!   checks are unaffected; the API documents that clearing invalidates the
 //!   prompt cache from the first cleared block on. A response's top-level
 //!   `context_management` report is ignored.
+//! - **Compaction only when asked.** [`Provider::compact`] sends
+//!   [`compaction_body`]: the turn's body without `context_management` and
+//!   `fallbacks`, plus `"compaction": {"type": "summarize", "instructions":
+//!   COMPACTION_INSTRUCTIONS}`, with only the [`COMPACTION_BETA`] beta,
+//!   through the same transport, scans and scrubbing as a turn; the
+//!   response is read by [`parse_compaction`], and one that contains the
+//!   key, its signature included, is refused whole as `InvalidResponse`. A
+//!   [`Message::Compacted`] is echoed as `{"role": "assistant", "content":
+//!   <its blocks exactly>}`, and only a request whose history holds one
+//!   adds [`COMPACTION_BETA`] after the options' betas, so every other
+//!   request is unchanged.
 //! - **Strict tools off by default.** Strict mode refuses `maxItems` and
 //!   similar bounds, which the harness's schemas use. With `strict_tools`,
 //!   each schema is sent through [`strict_input_schema`]: supported keywords
@@ -214,10 +225,14 @@ use super::http::{
     self, Credential, Failure, MAX_TOOL_NAME_BYTES, Transport, check_completion_tokens, excerpt,
     invalid,
 };
+use crate::compaction::{
+    COMPACTION_BETA, COMPACTION_BLOCK, COMPACTION_INSTRUCTIONS, COMPACTION_STOP,
+    stop_reason_is_valid,
+};
 use crate::engine::call_id_is_valid;
 use crate::provider::{
-    Message, ModelRequest, ModelResponse, Provider, ProviderContent, ProviderError,
-    ProviderErrorKind, ProviderInfo, StopReason, ToolCall, Usage,
+    CompactionResponse, Message, ModelRequest, ModelResponse, Provider, ProviderContent,
+    ProviderError, ProviderErrorKind, ProviderInfo, StopReason, ToolCall, Usage,
 };
 use crate::tools::{ExecContext, ToolLimits, ToolRegistry};
 
@@ -447,6 +462,8 @@ pub struct AnthropicProvider {
     client: Client,
     endpoint: Url,
     headers: HeaderMap,
+    /// The betas in `headers`, which the options need.
+    betas: Vec<&'static str>,
     config: AnthropicConfig,
 }
 
@@ -500,9 +517,9 @@ impl AnthropicProvider {
         .filter_map(|(on, beta)| on.then_some(beta))
         .collect::<Vec<_>>();
         if !betas.is_empty() {
-            let betas = HeaderValue::try_from(betas.join(","))
+            let value = HeaderValue::try_from(betas.join(","))
                 .map_err(|_| AnthropicError("beta list is not a valid header value".to_string()))?;
-            headers.insert(HeaderName::from_static("anthropic-beta"), betas);
+            headers.insert(HeaderName::from_static("anthropic-beta"), value);
         }
         if config.strict_tools {
             // The harness's own tools must survive the strict transform, so
@@ -522,6 +539,7 @@ impl AnthropicProvider {
             client,
             endpoint: config.endpoint(),
             headers,
+            betas,
             config,
         })
     }
@@ -531,38 +549,102 @@ impl AnthropicProvider {
         &self.config
     }
 
-    /// One HTTP exchange: send, read the bounded body, classify.
-    async fn attempt(&self, body: &[u8]) -> Result<ModelResponse, Failure> {
-        let limit = self.config.max_response_bytes;
+    /// The configured headers with `anthropic-beta` set to `betas`
+    /// instead of the options' own list.
+    fn headers_with_betas(&self, betas: &[&str]) -> Result<HeaderMap, ProviderError> {
+        let mut headers = self.headers.clone();
+        let value = HeaderValue::try_from(betas.join(",")).map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Rejected,
+                "beta list is not a valid header value",
+            )
+        })?;
+        headers.insert(HeaderName::from_static("anthropic-beta"), value);
+        Ok(headers)
+    }
+
+    /// The headers for an ordinary request: the configured ones, plus
+    /// [`COMPACTION_BETA`] after the options' betas when `history` carries
+    /// a summary. Every other request is unchanged.
+    fn request_headers(&self, history: &[Message]) -> Result<HeaderMap, ProviderError> {
+        if !history
+            .iter()
+            .any(|message| matches!(message, Message::Compacted { .. }))
+        {
+            return Ok(self.headers.clone());
+        }
+        let mut betas = self.betas.clone();
+        betas.push(COMPACTION_BETA);
+        self.headers_with_betas(&betas)
+    }
+
+    /// Send one request and read its bounded body: a success is returned
+    /// for the caller to decode, and anything else is classified. With a
+    /// key, the endpoint holds a credential: nothing it sends is quoted.
+    async fn post(&self, headers: HeaderMap, body: &[u8]) -> Result<http::Exchange, Failure> {
         let exchange = http::post(
             &self.client,
             &self.endpoint,
-            self.headers.clone(),
+            headers,
             body,
-            limit,
+            self.config.max_response_bytes,
         )
         .await?;
-        // With a key, the endpoint holds a credential: nothing it sends is
-        // quoted, and a response that contains the key is refused whole.
-        // Without one, a proxy holds the key and owns that scan.
-        let key = self.config.api_key.as_ref().map(Credential::new);
-        let key = key.as_ref();
         if exchange.status.is_success() {
-            let value = http::decode_success(&exchange, limit, key)?;
-            let parsed = parse_response_quoting(
-                &value,
-                &self.config.model,
-                self.config.fallbacks,
-                key.is_none(),
-            )?;
-            if key.is_some_and(|key| key.in_response(&parsed)) {
-                return Err(http::credential_echo());
-            }
-            return Ok(parsed);
+            return Ok(exchange);
         }
-        let mut failure = classify_status(exchange.status, &exchange.body, key);
+        let key = self.config.api_key.as_ref().map(Credential::new);
+        let mut failure = classify_status(exchange.status, &exchange.body, key.as_ref());
         failure.retry_after = exchange.retry_after;
         Err(failure)
+    }
+
+    /// One HTTP exchange: send, read the bounded body, classify.
+    async fn attempt(&self, headers: HeaderMap, body: &[u8]) -> Result<ModelResponse, Failure> {
+        let exchange = self.post(headers, body).await?;
+        // A response that contains the key is refused whole. Without one,
+        // a proxy holds the key and owns that scan.
+        let key = self.config.api_key.as_ref().map(Credential::new);
+        let key = key.as_ref();
+        let value = http::decode_success(&exchange, self.config.max_response_bytes, key)?;
+        let parsed = parse_response_quoting(
+            &value,
+            &self.config.model,
+            self.config.fallbacks,
+            key.is_none(),
+        )?;
+        if key.is_some_and(|key| key.in_response(&parsed)) {
+            return Err(http::credential_echo());
+        }
+        Ok(parsed)
+    }
+
+    /// One compaction exchange, through the same transport, scans and
+    /// classification as [`Self::attempt`]. A success that contains the
+    /// key anywhere, the signature included, is refused whole as
+    /// `InvalidResponse`: a signed block can never be redacted.
+    async fn compact_attempt(
+        &self,
+        headers: HeaderMap,
+        body: &[u8],
+    ) -> Result<CompactionResponse, Failure> {
+        let exchange = self.post(headers, body).await?;
+        let key = self.config.api_key.as_ref().map(Credential::new);
+        let key = key.as_ref();
+        let value = http::decode_success(&exchange, self.config.max_response_bytes, key).map_err(
+            |mut failure| {
+                failure.error.kind = ProviderErrorKind::InvalidResponse;
+                failure
+            },
+        )?;
+        let parsed = parse_compaction_quoting(&value, &self.config.model, key.is_none())?;
+        if key.is_some_and(|key| key.in_compaction(&parsed)) {
+            return Err(Failure::fatal(
+                ProviderErrorKind::InvalidResponse,
+                "response contained the request credential",
+            ));
+        }
+        Ok(parsed)
     }
 }
 
@@ -583,6 +665,14 @@ impl Provider for AnthropicProvider {
         let result = self.complete_unscrubbed(request).await;
         result.map_err(|error| scrub(error, self.config.api_key.as_ref()))
     }
+
+    async fn compact(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<CompactionResponse, ProviderError> {
+        let result = self.compact_unscrubbed(request).await;
+        result.map_err(|error| scrub(error, self.config.api_key.as_ref()))
+    }
 }
 
 impl AnthropicProvider {
@@ -596,10 +686,36 @@ impl AnthropicProvider {
                 format!("encode request: {error}"),
             )
         })?;
+        let headers = self.request_headers(request.messages)?;
         let transport = self.config.transport();
         transport.check_request(&body)?;
         transport
-            .with_retries(request.session_id, request.turn, || self.attempt(&body))
+            .with_retries(request.session_id, request.turn, || {
+                self.attempt(headers.clone(), &body)
+            })
+            .await
+    }
+
+    async fn compact_unscrubbed(
+        &self,
+        request: ModelRequest<'_>,
+    ) -> Result<CompactionResponse, ProviderError> {
+        let body =
+            serde_json::to_vec(&compaction_body(&self.config, &request)?).map_err(|error| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidResponse,
+                    format!("encode request: {error}"),
+                )
+            })?;
+        // Only the compaction beta: the request carries neither fallbacks
+        // nor context management.
+        let headers = self.headers_with_betas(&[COMPACTION_BETA])?;
+        let transport = self.config.transport();
+        transport.check_request(&body)?;
+        transport
+            .with_retries(request.session_id, request.turn, || {
+                self.compact_attempt(headers.clone(), &body)
+            })
             .await
     }
 }
@@ -627,7 +743,7 @@ pub fn request_body(
     config: &AnthropicConfig,
     request: &ModelRequest<'_>,
 ) -> Result<Value, ProviderError> {
-    let messages = messages(request.messages, config.clear_thinking.is_some());
+    let messages = messages(request.messages, config.clear_thinking.is_some())?;
     let mut body = Map::new();
     body.insert("model".to_string(), json!(config.model));
     body.insert("max_tokens".to_string(), json!(request.max_output_tokens));
@@ -684,10 +800,36 @@ pub fn request_body(
     Ok(Value::Object(body))
 }
 
+/// The body of a compaction request: exactly [`request_body`] for the same
+/// request, without `context_management` and `fallbacks`, plus
+/// `"compaction": {"type": "summarize", "instructions":
+/// COMPACTION_INSTRUCTIONS}`. Everything else, `cache_control`, `system`,
+/// `tools`, effort and `max_tokens` included, is unchanged, so the prompt
+/// prefix matches the last request's.
+///
+/// # Errors
+///
+/// As [`request_body`].
+pub fn compaction_body(
+    config: &AnthropicConfig,
+    request: &ModelRequest<'_>,
+) -> Result<Value, ProviderError> {
+    let mut body = request_body(config, request)?;
+    if let Some(map) = body.as_object_mut() {
+        map.remove("context_management");
+        map.remove("fallbacks");
+        map.insert(
+            "compaction".to_string(),
+            json!({"type": "summarize", "instructions": COMPACTION_INSTRUCTIONS}),
+        );
+    }
+    Ok(body)
+}
+
 /// The `messages` array for `history`, in order. See the module docs.
 /// With `turn_boundaries`, every tool-results message ends with a
 /// [`TURN_BOUNDARY_TEXT`] block.
-fn messages(history: &[Message], turn_boundaries: bool) -> Vec<Value> {
+fn messages(history: &[Message], turn_boundaries: bool) -> Result<Vec<Value>, ProviderError> {
     let mut messages: Vec<Value> = Vec::with_capacity(history.len());
     // Whether the last message pushed is user-role: a user turn or tool
     // results. The API wants roles to alternate, so a user turn right after
@@ -715,6 +857,20 @@ fn messages(history: &[Message], turn_boundaries: bool) -> Vec<Value> {
             } if content.provider == PROVIDER_NAME => {
                 // Verbatim: preserved thinking refuses an edited turn.
                 messages.push(json!({"role": "assistant", "content": content.blocks}));
+            }
+            Message::Compacted {
+                provider_content, ..
+            } => {
+                // Verbatim: the API refuses a block whose signature or
+                // content changed. Another provider's summary cannot stand
+                // in for one.
+                if provider_content.provider != PROVIDER_NAME {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Rejected,
+                        "a summary from another provider cannot be sent to anthropic",
+                    ));
+                }
+                messages.push(json!({"role": "assistant", "content": provider_content.blocks}));
             }
             Message::Assistant {
                 text, tool_calls, ..
@@ -765,7 +921,7 @@ fn messages(history: &[Message], turn_boundaries: bool) -> Vec<Value> {
         }
         after_user = user_role;
     }
-    messages
+    Ok(messages)
 }
 
 /// Schema keywords sent unchanged in strict mode.
@@ -1056,6 +1212,147 @@ fn parse_response_quoting(
         .any(|block| block.get("type").and_then(Value::as_str) != Some("fallback"));
     check_completion_tokens(&response, serving_output, opaque_output)?;
     Ok(response)
+}
+
+/// Map a parsed compaction response body to the harness's response.
+///
+/// The envelope is checked as for [`parse_response`], and the response's
+/// `model` must be the requested one. `stop_reason` must be 1 to 64 bytes
+/// of `[a-z0-9_]`. A `compaction` stop needs `content` to be exactly one
+/// `compaction` block with a non-empty string `content` and a string
+/// `signature`, every number in it exact; it is kept as the summary and,
+/// whole, as the opaque content. Any other stop needs an empty `content`
+/// and is a response without a summary. `usage.iterations` is required: a
+/// non-empty array of `compaction` entries, each naming no model or the
+/// requested one, summed into the usage; the top-level counters describe
+/// the reply a compaction does not generate, so they are checked as counts
+/// and may be zero. A summary needs nonzero input and at least one output
+/// token per [`MAX_OUTPUT_BYTES_PER_TOKEN`](super::http::MAX_OUTPUT_BYTES_PER_TOKEN)
+/// bytes of summary; a response without one may report zero usage.
+///
+/// # Errors
+///
+/// `InvalidResponse` for anything else.
+pub fn parse_compaction(
+    value: &Value,
+    requested_model: &str,
+) -> Result<CompactionResponse, ProviderError> {
+    parse_compaction_quoting(value, requested_model, false)
+}
+
+fn parse_compaction_quoting(
+    value: &Value,
+    requested_model: &str,
+    quote: bool,
+) -> Result<CompactionResponse, ProviderError> {
+    let model = check_envelope(value, quote)?;
+    if model != requested_model {
+        return Err(unmarked_switch());
+    }
+    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+        return Err(invalid("response has no content array"));
+    };
+    let stop_reason = match value.get("stop_reason").and_then(Value::as_str) {
+        Some(stop) if stop_reason_is_valid(stop) => stop.to_string(),
+        Some(_) => return Err(invalid("compaction stop_reason is not a valid stop reason")),
+        None => return Err(invalid("response has no stop_reason")),
+    };
+    let usage = parse_compaction_usage(value.get("usage"), requested_model)?;
+    if stop_reason != COMPACTION_STOP {
+        if !blocks.is_empty() {
+            return Err(invalid(
+                "a compaction response without a summary has content",
+            ));
+        }
+        return Ok(CompactionResponse::no_summary(stop_reason, usage));
+    }
+    let [block] = blocks.as_slice() else {
+        return Err(invalid("a compaction stop needs exactly one content block"));
+    };
+    if !block.is_object() || block.get("type").and_then(Value::as_str) != Some(COMPACTION_BLOCK) {
+        return Err(invalid(
+            "a compaction stop's block is not a compaction block",
+        ));
+    }
+    let summary = block
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|summary| !summary.is_empty())
+        .ok_or_else(|| invalid("compaction block has no non-empty string content"))?;
+    if !block.get("signature").is_some_and(Value::is_string) {
+        return Err(invalid("compaction block has no string signature"));
+    }
+    check_exact_numbers(block)?;
+    if usage.total_input_tokens() == 0 {
+        return Err(invalid("usage reports zero input tokens"));
+    }
+    let summary_bytes = summary.len() as u64;
+    if usage.output_tokens == 0
+        || usage
+            .output_tokens
+            .saturating_mul(http::MAX_OUTPUT_BYTES_PER_TOKEN)
+            < summary_bytes
+    {
+        return Err(invalid(format!(
+            "usage reports {} output tokens for a {summary_bytes}-byte summary",
+            usage.output_tokens
+        )));
+    }
+    let response = CompactionResponse {
+        stop_reason,
+        summary: Some(summary.to_string()),
+        usage,
+        provider_content: Some(ProviderContent {
+            provider: PROVIDER_NAME.to_string(),
+            model: Some(model),
+            blocks: Value::Array(blocks.clone()),
+            stop_details: None,
+        }),
+    };
+    // The grammar applies the same rules to what the engine journals.
+    if let Some(problem) = crate::compaction::response_problem(&response) {
+        return Err(invalid(problem));
+    }
+    Ok(response)
+}
+
+/// A compaction response's usage: the sum of `usage.iterations`, which
+/// must be a non-empty array of `compaction` entries naming no model or
+/// `requested_model`. The top-level counters must be counts and are not
+/// added.
+fn parse_compaction_usage(
+    usage: Option<&Value>,
+    requested_model: &str,
+) -> Result<Usage, ProviderError> {
+    let usage = usage
+        .filter(|usage| usage.is_object())
+        .ok_or_else(|| invalid("response has no usage; token budgets cannot be enforced"))?;
+    counters(usage, "usage")?;
+    let attempts = match usage.get("iterations") {
+        Some(Value::Array(attempts)) if !attempts.is_empty() => attempts,
+        _ => {
+            return Err(invalid(
+                "compaction usage.iterations is not a non-empty array",
+            ));
+        }
+    };
+    let mut sum = Usage::default();
+    for (index, attempt) in attempts.iter().enumerate() {
+        let what = format!("usage iterations[{index}]");
+        if !attempt.is_object() {
+            return Err(invalid(format!("{what} is not an object")));
+        }
+        if attempt.get("type").and_then(Value::as_str) != Some(COMPACTION_BLOCK) {
+            return Err(invalid(format!("{what} is not a compaction entry")));
+        }
+        match attempt.get("model") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(named)) if named == requested_model => {}
+            Some(_) => return Err(invalid(format!("{what} names another model"))),
+        }
+        sum = sum + counters(attempt, &what)?;
+    }
+    Ok(sum)
 }
 
 /// Refuse any JSON number `serde_json` does not hold exactly: a float, or an

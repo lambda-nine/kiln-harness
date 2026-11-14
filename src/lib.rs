@@ -6,6 +6,7 @@ compile_error!("kiln-harness supports only Unix hosts");
 
 pub mod api;
 pub mod audit;
+pub mod compaction;
 pub mod engine;
 pub mod eval;
 pub mod files;

@@ -545,6 +545,7 @@ fn ended_after(
         usage,
         sandbox_deleted: true,
         truncation_recoveries,
+        compactions: 0,
     }
 }
 

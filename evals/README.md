@@ -154,16 +154,19 @@ prompt cache, and `cache_write_tokens` when some was written to one. `replay` is
 In a priced suite, `cost_micro_usd` is the run's estimated cost in US
 micro-dollars (0 for a run that never reached the model), and
 `long_prompt_requests` appears when some responses were priced at a
-long-prompt rate.
+long-prompt rate. `compactions` appears when the run compacted its history
+(`--compact-at`): the number of summaries it went on from.
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
 kind and model, the base URL's host only, tasks, trials, runs at a time,
 the run cap when set, the effort sent and the thinking clearing (`off` or
-`keep N`, Anthropic only), the output limit per
+`keep N`, Anthropic only), the compaction threshold `compact_at` when set,
+the output limit per
 response, the price table and rates used or why the runs are unpriced,
 start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
 task the runs, passes, pass rate, outcome counts, mean and median steps, tool
-calls and wall time, mean tokens, mean cost, and replay counts; overall the macro pass
+calls and wall time, mean tokens, mean cost, mean compactions (only with
+`--compact-at`, so other reports are unchanged), and replay counts; overall the macro pass
 rate (the mean of the task pass rates), pass@1 with the number of trials, and
 totals and means, with the total cost and the cost per passed run.
 
@@ -176,7 +179,12 @@ It is not billing and never a limit; the token, byte and time limits are
 the controls. Each response is priced on its own: a Claude Haiku 5.5 request
 whose prompt, counting uncached input, cache reads and cache writes, is over
 100,000 tokens pays the long-prompt rates on every category, output
-included, and the report counts those responses. Cache writes are priced at
+included, and the report counts those responses. A compaction
+(`--compact-at`) is a request of its own that reads the whole history, so it
+is priced on its own card the same way and its usage is in the run's tokens;
+with a threshold over 100,000 tokens every Haiku compaction pays the
+long-prompt rate, and 100,000 or less keeps the estimate of each prompt
+under it (an estimate, not a guarantee). Cache writes are priced at
 the 5-minute rate, the only cache the harness asks for. The report's header
 gives the model's context window and output limit with the table's date.
 
@@ -229,7 +237,8 @@ the two reports ran at different concurrency, run caps, effort, thinking
 clearing or output limits per response, or were priced with different price
 tables; reports written before these were
 recorded carry none of them, and an unknown setting is not reported as a
-difference.
+difference. It also notes a different compaction threshold, off included:
+off is recorded as absent, and older reports could not compact.
 
 ## The starter suite
 

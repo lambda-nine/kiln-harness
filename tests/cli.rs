@@ -116,6 +116,7 @@ fn started() -> JournalEvent {
         seed: Vec::new(),
         check: None,
         exec_context: None,
+        compaction: None,
     }
 }
 
@@ -129,6 +130,7 @@ fn completed(steps: u32) -> JournalEvent {
         usage: Usage::default(),
         sandbox_deleted: true,
         truncation_recoveries: 0,
+        compactions: 0,
     }
 }
 

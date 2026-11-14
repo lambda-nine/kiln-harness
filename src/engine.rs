@@ -18,14 +18,15 @@ use crate::api::{
     backend_unsupported_feature, request_id_is_valid, sandbox_unusable_refusal,
 };
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
+use crate::compaction::{CompactionPolicy, compaction_due, message_bytes, swapped_history};
 use crate::journal::{
     JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedCheck, RecordedSeedFile,
-    RecordedToolLimits, SessionLimits, request_sha256,
+    RecordedToolLimits, SessionLimits, compaction_request_sha256, request_sha256,
 };
 use crate::live::{LiveOutput, LivePump};
 use crate::provider::{
-    Message, ModelRequest, ModelResponse, Provider, ProviderError, StopReason, ToolCall,
-    ToolDefinition, ToolResult, Usage,
+    CompactionResponse, Message, ModelRequest, ModelResponse, Provider, ProviderError,
+    ProviderErrorKind, StopReason, ToolCall, ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::{
     CheckRun, EXEC_CONTEXT_MISMATCH, ExecContext, ToolError, ToolLimits, ToolRegistry, ToolRun,
@@ -238,6 +239,10 @@ pub struct HarnessConfig {
     /// Added to the session and lifecycle windows to form the sandbox's
     /// maximum lifetime, so it outlives every path that still uses it.
     pub sandbox_lifetime_margin: Duration,
+    /// When to compact the history (`--compact-at`); `None`, the default,
+    /// never compacts. Recorded in `session_started`, and restored from it
+    /// on replay.
+    pub compaction: Option<CompactionPolicy>,
 }
 
 impl Default for HarnessConfig {
@@ -259,6 +264,7 @@ impl Default for HarnessConfig {
             tool_limits: ToolLimits::default(),
             sandbox_idle_timeout: Duration::from_secs(120),
             sandbox_lifetime_margin: Duration::from_secs(60),
+            compaction: None,
         }
     }
 }
@@ -439,6 +445,8 @@ struct Progress {
     output_bytes: u64,
     renews: u32,
     truncation_recoveries: u32,
+    /// Compactions that returned a summary.
+    compactions: u32,
     /// Transient renew failures in a row, across provider calls, and when
     /// the last one happened.
     renew_failures: u32,
@@ -506,6 +514,12 @@ where
     #[must_use]
     pub fn provider(&self) -> &P {
         &self.provider
+    }
+
+    /// The configuration the harness runs with.
+    #[must_use]
+    pub(crate) fn config(&self) -> &HarnessConfig {
+        &self.config
     }
 
     /// Run one session and wait until its sandbox has been deleted. Every
@@ -650,6 +664,7 @@ where
                 seed: task.seed.iter().map(RecordedSeedFile::new).collect(),
                 check: task.check.as_ref().map(RecordedCheck::new),
                 exec_context: exec_context.journal_name().map(str::to_string),
+                compaction: self.config.compaction.clone(),
             },
         );
         if let Err(error) = started {
@@ -664,6 +679,7 @@ where
                     sandbox_deleted: true,
                     renews: 0,
                     request_id_released: None,
+                    compactions: 0,
                 },
             );
             return Err(error.into());
@@ -1127,6 +1143,10 @@ where
         text: context.task.prompt.clone(),
     }];
     let mut known_execution_ids = initial_execution_ids.into_iter().collect::<BTreeSet<_>>();
+    // What compaction_due reads, tracked as the grammar rebuilds it: the
+    // last response's usage, the bytes of the message pushed after it, and
+    // the attempts that returned no summary.
+    let mut compaction = CompactionTrack::default();
 
     for turn in 1..=config.max_steps {
         if cancel.is_cancelled() {
@@ -1134,6 +1154,30 @@ where
         }
         if Instant::now() >= deadline {
             return Err(HarnessError::Deadline);
+        }
+        // At most one attempt per turn; after one without a summary the
+        // turn's request follows on the unchanged history.
+        if turn >= 2
+            && let Some(policy) = &config.compaction
+            && compaction_due(
+                policy,
+                &compaction.last_usage,
+                compaction.appended_bytes,
+                progress.compactions,
+                compaction.no_summaries,
+            )
+        {
+            compact(
+                provider,
+                audit,
+                journal,
+                context,
+                progress,
+                &mut compaction,
+                &mut messages,
+                CompactionTurn { turn, policy },
+            )
+            .await?;
         }
         let request = ModelRequest {
             session_id,
@@ -1183,13 +1227,8 @@ where
         progress.output_bytes = progress
             .output_bytes
             .saturating_add(response.output_bytes());
-        let over_tokens = response.usage.output_tokens
-            > u64::from(config.max_output_tokens_per_request)
-            || progress.usage.total_input_tokens() > config.max_total_input_tokens
-            || progress.usage.output_tokens > config.max_total_output_tokens;
-        // Reported usage is trusted only for cost; size is bounded here
-        // whatever the endpoint reports.
-        let over_bytes = progress.output_bytes > config.max_total_model_output_bytes;
+        compaction.last_usage = response.usage;
+        let (over_tokens, over_bytes) = over_budget(config, progress, &response.usage);
         // Whether this response is discarded and recovered from depends only
         // on the journaled response and the limits, and a budget wins over
         // it. The grammar counts it at model_responded, so it is counted
@@ -1251,9 +1290,11 @@ where
                         arguments: None,
                     },
                 )?;
-                messages.push(Message::User {
+                let note = Message::User {
                     text: truncation_note(config.max_output_tokens_per_request),
-                });
+                };
+                compaction.appended(config, &note);
+                messages.push(note);
                 continue;
             }
             StopReason::MaxTokens => return Err(HarnessError::ModelTruncated),
@@ -1473,9 +1514,175 @@ where
                 result: run.result,
             });
         }
-        messages.push(Message::ToolResults { results });
+        let results = Message::ToolResults { results };
+        compaction.appended(config, &results);
+        messages.push(results);
     }
     Err(HarnessError::StepBudget(config.max_steps))
+}
+
+/// Whether a response with `usage`, already added to `progress`, takes the
+/// session over a token budget, and over the output byte budget. Reported
+/// usage is trusted only for cost; size is bounded whatever the endpoint
+/// reports.
+fn over_budget(config: &HarnessConfig, progress: &Progress, usage: &Usage) -> (bool, bool) {
+    let over_tokens = usage.output_tokens > u64::from(config.max_output_tokens_per_request)
+        || progress.usage.total_input_tokens() > config.max_total_input_tokens
+        || progress.usage.output_tokens > config.max_total_output_tokens;
+    let over_bytes = progress.output_bytes > config.max_total_model_output_bytes;
+    (over_tokens, over_bytes)
+}
+
+/// What [`compaction_due`] reads besides the policy and the successes.
+#[derive(Debug, Default)]
+struct CompactionTrack {
+    /// The usage of the last journaled model response.
+    last_usage: Usage,
+    /// Compact JSON bytes of the message pushed after it: the tool results
+    /// or the truncation note.
+    appended_bytes: u64,
+    /// Attempts that returned no summary.
+    no_summaries: u32,
+}
+
+impl CompactionTrack {
+    /// Note the message pushed after the last response; measured only for
+    /// a session that can compact.
+    fn appended(&mut self, config: &HarnessConfig, message: &Message) {
+        if config.compaction.is_some() {
+            self.appended_bytes = message_bytes(message);
+        }
+    }
+}
+
+/// The turn a compaction runs before, and the policy it runs under.
+struct CompactionTurn<'a> {
+    turn: u32,
+    policy: &'a CompactionPolicy,
+}
+
+/// One compaction attempt before `turn`'s request: journaled, counted and
+/// budget-checked like a model response, and on a summary the history
+/// swapped for it. A provider error ends the session, as for a turn.
+#[allow(clippy::too_many_arguments)]
+async fn compact<A, P, S, J>(
+    provider: &mut P,
+    audit: &mut S,
+    journal: &mut J,
+    context: &LoopContext<'_, '_, A>,
+    progress: &mut Progress,
+    track: &mut CompactionTrack,
+    messages: &mut Vec<Message>,
+    at: CompactionTurn<'_>,
+) -> Result<(), HarnessError>
+where
+    A: SandboxApi,
+    P: Provider,
+    S: AuditSink,
+    J: JournalSink,
+{
+    let config = context.config;
+    let session_id = context.session_id;
+    let turn = at.turn;
+    let request = ModelRequest {
+        session_id,
+        turn,
+        system: &context.task.system,
+        tools: context.definitions,
+        messages,
+        max_output_tokens: config.max_output_tokens_per_request,
+    };
+    let messages_summarized = messages.len();
+    journal.append(
+        session_id,
+        JournalEvent::CompactionRequested {
+            turn,
+            request_sha256: compaction_request_sha256(&request, &at.policy.instructions_sha256),
+            message_count: messages_summarized,
+        },
+    )?;
+    let requested_at = Instant::now();
+    let response = with_heartbeat(provider.compact(request), context, progress)
+        .await?
+        // A response the journal could not hold is the provider's fault,
+        // like any other malformed response.
+        .and_then(
+            |response| match crate::compaction::response_problem(&response) {
+                None => Ok(response),
+                Some(problem) => Err(ProviderError::new(
+                    ProviderErrorKind::InvalidResponse,
+                    problem,
+                )),
+            },
+        );
+    let response: CompactionResponse = match response {
+        Ok(response) => response,
+        Err(error) => {
+            journal.append(
+                session_id,
+                JournalEvent::CompactionFailed {
+                    turn,
+                    kind: error.kind,
+                    message: error.message.clone(),
+                },
+            )?;
+            return Err(HarnessError::Provider(error));
+        }
+    };
+    let latency_ms = duration_ms(requested_at.elapsed());
+    journal.append(
+        session_id,
+        JournalEvent::CompactionResponded {
+            turn,
+            response: response.clone(),
+            latency_ms,
+        },
+    )?;
+    // Counted before any fallible audit write, as the grammar counts it at
+    // compaction_responded, so session_ended agrees whatever fails next.
+    progress.usage = progress.usage + response.usage;
+    progress.output_bytes = progress
+        .output_bytes
+        .saturating_add(response.output_bytes());
+    let success = response.is_success();
+    if success {
+        progress.compactions = progress.compactions.saturating_add(1);
+    } else {
+        track.no_summaries = track.no_summaries.saturating_add(1);
+    }
+    let (over_tokens, over_bytes) = over_budget(config, progress, &response.usage);
+    audit.append(
+        session_id,
+        Some(context.sandbox_id),
+        AuditEvent::ContextCompacted {
+            turn,
+            outcome: if success {
+                "compacted".to_string()
+            } else {
+                format!("no_summary:{}", response.stop_reason)
+            },
+            messages_summarized,
+            usage: response.usage,
+            latency_ms,
+        },
+    )?;
+    if over_tokens {
+        return Err(HarnessError::TokenBudget);
+    }
+    if over_bytes {
+        return Err(HarnessError::OutputBytesBudget(
+            config.max_total_model_output_bytes,
+        ));
+    }
+    if let CompactionResponse {
+        summary: Some(summary),
+        provider_content: Some(content),
+        ..
+    } = response
+    {
+        *messages = swapped_history(summary, content, &context.task.prompt);
+    }
+    Ok(())
 }
 
 /// Before a session may be recorded completed, one `GetSandbox` confirms the
@@ -1810,17 +2017,32 @@ where
     A: SandboxApi,
     P: Provider,
 {
+    with_heartbeat(provider.complete(request), context, progress).await
+}
+
+/// [`complete_with_heartbeat`] for any provider call, such as a
+/// compaction: the same deadline, cancellation and renewal. `call` is not
+/// polled before an overdue renew has run.
+async fn with_heartbeat<A, T, F>(
+    call: F,
+    context: &LoopContext<'_, '_, A>,
+    progress: &mut Progress,
+) -> Result<Result<T, ProviderError>, HarnessError>
+where
+    A: SandboxApi,
+    F: Future<Output = Result<T, ProviderError>>,
+{
     let deadline = context.deadline;
     let Some(heartbeat) = context.heartbeat else {
         return tokio::select! {
             () = context.cancel.cancelled() => Err(HarnessError::Canceled),
-            result = timeout_at(deadline, provider.complete(request)) => {
+            result = timeout_at(deadline, call) => {
                 result.map_err(|_| HarnessError::Deadline)
             }
         };
     };
     renew_if_due(context, heartbeat, progress, None).await?;
-    let call = timeout_at(deadline, provider.complete(request));
+    let call = timeout_at(deadline, call);
     tokio::pin!(call);
     let mut next_tick = renew_due(context, heartbeat, progress);
     let mut renew: Option<RenewCall<'_>> = None;
@@ -2012,6 +2234,7 @@ impl Terminal {
             sandbox_deleted: self.sandbox_deleted,
             renews: progress.renews,
             request_id_released: self.request_id_released,
+            compactions: progress.compactions,
         }
     }
 
@@ -2025,6 +2248,7 @@ impl Terminal {
             usage: progress.usage,
             sandbox_deleted: self.sandbox_deleted,
             truncation_recoveries: progress.truncation_recoveries,
+            compactions: progress.compactions,
         }
     }
 }
@@ -2227,6 +2451,22 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
             "session, tool, lifecycle, and sandbox expiry durations must be whole milliseconds"
                 .to_string(),
         ));
+    }
+    if let Some(policy) = &config.compaction {
+        if let Some(problem) = policy.problem() {
+            return Err(HarnessError::InvalidTask(format!(
+                "invalid compaction policy: {problem}"
+            )));
+        }
+        // A replay restores the recorded policy, and its summaries were
+        // written under the recorded instructions.
+        if !policy.instructions_are_current() {
+            return Err(HarnessError::InvalidTask(
+                "the compaction instructions differ from this build's; replay this journal with \
+                 the build that recorded it"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
 }

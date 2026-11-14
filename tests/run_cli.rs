@@ -396,6 +396,7 @@ fn provider_specific_flags_are_refused_for_the_other_provider() {
         ("--strict-tools", None),
         ("--fallbacks", None),
         ("--clear-thinking", Some("1")),
+        ("--compact-at", Some("80000")),
     ] {
         let run = Run::new(dir).arg("--prompt", "hi");
         let run = match value {
@@ -464,6 +465,61 @@ fn anthropic_needs_a_key_or_a_proxy_and_a_valid_effort() {
         .arg("--base-url", "http://api.example.com")
         .output();
     refused(dir, &cleartext, "requires an https base URL");
+}
+
+#[test]
+fn compact_at_is_refused_out_of_range_and_in_untested_combinations() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    let compacting = |at: &str| {
+        Run::anthropic(dir)
+            .env("KILN_TEST_KEY", SENTINEL_KEY)
+            .arg("--prompt", "hi")
+            .arg("--compact-at", at)
+    };
+    for at in ["0", "19999", "1000001"] {
+        refused(
+            dir,
+            &compacting(at).output(),
+            "--compact-at must be between 20000 and 1000000",
+        );
+    }
+    refused(
+        dir,
+        &compacting("80000").arg("--clear-thinking", "2").output(),
+        "--compact-at does not apply with --clear-thinking",
+    );
+    refused(
+        dir,
+        &compacting("80000").flag("--fallbacks").output(),
+        "--compact-at does not apply with --fallbacks",
+    );
+    // A listed model's context window must hold the threshold, the output
+    // limit and the headroom: 1,000,000 - 16,384 - 32,000 = 951,616.
+    refused(
+        dir,
+        &compacting("951617").output(),
+        "--compact-at 951617 plus --max-output-tokens 16384 and 32000 tokens of headroom \
+         exceeds claude-opus-5-5's 1000000-token context window",
+    );
+    refused(
+        dir,
+        &compacting("900000")
+            .arg("--max-output-tokens", "100000")
+            .output(),
+        "exceeds claude-opus-5-5's 1000000-token context window",
+    );
+    // Within every bound, validation passes and only kilnd is missing; an
+    // unlisted model is checked against the range alone.
+    for run in [
+        compacting("951616"),
+        compacting("1000000").arg("--model", "claude-unlisted-1"),
+    ] {
+        let output = run.output();
+        let text = stderr(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(!text.contains("--compact-at"), "{text}");
+    }
 }
 
 #[test]

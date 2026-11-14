@@ -83,7 +83,7 @@ impl ProviderContent {
 }
 
 /// A writer that only counts bytes, saturating.
-struct ByteCount(u64);
+pub(crate) struct ByteCount(pub(crate) u64);
 
 impl std::io::Write for ByteCount {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -112,6 +112,16 @@ pub enum Message {
     },
     ToolResults {
         results: Vec<ToolResult>,
+    },
+    /// A provider's summary of every message before it, which replaced
+    /// them after a compaction (see [`crate::compaction`]). `summary` is
+    /// the neutral copy of the summary text; `provider_content` holds the
+    /// signed block exactly as received, which the same adapter echoes
+    /// byte for byte. Only sessions that compacted contain it, so other
+    /// journals and request hashes are unchanged.
+    Compacted {
+        summary: String,
+        provider_content: ProviderContent,
     },
 }
 
@@ -244,6 +254,58 @@ impl ModelResponse {
     }
 }
 
+/// The answer to one compaction request: a summary of the whole history,
+/// or the stop reason the summarizer ended with instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactionResponse {
+    /// [`crate::compaction::COMPACTION_STOP`] on success; otherwise the
+    /// provider's stop reason verbatim, bounded and of a validated charset.
+    pub stop_reason: String,
+    /// The summary text, only on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Every attempt the call billed, summed.
+    pub usage: Usage,
+    /// Only on success: the response's content array exactly as received,
+    /// echoed on every later request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_content: Option<ProviderContent>,
+}
+
+impl CompactionResponse {
+    /// Whether it holds a summary.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.stop_reason == crate::compaction::COMPACTION_STOP
+    }
+
+    /// A response without a summary, for `stop_reason`.
+    #[must_use]
+    pub fn no_summary(stop_reason: impl Into<String>, usage: Usage) -> Self {
+        Self {
+            stop_reason: stop_reason.into(),
+            summary: None,
+            usage,
+            provider_content: None,
+        }
+    }
+
+    /// Bytes of model output the harness keeps from it: the summary plus
+    /// [`ProviderContent::bytes`]. The engine's output byte budget and the
+    /// grammar both count with this.
+    #[must_use]
+    pub fn output_bytes(&self) -> u64 {
+        self.summary
+            .as_ref()
+            .map_or(0, |summary| summary.len() as u64)
+            .saturating_add(
+                self.provider_content
+                    .as_ref()
+                    .map_or(0, ProviderContent::bytes),
+            )
+    }
+}
+
 /// Everything a provider needs for one completion. It carries no credentials.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelRequest<'a> {
@@ -333,6 +395,22 @@ pub trait Provider: Send {
     async fn complete(&mut self, request: ModelRequest<'_>)
     -> Result<ModelResponse, ProviderError>;
 
+    /// Summarize the whole history of `request` instead of answering it
+    /// (see [`crate::compaction`]). The engine calls it only for a session
+    /// with a compaction policy. A provider without compaction keeps this
+    /// default, which refuses.
+    ///
+    /// Network adapters bound, scan and scrub it exactly as `complete`.
+    async fn compact(
+        &mut self,
+        _request: ModelRequest<'_>,
+    ) -> Result<CompactionResponse, ProviderError> {
+        Err(ProviderError::new(
+            ProviderErrorKind::Rejected,
+            "compaction is unsupported",
+        ))
+    }
+
     /// Observe one completed tool call, after it is journaled and before its
     /// result goes back to the model. `call` is the sanitized call. Live
     /// providers ignore this; replay compares it with the recording, and an
@@ -363,6 +441,8 @@ pub const DEMO_CONTENT: &str = "hello from kiln-harness\n";
 /// A deterministic provider used by tests and the no-API demo.
 pub struct ScriptedProvider {
     responses: VecDeque<ModelResponse>,
+    /// Answers to compaction requests, in order, separate from the turns.
+    compactions: VecDeque<Result<CompactionResponse, ProviderError>>,
     validate_demo_results: bool,
 }
 
@@ -371,8 +451,20 @@ impl ScriptedProvider {
     pub fn new(responses: impl IntoIterator<Item = ModelResponse>) -> Self {
         Self {
             responses: responses.into_iter().collect(),
+            compactions: VecDeque::new(),
             validate_demo_results: false,
         }
+    }
+
+    /// The same script, answering compaction requests from `compactions`
+    /// in order.
+    #[must_use]
+    pub fn with_compactions(
+        mut self,
+        compactions: impl IntoIterator<Item = Result<CompactionResponse, ProviderError>>,
+    ) -> Self {
+        self.compactions = compactions.into_iter().collect();
+        self
     }
 
     /// Five turns, including one with two calls, then a verified final answer.
@@ -432,6 +524,18 @@ impl Provider for ScriptedProvider {
         self.responses
             .pop_front()
             .ok_or_else(|| script_error("script ended before a final answer"))
+    }
+
+    async fn compact(
+        &mut self,
+        request: ModelRequest<'_>,
+    ) -> Result<CompactionResponse, ProviderError> {
+        if request.tools.is_empty() {
+            return Err(script_error("tool registry is empty"));
+        }
+        self.compactions
+            .pop_front()
+            .unwrap_or_else(|| Err(script_error("script has no compaction response")))
     }
 }
 

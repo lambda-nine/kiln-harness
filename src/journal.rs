@@ -18,14 +18,15 @@ use thiserror::Error;
 // The harness reaches kilnd over a Unix socket and is Unix-only.
 use std::os::unix::fs::MetadataExt;
 
+use crate::compaction::{CompactionPolicy, compaction_due, message_bytes, swapped_history};
 use crate::engine::{
     CheckOutcome, MAX_SEED_FILES, SeedFile, TaskCheck, check_problem, seed_problem, truncation_note,
 };
 pub use crate::outputs::DirectoryProblem;
 use crate::outputs::{Existing, OutputError, Rollback, describe_unsafe};
 use crate::provider::{
-    Message, ModelRequest, ModelResponse, ProviderContent, ProviderErrorKind, ProviderInfo,
-    ToolCall, ToolDefinition, ToolResult, Usage,
+    CompactionResponse, Message, ModelRequest, ModelResponse, ProviderContent, ProviderErrorKind,
+    ProviderInfo, ToolCall, ToolDefinition, ToolResult, Usage,
 };
 use crate::tools::{CHECK_OUTPUT_BYTES, sanitize_call};
 
@@ -62,6 +63,10 @@ pub enum JournalEvent {
         /// and replay as they ran.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_context: Option<String>,
+        /// The session's compaction policy (`--compact-at`). Absent when
+        /// off, so journals without it are byte-identical to before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction: Option<CompactionPolicy>,
     },
     SandboxReady {
         sandbox_id: String,
@@ -85,6 +90,23 @@ pub enum JournalEvent {
         latency_ms: u64,
     },
     ModelFailed {
+        turn: u32,
+        kind: ProviderErrorKind,
+        message: String,
+    },
+    /// A compaction request before `model_requested` for the same turn:
+    /// [`compaction_request_sha256`] of the history it summarizes.
+    CompactionRequested {
+        turn: u32,
+        request_sha256: String,
+        message_count: usize,
+    },
+    CompactionResponded {
+        turn: u32,
+        response: CompactionResponse,
+        latency_ms: u64,
+    },
+    CompactionFailed {
         turn: u32,
         kind: ProviderErrorKind,
         message: String,
@@ -123,6 +145,10 @@ pub enum JournalEvent {
         /// skipped when 0, so those journals are byte-identical to before.
         #[serde(default, skip_serializing_if = "is_zero")]
         truncation_recoveries: u32,
+        /// Successful compactions. Skipped when 0, so journals without any
+        /// are byte-identical to before.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        compactions: u32,
     },
 }
 
@@ -838,6 +864,37 @@ fn check_expiry(
 ///   limits. `check_completed` appears only when a check was recorded, at
 ///   most once, right after an accepted final answer, and completed work
 ///   with a recorded check needs it.
+/// - Compaction, only with a policy recorded in `session_started` (within
+///   [`CompactionPolicy::problem`]'s bounds; instructions from another build
+///   still verify). Wherever `model_requested` t with t >= 2 could come
+///   next (after the previous turn's tool records are complete, or after a
+///   recovered truncation), [`compaction_due`] is computed from the recorded
+///   policy, the last response's usage, the compact JSON bytes of the
+///   message the rebuilt history gains (the tool results or the truncation
+///   note), and the successes and no-summary responses so far. When it is
+///   due, the next record is `compaction_requested` t or a `session_ended`
+///   that is not completed work; when it is not, `compaction_requested` is
+///   refused. At most one `compaction_requested` per turn.
+/// - `compaction_requested` t extends the rebuilt history exactly as a
+///   request does, and its `message_count` and
+///   [`compaction_request_sha256`] (with the policy's instructions hash)
+///   must match it. It is answered by `compaction_responded` t or
+///   `compaction_failed` t, or left unanswered by a `session_ended` that
+///   is not completed work.
+/// - `compaction_responded` adds its usage and
+///   [`CompactionResponse::output_bytes`] to the totals, checked against
+///   the token and byte budgets as for `model_responded`; over a budget,
+///   only a `session_ended` that is not completed work follows. Its shape
+///   must pass [`crate::compaction::response_problem`]: a summary is one
+///   anthropic `compaction` block whose string `content` is the summary,
+///   with a string `signature`, which cannot be authenticated offline.
+///   After a summary the rebuilt history is the summary and the restated
+///   task, so the next `model_requested` t has `message_count` 2; after
+///   no summary it is unchanged and `model_requested` t follows with no
+///   second attempt.
+/// - After `compaction_failed`, only a `session_ended` that is not
+///   completed work. `session_ended`'s `compactions` is the number of
+///   summaries, and its usage includes every compaction response.
 #[derive(Debug, Clone, Default)]
 pub struct Grammar {
     phase: Phase,
@@ -852,6 +909,43 @@ pub struct Grammar {
     output_bytes: u64,
     truncation_recoveries: u32,
     check: CheckState,
+    compaction: CompactionState,
+}
+
+/// What the grammar tracks for compaction.
+#[derive(Debug, Clone, Default)]
+struct CompactionState {
+    /// From `session_started`; `None` when the session cannot compact.
+    policy: Option<CompactionPolicy>,
+    /// The usage of the last `model_responded`.
+    last_usage: Usage,
+    successes: u32,
+    no_summaries: u32,
+    /// The turn of the last `compaction_requested`: at most one per turn.
+    attempted_turn: Option<u32>,
+    /// A `compaction_requested` not answered yet.
+    pending: Option<u32>,
+    /// `compaction_failed` was fed.
+    failed: bool,
+    /// A compaction response took the session over a budget.
+    over_budget: bool,
+}
+
+/// Which request a precondition is checked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    Model,
+    Compaction,
+}
+
+/// What [`Grammar::extend_history`] appended, so a failed check can undo it.
+#[derive(Debug)]
+enum Extension {
+    None,
+    /// The truncation note, after this discarded response.
+    Note(Box<RespondedTurn>),
+    /// The assistant turn and its tool results, for this turn.
+    Turn(u32),
 }
 
 /// Whether `session_started` recorded a check, and whether
@@ -877,6 +971,8 @@ enum Phase {
 #[derive(Debug, Clone)]
 struct SessionContext {
     system: String,
+    /// The task, restated after a summary.
+    task: String,
     tools: Vec<ToolDefinition>,
     limits: SessionLimits,
     messages: Vec<Message>,
@@ -921,12 +1017,7 @@ fn engine_accepts(
     limits: &SessionLimits,
 ) -> Disposition {
     use crate::provider::StopReason;
-    let within_budget = response.usage.output_tokens
-        <= u64::from(limits.max_output_tokens_per_request)
-        && usage_after.total_input_tokens() <= limits.max_total_input_tokens
-        && usage_after.output_tokens <= limits.max_total_output_tokens
-        && output_bytes_after <= limits.max_total_model_output_bytes;
-    if !within_budget {
+    if !within_budget(&response.usage, usage_after, output_bytes_after, limits) {
         return Disposition::Refused;
     }
     if response.stop_reason == StopReason::MaxTokens
@@ -959,6 +1050,21 @@ fn engine_accepts(
     }
 }
 
+/// The engine's budget checks after one model or compaction response: its
+/// own output tokens against the per-request cap, and the session's totals
+/// after it.
+fn within_budget(
+    usage: &Usage,
+    usage_after: Usage,
+    output_bytes_after: u64,
+    limits: &SessionLimits,
+) -> bool {
+    usage.output_tokens <= u64::from(limits.max_output_tokens_per_request)
+        && usage_after.total_input_tokens() <= limits.max_total_input_tokens
+        && usage_after.output_tokens <= limits.max_total_output_tokens
+        && output_bytes_after <= limits.max_total_model_output_bytes
+}
+
 impl Grammar {
     /// Advance by one event.
     ///
@@ -979,6 +1085,7 @@ impl Grammar {
                 seed,
                 check,
                 exec_context,
+                compaction,
                 ..
             } = event
             else {
@@ -1015,11 +1122,19 @@ impl Grammar {
                     reason: format!("recorded task is invalid: {problem}"),
                 });
             }
+            if let Some(problem) = compaction.as_ref().and_then(CompactionPolicy::problem) {
+                return Err(JournalError::Grammar {
+                    sequence,
+                    reason: format!("recorded compaction policy is invalid: {problem}"),
+                });
+            }
             if check.is_some() {
                 self.check = CheckState::Recorded;
             }
+            self.compaction.policy.clone_from(compaction);
             self.context = Some(SessionContext {
                 system: system.clone(),
+                task: task.clone(),
                 tools: tools.clone(),
                 limits: *limits,
                 messages: vec![Message::User { text: task.clone() }],
@@ -1094,6 +1209,7 @@ impl Grammar {
                 );
                 self.usage = usage_after;
                 self.output_bytes = output_bytes_after;
+                self.compaction.last_usage = response.usage;
                 if disposition == Disposition::Recovered {
                     self.truncation_recoveries += 1;
                 }
@@ -1112,6 +1228,21 @@ impl Grammar {
                 }
                 self.pending = None;
                 self.turn_failed = true;
+            }
+            JournalEvent::CompactionRequested {
+                turn,
+                request_sha256,
+                message_count,
+            } => self.compaction_requested(*turn, request_sha256, *message_count)?,
+            JournalEvent::CompactionResponded { turn, response, .. } => {
+                self.compaction_responded(*turn, response)?;
+            }
+            JournalEvent::CompactionFailed { turn, .. } => {
+                if self.compaction.pending != Some(*turn) {
+                    return Err("compaction_failed without a matching compaction_requested");
+                }
+                self.compaction.pending = None;
+                self.compaction.failed = true;
             }
             JournalEvent::ToolExecuted {
                 turn,
@@ -1141,42 +1272,204 @@ impl Grammar {
         request_sha256: &str,
         message_count: usize,
     ) -> Result<(), &'static str> {
+        if let Some(problem) = self.next_request_problem(turn, Request::Model) {
+            return Err(problem);
+        }
+        self.check_request(turn, request_sha256, message_count)?;
+        self.last_turn = turn;
+        self.pending = Some(turn);
+        Ok(())
+    }
+
+    /// Why `turn`'s model or compaction request cannot come next, if it
+    /// cannot: the order rules shared by both.
+    fn next_request_problem(&self, turn: u32, kind: Request) -> Option<&'static str> {
+        let pick = |model: &'static str, compaction: &'static str| match kind {
+            Request::Model => model,
+            Request::Compaction => compaction,
+        };
         if !self.sandbox_ready {
-            return Err("model_requested before sandbox_ready");
+            return Some(pick(
+                "model_requested before sandbox_ready",
+                "compaction_requested before sandbox_ready",
+            ));
         }
         if self.pending.is_some() {
-            return Err("model_requested before the previous turn was answered");
+            return Some(pick(
+                "model_requested before the previous turn was answered",
+                "compaction_requested before the previous turn was answered",
+            ));
+        }
+        if self.compaction.pending.is_some() {
+            return Some(pick(
+                "model_requested before the compaction was answered",
+                "compaction_requested before the previous compaction was answered",
+            ));
         }
         if self.turn_failed {
-            return Err("model_requested after model_failed");
+            return Some(pick(
+                "model_requested after model_failed",
+                "compaction_requested after model_failed",
+            ));
+        }
+        if self.compaction.failed {
+            return Some(pick(
+                "model_requested after compaction_failed",
+                "compaction_requested after compaction_failed",
+            ));
+        }
+        if self.compaction.over_budget {
+            return Some(pick(
+                "model_requested after a compaction response over a budget",
+                "compaction_requested after a compaction response over a budget",
+            ));
         }
         if let Some(last) = &self.last_response {
             match last.disposition {
                 Disposition::Refused => {
-                    return Err("model_requested after a response the engine refuses");
+                    return Some(pick(
+                        "model_requested after a response the engine refuses",
+                        "compaction_requested after a response the engine refuses",
+                    ));
                 }
                 // Nothing of a discarded response ran or stays.
                 Disposition::Recovered => {}
                 Disposition::Accepted => {
                     if last.calls.is_empty() {
-                        return Err("model_requested after a final response");
+                        return Some(pick(
+                            "model_requested after a final response",
+                            "compaction_requested after a final response",
+                        ));
                     }
                     if last.results.len() != last.calls.len() {
-                        return Err("model_requested before every tool call of the turn ran");
+                        return Some(pick(
+                            "model_requested before every tool call of the turn ran",
+                            "compaction_requested before every tool call of the turn ran",
+                        ));
                     }
                 }
             }
         }
         if Some(turn) != self.last_turn.checked_add(1) {
-            return Err("model_requested turns must run 1, 2, ...");
+            return Some(pick(
+                "model_requested turns must run 1, 2, ...",
+                "compaction_requested must be for the next turn",
+            ));
         }
         let max_steps = self.context.as_ref().map_or(0, |ctx| ctx.limits.max_steps);
         if turn > max_steps {
-            return Err("model_requested beyond max_steps");
+            return Some(pick(
+                "model_requested beyond max_steps",
+                "compaction_requested beyond max_steps",
+            ));
         }
-        self.check_request(turn, request_sha256, message_count)?;
-        self.last_turn = turn;
-        self.pending = Some(turn);
+        None
+    }
+
+    /// Whether the engine compacts before `turn`'s request, given the bytes
+    /// the history gained since the last response: never in turn 1, never
+    /// twice in one turn, and otherwise as [`compaction_due`] says under
+    /// the recorded policy.
+    fn compaction_due_at(&self, turn: u32, appended_bytes: u64) -> bool {
+        let state = &self.compaction;
+        let Some(policy) = &state.policy else {
+            return false;
+        };
+        turn >= 2
+            && state.attempted_turn != Some(turn)
+            && compaction_due(
+                policy,
+                &state.last_usage,
+                appended_bytes,
+                state.successes,
+                state.no_summaries,
+            )
+    }
+
+    /// Check one `compaction_requested`: it must be due where a request
+    /// could come next, and match the history extended as for a request.
+    fn compaction_requested(
+        &mut self,
+        turn: u32,
+        request_sha256: &str,
+        message_count: usize,
+    ) -> Result<(), &'static str> {
+        let Some(instructions) = self
+            .compaction
+            .policy
+            .as_ref()
+            .map(|policy| policy.instructions_sha256.clone())
+        else {
+            return Err("compaction_requested without a recorded compaction policy");
+        };
+        if self.compaction.attempted_turn == Some(turn) {
+            return Err("a second compaction_requested in one turn");
+        }
+        if let Some(problem) = self.next_request_problem(turn, Request::Compaction) {
+            return Err(problem);
+        }
+        let (extension, appended) = self.extend_history()?;
+        let reason = if self.compaction_due_at(turn, appended) {
+            let context = self.context.as_ref().ok_or("no session context")?;
+            Self::history_mismatch(
+                context,
+                turn,
+                request_sha256,
+                message_count,
+                Some(&instructions),
+            )
+        } else {
+            Some("compaction_requested when compaction was not due")
+        };
+        if let Some(reason) = reason {
+            self.undo_extension(extension);
+            return Err(reason);
+        }
+        self.compaction.attempted_turn = Some(turn);
+        self.compaction.pending = Some(turn);
+        Ok(())
+    }
+
+    /// Check one `compaction_responded`, count it, and on a summary within
+    /// the budgets replace the rebuilt history as the engine does.
+    fn compaction_responded(
+        &mut self,
+        turn: u32,
+        response: &CompactionResponse,
+    ) -> Result<(), &'static str> {
+        if self.compaction.pending != Some(turn) {
+            return Err("compaction_responded without a matching compaction_requested");
+        }
+        if let Some(problem) = crate::compaction::response_problem(response) {
+            return Err(problem);
+        }
+        let context = self.context.as_mut().ok_or("no session context")?;
+        let usage_after = self.usage + response.usage;
+        let output_bytes_after = self.output_bytes.saturating_add(response.output_bytes());
+        let within = within_budget(
+            &response.usage,
+            usage_after,
+            output_bytes_after,
+            &context.limits,
+        );
+        self.compaction.pending = None;
+        self.usage = usage_after;
+        self.output_bytes = output_bytes_after;
+        if !within {
+            self.compaction.over_budget = true;
+        }
+        if response.is_success() {
+            self.compaction.successes = self.compaction.successes.saturating_add(1);
+            // response_problem guarantees both on a summary.
+            if within
+                && let (Some(summary), Some(content)) =
+                    (&response.summary, &response.provider_content)
+            {
+                context.messages = swapped_history(summary.clone(), content.clone(), &context.task);
+            }
+        } else {
+            self.compaction.no_summaries = self.compaction.no_summaries.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -1260,98 +1553,136 @@ impl Grammar {
         Ok(())
     }
 
-    /// Extend the rebuilt history with the last tool turn, or with the
-    /// truncation note after a discarded response, as the engine does before
-    /// its next request, and require the recorded message count and request
-    /// hash to match it. On failure the history and the last response are
-    /// left exactly as they were.
+    /// Extend the rebuilt history as the engine does before its next
+    /// request: with the last tool turn, or with the truncation note after a
+    /// discarded response. Returns what was appended, for
+    /// [`Grammar::undo_extension`], and the compact JSON bytes of the
+    /// message [`compaction_due`] counts: the tool results or the note.
+    /// The callers have checked that the last response, if any, is one of
+    /// those two.
+    fn extend_history(&mut self) -> Result<(Extension, u64), &'static str> {
+        let context = self.context.as_mut().ok_or("no session context")?;
+        let Some(last) = self.last_response.take() else {
+            return Ok((Extension::None, 0));
+        };
+        if last.disposition == Disposition::Recovered {
+            let note = Message::User {
+                text: truncation_note(context.limits.max_output_tokens_per_request),
+            };
+            let bytes = message_bytes(&note);
+            context.messages.push(note);
+            return Ok((Extension::Note(Box::new(last)), bytes));
+        }
+        let turn = last.turn;
+        context.messages.push(Message::Assistant {
+            text: last.text,
+            tool_calls: last.calls,
+            provider_content: last.provider_content,
+        });
+        let results = Message::ToolResults {
+            results: last.results,
+        };
+        let bytes = message_bytes(&results);
+        context.messages.push(results);
+        Ok((Extension::Turn(turn), bytes))
+    }
+
+    /// Put the history and the last response back exactly as they were
+    /// before [`Grammar::extend_history`].
+    fn undo_extension(&mut self, extension: Extension) {
+        let Some(context) = self.context.as_mut() else {
+            return;
+        };
+        match extension {
+            Extension::None => {}
+            Extension::Note(last) => {
+                context.messages.pop();
+                self.last_response = Some(*last);
+            }
+            Extension::Turn(turn) => {
+                let results = context.messages.pop();
+                let assistant = context.messages.pop();
+                if let (
+                    Some(Message::Assistant {
+                        text,
+                        tool_calls,
+                        provider_content,
+                    }),
+                    Some(Message::ToolResults { results }),
+                ) = (assistant, results)
+                {
+                    // Only an accepted turn is extended.
+                    self.last_response = Some(RespondedTurn {
+                        turn,
+                        text,
+                        calls: tool_calls,
+                        provider_content,
+                        results,
+                        disposition: Disposition::Accepted,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Extend the rebuilt history as the engine does before its next
+    /// request, and require the recorded message count and request hash to
+    /// match it, and no compaction to have been due instead. On failure the
+    /// history and the last response are left exactly as they were.
     fn check_request(
         &mut self,
         turn: u32,
         recorded_sha256: &str,
         message_count: usize,
     ) -> Result<(), &'static str> {
-        let context = self.context.as_mut().ok_or("no session context")?;
-        if self
-            .last_response
-            .as_ref()
-            .is_some_and(|last| last.disposition == Disposition::Recovered)
-        {
-            // The discarded response stays in place until the check passes.
-            context.messages.push(Message::User {
-                text: truncation_note(context.limits.max_output_tokens_per_request),
-            });
-            let reason = Self::request_mismatch(context, turn, recorded_sha256, message_count);
-            if let Some(reason) = reason {
-                context.messages.pop();
-                return Err(reason);
-            }
-            self.last_response = None;
-            return Ok(());
-        }
-        // Move the last tool turn into the history; it is rebuilt from the
-        // history only if the check fails.
-        let extended = self.last_response.take().map(|last| {
-            context.messages.push(Message::Assistant {
-                text: last.text,
-                tool_calls: last.calls,
-                provider_content: last.provider_content,
-            });
-            context.messages.push(Message::ToolResults {
-                results: last.results,
-            });
-            last.turn
-        });
-        let reason = Self::request_mismatch(context, turn, recorded_sha256, message_count);
-        let Some(reason) = reason else {
-            return Ok(());
+        let (extension, appended) = self.extend_history()?;
+        let reason = if self.compaction_due_at(turn, appended) {
+            Some("model_requested when compaction was due")
+        } else {
+            let context = self.context.as_ref().ok_or("no session context")?;
+            Self::history_mismatch(context, turn, recorded_sha256, message_count, None)
         };
-        if let Some(last_turn) = extended {
-            let results = context.messages.pop();
-            let assistant = context.messages.pop();
-            if let (
-                Some(Message::Assistant {
-                    text,
-                    tool_calls,
-                    provider_content,
-                }),
-                Some(Message::ToolResults { results }),
-            ) = (assistant, results)
-            {
-                // Only an accepted turn reaches this check.
-                self.last_response = Some(RespondedTurn {
-                    turn: last_turn,
-                    text,
-                    calls: tool_calls,
-                    provider_content,
-                    results,
-                    disposition: Disposition::Accepted,
-                });
-            }
+        if let Some(reason) = reason {
+            self.undo_extension(extension);
+            return Err(reason);
         }
-        Err(reason)
+        Ok(())
     }
 
-    /// Why the rebuilt history does not match a recorded request, if not.
-    fn request_mismatch(
+    /// Why the rebuilt history does not match a recorded request, if not:
+    /// a model request, or with `compaction` (the policy's instructions
+    /// hash) a compaction request.
+    fn history_mismatch(
         context: &SessionContext,
         turn: u32,
         recorded_sha256: &str,
         message_count: usize,
+        compaction: Option<&str>,
     ) -> Option<&'static str> {
-        if context.messages.len() != message_count {
-            return Some("model_requested message_count differs from the rebuilt history");
-        }
-        let expected = request_sha256(&ModelRequest {
+        let request = ModelRequest {
             session_id: "",
             turn,
             system: &context.system,
             tools: &context.tools,
             messages: &context.messages,
             max_output_tokens: context.limits.max_output_tokens_per_request,
-        });
-        (expected != recorded_sha256)
-            .then_some("model_requested hash differs from the rebuilt request")
+        };
+        let (expected, count_reason, hash_reason) = match compaction {
+            None => (
+                request_sha256(&request),
+                "model_requested message_count differs from the rebuilt history",
+                "model_requested hash differs from the rebuilt request",
+            ),
+            Some(instructions) => (
+                compaction_request_sha256(&request, instructions),
+                "compaction_requested message_count differs from the rebuilt history",
+                "compaction_requested hash differs from the rebuilt request",
+            ),
+        };
+        if context.messages.len() != message_count {
+            return Some(count_reason);
+        }
+        (expected != recorded_sha256).then_some(hash_reason)
     }
 
     /// Check `session_ended` against everything fed before it.
@@ -1365,6 +1696,7 @@ impl Grammar {
             usage,
             sandbox_deleted,
             truncation_recoveries,
+            compactions,
         } = event
         else {
             return Err("not a session_ended record");
@@ -1392,6 +1724,16 @@ impl Grammar {
         }
         if *truncation_recoveries != self.truncation_recoveries {
             return Err("truncation_recoveries differs from the discarded responses");
+        }
+        if *compactions != self.compaction.successes {
+            return Err("compactions differs from the compaction summaries");
+        }
+        if work_outcome == "completed"
+            && (self.compaction.pending.is_some()
+                || self.compaction.failed
+                || self.compaction.over_budget)
+        {
+            return Err("completed work after an unanswered, failed or over-budget compaction");
         }
         // The engine ends create_failed only before it journals sandbox_ready; a
         // sandbox that exists but was never accepted as READY does not count.
@@ -1473,7 +1815,34 @@ pub fn request_sha256(request: &ModelRequest<'_>) -> String {
     sha256_hex(&encoded)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// The `v` of [`compaction_request_sha256`]'s input.
+pub const COMPACTION_HASH_VERSION: &str = "compaction-1";
+
+/// SHA-256 hex of a compaction request's content: the
+/// [`request_sha256`] input under `"v": "compaction-1"`, plus
+/// `"compaction"`: the SHA-256 of the instructions sent
+/// ([`crate::compaction::CompactionPolicy::instructions_sha256`]), so the
+/// instructions are bound and a journal from a build with other
+/// instructions still verifies.
+///
+/// # Panics
+///
+/// Never in practice: encoding an in-memory JSON value cannot fail.
+#[must_use]
+pub fn compaction_request_sha256(request: &ModelRequest<'_>, instructions_sha256: &str) -> String {
+    let request = json!({
+        "v": COMPACTION_HASH_VERSION,
+        "system": request.system,
+        "tools": request.tools,
+        "messages": request.messages,
+        "max_output_tokens": request.max_output_tokens,
+        "compaction": instructions_sha256,
+    });
+    let encoded = serde_json::to_vec(&request).expect("JSON values always serialize");
+    sha256_hex(&encoded)
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {

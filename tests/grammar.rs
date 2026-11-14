@@ -42,6 +42,7 @@ fn started() -> JournalEvent {
         seed: Vec::new(),
         check: None,
         exec_context: None,
+        compaction: None,
     }
 }
 
@@ -172,6 +173,7 @@ impl Ended {
             usage: self.usage,
             sandbox_deleted: self.sandbox_deleted,
             truncation_recoveries: 0,
+            compactions: 0,
         }
     }
 }
@@ -750,6 +752,7 @@ fn forge_tool_after(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
         usage,
         sandbox_deleted: true,
         truncation_recoveries: 0,
+        compactions: 0,
     });
     events
 }
@@ -779,6 +782,7 @@ fn forge_completion(mut events: Vec<JournalEvent>) -> Vec<JournalEvent> {
         usage,
         sandbox_deleted: true,
         truncation_recoveries,
+        compactions: 0,
     });
     events
 }
@@ -960,6 +964,7 @@ async fn engine_refusals_verify_and_forged_continuations_do_not() {
         usage,
         sandbox_deleted: true,
         truncation_recoveries: 0,
+        compactions: 0,
     });
     assert_rejected_because("past the call budget", over_calls, "beyond max_tool_calls");
 }

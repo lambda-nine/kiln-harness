@@ -298,7 +298,7 @@ impl Provider for OpenAiCompatProvider {
         &mut self,
         request: ModelRequest<'_>,
     ) -> Result<ModelResponse, ProviderError> {
-        let body = serde_json::to_vec(&request_body(&self.config, &request)).map_err(|error| {
+        let body = serde_json::to_vec(&request_body(&self.config, &request)?).map_err(|error| {
             ProviderError::new(
                 ProviderErrorKind::InvalidResponse,
                 format!("encode request: {error}"),
@@ -350,8 +350,15 @@ fn mentions_context_length(body: &[u8]) -> bool {
 }
 
 /// The request body for one completion.
-#[must_use]
-pub fn request_body(config: &OpenAiCompatConfig, request: &ModelRequest<'_>) -> Value {
+///
+/// # Errors
+///
+/// Returns `Rejected` for a history holding a provider's summary: this
+/// adapter has no compaction, and `--compact-at` is refused with it.
+pub fn request_body(
+    config: &OpenAiCompatConfig,
+    request: &ModelRequest<'_>,
+) -> Result<Value, ProviderError> {
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
     if !request.system.is_empty() {
         messages.push(json!({"role": "system", "content": request.system}));
@@ -383,6 +390,12 @@ pub fn request_body(config: &OpenAiCompatConfig, request: &ModelRequest<'_>) -> 
                     entry.insert("tool_calls".to_string(), Value::Array(calls));
                 }
                 messages.push(Value::Object(entry));
+            }
+            Message::Compacted { .. } => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Rejected,
+                    "openai-compat cannot send a compacted history",
+                ));
             }
             Message::ToolResults { results } => {
                 for result in results {
@@ -427,7 +440,7 @@ pub fn request_body(config: &OpenAiCompatConfig, request: &ModelRequest<'_>) -> 
         body.insert("seed".to_string(), json!(seed));
     }
     body.insert("stream".to_string(), json!(false));
-    Value::Object(body)
+    Ok(Value::Object(body))
 }
 
 /// The temperature as the decimal it was written as: `0.7_f32` widened to
