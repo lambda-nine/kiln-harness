@@ -34,7 +34,7 @@ use crate::files::{InputFileError, read_regular_file};
 use crate::journal::{JournalEvent, JsonlJournal, LoadedJournal, read_journal};
 use crate::pricing::{ModelPricing, PricingRecord, dollars, picodollars_to_micro};
 use crate::provider::{ModelResponse, Provider, ProviderInfo, ScriptedProvider, ToolCall};
-use crate::providers::default_system_prompt;
+use crate::providers::default_system_prompt_for;
 use crate::replay::ReplayProvider;
 use crate::tools::ToolLimits;
 
@@ -165,7 +165,7 @@ impl EvalTask {
             system: self
                 .system
                 .clone()
-                .unwrap_or_else(|| default_system_prompt(&config.tool_limits)),
+                .unwrap_or_else(|| default_system_prompt_for(&config.tool_limits, config.tool_set)),
             prompt: self.prompt.clone(),
             seed: self.seed.clone(),
             check: Some(self.check.clone()),
@@ -532,6 +532,15 @@ pub struct RunResult {
     /// Compactions that returned a summary, from the journal.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub compactions: u32,
+    /// The run's tool calls per recorded tool name (`unknown` for a name
+    /// the session did not offer), from the journal; missing in older
+    /// files, where it is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_by_name: Option<BTreeMap<String, u32>>,
+    /// Of the run's tool calls, those whose result was not ok; missing in
+    /// older files, where it is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tool_calls: Option<u32>,
     /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`; `None`
     /// without `--replay` or for a run that did not complete.
     pub replay: Option<String>,
@@ -581,6 +590,11 @@ pub struct Manifest {
     /// missing in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// The tools every run's model had (`--tool-set`): `base` or
+    /// `coding_v1`. Always written; older files, which had only the base
+    /// tools, read as `base`.
+    #[serde(default = "base_tool_set")]
+    pub tool_set: String,
     /// The price table version, model limits and rates the runs were priced
     /// with; missing when unpriced and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -716,6 +730,14 @@ pub struct OverallReport {
     /// Responses priced on a long-prompt card, over every run.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub long_prompt_requests: u32,
+    /// Tool calls per recorded tool name over every run; missing unless
+    /// there is a run and every run recorded them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_by_name: Option<BTreeMap<String, u64>>,
+    /// Tool calls whose result was not ok, over every run; missing as
+    /// [`OverallReport::tool_calls_by_name`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_tool_calls: Option<u64>,
 }
 
 /// `report.json`.
@@ -744,6 +766,9 @@ pub struct Report {
     /// As in [`Manifest::max_output_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// As in [`Manifest::tool_set`]: `base` for an older report.
+    #[serde(default = "base_tool_set")]
+    pub tool_set: String,
     /// The price table version of [`Manifest::pricing`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_version: Option<String>,
@@ -765,6 +790,49 @@ pub struct Report {
 /// What a manifest or report without `concurrency` ran at.
 fn default_concurrency() -> u32 {
     1
+}
+
+/// What a manifest or report without `tool_set` ran with.
+fn base_tool_set() -> String {
+    crate::tools::ToolSet::Base.report_name().to_string()
+}
+
+/// Tool calls per name and failed calls over `runs`: `None` unless there
+/// is a run and every run recorded both.
+fn tool_call_totals(runs: &[&RunResult]) -> Option<(BTreeMap<String, u64>, u64)> {
+    if runs.is_empty() {
+        return None;
+    }
+    let mut by_name = BTreeMap::new();
+    let mut failed = 0u64;
+    for run in runs {
+        for (name, calls) in run.tool_calls_by_name.as_ref()? {
+            let total: &mut u64 = by_name.entry(name.clone()).or_default();
+            *total = total.saturating_add(u64::from(*calls));
+        }
+        failed = failed.saturating_add(u64::from(run.failed_tool_calls?));
+    }
+    Some((by_name, failed))
+}
+
+/// `Tool calls by name: exec 120, read_file 30; failed 7.`, or `unknown`
+/// when a run did not record them.
+fn tool_calls_sentence(report: &OverallReport) -> String {
+    match (&report.tool_calls_by_name, report.failed_tool_calls) {
+        (Some(by_name), Some(failed)) => {
+            let names = if by_name.is_empty() {
+                "none".to_string()
+            } else {
+                by_name
+                    .iter()
+                    .map(|(name, calls)| format!("{} {calls}", cell(name)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("{names}; failed {failed}")
+        }
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Counters written only when nonzero.
@@ -906,6 +974,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
             .iter()
             .fold(0u64, |sum, cost| sum.saturating_add(*cost))
     });
+    let tool_calls = tool_call_totals(&counted);
     let pricing = manifest.pricing.as_ref();
     Report {
         schema: REPORT_SCHEMA,
@@ -919,6 +988,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         clear_thinking: manifest.clear_thinking.clone(),
         compact_at: manifest.compact_at,
         max_output_tokens: manifest.max_output_tokens,
+        tool_set: manifest.tool_set.clone(),
         pricing_version: pricing.map(|pricing| pricing.version.clone()),
         unpriced_reason: manifest.unpriced_reason.clone(),
         context_window: pricing.map(|pricing| pricing.context_window),
@@ -937,6 +1007,8 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
                 .cost_micro_usd
                 .and_then(|total| mean_of(total, passed)),
             long_prompt_requests,
+            failed_tool_calls: tool_calls.as_ref().map(|(_, failed)| *failed),
+            tool_calls_by_name: tool_calls.map(|(by_name, _)| by_name),
         },
         tasks,
     }
@@ -1016,6 +1088,7 @@ fn write_report_header(text: &mut String, report: &Report) {
     if let Some(tokens) = report.max_output_tokens {
         let _ = writeln!(text, "- Output limit per response: {tokens} tokens");
     }
+    let _ = writeln!(text, "- Tool set: {}", cell(&report.tool_set));
     if let Some(stopped) = &report.stopped {
         let _ = writeln!(text, "- Stopped early: {}", cell(stopped));
     }
@@ -1102,6 +1175,7 @@ pub fn report_markdown(report: &Report) -> String {
         );
     }
     let overall = &report.overall;
+    let tool_calls = tool_calls_sentence(overall);
     let _ = writeln!(
         text,
         "| **Overall** | {} | {} | {} (macro) | | {} | {} | {} | {} | {} | {}{} | |",
@@ -1116,6 +1190,7 @@ pub fn report_markdown(report: &Report) -> String {
         compactions(overall.means.compactions),
         number(overall.means.wall_ms),
     );
+    let _ = writeln!(text, "\nTool calls by name: {tool_calls}.");
     let _ = write!(
         text,
         "\nMacro pass rate (mean of task pass rates): {}. pass@1 from {} trial(s) per task: {}. \
@@ -1254,13 +1329,37 @@ pub fn compare(base: &Report, new: &Report) -> String {
             mean_dollars(new.overall.cost_per_pass_micro_usd),
         );
     }
+    write_tool_calls(&mut text, base, new);
     write_setting_notes(&mut text, base, new);
     text
+}
+
+/// Each side's tool calls by name, when both reports know them: unknown
+/// counts are not zero.
+fn write_tool_calls(text: &mut String, base: &Report, new: &Report) {
+    if base.overall.tool_calls_by_name.is_some() && new.overall.tool_calls_by_name.is_some() {
+        let _ = writeln!(
+            text,
+            "Base tool calls by name: {}.\nNew tool calls by name: {}.",
+            tool_calls_sentence(&base.overall),
+            tool_calls_sentence(&new.overall)
+        );
+    }
 }
 
 /// The notes [`compare`] ends with: one per run setting the two reports
 /// differ in, since those make their numbers not directly comparable.
 fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
+    // An older report had the base tools, so its tool set is known.
+    if base.tool_set != new.tool_set {
+        let _ = writeln!(
+            text,
+            "\nTool sets differ: {} → {}; the model had other tools, so pass rates, tokens, \
+             costs and wall times are not directly comparable.",
+            cell(&base.tool_set),
+            cell(&new.tool_set)
+        );
+    }
     if base.concurrency != new.concurrency {
         let _ = writeln!(
             text,
@@ -1826,6 +1925,10 @@ struct Recorded {
     long_prompt_requests: u32,
     /// Compactions that returned a summary.
     compactions: u32,
+    /// Tool calls per recorded tool name.
+    tool_calls_by_name: BTreeMap<String, u32>,
+    /// Tool calls whose result was not ok.
+    failed_tool_calls: u32,
 }
 
 impl Recorded {
@@ -1879,7 +1982,14 @@ fn recorded(journal: Option<&LoadedJournal>, pricing: Option<&ModelPricing>) -> 
                 recorded.price(pricing, &response.usage);
                 recorded.compactions += u32::from(response.is_success());
             }
-            JournalEvent::ToolExecuted { .. } => recorded.tool_calls += 1,
+            JournalEvent::ToolExecuted { call, ok, .. } => {
+                recorded.tool_calls += 1;
+                *recorded
+                    .tool_calls_by_name
+                    .entry(call.tool.clone())
+                    .or_default() += 1;
+                recorded.failed_tool_calls += u32::from(!*ok);
+            }
             JournalEvent::CheckCompleted { outcome, .. } => {
                 recorded.check = Some(outcome.clone());
             }
@@ -2103,6 +2213,7 @@ where
             .as_ref()
             .map(|policy| policy.compact_at),
         max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
+        tool_set: options.base_config.tool_set.report_name().to_string(),
         pricing: options.pricing.map(PricingRecord::from),
         unpriced_reason: options.unpriced_reason.clone(),
         replay: options.replay,
@@ -2309,6 +2420,8 @@ where
             .map(|_| picodollars_to_micro(recorded.cost_picodollars)),
         long_prompt_requests: recorded.long_prompt_requests,
         compactions: recorded.compactions,
+        tool_calls_by_name: Some(recorded.tool_calls_by_name),
+        failed_tool_calls: Some(recorded.failed_tool_calls),
         replay: None,
         error: outcome.as_ref().err().map(ToString::to_string),
     };

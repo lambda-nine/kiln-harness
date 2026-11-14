@@ -61,6 +61,7 @@ impl Fixture {
                 check: None,
                 exec_context: None,
                 compaction: None,
+                tool_set: None,
             },
             JournalEvent::SandboxReady {
                 sandbox_id: "sb-1".to_string(),

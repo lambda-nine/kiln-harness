@@ -476,6 +476,7 @@ fn unsupported_schema_is_rejected() {
             check: None,
             exec_context: None,
             compaction: None,
+            tool_set: None,
         },
     };
     let temp = common::private_tempdir().expect("temp dir");
@@ -1053,6 +1054,7 @@ fn distinct_config() -> HarnessConfig {
         sandbox_idle_timeout: Duration::from_secs(33),
         sandbox_lifetime_margin: Duration::from_secs(4),
         compaction: None,
+        tool_set: kiln_harness::tools::ToolSet::Base,
     }
 }
 
@@ -1803,6 +1805,7 @@ fn discarding_an_unwritten_output_removes_its_new_directories() {
                 check: None,
                 exec_context: None,
                 compaction: None,
+                tool_set: None,
             },
         )
         .expect("first record");

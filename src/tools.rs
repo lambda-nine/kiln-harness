@@ -21,7 +21,81 @@ use crate::journal::SessionLimits;
 use crate::live::LiveOutput;
 use crate::provider::{ToolCall, ToolDefinition};
 
+mod coding;
+
+use coding::EditArgs;
+
 const WORKSPACE: &str = "/workspace";
+
+/// Which tools a session gives the model. The journal records it in
+/// `session_started`, so replay offers a recording the tools it had.
+/// Every constant of the coding tools belongs to [`ToolSet::CodingV1`]:
+/// changing any of them needs a new set name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolSet {
+    /// `exec`, `read_file`, `write_file`, `list_dir` and `workspace_diff`.
+    #[default]
+    Base,
+    /// The base tools, with line ranges in `read_file`, plus `edit_file`
+    /// and `search`.
+    CodingV1,
+}
+
+impl ToolSet {
+    /// The `session_started.tool_set` value; `None` for [`ToolSet::Base`],
+    /// which journals omit, so base journals are unchanged.
+    #[must_use]
+    pub fn journal_name(self) -> Option<&'static str> {
+        match self {
+            Self::Base => None,
+            Self::CodingV1 => Some("coding_v1"),
+        }
+    }
+
+    /// The set a recorded `tool_set` names: absent is base, and any value
+    /// but `coding_v1` is unknown (`None`).
+    #[must_use]
+    pub fn from_journal(name: Option<&str>) -> Option<Self> {
+        match name {
+            None => Some(Self::Base),
+            Some("coding_v1") => Some(Self::CodingV1),
+            Some(_) => None,
+        }
+    }
+
+    /// The name eval manifests and reports use: `base` or `coding_v1`.
+    #[must_use]
+    pub fn report_name(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::CodingV1 => "coding_v1",
+        }
+    }
+}
+
+/// How much of a file a ranged `read_file` scans for lines.
+pub const MAX_SCAN_BYTES: usize = 1 << 20;
+/// The most lines one ranged `read_file` returns, and its default.
+pub const MAX_LINE_COUNT: u32 = 5000;
+/// The highest `start_line` a ranged `read_file` accepts.
+pub const MAX_START_LINE: u32 = 10_000_000;
+/// The most edits one `edit_file` call carries.
+pub const MAX_EDITS: usize = 32;
+/// The most replacements one `edit_file` call makes, over all its edits.
+pub const MAX_REPLACEMENTS: usize = 10_000;
+/// The longest `search` pattern.
+pub const MAX_PATTERN_BYTES: usize = 1024;
+/// The most matches one `search` returns.
+pub const MAX_SEARCH_RESULTS: u32 = 200;
+/// The matches `search` returns without `max_results`.
+pub const DEFAULT_SEARCH_RESULTS: u32 = 50;
+/// The longest match text `search` returns before cutting it.
+pub const SEARCH_TEXT_BYTES: usize = 300;
+/// How much of a failed command's stderr a coding tool's error carries.
+pub const ERROR_STDERR_BYTES: usize = 1024;
+/// Room left for a result's other fields when its content is budgeted
+/// against the result limit.
+pub const RESULT_RESERVE_BYTES: usize = 1024;
 
 /// The environment every execution gets over kiln's defaults, in order.
 /// The output goes to a model, so no colour or other escape codes
@@ -340,15 +414,32 @@ pub struct ToolRegistry {
     definitions: Vec<ToolDefinition>,
     /// The same tools as a streaming session describes them.
     streaming_definitions: Vec<ToolDefinition>,
+    /// The [`ToolSet::CodingV1`] tools, unary and streaming.
+    coding_definitions: Vec<ToolDefinition>,
+    coding_streaming_definitions: Vec<ToolDefinition>,
 }
 
 impl ToolRegistry {
     #[must_use]
     pub fn new(limits: ToolLimits) -> Self {
         Self {
+            definitions: definitions(false, ToolSet::Base, &limits),
+            streaming_definitions: definitions(true, ToolSet::Base, &limits),
+            coding_definitions: definitions(false, ToolSet::CodingV1, &limits),
+            coding_streaming_definitions: definitions(true, ToolSet::CodingV1, &limits),
             limits,
-            definitions: definitions(false),
-            streaming_definitions: definitions(true),
+        }
+    }
+
+    /// The tools of `tool_set`, described as a session that streams its
+    /// model's commands (`streaming`) or one that does not.
+    #[must_use]
+    pub fn definitions_of(&self, tool_set: ToolSet, streaming: bool) -> &[ToolDefinition] {
+        match (tool_set, streaming) {
+            (ToolSet::Base, false) => &self.definitions,
+            (ToolSet::Base, true) => &self.streaming_definitions,
+            (ToolSet::CodingV1, false) => &self.coding_definitions,
+            (ToolSet::CodingV1, true) => &self.coding_streaming_definitions,
         }
     }
 
@@ -363,13 +454,15 @@ impl ToolRegistry {
     /// every model request, which replay compares by hash, so a recording
     /// keeps the definitions its context had: only a streaming session's
     /// `exec` states the output cutoff.
+    /// The coding set's tools are described the same way, in either
+    /// context.
     #[must_use]
-    pub(crate) fn definitions_in(&self, context: ExecContext) -> &[ToolDefinition] {
-        if context.streams_exec() {
-            &self.streaming_definitions
-        } else {
-            &self.definitions
-        }
+    pub(crate) fn definitions_in(
+        &self,
+        context: ExecContext,
+        tool_set: ToolSet,
+    ) -> &[ToolDefinition] {
+        self.definitions_of(tool_set, context.streams_exec())
     }
 
     /// Capture the fixed workspace baseline for a newly created sandbox.
@@ -377,7 +470,8 @@ impl ToolRegistry {
     /// create was sent: the first activity anchor, on the early side.
     /// `typed_reasons` says whether the daemon lists typed refusal reasons;
     /// only then does a tool call end on a refusal proving the sandbox gone.
-    /// Every execution runs in `exec_context`.
+    /// Every execution runs in `exec_context`, and the model's calls are
+    /// planned as `tool_set` defines its tools.
     ///
     /// # Errors
     ///
@@ -392,11 +486,13 @@ impl ToolRegistry {
         exec_context: ExecContext,
         ready_at: Instant,
         seed: &[SeedFile],
+        tool_set: ToolSet,
     ) -> Result<(ToolSession<'a, A>, Option<SeedEvidence>, BaselineEvidence), ToolError> {
         let mut session = ToolSession {
             api,
             sandbox_id,
             exec_context,
+            tool_set,
             limits: &self.limits,
             baseline: BTreeSet::new(),
             typed_reasons,
@@ -471,6 +567,8 @@ pub struct ToolSession<'a, A: SandboxApi> {
     sandbox_id: String,
     /// The cwd and env every execution sends, and kilnd must report.
     exec_context: ExecContext,
+    /// Which tools the model has, and so how its calls are planned.
+    tool_set: ToolSet,
     limits: &'a ToolLimits,
     baseline: BTreeSet<String>,
     typed_reasons: bool,
@@ -513,6 +611,39 @@ pub struct ToolRun {
     /// How a streamed execution's output was delivered live; `None` for
     /// every unary call.
     pub live: Option<Box<LiveEvidence>>,
+    /// Set when a coding tool's later execution has an unknown outcome
+    /// (its RPC failed or its deadline passed) after earlier ones of the
+    /// same call settled. `execution_ids` and the evidence then already hold
+    /// those earlier executions, and response-loss recovery still looks for
+    /// what follows them; see [`ToolRun::needs_recovery`].
+    pub(crate) earlier: Option<EarlierExecutions>,
+}
+
+/// The executions a call settled before one whose outcome is unknown, with
+/// their evidence alone.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EarlierExecutions {
+    pub(crate) execution_ids: Vec<String>,
+    pub(crate) stdout: OutputEvidence,
+    pub(crate) stderr: OutputEvidence,
+}
+
+impl EarlierExecutions {
+    fn of(executions: &[&Execution]) -> Self {
+        let mut earlier = Self {
+            execution_ids: Vec::new(),
+            stdout: empty_evidence(),
+            stderr: empty_evidence(),
+        };
+        for execution in executions {
+            if !earlier.execution_ids.contains(&execution.id) {
+                earlier.execution_ids.push(execution.id.clone());
+            }
+            earlier.stdout = merge_evidence(earlier.stdout, evidence(&execution.stdout));
+            earlier.stderr = merge_evidence(earlier.stderr, evidence(&execution.stderr));
+        }
+        earlier
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -601,6 +732,7 @@ impl ToolRun {
             stderr: empty_evidence(),
             stop: None,
             live: None,
+            earlier: None,
         }
     }
 
@@ -613,6 +745,7 @@ impl ToolRun {
             stderr: evidence(&execution.stderr),
             stop: None,
             live: None,
+            earlier: None,
         }
     }
 
@@ -626,6 +759,7 @@ impl ToolRun {
             stderr: unknown_evidence(),
             stop: Some(stop),
             live: None,
+            earlier: None,
         }
     }
 
@@ -644,20 +778,46 @@ impl ToolRun {
         self
     }
 
+    /// Whether response-loss recovery should look for executions this call
+    /// may have made that it does not know of: none is known and the
+    /// evidence is unknown, or a coding tool's later execution has an
+    /// unknown outcome after earlier ones it keeps.
+    #[must_use]
+    pub fn needs_recovery(&self) -> bool {
+        (self.execution_ids.is_empty() || self.earlier.is_some())
+            && (!self.stdout.total_bytes_known || !self.stderr.total_bytes_known)
+    }
+
     /// Attach evidence recovered after a lost response. A recovered row that
     /// left the sandbox unusable stops the session like a returned one; an
-    /// interruption already recorded keeps its own stop.
+    /// interruption already recorded keeps its own stop. Executions the
+    /// call settled before the lost one stay first, and recovery, which
+    /// looked past them, adds what it found after them; if it found
+    /// nothing, they stay with the unknown evidence.
     pub fn attach_recovered(&mut self, recovered: RecoveredExecutionEvidence) {
         // A stop needs no IDs: an unreadable window has none.
         if self.stop.is_none() {
             self.stop = recovered.stop();
         }
+        let earlier = self.earlier.take();
         if recovered.execution_ids.is_empty() {
             return;
         }
-        self.execution_ids = recovered.execution_ids;
-        self.stdout = recovered.stdout;
-        self.stderr = recovered.stderr;
+        if let Some(earlier) = earlier {
+            let mut ids = earlier.execution_ids;
+            for id in recovered.execution_ids {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            self.execution_ids = ids;
+            self.stdout = merge_evidence(earlier.stdout, recovered.stdout);
+            self.stderr = merge_evidence(earlier.stderr, recovered.stderr);
+        } else {
+            self.execution_ids = recovered.execution_ids;
+            self.stdout = recovered.stdout;
+            self.stderr = recovered.stderr;
+        }
     }
 }
 
@@ -859,7 +1019,18 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             Ok(ToolPlan::Read { path, max_bytes }) => {
                 self.read_file(path, max_bytes, deadline).await
             }
+            Ok(ToolPlan::ReadLines {
+                path,
+                start,
+                count,
+                max_bytes,
+            }) => {
+                self.read_lines(path, start, count, max_bytes, deadline)
+                    .await
+            }
             Ok(ToolPlan::Write { path, bytes }) => self.write_file(path, bytes, deadline).await,
+            Ok(ToolPlan::Edit { path, edits }) => self.edit_file(path, edits, deadline).await,
+            Ok(ToolPlan::Search(plan)) => self.search(plan, deadline).await,
             Ok(ToolPlan::List { path }) => self.list_dir(path, deadline).await,
             Ok(ToolPlan::Diff) => self.workspace_diff(deadline).await,
         };
@@ -876,22 +1047,19 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     // A refusal is built once per call, on the host's cold path.
     #[allow(clippy::result_large_err)]
     fn plan(&self, tool: &str, arguments: Value) -> Result<ToolPlan, ToolRun> {
-        match tool {
-            "exec" => self.plan_exec(arguments).map(ToolPlan::Exec),
-            "read_file" => {
+        match (self.tool_set, tool) {
+            (_, "exec") => self.plan_exec(arguments).map(ToolPlan::Exec),
+            (ToolSet::Base, "read_file") => {
                 let args: ReadFileArgs = parse_arguments(arguments)?;
                 let path = workspace_path(&args.path, false)
                     .map_err(|message| ToolRun::rejected("invalid_path", message))?;
-                let max_bytes = args.max_bytes.unwrap_or(self.limits.max_file_bytes);
-                if max_bytes == 0 || max_bytes > self.limits.max_file_bytes {
-                    return Err(ToolRun::rejected(
-                        "invalid_arguments",
-                        "max_bytes is outside the per-file limit",
-                    ));
-                }
+                let max_bytes = self.read_max_bytes(args.max_bytes)?;
                 Ok(ToolPlan::Read { path, max_bytes })
             }
-            "write_file" => {
+            (ToolSet::CodingV1, "read_file") => self.plan_coding_read(arguments),
+            (ToolSet::CodingV1, "edit_file") => self.plan_edit(arguments),
+            (ToolSet::CodingV1, "search") => Self::plan_search(arguments).map(ToolPlan::Search),
+            (_, "write_file") => {
                 let args: WriteFileArgs = parse_arguments(arguments)?;
                 let path = workspace_path(&args.path, false)
                     .map_err(|message| ToolRun::rejected("invalid_path", message))?;
@@ -906,13 +1074,13 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                     bytes: args.content.into_bytes(),
                 })
             }
-            "list_dir" => {
+            (_, "list_dir") => {
                 let args: ListDirArgs = parse_arguments(arguments)?;
                 let path = workspace_path(&args.path, true)
                     .map_err(|message| ToolRun::rejected("invalid_path", message))?;
                 Ok(ToolPlan::List { path })
             }
-            "workspace_diff" => {
+            (_, "workspace_diff") => {
                 if serde_json::from_value::<WorkspaceDiffArgs>(arguments).is_err() {
                     return Err(ToolRun::rejected(
                         "invalid_arguments",
@@ -923,6 +1091,19 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             }
             _ => Err(ToolRun::rejected("unknown_tool", "tool is not registered")),
         }
+    }
+
+    /// `read_file`'s `max_bytes`, defaulting to the per-file limit.
+    #[allow(clippy::result_large_err)]
+    fn read_max_bytes(&self, max_bytes: Option<usize>) -> Result<usize, ToolRun> {
+        let max_bytes = max_bytes.unwrap_or(self.limits.max_file_bytes);
+        if max_bytes == 0 || max_bytes > self.limits.max_file_bytes {
+            return Err(ToolRun::rejected(
+                "invalid_arguments",
+                "max_bytes is outside the per-file limit",
+            ));
+        }
+        Ok(max_bytes)
     }
 
     #[allow(clippy::result_large_err)]
@@ -1084,6 +1265,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             stderr: merge_evidence(evidence(&stat.stderr), evidence(&read.stderr)),
             stop: None,
             live: None,
+            earlier: None,
         };
         if size > max_bytes as u64 {
             run.stdout.truncated = true;
@@ -1158,6 +1340,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                     stderr: manifest.stderr,
                     stop: None,
                     live: None,
+                    earlier: None,
                 }
             }
             Err(error) => tool_error_run(error, "workspace_diff_failed", self.typed_reasons),
@@ -1753,9 +1936,29 @@ fn write_argv(path: &str) -> Vec<String> {
 /// A tool call that passed every host-side check.
 enum ToolPlan {
     Exec(ExecPlan),
-    Read { path: String, max_bytes: usize },
-    Write { path: String, bytes: Vec<u8> },
-    List { path: String },
+    Read {
+        path: String,
+        max_bytes: usize,
+    },
+    /// A coding `read_file` with a line range.
+    ReadLines {
+        path: String,
+        start: u32,
+        count: u32,
+        max_bytes: usize,
+    },
+    Write {
+        path: String,
+        bytes: Vec<u8>,
+    },
+    Edit {
+        path: String,
+        edits: Vec<EditArgs>,
+    },
+    Search(coding::SearchPlan),
+    List {
+        path: String,
+    },
     Diff,
 }
 
@@ -1921,6 +2124,53 @@ fn execution_error(execution: &Execution, kind: &str) -> ToolRun {
         }),
         false,
     )
+}
+
+/// [`execution_error`] with the start of the command's stderr, at most
+/// [`ERROR_STDERR_BYTES`] of it, for a coding tool's failed command.
+fn execution_error_with_stderr(execution: &Execution, kind: &str) -> ToolRun {
+    let mut run = execution_error(execution, kind);
+    let stderr = bounded_text(&execution.stderr.data, ERROR_STDERR_BYTES);
+    if let Value::Object(result) = &mut run.result {
+        result.insert("stderr".to_string(), Value::String(stderr.text));
+    }
+    run.stderr.truncated |= stderr.truncated;
+    run
+}
+
+/// Whether kilnd kept every byte the program wrote to this stream.
+fn complete(output: &CapturedOutput) -> bool {
+    output.total_bytes_known
+        && !output.truncated
+        && output.data.len() as u64 == output.observed_bytes
+}
+
+/// A host refusal after `executions` ran: `kind` and `message` as for a
+/// refusal before any, with every execution's ID and evidence in order.
+fn refused_after(executions: &[&Execution], kind: &str, message: String) -> ToolRun {
+    let mut run = ToolRun::rejected(kind, message);
+    with_executions(&mut run, executions);
+    run
+}
+
+/// Put `executions` first in `run`'s IDs and evidence, in order, each ID
+/// once.
+fn with_executions(run: &mut ToolRun, executions: &[&Execution]) {
+    let mut ids = Vec::new();
+    for id in executions
+        .iter()
+        .map(|execution| &execution.id)
+        .chain(&run.execution_ids)
+    {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    run.execution_ids = ids;
+    for execution in executions.iter().rev() {
+        run.stdout = merge_evidence(evidence(&execution.stdout), run.stdout);
+        run.stderr = merge_evidence(evidence(&execution.stderr), run.stderr);
+    }
 }
 
 fn combine_execution_error(first: &Execution, second: &Execution, kind: &str) -> ToolRun {
@@ -2109,6 +2359,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
                     sandbox_unusable_refusal(&error, typed_reasons).then(ToolStop::unusable)
                 }),
             live: None,
+            earlier: None,
         },
         ToolError::Manifest {
             message,
@@ -2123,6 +2374,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stderr,
             stop: None,
             live: None,
+            earlier: None,
         },
         // Only seeding returns this, and never through a tool.
         ToolError::Seed {
@@ -2136,6 +2388,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stderr: unknown_evidence(),
             stop: None,
             live: None,
+            earlier: None,
         },
         // Only the baseline returns this; a tool's own check in `execute`
         // sets the stop.
@@ -2157,6 +2410,7 @@ fn tool_error_run(error: ToolError, kind: &str, typed_reasons: bool) -> ToolRun 
             stderr: unknown_evidence(),
             stop: Some(stop),
             live: None,
+            earlier: None,
         },
     }
 }
@@ -2521,9 +2775,20 @@ fn aggregate_recovered(
     recovered
 }
 
-/// The registered tools; `streaming` describes `exec` as a streaming
-/// session runs it.
-fn definitions(streaming: bool) -> Vec<ToolDefinition> {
+/// The registered tools of `tool_set`; `streaming` describes `exec` as a
+/// streaming session runs it. Only the coding set's descriptions use
+/// `limits`.
+fn definitions(streaming: bool, tool_set: ToolSet, limits: &ToolLimits) -> Vec<ToolDefinition> {
+    let mut tools = base_definitions(streaming);
+    if tool_set == ToolSet::CodingV1 {
+        coding::extend_definitions(&mut tools, limits);
+    }
+    tools
+}
+
+/// The base tools; `streaming` describes `exec` as a streaming session
+/// runs it.
+fn base_definitions(streaming: bool) -> Vec<ToolDefinition> {
     let mut exec =
         "Execute literal argv in the session sandbox; no host shell is used.".to_string();
     if streaming {

@@ -988,6 +988,10 @@ of headroom. Without the flag, requests are byte for byte as before.
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |
 | `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline |
 
+These five are the base tool set, the default. `--tool-set coding` (see
+[The coding tool set](#the-coding-tool-set)) gives the model `read_file`
+with line ranges, `edit_file` and `search` as well.
+
 In a streaming session the `exec` tool's description ends "A command whose
 stdout or stderr passes 8 MiB is stopped.", so the model is told of the
 cutoff whatever system prompt the session brings. Tool definitions are part
@@ -1061,6 +1065,107 @@ deadline construction cannot overflow after a sandbox exists.
 
 Both `HarnessConfig` and `run` allow two truncation recoveries per session
 by default (`--max-truncation-recoveries`).
+
+### The coding tool set
+
+`HarnessConfig::tool_set` (`--tool-set base|coding`) picks the tools the
+model gets. `base`, the default, is the five tools above, with requests,
+journals and replay byte-identical to builds before tool sets existed.
+`coding` is the set `coding_v1`: the base list with `read_file` replaced by
+a version that also takes line ranges, then `edit_file` and `search` after
+`workspace_diff`. Its definitions, its limits below, and the default system
+prompt's tool list (which adds a line for each new tool and a sentence
+preferring `edit_file` and ranged reads) belong to the name: changing any of
+them needs a new name. Under `base`, `edit_file` and `search` are unknown
+tools, and `read_file` with `start_line` fails argument parsing exactly as
+before.
+
+| Tool | kilnd executions | Argv |
+|---|---:|---|
+| `read_file` with `start_line` or `line_count` | 2 | `/bin/stat -L -c %s -- P`, then `/usr/bin/head -c 1048576 -- P` |
+| `edit_file` | 2 | `/usr/bin/head -c <max_file_bytes + 1> -- P`, then `/bin/dd of=P status=none` with the new bytes on stdin |
+| `search` | 1 + one per chunk | `/usr/bin/find ROOT -xdev -type f -print0`, then `/bin/grep -n -H (-F\|-E) [-i] -e PATTERN -- FILE...` |
+
+`P` and `ROOT` are validated `/workspace` paths, as for the base tools
+(`search`'s path defaults to `.`, the whole workspace, and may name a file
+or a directory). The model's text reaches kilnd only as one argv entry, the
+path or the pattern after `-e` (so a pattern starting with `-` stays a
+pattern), or as `dd`'s stdin.
+
+**Complete capture.** kilnd may keep less of a stream than the program
+wrote. A capture is complete when kilnd knows the total
+(`total_bytes_known`), did not truncate it, and kept every observed byte
+(`data.len() == observed_bytes`). Every host decision that treats output as
+a whole file or a whole listing checks it: `edit_file` refuses an
+incomplete read with `read_incomplete` and writes nothing; a ranged read
+treats an incomplete or short read as a prefix whose end is unknown;
+`search` refuses an incomplete file list and stops at an incomplete grep
+chunk. A refusal after an execution keeps that execution's ID and output
+evidence.
+
+**Earlier executions.** Each coding tool runs its executions in turn, and
+a failure of a later one (a refusal, a context mismatch, a sandbox left
+unusable, or a `kilnd_error`) keeps every earlier one's ID and output
+evidence first, in order, each ID once. When the later execution's outcome
+is unknown, because its RPC failed or the deadline passed, the result also
+carries the earlier executions on their own (`ToolRun::earlier`, crate
+private). The engine then still runs response-loss recovery, which it
+otherwise runs only for a call with no known execution: it looks for rows
+other than the session's and this call's known ones, and the rows it finds
+follow the earlier executions, their evidence merged after theirs. If it
+finds none, the earlier executions stay with the unknown evidence. When the
+sandbox was already unusable no Exec is sent, so there is nothing to look
+for. The base tools keep their behaviour.
+
+**Ranged `read_file`.** Without either line field it is the base read.
+Its `stat` takes `-L`, so through a symbolic link the size is the target's,
+the file `head` reads; the base read's `stat` does not, and reports a
+link's own size.
+With either, `start_line` is 1 to 10,000,000 (default 1) and `line_count`
+1 to 5,000 (default 5,000). The host slices the first 1 MiB byte for byte:
+lines split after each `\n`, CR and NUL kept. When the capture is complete
+and as long as the `stat` size, a last line without `\n` counts;
+otherwise only lines ending in `\n` are known. Whole lines are returned
+while their JSON-encoded size stays within `max_bytes` and the result limit
+less 1 KiB. A first line over that budget is cut at a character boundary
+(raw, then decoded, when it is not UTF-8) and marked `line_truncated`.
+`next_line` names the first line not returned when it exists or may exist,
+and is `null` only when the whole file through its end was returned; a
+`start_line` past the known lines of a file that may go on is refused
+`beyond_scan_limit`.
+
+**`edit_file`.** Up to 32 edits of `old_text` to `new_text`, checked on the
+host first (non-empty, different, each within the file limit). The whole
+file must come back complete, within `max_file_bytes`, and as UTF-8. Every
+edit matches the original: a unique edit counts occurrences at every start
+position, overlapping ones too, and must find exactly one; `replace_all`
+takes every non-overlapping one, left to right. At most 10,000 replacements
+in all. Matches of different edits may touch but not overlap. The edited
+size is computed before anything is allocated and must fit the file and
+stdin limits. Edits apply together or not at all; inserted text is never
+matched again. Refusals, in that order, are `no_match`, `not_unique`,
+`too_many_replacements`, `overlapping_edits` and `file_too_large`, each
+naming the edits by their 0-based index.
+
+**`search` ordering.** Results never depend on the order the file system
+lists entries in. The file list is parsed as NUL-separated names under
+`/workspace/`; a name that is not UTF-8, holds a control character, or holds
+`:` (which separates grep's output fields) is skipped and counted in
+`skipped_files`. The rest are sorted by bytes and passed to `grep` in that
+order, in chunks of at most 256 names that keep the argv within the argv
+limit, so the output is in path order, then line order. Each output line
+must start with a name of its chunk, up to the first `:`, then digits and
+`:`; anything else counts as `unparsed` and is not returned. Match text
+loses one trailing CR, has invalid UTF-8 and control characters other than
+tab replaced by U+FFFD, and is cut at 300 bytes with `…`. At most
+`max_results` (1 to 200, default 50) matches are returned within the result
+limit less 1 KiB; `seen` counts every parsed match observed, and `truncated`
+says some were left out or chunks were not run. grep's exit 1 is no match;
+exit 2 with output is a `partial` result carrying the start of grep's
+stderr as `errors`, and without output, like any other state or exit, is
+`search_failed` with the stderr. A bad regular expression is reported only
+when grep has a file to compile it against: with no searchable files the
+call returns no matches.
 
 Every configuration, including limits loaded from a journal, must also stay
 under hard ceilings: 1,000 steps, 10,000 tool calls and 64 per turn, a 6-hour
@@ -1257,7 +1362,10 @@ For a task with a seed or a check it also records `seed` (each file's path
 and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
 replay is self-contained. Both are omitted when absent, so a journal without
 them is byte-identical to one written before they existed, and the schema
-stays 1. `exec_context` names where every execution ran: new sessions
+stays 1. `tool_set` names the tool set when it is not base (`coding_v1`),
+and is omitted otherwise, so base journals are byte-identical to before; a
+journal naming a set this build does not know is refused before anything
+else in it is checked or replayed. `exec_context` names where every execution ran: new sessions
 always write `"exec_context":"workspace_stream_v1"` (`/workspace` and the
 fixed overrides, the model's `exec` streamed); `workspace_v1` is the same
 with every execution unary, as journals recorded before streaming say. Absent means the legacy context, no cwd and no env, exactly
@@ -1454,7 +1562,9 @@ recorded summary is the one sent on. An unanswered recorded compaction
 behaves as an unanswered request, and `exhausted()` counts every recorded
 attempt. Replay restores the compaction policy from `session_started`, and
 refuses, before kilnd is contacted, a policy whose instructions hash is not
-this build's: its summaries were written under other instructions.
+this build's: its summaries were written under other instructions. It
+restores the tool set the same way, and refuses before kilnd a replay
+configuration whose tool set differs from the recording's.
 
 Replay rebuilds the whole task from `session_started`, seed, check and exec context
 included, seeds the fresh sandbox the same way, and reruns the check after
@@ -1502,6 +1612,16 @@ files, which could not compact, so `eval compare` notes any difference in
 it, off included. With it, each result line carries `compactions` (omitted
 when 0), and `report.md` adds a "Compactions (mean)" column; without it the
 report is unchanged.
+The manifest and report always record `tool_set` (`base` or `coding_v1`);
+an older file reads as `base`, the only set it could have used, so `eval
+compare` notes any difference. Each result line carries
+`tool_calls_by_name`, the run's tool calls per recorded tool name
+(`unknown` for a name the session did not offer), and `failed_tool_calls`,
+those whose result was not ok; a line without them, from an older run, is
+unknown rather than zero. The report's overall section sums both only when
+every run recorded them, `report.md` gives them on one line ("Tool calls by
+name: ...; failed N", or "unknown"), and `eval compare` shows each side's
+when both know them.
 `truncation_recoveries` is always written, and a line without it reads as 0.
 With `--replay`, a completed run is replayed against a fresh sandbox right
 after it, on the same connection. The suite fails closed: a run or replay

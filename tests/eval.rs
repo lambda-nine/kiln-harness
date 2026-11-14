@@ -3247,6 +3247,8 @@ fn result(
         cost_micro_usd: None,
         long_prompt_requests: 0,
         compactions: 0,
+        tool_calls_by_name: None,
+        failed_tool_calls: None,
         replay: None,
         error: None,
     }
@@ -3268,6 +3270,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         clear_thinking: None,
         compact_at: None,
         max_output_tokens: None,
+        tool_set: "base".to_string(),
         pricing: None,
         unpriced_reason: None,
         replay: true,

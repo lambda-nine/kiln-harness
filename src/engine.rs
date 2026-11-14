@@ -30,8 +30,8 @@ use crate::provider::{
 };
 use crate::tools::{
     CheckRun, EXEC_CONTEXT_MISMATCH, ExecContext, ToolError, ToolLimits, ToolRegistry, ToolRun,
-    ToolSession, ToolStop, UNUSABLE_SANDBOX, exec_limits_problem, recover_execution_evidence_in,
-    sanitize_call_bounded, stream_limits_problem, unusable_stop,
+    ToolSession, ToolSet, ToolStop, UNUSABLE_SANDBOX, exec_limits_problem,
+    recover_execution_evidence_in, sanitize_call_bounded, stream_limits_problem, unusable_stop,
 };
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -243,6 +243,10 @@ pub struct HarnessConfig {
     /// never compacts. Recorded in `session_started`, and restored from it
     /// on replay.
     pub compaction: Option<CompactionPolicy>,
+    /// Which tools the model gets (`--tool-set`); [`ToolSet::Base`] by
+    /// default. Recorded in `session_started` when not base, and restored
+    /// from it on replay.
+    pub tool_set: ToolSet,
 }
 
 impl Default for HarnessConfig {
@@ -265,6 +269,7 @@ impl Default for HarnessConfig {
             sandbox_idle_timeout: Duration::from_secs(120),
             sandbox_lifetime_margin: Duration::from_secs(60),
             compaction: None,
+            tool_set: ToolSet::Base,
         }
     }
 }
@@ -659,12 +664,16 @@ where
                 provider: self.provider.info(),
                 system: task.system.clone(),
                 task: task.prompt.clone(),
-                tools: self.registry.definitions_in(exec_context).to_vec(),
+                tools: self
+                    .registry
+                    .definitions_in(exec_context, self.config.tool_set)
+                    .to_vec(),
                 limits: self.config.limits(),
                 seed: task.seed.iter().map(RecordedSeedFile::new).collect(),
                 check: task.check.as_ref().map(RecordedCheck::new),
                 exec_context: exec_context.journal_name().map(str::to_string),
                 compaction: self.config.compaction.clone(),
+                tool_set: self.config.tool_set.journal_name().map(str::to_string),
             },
         );
         if let Err(error) = started {
@@ -804,6 +813,7 @@ where
                         exec_context,
                         create_sent,
                         &task.seed,
+                        self.config.tool_set,
                     ) => {
                     Some(started)
                 }
@@ -942,7 +952,9 @@ where
                 typed_reasons,
                 config: &self.config,
                 task,
-                definitions: self.registry.definitions_in(exec_context),
+                definitions: self
+                    .registry
+                    .definitions_in(exec_context, self.config.tool_set),
                 tools: &tools,
                 session_id: &session_id,
                 sandbox_id: &sandbox_id,
@@ -1445,21 +1457,19 @@ where
                     ) => run,
                 }
             };
-            if run.execution_ids.is_empty()
-                && (!run.stdout.total_bytes_known || !run.stderr.total_bytes_known)
-            {
+            if run.needs_recovery() {
                 let recovery_window = recovery_window(config);
                 if let Some(recovery_deadline) = Instant::now()
                     .checked_add(recovery_window)
                     .map(|end| end.min(tool_deadline))
                 {
+                    // Executions this call already settled are not what
+                    // recovery looks for.
+                    let mut known = known_execution_ids.clone();
+                    known.extend(run.execution_ids.iter().cloned());
                     let recovered = context
                         .tools
-                        .recover_new_execution_evidence(
-                            &known_execution_ids,
-                            recovery_deadline,
-                            cancel,
-                        )
+                        .recover_new_execution_evidence(&known, recovery_deadline, cancel)
                         .await;
                     run.attach_recovered(recovered);
                 }
@@ -2648,6 +2658,7 @@ fn rejected_tool_run(kind: &str) -> ToolRun {
         stderr: empty_output(),
         stop: None,
         live: None,
+        earlier: None,
     }
     .bounded(64)
 }

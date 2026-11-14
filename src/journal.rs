@@ -38,6 +38,9 @@ pub const MAX_JOURNAL_LINE_BYTES: usize = 8 << 20;
 /// `prev_sha256` of the first record.
 pub const GENESIS_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+// `session_started` is by far the largest event and is written once per
+// session; boxing it would change every match on it for no gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum JournalEvent {
@@ -67,6 +70,12 @@ pub enum JournalEvent {
         /// off, so journals without it are byte-identical to before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compaction: Option<CompactionPolicy>,
+        /// The tools the model had (`--tool-set`): `coding_v1` adds
+        /// `edit_file`, `search` and line ranges in `read_file`. Absent is
+        /// the base set, so journals recorded with it are byte-identical to
+        /// before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_set: Option<String>,
     },
     SandboxReady {
         sandbox_id: String,
@@ -408,6 +417,8 @@ pub enum JournalError {
     RecordAfterEnd { sequence: u64 },
     #[error("journal record {sequence} breaks the session grammar: {reason}")]
     Grammar { sequence: u64, reason: String },
+    #[error("journal record {sequence} names tool set {name:?}, which this build does not know")]
+    UnknownToolSet { sequence: u64, name: String },
     #[error("journal path {0:?} does not name a file")]
     InvalidPath(PathBuf),
     #[error("{}", describe_unsafe("journal", "--journal", path, *mode, *problem))]
@@ -1086,11 +1097,22 @@ impl Grammar {
                 check,
                 exec_context,
                 compaction,
+                tool_set,
                 ..
             } = event
             else {
                 return Err(JournalError::MissingSessionStarted { sequence });
             };
+            // Nothing of a session whose tools this build cannot offer is
+            // replayed or checked further.
+            if let Some(name) = tool_set
+                && crate::tools::ToolSet::from_journal(Some(name)).is_none()
+            {
+                return Err(JournalError::UnknownToolSet {
+                    sequence,
+                    name: name.clone(),
+                });
+            }
             if crate::tools::ExecContext::from_journal(exec_context.as_deref()).is_none() {
                 return Err(JournalError::Grammar {
                     sequence,

@@ -129,6 +129,14 @@ pub enum HealthScript {
 /// fake's files, which it may change.
 pub type ShHandler = Arc<dyn Fn(&[u8], &mut BTreeMap<String, Vec<u8>>) -> ShAnswer + Send + Sync>;
 
+/// How the fake answers a `/bin/grep` its own emulation does not: given
+/// the argv and the fake's files.
+pub type GrepHandler = Arc<dyn Fn(&[String], &BTreeMap<String, Vec<u8>>) -> ShAnswer + Send + Sync>;
+
+/// Changes the stdout capture of an execution, as a daemon that kept only
+/// part of it would report it.
+pub type CaptureTamper = fn(&mut CapturedOutput);
+
 /// One `/bin/sh` execution's terminal state.
 #[derive(Debug, Clone)]
 pub struct ShAnswer {
@@ -296,6 +304,31 @@ pub struct FakeState {
     /// Refuse this many Health calls with `RESOURCE_EXHAUSTED`, as kilnd's
     /// Health lane does when it is full, before answering again.
     pub health_refusals: u32,
+    /// Answers every `/bin/grep`, instead of the fake's literal-only
+    /// emulation (which refuses `-E`).
+    pub grep_handler: Option<GrepHandler>,
+    /// `find` lists files in reverse path order, as a filesystem may.
+    pub find_reversed: bool,
+    /// The stdout capture of every execution whose `argv[0]` is the first
+    /// is changed by the second, as kilnd's would be when it kept only part.
+    pub capture_tamper: Option<(&'static str, CaptureTamper)>,
+    /// Symbolic links: each path's link text, a name relative to the
+    /// link's directory. `head` follows one, as does `stat -L`; plain `stat`
+    /// reports the link's own size, the length of its text.
+    pub symlinks: BTreeMap<String, String>,
+}
+
+impl FakeState {
+    /// The file `path` names, following one symbolic link.
+    fn resolve(&self, path: &str) -> String {
+        match self.symlinks.get(path) {
+            Some(text) => match path.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{text}"),
+                None => text.clone(),
+            },
+            None => path.to_string(),
+        }
+    }
 }
 
 impl FakeApi {
@@ -407,14 +440,16 @@ impl FakeApi {
                     if state.fail_baseline && state.execs.len() == 1 {
                         (1, Vec::new(), b"find failed".to_vec())
                     } else {
-                        let mut output = Vec::new();
-                        for path in state.files.keys() {
-                            output.extend_from_slice(path.as_bytes());
-                            output.push(0);
-                        }
-                        (0, output, Vec::new())
+                        fake_find(&state, argv)
                     }
                 }
+                Some("/bin/grep") => match &state.grep_handler {
+                    Some(handler) => {
+                        let answer = handler(argv, &state.files);
+                        (answer.exit_code.unwrap_or(0), answer.stdout, answer.stderr)
+                    }
+                    None => fake_grep(&state.files, argv),
+                },
                 Some("/bin/dd") => {
                     state.dd_count += 1;
                     let path = argv
@@ -434,15 +469,19 @@ impl FakeApi {
                 }
                 Some("/bin/stat") => {
                     let path = argv.last().expect("stat path");
-                    match state.files.get(path) {
-                        Some(bytes) => (0, format!("{}\n", bytes.len()).into_bytes(), Vec::new()),
+                    let size = match state.symlinks.get(path) {
+                        Some(text) if !argv.iter().any(|arg| arg == "-L") => Some(text.len()),
+                        _ => state.files.get(&state.resolve(path)).map(Vec::len),
+                    };
+                    match size {
+                        Some(size) => (0, format!("{size}\n").into_bytes(), Vec::new()),
                         None => (1, Vec::new(), b"not found".to_vec()),
                     }
                 }
                 Some("/usr/bin/head") => {
                     let limit = argv[2].parse::<usize>().expect("head limit");
-                    let path = argv.last().expect("head path");
-                    let stored = state.read_override.as_ref().or(state.files.get(path));
+                    let path = state.resolve(argv.last().expect("head path"));
+                    let stored = state.read_override.as_ref().or(state.files.get(&path));
                     match stored {
                         Some(bytes) => (0, bytes[..bytes.len().min(limit)].to_vec(), Vec::new()),
                         None => (1, Vec::new(), b"not found".to_vec()),
@@ -484,6 +523,11 @@ impl FakeApi {
             if let Some((exec_state, exec_code)) = sh_state {
                 execution.state = exec_state;
                 execution.exit_code = exec_code;
+            }
+            if let Some((program, tamper)) = state.capture_tamper
+                && argv.first().map(String::as_str) == Some(program)
+            {
+                tamper(&mut execution.stdout);
             }
             if let Some((number, tamper)) = state.tamper_exec
                 && number == state.execs.len()
@@ -1167,6 +1211,101 @@ fn leave_unusable_if_scripted(state: &mut FakeState, execution: &mut Execution) 
         execution.cancel_reason = cause;
         state.expired = Some("sandbox_deleted");
     }
+}
+
+/// `find ROOT -xdev -type f -print0` over the fake's files: every file
+/// when ROOT is `/workspace`, otherwise ROOT itself or the files under it,
+/// and exit 1 when there is none.
+fn fake_find(state: &FakeState, argv: &[String]) -> (i32, Vec<u8>, Vec<u8>) {
+    let root = argv.get(1).map_or("/workspace", String::as_str);
+    let under = format!("{root}/");
+    let mut paths = state
+        .files
+        .keys()
+        .filter(|path| root == "/workspace" || *path == root || path.starts_with(&under))
+        .collect::<Vec<_>>();
+    if paths.is_empty() && root != "/workspace" {
+        return (
+            1,
+            Vec::new(),
+            format!("find: {root}: No such file or directory\n").into_bytes(),
+        );
+    }
+    if state.find_reversed {
+        paths.reverse();
+    }
+    let mut output = Vec::new();
+    for path in paths {
+        output.extend_from_slice(path.as_bytes());
+        output.push(0);
+    }
+    (0, output, Vec::new())
+}
+
+/// `grep -n -H -F [-i] -e PATTERN -- FILE...` over the fake's files, in
+/// argv order, as busybox prints it: exit 0 with a match, 1 without, 2
+/// when a file is missing (with a line on stderr). Anything else,
+/// `-E` included, exits 2: the fake matches literal strings only.
+fn fake_grep(files: &BTreeMap<String, Vec<u8>>, argv: &[String]) -> (i32, Vec<u8>, Vec<u8>) {
+    let unsupported = |what: &str| {
+        (
+            2,
+            Vec::new(),
+            format!("fake: {what} unsupported\n").into_bytes(),
+        )
+    };
+    let mut words = argv[1..].iter().map(String::as_str);
+    let mut ignore_case = false;
+    let mut pattern = None;
+    loop {
+        match words.next() {
+            Some("-n" | "-H" | "-F") => {}
+            Some("-i") => ignore_case = true,
+            Some("-E") => return unsupported("-E"),
+            Some("-e") => pattern = words.next(),
+            Some("--") => break,
+            Some(other) => return unsupported(other),
+            None => return unsupported("an argv without --"),
+        }
+    }
+    let Some(pattern) = pattern else {
+        return unsupported("an argv without -e");
+    };
+    let fold = |bytes: &[u8]| -> Vec<u8> {
+        if ignore_case {
+            bytes.to_ascii_lowercase()
+        } else {
+            bytes.to_vec()
+        }
+    };
+    let needle = fold(pattern.as_bytes());
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    let (mut matched, mut failed) = (false, false);
+    for file in words {
+        let Some(bytes) = files.get(file) else {
+            failed = true;
+            stderr
+                .extend_from_slice(format!("grep: {file}: No such file or directory\n").as_bytes());
+            continue;
+        };
+        let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        if bytes.is_empty() {
+            continue;
+        }
+        for (index, line) in body.split(|byte| *byte == b'\n').enumerate() {
+            if fold(line)
+                .windows(needle.len())
+                .any(|window| window == needle.as_slice())
+            {
+                matched = true;
+                stdout.extend_from_slice(format!("{file}:{}:", index + 1).as_bytes());
+                stdout.extend_from_slice(line);
+                stdout.push(b'\n');
+            }
+        }
+    }
+    let code = if failed { 2 } else { i32::from(!matched) };
+    (code, stdout, stderr)
 }
 
 pub fn api_error(code: Code, message: &str) -> ApiError {

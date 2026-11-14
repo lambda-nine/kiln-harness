@@ -114,6 +114,14 @@ sudo env KILND_INTEGRATION=1 "$test_bin" \
 
 assert_clean
 
+# The coding tool set reads line ranges, edits and searches through busybox,
+# and its recording replays against a fresh sandbox.
+sudo env KILND_INTEGRATION=1 "$test_bin" \
+    --exact coding_tools_run_through_installed_kilnd \
+    --nocapture
+
+assert_clean
+
 # The eval self-test proves two starter tasks' checks against kilnd.
 sudo env KILND_INTEGRATION=1 "$test_bin" \
     --exact eval_selftest_proves_two_starter_tasks_against_installed_kilnd \

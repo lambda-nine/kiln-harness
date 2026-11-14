@@ -28,7 +28,7 @@ use crate::provider::{
     CompactionResponse, ModelRequest, ModelResponse, Provider, ProviderError, ProviderErrorKind,
     ProviderInfo, ToolCall,
 };
-use crate::tools::ExecContext;
+use crate::tools::{ExecContext, ToolSet};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -74,6 +74,8 @@ pub struct ReplayProvider {
     limits: SessionLimits,
     /// The recorded compaction policy, restored for the replay.
     compaction: Option<CompactionPolicy>,
+    /// The recorded tool set, restored for the replay.
+    tool_set: ToolSet,
     /// The idle timeout the recorded session sent kilnd, if it used expiry.
     sandbox_idle_ms: Option<u64>,
     /// Model requests and compactions, in recorded order.
@@ -130,6 +132,7 @@ impl ReplayProvider {
             check,
             exec_context,
             compaction,
+            tool_set,
             ..
         }) = records.next().map(|record| &record.event)
         else {
@@ -157,6 +160,7 @@ impl ReplayProvider {
             exec_context: recorded_exec_context(exec_context.as_deref())?,
             limits: *limits,
             compaction: compaction.clone(),
+            tool_set: ToolSet::from_journal(tool_set.as_deref()).ok_or(ReplayError::InvalidTask)?,
             sandbox_idle_ms: None,
             turns: VecDeque::new(),
             tools: VecDeque::new(),
@@ -267,6 +271,12 @@ impl ReplayProvider {
         self.compaction.as_ref()
     }
 
+    /// The recorded tool set: the tools the recorded model had.
+    #[must_use]
+    pub fn tool_set(&self) -> ToolSet {
+        self.tool_set
+    }
+
     /// Why this build cannot replay the recording's compactions, if it
     /// cannot: they were requested with other instructions. The journal
     /// still verifies; [`Harness::replay`] refuses it before any sandbox
@@ -287,7 +297,7 @@ impl ReplayProvider {
     }
 
     /// The configuration that replays this recording: `base` with the
-    /// recorded limits and compaction policy, and the sandbox idle timeout
+    /// recorded limits, compaction policy and tool set, and the sandbox idle timeout
     /// from [`crate::engine::HarnessConfig::fit_replay_idle_timeout`].
     #[must_use]
     pub fn replay_config(
@@ -297,6 +307,7 @@ impl ReplayProvider {
         let mut config = base;
         config.apply_limits(&self.limits);
         config.compaction.clone_from(&self.compaction);
+        config.tool_set = self.tool_set;
         config.fit_replay_idle_timeout(self.recorded_sandbox_idle_timeout());
         config
     }
@@ -525,14 +536,15 @@ where
     ///
     /// Construct the harness with [`ReplayProvider::replay_config`]: a
     /// recording that could compact replays only under its recorded policy
-    /// and with this build's instructions, and anything else is refused
-    /// before a sandbox exists.
+    /// and with this build's instructions, a recording replays only with
+    /// its recorded tool set, and anything else is refused before a sandbox
+    /// exists.
     ///
     /// # Errors
     ///
     /// `InvalidTask` when the recording compacted with other instructions,
-    /// or the harness's compaction policy is not the recorded one; otherwise
-    /// as [`Harness::run`].
+    /// or the harness's compaction policy or tool set is not the recorded
+    /// one; otherwise as [`Harness::run`].
     pub async fn replay(
         &mut self,
         cancel: CancellationToken,
@@ -544,6 +556,13 @@ where
             return Err(HarnessError::InvalidTask(
                 "the compaction policy differs from the recording's; build the replay's \
                  configuration with ReplayProvider::replay_config"
+                    .to_string(),
+            ));
+        }
+        if self.config().tool_set != self.provider().tool_set() {
+            return Err(HarnessError::InvalidTask(
+                "the tool set differs from the recording's; build the replay's configuration \
+                 with ReplayProvider::replay_config"
                     .to_string(),
             ));
         }

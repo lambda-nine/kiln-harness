@@ -82,6 +82,21 @@ it is not a hostile multi-tenant boundary.
   `/workspace` paths, relative or with the `/workspace/` prefix stripped
   once, and refuse every other absolute path and any `.` or `..` component; `exec` remains a deliberately general sandbox
   argv primitive.
+- The coding tool set (`--tool-set coding`) keeps the same rule: the
+  model's text reaches kilnd only as one argv entry of a fixed program (a
+  validated path, or a search pattern after `-e`, so one starting with `-`
+  is not an option) or as stdin (an edited file's new bytes for `dd`). The
+  host work on sandbox output is bounded before it starts: a ranged
+  `read_file` scans at most the first 1 MiB; `edit_file` reads at most the
+  file limit plus one byte, makes at most 10,000 replacements over at most
+  32 edits, and computes the edited size, refusing it over the file and
+  stdin limits, before allocating it; `search` parses at most the manifest
+  limits' worth of names and keeps at most 200 matches of at most 300 bytes
+  of text each, within the result limit. File names that could be confused
+  with grep's `path:line:` framing (holding `:` or a control character, or
+  not UTF-8) are skipped, not parsed, and output lines that do not start
+  with a name of their own chunk are dropped. An edit never writes back a
+  capture kilnd did not keep whole.
 - Step, call, argv, stdin, file, manifest, result, per-execution, and session
   bounds are finite. kilnd supplies a second validation and capture boundary.
 - Provider, audit, budget, cancellation, deadline, and tool errors all enter a
@@ -304,7 +319,14 @@ it is not a hostile multi-tenant boundary.
   symlink under `/workspace` can target another sandbox path; read-only root
   blocks helper writes outside approved writable paths, and the sandbox—not the
   workspace prefix—is the host boundary. General `exec` can read any path the
-  sandbox policy permits.
+  sandbox policy permits. The coding tools follow symlinks the same way:
+  a ranged `read_file` sizes and reads a link's target (`stat -L`),
+  `edit_file` reads and writes through one, and `search` lists only regular
+  files (`find -type f`, which does not follow links) but `grep` opens what
+  it is given. `search` is best-effort: grep's own diagnostics mark a result
+  `partial`, but a file that changes between the listing and grep can be
+  missed, and a regular expression's cost is bounded only by the tool
+  timeout.
 - A model endpoint is trusted for availability only. A slow or hanging server
   delays the session until its deadline, and retries (at most 8 attempts,
   each backoff capped) spend session time, not extra budget. Dropping the

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "find-and-fix",
+  "description": "Find a leap-year bug by its symptom in a 34-file shell library and fix it at its source without touching the tests.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 300,
+  "max_steps": 30
+}

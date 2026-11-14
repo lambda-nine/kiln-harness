@@ -13,6 +13,7 @@ use kiln_harness::journal::{JournalEvent, JsonlJournal, read_journal};
 use kiln_harness::live::LiveOutput;
 use kiln_harness::provider::{ModelResponse, ScriptedProvider, ToolCall};
 use kiln_harness::replay::ReplayProvider;
+use kiln_harness::tools::ToolSet;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -342,6 +343,281 @@ async fn model_exec_streams_live_and_cuts_a_runaway_through_installed_kilnd() {
     );
     assert_eq!(results[2]["ok"], true, "{}", results[2]);
     assert_eq!(results[2]["stdout"], "after\n");
+
+    let after = api.health().await.expect("health after");
+    assert_eq!(after.active_sandboxes, 0);
+    assert_eq!(after.running_executions, 0);
+    assert_eq!(after.reservations, before.reservations);
+    assert_eq!(non_deleted_ids(&api).await, sandboxes_before);
+}
+
+/// The `coding_v1` tools through installed kilnd's busybox: ranged reads
+/// of a file over 64 KiB built in the sandbox, an edit round trip and every
+/// refusal that reaches kilnd, and searches whose results come back in path
+/// order. The session then replays against a fresh sandbox.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn coding_tools_run_through_installed_kilnd() {
+    if std::env::var_os("KILND_INTEGRATION").is_none() {
+        return;
+    }
+    let socket = std::env::var_os("KILND_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/kilnd/kilnd.sock"), PathBuf::from);
+    let api = TonicKilnd::connect(socket)
+        .await
+        .expect("connect to installed kilnd");
+    let before = api.health().await.expect("health before");
+    assert!(before.serving, "kilnd unhealthy: {}", before.detail);
+    assert_eq!(before.active_sandboxes, 0);
+    let sandboxes_before = non_deleted_ids(&api).await;
+
+    // 6,000 numbered lines of 11 bytes, then a CRLF line, a line with a
+    // NUL, and a last line without a newline: 66,019 bytes.
+    let build = "set -e
+awk 'BEGIN { for (i = 1; i <= 6000; i++) printf \"line %05d\\n\", i }' > big.txt
+printf 'crlf\\r\\nnul\\000byte\\nlast' >> big.txt
+printf 'alpha\\nbeta\\ngamma\\n' > edit.txt
+mkdir -p sub alpha zeta
+printf 'x\\n' > sub/inner.txt
+printf '\\377\\376\\n' > bin.dat
+awk 'BEGIN { for (i = 0; i < 7000; i++) printf \"0123456789\" }' > huge.txt
+printf 'needle 1\\n' > alpha/b.txt
+printf 'needle 2\\n' > mid.txt
+printf 'needle 3\\n' > zeta/a.txt
+printf 'Needle 4\\n' > caps.txt
+printf 'needle odd\\n' > 'odd:name.txt'
+printf 'a -v flag\\n' > dash.txt
+printf abc > target.txt
+ln -s target.txt link.txt
+printf 'abc\\n' > target-lf.txt
+ln -s target-lf.txt link-lf.txt
+wc -c < big.txt";
+    let call = |id: &str, tool: &str, arguments: Value| ToolCall::new(id, tool, arguments);
+    let edit = |path: &str, old: &str, new: &str| json!({"path": path, "edits": [{"old_text": old, "new_text": new}]});
+    let provider = ScriptedProvider::new([
+        ModelResponse::tool_use([call(
+            "build",
+            "exec",
+            json!({"argv": ["/bin/sh", "-c", build]}),
+        )]),
+        ModelResponse::tool_use([
+            call(
+                "r-middle",
+                "read_file",
+                json!({"path": "big.txt", "start_line": 3000, "line_count": 2}),
+            ),
+            call(
+                "r-tail",
+                "read_file",
+                json!({"path": "big.txt", "start_line": 6001}),
+            ),
+            call(
+                "r-past",
+                "read_file",
+                json!({"path": "big.txt", "start_line": 6004}),
+            ),
+            call("r-prefix", "read_file", json!({"path": "big.txt"})),
+            call(
+                "l-plain",
+                "read_file",
+                json!({"path": "link.txt", "start_line": 1}),
+            ),
+            call(
+                "l-lf",
+                "read_file",
+                json!({"path": "link-lf.txt", "start_line": 1}),
+            ),
+            call(
+                "l-past",
+                "read_file",
+                json!({"path": "link.txt", "start_line": 2}),
+            ),
+        ]),
+        ModelResponse::tool_use([
+            call("e-ok", "edit_file", edit("edit.txt", "beta", "BETA")),
+            call("e-check", "read_file", json!({"path": "edit.txt"})),
+            call("e-missing", "edit_file", edit("missing.txt", "a", "b")),
+            call("e-dir", "edit_file", edit("sub", "a", "b")),
+            call("e-binary", "edit_file", edit("bin.dat", "a", "b")),
+            call("e-huge", "edit_file", edit("huge.txt", "0", "1")),
+        ]),
+        ModelResponse::tool_use([
+            call("s-literal", "search", json!({"pattern": "needle"})),
+            call(
+                "s-fold",
+                "search",
+                json!({"pattern": "NEEDLE", "ignore_case": true}),
+            ),
+            call(
+                "s-regex",
+                "search",
+                json!({"pattern": "^needle [13]$", "regex": true}),
+            ),
+            call("s-dash", "search", json!({"pattern": "-v"})),
+            call("s-bad", "search", json!({"pattern": "a(", "regex": true})),
+            call("s-none", "search", json!({"pattern": "absent-text"})),
+            call(
+                "s-missing",
+                "search",
+                json!({"pattern": "x", "path": "nowhere"}),
+            ),
+            call(
+                "s-dir",
+                "search",
+                json!({"pattern": "needle", "path": "zeta"}),
+            ),
+        ]),
+        ModelResponse::tool_use([call(
+            "version",
+            "exec",
+            json!({"argv": ["/bin/sh", "-c", "/bin/busybox --help | head -1"]}),
+        )]),
+        ModelResponse::final_text("coded"),
+    ]);
+    let config = HarnessConfig {
+        max_steps: 12,
+        max_tool_calls: 64,
+        tool_set: ToolSet::CodingV1,
+        ..HarnessConfig::default()
+    };
+    let temp = common::private_tempdir().expect("temporary directory");
+    let journal_path = temp.path().join("coding-journal.jsonl");
+    let mut harness = Harness::new(
+        api.clone(),
+        provider,
+        JsonlAudit::open(&temp.path().join("coding-audit.jsonl")).expect("open audit"),
+        JsonlJournal::open(&journal_path).expect("open journal"),
+        config,
+    );
+    harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("the coding session completes");
+
+    let recorded = read_journal(&journal_path).expect("journal verifies");
+    let JournalEvent::SessionStarted { tool_set, .. } = &recorded.records[0].event else {
+        panic!("session start");
+    };
+    assert_eq!(tool_set.as_deref(), Some("coding_v1"));
+    let results: BTreeMap<String, Value> = recorded
+        .records
+        .iter()
+        .filter_map(|record| match &record.event {
+            JournalEvent::ToolExecuted { call, result, .. } => {
+                Some((call.call_id.clone(), result.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let version = results["version"]["stdout"].as_str().unwrap_or_default();
+    eprintln!("busybox: {}", version.trim_end());
+    assert_eq!(
+        results["build"]["stdout"].as_str().map(str::trim),
+        Some("66019"),
+        "{}",
+        results["build"]
+    );
+
+    assert_eq!(
+        results["r-middle"],
+        json!({"ok": true, "content": "line 03000\nline 03001\n", "utf8": true,
+               "file_bytes": 66019, "start_line": 3000, "returned_lines": 2,
+               "next_line": 3002, "line_truncated": false, "truncated": true})
+    );
+    assert_eq!(
+        results["r-tail"],
+        json!({"ok": true, "content": "crlf\r\nnul\u{0}byte\nlast", "utf8": true,
+               "file_bytes": 66019, "start_line": 6001, "returned_lines": 3,
+               "next_line": null, "line_truncated": false, "truncated": false})
+    );
+    assert_eq!(
+        results["r-past"]["returned_lines"], 0,
+        "{}",
+        results["r-past"]
+    );
+    assert_eq!(results["r-past"]["next_line"], Value::Null);
+    assert_eq!(results["r-prefix"]["returned_bytes"], 65536);
+    // Through a symlink the size is the target's, as head reads it.
+    for (id, content, size, returned) in [
+        ("l-plain", "abc", 3, 1),
+        ("l-lf", "abc\n", 4, 1),
+        ("l-past", "", 3, 0),
+    ] {
+        assert_eq!(results[id]["content"], content, "{id}: {}", results[id]);
+        assert_eq!(results[id]["file_bytes"], size, "{id}: {}", results[id]);
+        assert_eq!(results[id]["returned_lines"], returned, "{id}");
+        assert_eq!(results[id]["next_line"], Value::Null, "{id}");
+    }
+    assert_eq!(results["r-prefix"]["truncated"], true);
+
+    assert_eq!(
+        results["e-ok"],
+        json!({"ok": true, "replacements": 1, "file_bytes": 17})
+    );
+    assert_eq!(results["e-check"]["content"], "alpha\nBETA\ngamma\n");
+    for id in ["e-missing", "e-dir"] {
+        assert_eq!(results[id]["error"], "read_failed", "{id}: {}", results[id]);
+        assert_ne!(results[id]["stderr"], "", "{id}: {}", results[id]);
+    }
+    assert_eq!(
+        results["e-binary"]["error"], "not_utf8",
+        "{}",
+        results["e-binary"]
+    );
+    assert_eq!(
+        results["e-huge"],
+        json!({"ok": false, "error": "file_too_large",
+               "message": "the file exceeds 64 KiB; use exec"})
+    );
+
+    assert_eq!(
+        results["s-literal"],
+        json!({"ok": true,
+               "matches": "alpha/b.txt:1:needle 1\nmid.txt:1:needle 2\nzeta/a.txt:1:needle 3\n",
+               "returned": 3, "seen": 3, "truncated": false, "skipped_files": 1,
+               "unparsed": 0, "partial": false})
+    );
+    assert_eq!(
+        results["s-fold"]["matches"],
+        "alpha/b.txt:1:needle 1\ncaps.txt:1:Needle 4\nmid.txt:1:needle 2\nzeta/a.txt:1:needle 3\n"
+    );
+    assert_eq!(
+        results["s-regex"]["matches"], "alpha/b.txt:1:needle 1\nzeta/a.txt:1:needle 3\n",
+        "{}",
+        results["s-regex"]
+    );
+    assert_eq!(results["s-dash"]["matches"], "dash.txt:1:a -v flag\n");
+    // A bad regex with input to compile against is grep's error.
+    assert_eq!(
+        results["s-bad"]["error"], "search_failed",
+        "{}",
+        results["s-bad"]
+    );
+    assert_eq!(results["s-bad"]["exit_code"], 2);
+    assert_ne!(results["s-bad"]["stderr"], "");
+    assert_eq!(results["s-none"]["returned"], 0);
+    assert_eq!(results["s-none"]["matches"], "");
+    assert_eq!(results["s-missing"]["error"], "search_failed");
+    assert_eq!(results["s-dir"]["matches"], "zeta/a.txt:1:needle 3\n");
+
+    // A fresh sandbox reproduces every result, search order included.
+    let provider = ReplayProvider::from_journal(&recorded).expect("replayable journal");
+    let config = provider.replay_config(HarnessConfig::default());
+    assert_eq!(config.tool_set, ToolSet::CodingV1);
+    let mut replay = Harness::new(
+        api.clone(),
+        provider,
+        JsonlAudit::open(&temp.path().join("coding-replay.jsonl")).expect("open replay audit"),
+        JsonlJournal::open(&temp.path().join("coding-replay-journal.jsonl"))
+            .expect("open replay journal"),
+        config,
+    );
+    replay
+        .replay(CancellationToken::new())
+        .await
+        .expect("the coding session replays");
+    assert_eq!(replay.provider().diverged_at(), None);
+    assert!(replay.provider().exhausted());
 
     let after = api.health().await.expect("health after");
     assert_eq!(after.active_sandboxes, 0);

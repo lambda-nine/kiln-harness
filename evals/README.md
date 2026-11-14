@@ -156,19 +156,27 @@ micro-dollars (0 for a run that never reached the model), and
 `long_prompt_requests` appears when some responses were priced at a
 long-prompt rate. `compactions` appears when the run compacted its history
 (`--compact-at`): the number of summaries it went on from.
+`tool_calls_by_name` maps each tool name the journal recorded to its
+calls (`unknown` for a name the session did not offer) and
+`failed_tool_calls` counts the calls whose result was not ok; a line
+written before they existed has neither, and its counts are unknown, not
+zero.
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
 kind and model, the base URL's host only, tasks, trials, runs at a time,
 the run cap when set, the effort sent and the thinking clearing (`off` or
 `keep N`, Anthropic only), the compaction threshold `compact_at` when set,
 the output limit per
-response, the price table and rates used or why the runs are unpriced,
+response, the tool set (`tool_set`: `base` or `coding_v1`; an older
+manifest reads as `base`), the price table and rates used or why the runs are unpriced,
 start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
 task the runs, passes, pass rate, outcome counts, mean and median steps, tool
 calls and wall time, mean tokens, mean cost, mean compactions (only with
 `--compact-at`, so other reports are unchanged), and replay counts; overall the macro pass
 rate (the mean of the task pass rates), pass@1 with the number of trials, and
-totals and means, with the total cost and the cost per passed run.
+totals and means, with the total cost and the cost per passed run. A line
+under the table gives the tool calls by name over every run and how many
+failed, or `unknown` when any run did not record them.
 
 ### Cost
 
@@ -238,7 +246,10 @@ clearing or output limits per response, or were priced with different price
 tables; reports written before these were
 recorded carry none of them, and an unknown setting is not reported as a
 difference. It also notes a different compaction threshold, off included:
-off is recorded as absent, and older reports could not compact.
+off is recorded as absent, and older reports could not compact. It notes a
+different tool set ("Tool sets differ: base → coding_v1"), an older report
+counting as `base`, and when both reports know their tool calls by name it
+shows each side's.
 
 ## The starter suite
 
@@ -303,6 +314,34 @@ them on the host too. `tests/fixtures/eval-hard/<id>/` holds overlays for each
 task: `fail-*` directories are plausible wrong answers the check must refuse,
 and `pass-*` directories correct answers written differently from the
 reference solution, which it must accept.
+
+## The coding suite
+
+`evals/coding` holds two tasks about changing existing files, for comparing
+`--tool-set base` with `--tool-set coding`: the coding tools are for
+editing part of a large file and finding code by what it does, which the
+starter and hard suites exercise only in passing. Both prompts name no
+tool, since both arms run them. Each gives a session 300 seconds and 30
+steps, with a 30-second check.
+
+- `config-sweep`: a 57 KiB `settings.conf` of about 1,600 lines; change
+  three named settings and delete one, leaving every other byte unchanged,
+  including comments that mention the same keys. The check regenerates the
+  expected file with the seed's own `awk` generator and compares bytes.
+- `find-and-fix`: textkit, a 34-file shell library under `lib/` and `bin/`
+  with a test script; one function, described by its symptom (wrong February
+  lengths in some years) rather than by file, has a bug. The check verifies
+  the test script is unchanged, runs it, and tries the leap-year rule on
+  years the tests do not, so a fix of the symptom elsewhere fails. It also
+  calls the rest of the fixed module (`month_name` and `month_abbr`, invalid
+  months included) and most functions of the other modules and commands on
+  inputs the tests do not use, so a rewrite that loses or changes one fails;
+  it does not require any file to stay byte for byte the same.
+
+Run it with `--tasks evals/coding` and self-test it with
+`eval selftest --tasks evals/coding`. Its checks and solutions are POSIX
+`sh` and `awk`, and the tests run them on the host too, with a few
+plausible wrong answers each check must refuse.
 
 ## Honest limits
 

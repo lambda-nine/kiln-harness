@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "config-sweep",
+  "description": "Change three settings and delete one in a 57 KiB config file, leaving every other byte, look-alike comments included, unchanged.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 300,
+  "max_steps": 30
+}

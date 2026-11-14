@@ -6,6 +6,36 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `--tool-set coding` (`run` and `eval run`; `base`, the default, is
+  unchanged) gives the model the tool set `coding_v1`: `read_file` also
+  takes `start_line` and `line_count` and returns whole lines, byte for
+  byte, from the first 1 MiB of a file (`stat -L`, so a symlink's target
+  is measured, then `head -c 1048576`);
+  `edit_file` replaces exact text with up to 32 edits matched against the
+  original file, each unique unless `replace_all`, which apply together or
+  not at all (`head -c` the file limit plus one, then `dd` with the new
+  bytes on stdin); `search` finds lines containing a literal string or a
+  POSIX extended regex under a `/workspace` path (`find -type f -print0`,
+  then `grep -n -H -F|-E [-i] -e PATTERN --` over the sorted names in argv
+  chunks), returning `path:line:text` in path order whatever the file
+  system's listing order. The default system prompt lists the new tools.
+  Host processing is bounded before it starts (1 MiB scanned, 10,000
+  replacements, the edited size computed before it is allocated, 200
+  matches), and every decision that treats output as a whole file or
+  listing first checks kilnd kept all of it: an edit after an incomplete
+  read is refused and writes nothing. A failure of a tool's later
+  execution keeps its earlier executions' IDs and evidence, and a lost
+  response there is still recovered after them. `session_started` records
+  `tool_set: "coding_v1"`; replay restores it and refuses a configuration
+  with another set, and `journal verify` refuses a journal naming a set
+  this build does not know. Base sessions' requests, journals and replay
+  are byte-identical to before. Eval manifests and reports record
+  `tool_set` (`base` for older files), result lines add
+  `tool_calls_by_name` and `failed_tool_calls` (unknown for older lines),
+  `report.md` gives them on one line with the tool set in its header, and
+  `eval compare` notes differing tool sets and shows both sides' tool calls
+  when both know them. A new `evals/coding` suite (`config-sweep`,
+  `find-and-fix`) exercises work on existing files.
 - `--compact-at TOKENS` (20,000 to 1,000,000, `--provider anthropic` only,
   off by default) compacts the session's context, recorded. Before a turn
   whose prompt is estimated over TOKENS (the last response's usage plus the

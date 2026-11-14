@@ -35,10 +35,10 @@ use kiln_harness::provider::{
 use kiln_harness::providers::anthropic::{DEFAULT_BASE_URL, DEFAULT_MODEL};
 use kiln_harness::providers::{
     AnthropicConfig, AnthropicProvider, Effort, OpenAiCompatConfig, OpenAiCompatProvider,
-    SecretString, default_system_prompt,
+    SecretString, default_system_prompt_for,
 };
 use kiln_harness::replay::ReplayProvider;
-use kiln_harness::tools::ToolLimits;
+use kiln_harness::tools::{ToolLimits, ToolSet};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -110,6 +110,24 @@ enum ProviderKind {
     Anthropic,
 }
 
+/// `--tool-set`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ToolSetArg {
+    #[value(name = "base")]
+    Base,
+    #[value(name = "coding")]
+    Coding,
+}
+
+impl From<ToolSetArg> for ToolSet {
+    fn from(arg: ToolSetArg) -> Self {
+        match arg {
+            ToolSetArg::Base => Self::Base,
+            ToolSetArg::Coding => Self::CodingV1,
+        }
+    }
+}
+
 /// The provider and limit flags `run` and `eval run` share.
 #[derive(clap::Args)]
 struct ModelArgs {
@@ -157,6 +175,14 @@ struct ModelArgs {
     /// Not with --clear-thinking or --fallbacks.
     #[arg(long, value_name = "TOKENS")]
     compact_at: Option<u64>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ToolSetArg::Base,
+        help = "Tools the model gets: base (exec, read_file, write_file, list_dir, \
+                workspace_diff) or coding (adds edit_file, search and line ranges in read_file)"
+    )]
+    tool_set: ToolSetArg,
     /// Model turns per session.
     #[arg(long, default_value_t = 40)]
     max_steps: u32,
@@ -478,7 +504,7 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
     }
     let system = match &args.system_file {
         Some(path) => read_text_file("--system-file", path)?,
-        None => default_system_prompt(&config.tool_limits),
+        None => default_system_prompt_for(&config.tool_limits, config.tool_set),
     };
 
     let provider = build_provider(&args.model)?;
@@ -576,6 +602,7 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         sandbox_idle_timeout: Duration::from_secs(args.sandbox_idle_timeout_secs),
         sandbox_lifetime_margin: Duration::from_secs(args.sandbox_lifetime_margin_secs),
         compaction,
+        tool_set: args.tool_set.into(),
         ..HarnessConfig::default()
     };
     config.validate()?;
@@ -990,6 +1017,9 @@ fn verify(path: &Path) -> ExitCode {
     );
     println!("turns: {}", summary.turns);
     println!("tool calls: {}", summary.tool_calls);
+    if let Some(tool_set) = &summary.tool_set {
+        println!("tool set: {}", terminal_safe(tool_set));
+    }
     if summary.compactions > 0 {
         println!("compactions: {}", summary.compactions);
     }
@@ -1016,6 +1046,8 @@ struct Summary {
     tool_calls: u32,
     /// Compactions that returned a summary.
     compactions: u32,
+    /// The recorded tool set, when not base.
+    tool_set: Option<String>,
     usage: Usage,
     seed_files: usize,
     check: Option<CheckOutcome>,
@@ -1028,13 +1060,17 @@ fn summarize(journal: &LoadedJournal) -> Summary {
         turns: 0,
         tool_calls: 0,
         compactions: 0,
+        tool_set: None,
         usage: Usage::default(),
         seed_files: 0,
         check: None,
     };
     for record in &journal.records {
         match &record.event {
-            JournalEvent::SessionStarted { seed, .. } => summary.seed_files = seed.len(),
+            JournalEvent::SessionStarted { seed, tool_set, .. } => {
+                summary.seed_files = seed.len();
+                summary.tool_set.clone_from(tool_set);
+            }
             JournalEvent::CheckCompleted { outcome, .. } => summary.check = Some(outcome.clone()),
             JournalEvent::ModelRequested { .. } => summary.turns += 1,
             JournalEvent::ModelResponded { response, .. } => {
@@ -1515,6 +1551,52 @@ mod tests {
                 "--max-truncation-recoveries must be between 0 and 16"
             );
         }
+    }
+
+    #[test]
+    fn the_tool_set_flag_reaches_the_config_and_the_default_prompt() {
+        let parse = |argv: &[&str]| match Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Command::Run(run)) => Ok(run),
+            Ok(_) => panic!("parsed as run"),
+            Err(error) => Err(error),
+        };
+        let base = [
+            "kiln-harness",
+            "run",
+            "--provider",
+            "anthropic",
+            "--base-url",
+            "http://127.0.0.1:8788",
+            "--prompt",
+            "x",
+        ];
+        let run = parse(&base).expect("parses");
+        assert_eq!(
+            model_config(&run.model).expect("config").tool_set,
+            ToolSet::Base
+        );
+        let prepared = prepare_run(&run).expect("prepared");
+        assert_eq!(
+            prepared.task.system,
+            default_system_prompt_for(&prepared.config.tool_limits, ToolSet::Base)
+        );
+        let mut coding = base.to_vec();
+        coding.extend(["--tool-set", "coding"]);
+        let run = parse(&coding).expect("parses");
+        let prepared = prepare_run(&run).expect("prepared");
+        assert_eq!(prepared.config.tool_set, ToolSet::CodingV1);
+        assert!(prepared.task.system.contains("- edit_file: "));
+        // A system file still wins.
+        let dir = private_tempdir().expect("temp dir");
+        let system = dir.path().join("system.md");
+        std::fs::write(&system, "Mine.").expect("write");
+        let mut with_file = coding.clone();
+        with_file.extend(["--system-file", system.to_str().expect("utf-8")]);
+        let run = parse(&with_file).expect("parses");
+        assert_eq!(prepare_run(&run).expect("prepared").task.system, "Mine.");
+        let mut wrong = base.to_vec();
+        wrong.extend(["--tool-set", "coding_v1"]);
+        assert!(parse(&wrong).is_err());
     }
 
     fn run_model_args(extra: &[&str]) -> ModelArgs {

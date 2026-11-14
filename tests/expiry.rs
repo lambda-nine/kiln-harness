@@ -730,6 +730,7 @@ fn common_session_started() -> JournalEvent {
         check: None,
         exec_context: None,
         compaction: None,
+        tool_set: None,
     }
 }
 
