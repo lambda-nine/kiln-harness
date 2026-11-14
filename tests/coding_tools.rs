@@ -2049,3 +2049,182 @@ async fn a_ranged_read_through_a_symlink_measures_the_target() {
         ["/bin/stat", "-c", "%s", "--", "/workspace/link.txt"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation during a composite tool
+
+/// What the first tool call of a session canceled during it recorded: its
+/// journaled and audited execution IDs, which must agree, and its stdout
+/// evidence. With `sent`, the session is canceled once that many Execs were
+/// sent (the baseline included); otherwise the fake cancels `cancel` itself.
+async fn canceled_first_call(
+    api: &FakeApi,
+    config: HarnessConfig,
+    call: (&str, Value),
+    cancel: CancellationToken,
+    sent: Option<usize>,
+) -> (Vec<String>, kiln_harness::audit::OutputEvidence) {
+    use std::time::Duration;
+    let tool = call.0.to_string();
+    let task = coding_task(&config);
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new([
+            turn(vec![("first", call.0, call.1)]),
+            ModelResponse::final_text("done"),
+        ]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let canceler = {
+        let cancel = cancel.clone();
+        let control = api.clone();
+        async move {
+            let Some(sent) = sent else { return };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while control.state().execs.len() < sent {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the later Exec was sent");
+            cancel.cancel();
+        }
+    };
+    let (result, ()) = tokio::join!(harness.run(&task, cancel), canceler);
+    assert!(
+        matches!(result, Err(HarnessError::Canceled)),
+        "{tool}: {result:?}"
+    );
+    let journaled = harness
+        .journal()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::ToolExecuted { execution_ids, .. } => Some(execution_ids.clone()),
+            _ => None,
+        })
+        .expect("the call was journaled");
+    let (audited, stdout) = harness
+        .audit()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            AuditEvent::ToolCompleted {
+                execution_ids,
+                stdout,
+                ..
+            } => Some((execution_ids.clone(), *stdout)),
+            _ => None,
+        })
+        .expect("the call was audited");
+    assert_eq!(journaled, audited, "{tool}");
+    (audited, stdout)
+}
+
+/// The stdout bytes the fake's executions `first` to `last` (from 1)
+/// observed.
+fn observed(api: &FakeApi, first: usize, last: usize) -> u64 {
+    api.state().executions[first - 1..last]
+        .iter()
+        .map(|execution| execution.stdout.observed_bytes)
+        .sum()
+}
+
+#[tokio::test]
+async fn a_cancellation_with_recovery_unreadable_keeps_the_earlier_executions() {
+    for (tool, arguments, later, earlier, earlier_stdout) in composite_calls() {
+        let api = api_with(&[("notes.txt", NOTES)]);
+        api.state().tool_exec_delay = std::time::Duration::from_millis(80);
+        api.state().recent_unavailable = true;
+        let (ids_seen, stdout) = canceled_first_call(
+            &api,
+            coding_config(),
+            (tool, arguments),
+            CancellationToken::new(),
+            Some(later),
+        )
+        .await;
+        // The later Exec's outcome is unknown, and so are the totals; what
+        // the earlier ones returned is still on record.
+        assert_eq!(ids_seen, earlier, "{tool}");
+        assert_eq!(stdout.observed_bytes, earlier_stdout, "{tool}");
+        assert!(!stdout.total_bytes_known, "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_recovers_the_later_execution_after_the_earlier_ones() {
+    for (tool, arguments, later, mut earlier, _) in composite_calls() {
+        let api = api_with(&[("notes.txt", NOTES)]);
+        api.state().tool_exec_delay = std::time::Duration::from_millis(80);
+        let (ids_seen, stdout) = canceled_first_call(
+            &api,
+            coding_config(),
+            (tool, arguments),
+            CancellationToken::new(),
+            Some(later),
+        )
+        .await;
+        // In execution order, though kilnd lists the newest first.
+        earlier.extend(ids(&[later]));
+        assert_eq!(ids_seen, earlier, "{tool}");
+        assert_eq!(stdout.observed_bytes, observed(&api, 2, later), "{tool}");
+        assert!(stdout.total_bytes_known, "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_between_executions_keeps_only_the_earlier_ones() {
+    for (tool, arguments, later, earlier, earlier_stdout) in composite_calls() {
+        let api = api_with(&[("notes.txt", NOTES)]);
+        let cancel = CancellationToken::new();
+        api.state().cancel_at_exec = Some((later, cancel.clone()));
+        let (ids_seen, stdout) =
+            canceled_first_call(&api, coding_config(), (tool, arguments), cancel, None).await;
+        assert_eq!(
+            api.state().execs.len(),
+            later - 1,
+            "{tool}: nothing reached kilnd"
+        );
+        assert_eq!(ids_seen, earlier, "{tool}");
+        assert_eq!(stdout.observed_bytes, earlier_stdout, "{tool}");
+        assert!(!stdout.total_bytes_known, "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_during_a_later_search_chunk_keeps_the_listing_and_earlier_chunks() {
+    let search = || ("search", json!({"pattern": "needle"}));
+    // Unreadable recovery: the listing and the first chunk stay.
+    let api = two_chunk_api();
+    api.state().tool_exec_delay = std::time::Duration::from_millis(80);
+    api.state().recent_unavailable = true;
+    let (ids_seen, stdout) = canceled_first_call(
+        &api,
+        two_chunk_config(),
+        search(),
+        CancellationToken::new(),
+        Some(4),
+    )
+    .await;
+    assert_eq!(ids_seen, ids(&[2, 3]));
+    assert_eq!(stdout.observed_bytes, observed(&api, 2, 3));
+    assert!(!stdout.total_bytes_known);
+
+    // Readable recovery adds the second chunk after them.
+    let api = two_chunk_api();
+    api.state().tool_exec_delay = std::time::Duration::from_millis(80);
+    let (ids_seen, stdout) = canceled_first_call(
+        &api,
+        two_chunk_config(),
+        search(),
+        CancellationToken::new(),
+        Some(4),
+    )
+    .await;
+    assert_eq!(ids_seen, ids(&[2, 3, 4]));
+    assert_eq!(stdout.observed_bytes, observed(&api, 2, 4));
+    assert!(stdout.total_bytes_known);
+}

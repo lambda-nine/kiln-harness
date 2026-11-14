@@ -264,7 +264,9 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     /// outcome is unknown (its RPC failed, or the deadline passed), the run
     /// also says so, so response-loss recovery still looks for it; when the
     /// sandbox was already unusable nothing was sent, and there is nothing
-    /// to look for.
+    /// to look for. A settled execution is also recorded outside the call's
+    /// future ([`ToolSession::record_settled`]), so a call dropped by
+    /// cancellation keeps it too.
     async fn run_fixed(
         &self,
         argv: Vec<String>,
@@ -274,7 +276,10 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     ) -> Result<Execution, ToolRun> {
         let unusable_before = self.unusable().is_some();
         let error = match self.run(argv, stdin, self.limits.timeout, deadline).await {
-            Ok(execution) => return Ok(execution),
+            Ok(execution) => {
+                self.record_settled(&execution);
+                return Ok(execution);
+            }
             Err(error) => error,
         };
         let unresolved = matches!(error, ToolError::Deadline)

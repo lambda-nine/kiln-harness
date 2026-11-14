@@ -502,6 +502,7 @@ impl ToolRegistry {
             unusable: Mutex::new(None),
             live: None,
             stream_call: Mutex::new(None),
+            settled_call: Mutex::new(None),
         };
         // The seed goes in before the baseline, so the baseline includes it
         // and `workspace_diff` shows only the agent's changes.
@@ -589,6 +590,11 @@ pub struct ToolSession<'a, A: SandboxApi> {
     /// recovery. It lives outside the call's future, so a call dropped by
     /// cancellation or its deadline still leaves what it learned.
     stream_call: Mutex<Option<StreamCall>>,
+    /// The executions the coding call in flight has settled, in order, with
+    /// their evidence. It lives outside the call's future, so a call dropped
+    /// by cancellation still leaves what it learned; see
+    /// [`ToolSession::take_settled_call`].
+    settled_call: Mutex<Option<EarlierExecutions>>,
 }
 
 /// What a streamed `exec` learned from its stream, kept for response-loss
@@ -629,20 +635,29 @@ pub(crate) struct EarlierExecutions {
 }
 
 impl EarlierExecutions {
-    fn of(executions: &[&Execution]) -> Self {
-        let mut earlier = Self {
+    fn empty() -> Self {
+        Self {
             execution_ids: Vec::new(),
             stdout: empty_evidence(),
             stderr: empty_evidence(),
-        };
+        }
+    }
+
+    fn of(executions: &[&Execution]) -> Self {
+        let mut earlier = Self::empty();
         for execution in executions {
-            if !earlier.execution_ids.contains(&execution.id) {
-                earlier.execution_ids.push(execution.id.clone());
-            }
-            earlier.stdout = merge_evidence(earlier.stdout, evidence(&execution.stdout));
-            earlier.stderr = merge_evidence(earlier.stderr, evidence(&execution.stderr));
+            earlier.push(execution);
         }
         earlier
+    }
+
+    /// Add `execution` after the others: its ID once, its evidence merged.
+    fn push(&mut self, execution: &Execution) {
+        if !self.execution_ids.contains(&execution.id) {
+            self.execution_ids.push(execution.id.clone());
+        }
+        self.stdout = merge_evidence(self.stdout, evidence(&execution.stdout));
+        self.stderr = merge_evidence(self.stderr, evidence(&execution.stderr));
     }
 }
 
@@ -761,6 +776,22 @@ impl ToolRun {
             live: None,
             earlier: None,
         }
+    }
+
+    /// [`ToolRun::interrupted`] for a call that had already settled
+    /// `earlier`, the executions a coding tool ran before it was dropped.
+    /// They stay first in its IDs and evidence, the totals stay unknown, and
+    /// response-loss recovery still looks for what may have followed them.
+    /// With `None` it is exactly [`ToolRun::interrupted`].
+    pub(crate) fn interrupted_after(stop: ToolStop, earlier: Option<EarlierExecutions>) -> Self {
+        let mut run = Self::interrupted(stop);
+        if let Some(earlier) = earlier {
+            run.execution_ids.clone_from(&earlier.execution_ids);
+            run.stdout = merge_evidence(earlier.stdout, run.stdout);
+            run.stderr = merge_evidence(earlier.stderr, run.stderr);
+            run.earlier = Some(earlier);
+        }
+        run
     }
 
     pub(crate) fn bounded(mut self, max_bytes: usize) -> Self {
@@ -970,6 +1001,27 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         recovered
     }
 
+    /// Record that the coding call in flight settled `execution`, after the
+    /// ones it settled before.
+    pub(crate) fn record_settled(&self, execution: &Execution) {
+        self.settled_call
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(EarlierExecutions::empty)
+            .push(execution);
+    }
+
+    /// What a coding call dropped before it returned had settled, in order,
+    /// for [`ToolRun::interrupted_after`]; `None` when it settled nothing,
+    /// or when the call was not a coding tool's. Each call starts and ends
+    /// with this cleared, so it never names an earlier call's executions.
+    pub(crate) fn take_settled_call(&self) -> Option<EarlierExecutions> {
+        self.settled_call
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     /// Whether `tool` with `arguments` would reach kilnd: a registered tool
     /// whose arguments pass every host-side check. Unknown tools and invalid
     /// arguments are answered on the host and send nothing.
@@ -1009,6 +1061,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .stream_call
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.take_settled_call();
         let deadline = session_deadline.min(Instant::now() + self.limits.timeout);
         let run = match self.plan(tool, arguments) {
             Err(rejected) => rejected,
@@ -1034,6 +1087,8 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             Ok(ToolPlan::List { path }) => self.list_dir(path, deadline).await,
             Ok(ToolPlan::Diff) => self.workspace_diff(deadline).await,
         };
+        // The call ended with its own run, which holds what it settled.
+        self.take_settled_call();
         let mut run = run.bounded(self.limits.max_result_bytes);
         // A successful RPC does not mean the sandbox survived. The result
         // stays as it is, but the session cannot go on.

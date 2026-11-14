@@ -1446,8 +1446,13 @@ where
                 // Misnamed tools are model mistakes: report and continue.
                 rejected_tool_run("unknown_tool")
             } else {
+                // A coding call dropped here keeps the executions it had
+                // settled; recovery then looks only past them.
                 tokio::select! {
-                    () = cancel.cancelled() => ToolRun::interrupted(ToolStop::Canceled),
+                    () = cancel.cancelled() => ToolRun::interrupted_after(
+                        ToolStop::Canceled,
+                        context.tools.take_settled_call(),
+                    ),
                     run = context.tools.execute_call(
                         &call.visible.tool,
                         call.visible.arguments.clone(),

@@ -25,7 +25,8 @@ change the CLI or audit format.
   listing first checks kilnd kept all of it: an edit after an incomplete
   read is refused and writes nothing. A failure of a tool's later
   execution keeps its earlier executions' IDs and evidence, and a lost
-  response there is still recovered after them. `session_started` records
+  response there, or a cancellation during the call, is still recovered
+  after them, in execution order. `session_started` records
   `tool_set: "coding_v1"`; replay restores it and refuses a configuration
   with another set, and `journal verify` refuses a journal naming a set
   this build does not know. Base sessions' requests, journals and replay

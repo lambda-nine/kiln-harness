@@ -1115,7 +1115,13 @@ other than the session's and this call's known ones, and the rows it finds
 follow the earlier executions, their evidence merged after theirs. If it
 finds none, the earlier executions stay with the unknown evidence. When the
 sandbox was already unusable no Exec is sent, so there is nothing to look
-for. The base tools keep their behaviour.
+for. Cancellation drops the call's future, so each execution a coding tool
+settles is also recorded outside it, in the tool session, cleared at each
+call's start and end. A session canceled during the call ends it with
+those executions first and its evidence unknown, as for a later lost
+response, and the same recovery then looks only past them; a cancellation
+between two executions keeps the earlier ones and finds nothing more. The
+base tools keep their behaviour.
 
 **Ranged `read_file`.** Without either line field it is the base read.
 Its `stat` takes `-L`, so through a symbolic link the size is the target's,

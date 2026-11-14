@@ -316,6 +316,9 @@ pub struct FakeState {
     /// link's directory. `head` follows one, as does `stat -L`; plain `stat`
     /// reports the link's own size, the length of its text.
     pub symlinks: BTreeMap<String, String>,
+    /// The Nth Exec (from 1) cancels this token and never answers, with no
+    /// row: a cancellation that lands before the request reaches kilnd.
+    pub cancel_at_exec: Option<(usize, tokio_util::sync::CancellationToken)>,
 }
 
 impl FakeState {
@@ -877,6 +880,18 @@ impl SandboxApi for FakeApi {
     }
 
     async fn exec(&self, request: SandboxExec) -> Result<Execution, ApiError> {
+        let held = {
+            let state = self.state();
+            state
+                .cancel_at_exec
+                .as_ref()
+                .filter(|(number, _)| *number == state.execs.len() + 1)
+                .map(|(_, token)| token.clone())
+        };
+        if let Some(token) = held {
+            token.cancel();
+            std::future::pending::<()>().await;
+        }
         let (execution, delay, lost) = self.record_exec(request, ExecutionMode::Unary).await?;
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
