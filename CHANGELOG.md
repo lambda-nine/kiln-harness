@@ -6,6 +6,15 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `--tool-set coding` now gives the tool set `coding_v2`. It is `coding_v1`
+  but for `edit_file`, which also takes one edit as top-level `old_text`,
+  `new_text` and `replace_all` (only `path` is required), or several as
+  `edits` as before, never both. A call with both forms, or with `edits`
+  sent as a string, is refused with a message that says how to send it; a
+  one-edit call's messages name no edit index ("old_text was not found"),
+  with the same error kinds. The default system prompt's `edit_file` line
+  leads with the one-edit form. Journals recorded with `coding_v1` still
+  replay with `coding_v1`'s tools, prompt and messages, unchanged.
 - `--tool-set coding` (`run` and `eval run`; `base`, the default, is
   unchanged) gives the model the tool set `coding_v1`: `read_file` also
   takes `start_line` and `line_count` and returns whole lines, byte for

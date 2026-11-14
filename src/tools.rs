@@ -23,22 +23,27 @@ use crate::provider::{ToolCall, ToolDefinition};
 
 mod coding;
 
-use coding::EditArgs;
+use coding::{EditArgs, EditForm};
 
 const WORKSPACE: &str = "/workspace";
 
 /// Which tools a session gives the model. The journal records it in
 /// `session_started`, so replay offers a recording the tools it had.
-/// Every constant of the coding tools belongs to [`ToolSet::CodingV1`]:
-/// changing any of them needs a new set name.
+/// Every constant of a coding set's tools belongs to that set: changing any
+/// of them needs a new set name. [`ToolSet::CodingV1`] is kept unchanged so
+/// its recordings replay; `--tool-set coding` gives [`ToolSet::CodingV2`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolSet {
     /// `exec`, `read_file`, `write_file`, `list_dir` and `workspace_diff`.
     #[default]
     Base,
     /// The base tools, with line ranges in `read_file`, plus `edit_file`
-    /// and `search`.
+    /// and `search`. `edit_file` takes its edits only as an `edits` array.
     CodingV1,
+    /// [`ToolSet::CodingV1`], except that `edit_file` also takes one edit
+    /// as top-level `old_text`, `new_text` and `replace_all`, and refuses a
+    /// call in that form without an edit index in its messages.
+    CodingV2,
 }
 
 impl ToolSet {
@@ -49,26 +54,30 @@ impl ToolSet {
         match self {
             Self::Base => None,
             Self::CodingV1 => Some("coding_v1"),
+            Self::CodingV2 => Some("coding_v2"),
         }
     }
 
     /// The set a recorded `tool_set` names: absent is base, and any value
-    /// but `coding_v1` is unknown (`None`).
+    /// but `coding_v1` and `coding_v2` is unknown (`None`).
     #[must_use]
     pub fn from_journal(name: Option<&str>) -> Option<Self> {
         match name {
             None => Some(Self::Base),
             Some("coding_v1") => Some(Self::CodingV1),
+            Some("coding_v2") => Some(Self::CodingV2),
             Some(_) => None,
         }
     }
 
-    /// The name eval manifests and reports use: `base` or `coding_v1`.
+    /// The name eval manifests and reports use: `base`, `coding_v1` or
+    /// `coding_v2`.
     #[must_use]
     pub fn report_name(self) -> &'static str {
         match self {
             Self::Base => "base",
             Self::CodingV1 => "coding_v1",
+            Self::CodingV2 => "coding_v2",
         }
     }
 }
@@ -417,6 +426,9 @@ pub struct ToolRegistry {
     /// The [`ToolSet::CodingV1`] tools, unary and streaming.
     coding_definitions: Vec<ToolDefinition>,
     coding_streaming_definitions: Vec<ToolDefinition>,
+    /// The [`ToolSet::CodingV2`] tools, unary and streaming.
+    coding_v2_definitions: Vec<ToolDefinition>,
+    coding_v2_streaming_definitions: Vec<ToolDefinition>,
 }
 
 impl ToolRegistry {
@@ -427,6 +439,8 @@ impl ToolRegistry {
             streaming_definitions: definitions(true, ToolSet::Base, &limits),
             coding_definitions: definitions(false, ToolSet::CodingV1, &limits),
             coding_streaming_definitions: definitions(true, ToolSet::CodingV1, &limits),
+            coding_v2_definitions: definitions(false, ToolSet::CodingV2, &limits),
+            coding_v2_streaming_definitions: definitions(true, ToolSet::CodingV2, &limits),
             limits,
         }
     }
@@ -440,6 +454,8 @@ impl ToolRegistry {
             (ToolSet::Base, true) => &self.streaming_definitions,
             (ToolSet::CodingV1, false) => &self.coding_definitions,
             (ToolSet::CodingV1, true) => &self.coding_streaming_definitions,
+            (ToolSet::CodingV2, false) => &self.coding_v2_definitions,
+            (ToolSet::CodingV2, true) => &self.coding_v2_streaming_definitions,
         }
     }
 
@@ -1082,7 +1098,9 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                     .await
             }
             Ok(ToolPlan::Write { path, bytes }) => self.write_file(path, bytes, deadline).await,
-            Ok(ToolPlan::Edit { path, edits }) => self.edit_file(path, edits, deadline).await,
+            Ok(ToolPlan::Edit { path, edits, form }) => {
+                self.edit_file(path, edits, form, deadline).await
+            }
             Ok(ToolPlan::Search(plan)) => self.search(plan, deadline).await,
             Ok(ToolPlan::List { path }) => self.list_dir(path, deadline).await,
             Ok(ToolPlan::Diff) => self.workspace_diff(deadline).await,
@@ -1111,9 +1129,14 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 let max_bytes = self.read_max_bytes(args.max_bytes)?;
                 Ok(ToolPlan::Read { path, max_bytes })
             }
-            (ToolSet::CodingV1, "read_file") => self.plan_coding_read(arguments),
+            (ToolSet::CodingV1 | ToolSet::CodingV2, "read_file") => {
+                self.plan_coding_read(arguments)
+            }
             (ToolSet::CodingV1, "edit_file") => self.plan_edit(arguments),
-            (ToolSet::CodingV1, "search") => Self::plan_search(arguments).map(ToolPlan::Search),
+            (ToolSet::CodingV2, "edit_file") => self.plan_edit_v2(arguments),
+            (ToolSet::CodingV1 | ToolSet::CodingV2, "search") => {
+                Self::plan_search(arguments).map(ToolPlan::Search)
+            }
             (_, "write_file") => {
                 let args: WriteFileArgs = parse_arguments(arguments)?;
                 let path = workspace_path(&args.path, false)
@@ -2009,6 +2032,7 @@ enum ToolPlan {
     Edit {
         path: String,
         edits: Vec<EditArgs>,
+        form: EditForm,
     },
     Search(coding::SearchPlan),
     List {
@@ -2831,12 +2855,12 @@ fn aggregate_recovered(
 }
 
 /// The registered tools of `tool_set`; `streaming` describes `exec` as a
-/// streaming session runs it. Only the coding set's descriptions use
+/// streaming session runs it. Only the coding sets' descriptions use
 /// `limits`.
 fn definitions(streaming: bool, tool_set: ToolSet, limits: &ToolLimits) -> Vec<ToolDefinition> {
     let mut tools = base_definitions(streaming);
-    if tool_set == ToolSet::CodingV1 {
-        coding::extend_definitions(&mut tools, limits);
+    if tool_set != ToolSet::Base {
+        coding::extend_definitions(&mut tools, limits, tool_set);
     }
     tools
 }

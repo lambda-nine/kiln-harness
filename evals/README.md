@@ -167,7 +167,7 @@ kind and model, the base URL's host only, tasks, trials, runs at a time,
 the run cap when set, the effort sent and the thinking clearing (`off` or
 `keep N`, Anthropic only), the compaction threshold `compact_at` when set,
 the output limit per
-response, the tool set (`tool_set`: `base` or `coding_v1`; an older
+response, the tool set (`tool_set`: `base`, `coding_v1` or `coding_v2`; an older
 manifest reads as `base`), the price table and rates used or why the runs are unpriced,
 start and end times, and the features kilnd listed), `OUT/report.json`, and `OUT/report.md`: per
 task the runs, passes, pass rate, outcome counts, mean and median steps, tool
@@ -247,7 +247,7 @@ tables; reports written before these were
 recorded carry none of them, and an unknown setting is not reported as a
 difference. It also notes a different compaction threshold, off included:
 off is recorded as absent, and older reports could not compact. It notes a
-different tool set ("Tool sets differ: base → coding_v1"), an older report
+different tool set ("Tool sets differ: base → coding_v2"), an older report
 counting as `base`, and when both reports know their tool calls by name it
 shows each side's.
 
@@ -317,12 +317,14 @@ reference solution, which it must accept.
 
 ## The coding suite
 
-`evals/coding` holds two tasks about changing existing files, for comparing
+`evals/coding` holds six tasks about changing existing files, for comparing
 `--tool-set base` with `--tool-set coding`: the coding tools are for
 editing part of a large file and finding code by what it does, which the
-starter and hard suites exercise only in passing. Both prompts name no
-tool, since both arms run them. Each gives a session 300 seconds and 30
-steps, with a 30-second check.
+starter and hard suites exercise only in passing. No prompt names a tool,
+since both arms run them. The first two give a session 300 seconds and 30
+steps; the last four, made so that a single `sed` or a whole-file rewrite
+is unlikely to get them right, give 600 seconds, 40 steps and 80 tool
+calls. Every check has 30 seconds.
 
 - `config-sweep`: a 57 KiB `settings.conf` of about 1,600 lines; change
   three named settings and delete one, leaving every other byte unchanged,
@@ -337,6 +339,41 @@ steps, with a 30-second check.
   months included) and most functions of the other modules and commands on
   inputs the tests do not use, so a rewrite that loses or changes one fails;
   it does not require any file to stay byte for byte the same.
+- `rename-across-tree`: rename the shell function `fmt_size` to
+  `format_size` across a 36-file project (41 places: calls in pipelines,
+  after `;` and `&&`, inside `$( )`, backquotes, here-documents and an
+  `sh -c` string, `command -v` and a variable holding the name), while
+  printed text that says `fmt_size`, a variable called `fmt_size`, the awk
+  helpers of that name, `fmt_size_si` and the other look-alikes, and every
+  file that is not a `.sh` file stay as they are. The check compares every
+  file with the expected tree by SHA-256 and runs the project's tests.
+- `three-fixes-big-file`: a 50 KiB, 1,385-line awk invoicing program with
+  three bugs reported by symptom only (CSV doubled quotes, refund rounding,
+  JSON backslashes), in functions early, in the middle and near the end of
+  the file. The check requires every line outside those three functions to
+  be unchanged and the file to end with a newline; a function runs from its
+  `function NAME(` line, spacing free, to the next top-level function or
+  block, less the comment and blank lines just before that. It builds the
+  reference by putting the fixed functions into the agent's file, and
+  compares all ten reports on seven hidden inputs with it: stdout, stderr
+  and exit status.
+- `add-parameter`: `log_event LEVEL MESSAGE` gains an optional COMPONENT,
+  and its 24 calls across 8 scripts pass their file's base name, placed
+  right after the message even when the call continues over lines, the
+  message spans lines, or a redirection or `||` follows it. Comments,
+  printed examples, `log_events`, `tests/` and `etc/` stay unchanged. The
+  check compares every other file by SHA-256, the parts of `lib/log.sh`
+  around `log_event`, and the function's behaviour, then runs the tests,
+  one of which expects the new format.
+- `section-config`: seven changes in a 49 KiB, 224-section INI file whose
+  sections repeat the same keys and values: set a value with its aligned
+  spacing kept, insert a line after a multi-line value, delete a setting
+  with its continuation lines, rename one section header, and edit two
+  lists, each in one named section only. The check hashes the file section
+  by section, so a failure names the first section that differs.
+
+These four checks also refuse any entry in the workspace that is not a
+regular file or a directory, such as a symlink left behind.
 
 Run it with `--tasks evals/coding` and self-test it with
 `eval selftest --tasks evals/coding`. Its checks and solutions are POSIX

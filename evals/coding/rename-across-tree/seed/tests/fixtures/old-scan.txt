@@ -1,0 +1,5 @@
+# The same tree, a week earlier.
+docs/a.txt 512
+src/main.c 18432
+src/big.bin 2097152
+img/logo.png 1048576

@@ -1,6 +1,8 @@
-//! The opt-in `coding_v1` tool set: ranged `read_file`, `edit_file` and
-//! `search` against the fake kilnd, its journal record and replay, and the
-//! base set's byte-for-byte compatibility.
+//! The opt-in coding tool sets: ranged `read_file`, `edit_file` and
+//! `search` against the fake kilnd, their journal record and replay, and the
+//! base set's byte-for-byte compatibility. `coding_v1` takes `edit_file`'s
+//! edits only as an array and stays as recorded; `coding_v2` also takes one
+//! edit as top-level fields.
 mod common;
 
 use std::collections::BTreeMap;
@@ -248,15 +250,101 @@ fn the_base_set_refuses_the_coding_calls_as_before() {
 
 #[test]
 fn tool_set_names_round_trip() {
-    for set in [ToolSet::Base, ToolSet::CodingV1] {
+    for set in [ToolSet::Base, ToolSet::CodingV1, ToolSet::CodingV2] {
         assert_eq!(ToolSet::from_journal(set.journal_name()), Some(set));
     }
     assert_eq!(ToolSet::Base.journal_name(), None);
     assert_eq!(ToolSet::CodingV1.journal_name(), Some("coding_v1"));
+    assert_eq!(ToolSet::CodingV2.journal_name(), Some("coding_v2"));
+    assert_eq!(
+        ToolSet::from_journal(Some("coding_v1")),
+        Some(ToolSet::CodingV1)
+    );
+    assert_eq!(
+        ToolSet::from_journal(Some("coding_v2")),
+        Some(ToolSet::CodingV2)
+    );
     assert_eq!(ToolSet::from_journal(Some("coding_v9")), None);
+    assert_eq!(ToolSet::from_journal(Some("coding")), None);
     assert_eq!(ToolSet::from_journal(Some("base")), None);
     assert_eq!(ToolSet::Base.report_name(), "base");
     assert_eq!(ToolSet::CodingV1.report_name(), "coding_v1");
+    assert_eq!(ToolSet::CodingV2.report_name(), "coding_v2");
+}
+
+fn edit_tool(set: ToolSet) -> kiln_harness::provider::ToolDefinition {
+    ToolRegistry::new(ToolLimits::default())
+        .definitions_of(set, true)
+        .iter()
+        .find(|tool| tool.name == "edit_file")
+        .expect("edit_file")
+        .clone()
+}
+
+/// `coding_v1`'s `edit_file` is exactly what the build that introduced it
+/// described, so its recordings replay: this literal was taken from it.
+#[test]
+fn the_coding_v1_edit_file_is_as_recorded() {
+    let tool = edit_tool(ToolSet::CodingV1);
+    assert_eq!(
+        tool.description,
+        "Replace exact text in one /workspace file of at most 64 KiB (path as for read_file). \
+         Each old_text must occur exactly once in the current file unless replace_all is true, \
+         which replaces every non-overlapping occurrence. Edits are matched against the file \
+         before any of them applies, may not overlap, and apply together or not at all. \
+         Matching is byte-exact: no whitespace or line-ending normalization."
+    );
+    assert_eq!(
+        serde_json::to_string(&tool.input_schema).expect("encode"),
+        r#"{"additionalProperties":false,"properties":{"edits":{"items":{"additionalProperties":false,"properties":{"new_text":{"type":"string"},"old_text":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["old_text","new_text"],"type":"object"},"maxItems":32,"minItems":1,"type":"array"},"path":{"type":"string"}},"required":["path","edits"],"type":"object"}"#
+    );
+}
+
+/// `coding_v2` is `coding_v1` but for `edit_file`, which takes one edit as
+/// top-level fields or several as `edits`.
+#[test]
+fn the_coding_v2_set_differs_only_in_edit_file() {
+    let registry = ToolRegistry::new(ToolLimits::default());
+    for streaming in [false, true] {
+        let v1 = registry.definitions_of(ToolSet::CodingV1, streaming);
+        let v2 = registry.definitions_of(ToolSet::CodingV2, streaming);
+        assert_eq!(v1.len(), v2.len());
+        for (v1, v2) in v1.iter().zip(v2) {
+            assert_eq!(v1.name, v2.name);
+            if v1.name == "edit_file" {
+                assert_ne!(v1, v2);
+            } else {
+                assert_eq!(v1, v2);
+            }
+        }
+    }
+    let v1 = edit_tool(ToolSet::CodingV1);
+    let tool = edit_tool(ToolSet::CodingV2);
+    assert_eq!(
+        tool.input_schema,
+        json!({
+            "type": "object",
+            "required": ["path"],
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+                "edits": v1.input_schema["properties"]["edits"].clone()
+            }
+        })
+    );
+    assert_eq!(
+        tool.description,
+        "Replace exact text in one /workspace file of at most 64 KiB (path as for read_file). \
+         For one edit, give old_text and new_text; old_text must occur exactly once in the \
+         current file unless replace_all is true, which replaces every non-overlapping \
+         occurrence. For several edits to the same file, give edits instead: an array of \
+         {old_text, new_text, replace_all} objects, each matched as above, all against the file \
+         before any applies, not overlapping, and applied together or not at all. Give one \
+         form, not both. Matching is byte-exact: no whitespace or line-ending normalization."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -271,9 +359,16 @@ fn coding_config() -> HarnessConfig {
     }
 }
 
+fn coding_v2_config() -> HarnessConfig {
+    HarnessConfig {
+        tool_set: ToolSet::CodingV2,
+        ..coding_config()
+    }
+}
+
 fn coding_task(config: &HarnessConfig) -> SessionTask {
     SessionTask::new(
-        default_system_prompt_for(&config.tool_limits, ToolSet::CodingV1),
+        default_system_prompt_for(&config.tool_limits, config.tool_set),
         "Change beta to BETA in notes.txt.",
     )
 }
@@ -700,6 +795,14 @@ async fn coding_calls_are_checked_on_the_host() {
             "invalid_arguments",
             "unknown field `all`, expected one of `old_text`, `new_text`, `replace_all`",
         ),
+        // coding_v1 takes no edit as top-level fields (serde sees the keys
+        // in sorted order).
+        (
+            "edit_file",
+            json!({"path": "notes.txt", "old_text": "beta", "new_text": "BETA"}),
+            "invalid_arguments",
+            "unknown field `new_text`, expected `path` or `edits`",
+        ),
         (
             "search",
             json!({"pattern": ""}),
@@ -775,6 +878,395 @@ async fn coding_calls_are_checked_on_the_host() {
     // Only the baseline reached kilnd.
     assert_eq!(api.state().execs.len(), 1);
     assert_eq!(api.state().files["/workspace/notes.txt"], NOTES);
+}
+
+/// Every host-side refusal of `coding_v2`'s `edit_file`, with nothing sent
+/// to kilnd.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn coding_v2_edit_calls_are_checked_on_the_host() {
+    let api = api_with(&workspace());
+    let config = HarnessConfig {
+        tool_limits: ToolLimits {
+            max_file_bytes: 1024,
+            ..ToolLimits::default()
+        },
+        ..coding_v2_config()
+    };
+    let long = "x".repeat(1025);
+    let edits = |count: usize| {
+        (0..count)
+            .map(|index| json!({"old_text": format!("o{index}"), "new_text": "n"}))
+            .collect::<Vec<_>>()
+    };
+    let one_or_the_other =
+        "give old_text and new_text for one edit, or edits for several, not both";
+    let missing = |what: &str| {
+        format!("{what}; give old_text and new_text for one edit, or edits for several")
+    };
+    let calls: Vec<(Value, &str, String)> = vec![
+        (
+            json!({"path": "notes.txt", "old_text": "a", "new_text": "b", "edits": edits(1)}),
+            "invalid_arguments",
+            one_or_the_other.to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "replace_all": true, "edits": edits(1)}),
+            "invalid_arguments",
+            one_or_the_other.to_string(),
+        ),
+        // What the model sent most: the array as JSON text, with new_text
+        // beside it. It gets the message that names the fix.
+        (
+            json!({"path": "notes.txt", "edits": "[{\"old_text\": \"beta\"}]", "new_text": "B"}),
+            "invalid_arguments",
+            "edits must be a JSON array of {old_text, new_text, replace_all} objects, not a \
+             string; for one edit, give old_text and new_text as top-level fields instead"
+                .to_string(),
+        ),
+        (
+            json!({"path": "notes.txt",
+                   "edits": "[{\"old_text\": \"beta\", \"new_text\": \"BETA\"}]"}),
+            "invalid_arguments",
+            "edits must be a JSON array of {old_text, new_text, replace_all} objects, not a \
+             string; for one edit, give old_text and new_text as top-level fields instead"
+                .to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": {"old_text": "a", "new_text": "b"}}),
+            "invalid_arguments",
+            "edits: invalid type: map, expected a sequence".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": [{"old_text": "a"}]}),
+            "invalid_arguments",
+            "edits: missing field `new_text`".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": [{"old_text": "a", "new_text": "b", "all": true}]}),
+            "invalid_arguments",
+            "edits: unknown field `all`, expected one of `old_text`, `new_text`, `replace_all`"
+                .to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": []}),
+            "invalid_arguments",
+            "edits must hold 1 to 32 edits".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": edits(33)}),
+            "invalid_arguments",
+            "edits must hold 1 to 32 edits".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": [{"old_text": "", "new_text": "x"}]}),
+            "invalid_arguments",
+            "edit 0: old_text is empty".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": [{"old_text": "a", "new_text": "b"}, {"old_text": "c", "new_text": "c"}]}),
+            "invalid_arguments",
+            "edit 1: new_text equals old_text".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": "beta"}),
+            "invalid_arguments",
+            missing("new_text is missing"),
+        ),
+        (
+            json!({"path": "notes.txt", "new_text": "BETA", "replace_all": true}),
+            "invalid_arguments",
+            missing("old_text is missing"),
+        ),
+        (
+            json!({"path": "notes.txt"}),
+            "invalid_arguments",
+            missing("old_text and new_text are missing"),
+        ),
+        (
+            json!({"path": "notes.txt", "replace_all": false}),
+            "invalid_arguments",
+            missing("old_text and new_text are missing"),
+        ),
+        (
+            json!({"path": "notes.txt", "edit_files": [{"old_text": "a", "new_text": "b"}]}),
+            "invalid_arguments",
+            "unknown field `edit_files`, expected one of `path`, `old_text`, `new_text`, \
+             `replace_all`, `edits`"
+                .to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": "a", "new_text": "b", "replace_all": "yes"}),
+            "invalid_arguments",
+            "invalid type: string \"yes\", expected a boolean".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": "", "new_text": "x"}),
+            "invalid_arguments",
+            "old_text is empty".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": "c", "new_text": "c"}),
+            "invalid_arguments",
+            "new_text equals old_text".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": "a", "new_text": long}),
+            "invalid_arguments",
+            "text exceeds the per-file limit".to_string(),
+        ),
+        (
+            json!({"path": "/workspace", "old_text": "a", "new_text": "b"}),
+            "invalid_path",
+            "path names the workspace directory, not a file".to_string(),
+        ),
+        // The path is checked before the form.
+        (
+            json!({"path": "../notes.txt", "old_text": "a", "new_text": "b", "edits": edits(1)}),
+            "invalid_path",
+            "path components may not be empty, '.' or '..'".to_string(),
+        ),
+        // An explicit null is not an absent field: it neither picks the
+        // form nor defaults.
+        (
+            json!({"path": "notes.txt", "old_text": "beta", "new_text": "BETA", "edits": null}),
+            "invalid_arguments",
+            "edits is null; leave it out or give an array of edits".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": null, "edits": edits(1)}),
+            "invalid_arguments",
+            "old_text is null; leave it out or give a string".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "new_text": null, "edits": edits(1)}),
+            "invalid_arguments",
+            "new_text is null; leave it out or give a string".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "old_text": "beta", "new_text": "BETA",
+                   "replace_all": null}),
+            "invalid_arguments",
+            "replace_all is null; leave it out or give a boolean".to_string(),
+        ),
+        (
+            json!({"path": null, "old_text": "beta", "new_text": "BETA"}),
+            "invalid_arguments",
+            "path is null; give a string".to_string(),
+        ),
+        // Unknown fields are reported before nulls, even one serde reads
+        // after a null.
+        (
+            json!({"path": null, "replace": true, "edits": null}),
+            "invalid_arguments",
+            "unknown field `replace`, expected one of `path`, `old_text`, `new_text`, \
+             `replace_all`, `edits`"
+                .to_string(),
+        ),
+        // A null inside an edit is a type error, as in coding_v1.
+        (
+            json!({"path": "notes.txt",
+                   "edits": [{"old_text": "a", "new_text": "b", "replace_all": null}]}),
+            "invalid_arguments",
+            "edits: invalid type: null, expected a boolean".to_string(),
+        ),
+        (
+            json!({"path": "notes.txt", "edits": [{"old_text": null, "new_text": "b"}]}),
+            "invalid_arguments",
+            "edits: invalid type: null, expected a string".to_string(),
+        ),
+    ];
+    let mut responses = calls
+        .chunks(8)
+        .enumerate()
+        .map(|(chunk, calls)| {
+            turn(
+                calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (arguments, _, _))| {
+                        (
+                            Box::leak(format!("c{chunk}-{index}").into_boxed_str()) as &str,
+                            "edit_file",
+                            arguments.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(ModelResponse::final_text("done"));
+    let (_, results) = session(&api, config, responses).await;
+    for (number, (arguments, kind, message)) in calls.iter().enumerate() {
+        let result = &results[&format!("c{}-{}", number / 8, number % 8)];
+        assert_eq!(
+            result,
+            &json!({"ok": false, "error": kind, "message": message}),
+            "{arguments}"
+        );
+    }
+    // Only the baseline reached kilnd.
+    assert_eq!(api.state().execs.len(), 1);
+    assert_eq!(api.state().files["/workspace/notes.txt"], NOTES);
+}
+
+fn coding_v2_script() -> Vec<ModelResponse> {
+    vec![
+        turn(vec![(
+            "flat",
+            "edit_file",
+            json!({"path": "notes.txt", "old_text": "beta", "new_text": "BETA"}),
+        )]),
+        turn(vec![(
+            "every",
+            "edit_file",
+            json!({"path": "notes.txt", "old_text": "a", "new_text": "A", "replace_all": true}),
+        )]),
+        turn(vec![(
+            "batch",
+            "edit_file",
+            json!({"path": "lib/a.sh", "edits": [
+                {"old_text": "a=1", "new_text": "x=1"},
+                {"old_text": "a=3", "new_text": "z=3"}
+            ]}),
+        )]),
+        turn(vec![
+            (
+                "none",
+                "edit_file",
+                json!({"path": "notes.txt", "old_text": "delta", "new_text": "d"}),
+            ),
+            (
+                "twice",
+                "edit_file",
+                json!({"path": "notes.txt", "old_text": "A", "new_text": "a"}),
+            ),
+            (
+                "batch-none",
+                "edit_file",
+                json!({"path": "notes.txt", "edits": [{"old_text": "delta", "new_text": "d"}]}),
+            ),
+        ]),
+        ModelResponse::final_text("done"),
+    ]
+}
+
+/// A `coding_v2` session applies one edit given as top-level fields, with
+/// and without `replace_all`, and a batch; refuses a single edit with no
+/// edit index in its message; and replays matched.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_coding_v2_session_edits_in_either_form_and_replays_matched() {
+    let api = api_with(&workspace());
+    let (records, results) = session(&api, coding_v2_config(), coding_v2_script()).await;
+    let JournalEvent::SessionStarted {
+        tool_set,
+        tools,
+        system,
+        ..
+    } = &records[0].event
+    else {
+        panic!("session start");
+    };
+    assert_eq!(tool_set.as_deref(), Some("coding_v2"));
+    assert_eq!(
+        tools.as_slice(),
+        ToolRegistry::new(coding_v2_config().tool_limits).definitions_of(ToolSet::CodingV2, true)
+    );
+    assert_eq!(
+        *system,
+        default_system_prompt_for(&coding_v2_config().tool_limits, ToolSet::CodingV2)
+    );
+    assert_eq!(
+        results["flat"],
+        json!({"ok": true, "replacements": 1, "file_bytes": NOTES.len()})
+    );
+    assert_eq!(
+        results["every"],
+        json!({"ok": true, "replacements": 4, "file_bytes": NOTES.len()})
+    );
+    assert_eq!(
+        results["batch"],
+        json!({"ok": true, "replacements": 2, "file_bytes": 12})
+    );
+    let refusal =
+        |kind: &str, message: &str| json!({"ok": false, "error": kind, "message": message});
+    assert_eq!(
+        results["none"],
+        refusal("no_match", "old_text was not found")
+    );
+    assert_eq!(
+        results["twice"],
+        refusal(
+            "not_unique",
+            "old_text occurs more than once; include more surrounding text or set replace_all"
+        )
+    );
+    assert_eq!(
+        results["batch-none"],
+        refusal("no_match", "edit 0: old_text was not found")
+    );
+    let expected_notes: &[u8] = b"AlphA\nBETA\ngAmmA\n";
+    let expected_lib: &[u8] = b"x=1\nb=2\nz=3\n";
+    assert_eq!(api.state().files["/workspace/notes.txt"], expected_notes);
+    assert_eq!(api.state().files["/workspace/lib/a.sh"], expected_lib);
+
+    let temp = common::private_tempdir().expect("temp dir");
+    let path = temp.path().join("coding-v2.jsonl");
+    let events = records.iter().map(|record| record.event.clone()).collect();
+    common::write_journal_lines(&path, &common::chained_lines("hs-coding-v2", events));
+    let journal = read_journal(&path).expect("the coding_v2 journal verifies");
+    let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    assert_eq!(provider.tool_set(), ToolSet::CodingV2);
+    let config = provider.replay_config(short_lifecycle_config());
+    assert_eq!(config.tool_set, ToolSet::CodingV2);
+    let replay_api = api_with(&workspace());
+    let mut replay = Harness::new(
+        replay_api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let outcome = replay
+        .replay(CancellationToken::new())
+        .await
+        .expect("the replay completes");
+    assert_eq!(outcome.final_answer, "done");
+    assert_eq!(replay.provider().diverged_at(), None);
+    assert!(replay.provider().exhausted());
+    assert_eq!(tool_results(&replay.journal().records), results);
+    assert_eq!(
+        replay_api.state().files["/workspace/notes.txt"],
+        expected_notes
+    );
+
+    // Under coding_v1 the same recording is refused before kilnd.
+    let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    let mut config = provider.replay_config(short_lifecycle_config());
+    config.tool_set = ToolSet::CodingV1;
+    let api = api_with(&workspace());
+    let mut replay = Harness::new(
+        api.clone(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    assert!(matches!(
+        replay.replay(CancellationToken::new()).await,
+        Err(HarnessError::InvalidTask(_))
+    ));
+    assert!(api.state().creates.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kiln-harness"))
+        .args(["journal", "verify"])
+        .arg(&path)
+        .output()
+        .expect("run journal verify");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("\ntool set: coding_v2\n"), "{stdout}");
 }
 
 fn incomplete_truncated(output: &mut CapturedOutput) {
@@ -1353,6 +1845,20 @@ fn eval_options(out: &Path, config: HarnessConfig) -> SuiteOptions {
 
 #[tokio::test]
 async fn an_eval_run_records_its_tool_set_and_tool_calls_by_name() {
+    eval_run_records(coding_config()).await;
+}
+
+/// `--tool-set coding` gives `coding_v2`, which manifests and reports name.
+#[tokio::test]
+async fn an_eval_run_with_coding_v2_records_it() {
+    eval_run_records(coding_v2_config()).await;
+}
+
+/// Run a one-task suite with `config` and check what its manifest, report
+/// and results record.
+#[allow(clippy::too_many_lines)]
+async fn eval_run_records(config: HarnessConfig) {
+    let name = config.tool_set.report_name();
     let temp = common::private_tempdir().expect("temp dir");
     let root = temp.path().join("tasks");
     let dir = root.join("edit-notes");
@@ -1375,7 +1881,6 @@ async fn an_eval_run_records_its_tool_set_and_tool_calls_by_name() {
         b"sed -i s/beta/BETA/ /workspace/notes.txt\n",
     );
     write_file(&dir.join("seed/notes.txt"), NOTES);
-    let config = coding_config();
     let tasks = eval::load_tasks(&root, &[], &config).expect("loads");
     // The default system prompt follows the tool set.
     assert!(
@@ -1433,12 +1938,15 @@ async fn an_eval_run_records_its_tool_set_and_tool_calls_by_name() {
     let manifest: Manifest =
         serde_json::from_slice(&std::fs::read(out.join("manifest.json")).expect("manifest"))
             .expect("manifest JSON");
-    assert_eq!(manifest.tool_set, "coding_v1");
+    assert_eq!(manifest.tool_set, name);
     let report = &summary.report;
-    assert_eq!(report.tool_set, "coding_v1");
+    assert_eq!(report.tool_set, name);
     assert_eq!(report.overall.failed_tool_calls, Some(2));
     let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
-    assert!(markdown.contains("- Tool set: coding_v1\n"), "{markdown}");
+    assert!(
+        markdown.contains(&format!("- Tool set: {name}\n")),
+        "{markdown}"
+    );
     assert!(
         markdown.contains("\nTool calls by name: edit_file 1, read_file 1, unknown 1; failed 2.\n"),
         "{markdown}"
@@ -1632,16 +2140,33 @@ fn the_coding_suite_loads_with_prompts_that_name_no_tool() {
             .iter()
             .map(|task| task.id.as_str())
             .collect::<Vec<_>>(),
-        ["config-sweep", "find-and-fix"]
+        [
+            "add-parameter",
+            "config-sweep",
+            "find-and-fix",
+            "rename-across-tree",
+            "section-config",
+            "three-fixes-big-file"
+        ]
     );
     let tools = ToolRegistry::new(ToolLimits::default());
     for task in &tasks {
         assert_eq!(task.check.timeout, std::time::Duration::from_secs(30));
+        // The first two tasks keep their limits, so their results line up
+        // with earlier runs; the existing-file tasks get more room.
+        let (secs, steps, calls) = if ["config-sweep", "find-and-fix"].contains(&task.id.as_str()) {
+            (300, 30, None)
+        } else {
+            (600, 40, Some(80))
+        };
         assert_eq!(
             task.session_timeout,
-            Some(std::time::Duration::from_secs(300))
+            Some(std::time::Duration::from_secs(secs)),
+            "{}",
+            task.id
         );
-        assert_eq!(task.max_steps, Some(30));
+        assert_eq!(task.max_steps, Some(steps), "{}", task.id);
+        assert_eq!(task.max_tool_calls, calls, "{}", task.id);
         let script = String::from_utf8(task.check.script.clone()).expect("UTF-8");
         assert!(
             script.starts_with("cd /workspace || exit 2\n"),
@@ -1662,12 +2187,18 @@ fn the_coding_suite_loads_with_prompts_that_name_no_tool() {
             );
         }
     }
-    let config = &tasks[0].seed[0];
+    let task = |id: &str| {
+        tasks
+            .iter()
+            .find(|task| task.id == id)
+            .unwrap_or_else(|| panic!("{id}"))
+    };
+    let config = &task("config-sweep").seed[0];
     assert_eq!(config.path, "settings.conf");
     assert!((55 << 10..=62 << 10).contains(&config.contents.len()));
     let lines = config.contents.split(|byte| *byte == b'\n').count() - 1;
     assert!((1400..=1700).contains(&lines), "{lines}");
-    let project = &tasks[1].seed;
+    let project = &task("find-and-fix").seed;
     let code = project
         .iter()
         .filter(|file| file.path.starts_with("lib/") || file.path.starts_with("bin/"))
@@ -1679,7 +2210,14 @@ fn the_coding_suite_loads_with_prompts_that_name_no_tool() {
 
 #[test]
 fn each_coding_check_fails_bare_and_passes_after_its_solution_on_the_host() {
-    for id in ["config-sweep", "find-and-fix"] {
+    for id in [
+        "add-parameter",
+        "config-sweep",
+        "find-and-fix",
+        "rename-across-tree",
+        "section-config",
+        "three-fixes-big-file",
+    ] {
         let task = host_task(id);
         assert!(!host_sh(&task.check), "{id}: the bare seed passed");
         assert!(host_sh(&task.solution), "{id}: the solution failed");
@@ -1762,6 +2300,112 @@ fn coding_checks_refuse_plausible_wrong_answers() {
         assert!(
             !host_sh(&task.check),
             "the check passed without {file}'s {from}"
+        );
+    }
+}
+
+#[test]
+fn larger_coding_checks_refuse_wrong_answers_and_accept_equivalent_edits() {
+    let run = |task: &HostTask, script: &str| {
+        let script = format!("cd {} || exit 1\n{script}", task.workspace.display());
+        assert!(host_sh(&script), "{script}");
+    };
+    // The four larger tasks: each solved, then changed. `true` marks a change
+    // the check must still accept.
+    for (id, accept, change) in [
+        // A symlink or other non-regular entry left behind, in every task.
+        (
+            "rename-across-tree",
+            false,
+            "ln -s not-a-real-file leftover.bak",
+        ),
+        ("add-parameter", false, "ln -s not-a-real-file leftover.bak"),
+        (
+            "section-config",
+            false,
+            "ln -s not-a-real-file leftover.bak",
+        ),
+        (
+            "three-fixes-big-file",
+            false,
+            "ln -s not-a-real-file leftover.bak",
+        ),
+        // rename-across-tree: the variable called fmt_size renamed too.
+        (
+            "rename-across-tree",
+            false,
+            "sed 's/fmt_size=/format_size=/; s/\"$fmt_size\"/\"$format_size\"/' lib/fmt/json.sh \
+             > j.new && mv j.new lib/fmt/json.sh",
+        ),
+        // add-parameter: lib/log.sh without its final newline; a printed
+        // example in a here-document given a component.
+        (
+            "add-parameter",
+            false,
+            "printf %s \"$(cat lib/log.sh)\" > l.new && mv l.new lib/log.sh",
+        ),
+        (
+            "add-parameter",
+            false,
+            "sed 's/log_event info \"backup started\"$/log_event info \"backup started\" nightly/' \
+             bin/nightly > n.new && mv n.new bin/nightly",
+        ),
+        // section-config: the origin removed from every web section.
+        (
+            "section-config",
+            false,
+            "grep -v '^ *https://admin.example.com$' app.ini > a.new; mv a.new app.ini",
+        ),
+        // three-fixes-big-file: no final newline; the refund fix moved to
+        // the caller; a comment outside the functions edited. Spacing before
+        // a function's parenthesis, an indented closing brace and a comment
+        // inside a fixed function are fine.
+        (
+            "three-fixes-big-file",
+            false,
+            "printf %s \"$(cat invoice.awk)\" > i.new && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            false,
+            "awk '$0 == \"  if (n < 0) return -round_div(-n, d)\" { next } \
+             $0 == \"function apply_rate(cents, bp) {\" { print; \
+             print \"  if (cents < 0) return -round_div(-cents * bp, 10000)\"; next } { print }' \
+             invoice.awk > i.new && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            false,
+            "awk '/^# json_line/ { print \"# json_line(L, last): changed.\"; next } { print }' \
+             invoice.awk > i.new && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            true,
+            "sed 's/^function round_div(/function round_div (/' invoice.awk > i.new \
+             && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            true,
+            "awk '/^function json_str\\(/ { f = 1 } f && /^}$/ { print \"  }\"; f = 0; next } \
+             { print }' invoice.awk > i.new && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            true,
+            "awk '/^function csv_split\\(/ { print; print \"\"; print \"  # quotes\"; next } \
+             { print }' invoice.awk > i.new && mv i.new invoice.awk",
+        ),
+    ] {
+        let task = host_task(id);
+        assert!(host_sh(&task.solution), "{id}: the solution failed");
+        run(&task, change);
+        assert_eq!(
+            host_sh(&task.check),
+            accept,
+            "{id}: the check {} after {change}",
+            if accept { "refused" } else { "passed" }
         );
     }
 }

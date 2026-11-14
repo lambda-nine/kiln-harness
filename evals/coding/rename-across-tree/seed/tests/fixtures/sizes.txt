@@ -1,0 +1,9 @@
+# fmt_sizes: BYTES, then what fmt_size and fmt_size_si print for it.
+0 0B 0B
+999 999B 999B
+1000 1000B 1.0kB
+1023 1023B 1.0kB
+1024 1.0K 1.0kB
+1536 1.5K 1.5kB
+1048576 1.0M 1.0MB
+1610612736 1.5G 1.6GB

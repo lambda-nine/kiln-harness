@@ -123,7 +123,7 @@ impl From<ToolSetArg> for ToolSet {
     fn from(arg: ToolSetArg) -> Self {
         match arg {
             ToolSetArg::Base => Self::Base,
-            ToolSetArg::Coding => Self::CodingV1,
+            ToolSetArg::Coding => Self::CodingV2,
         }
     }
 }
@@ -1584,7 +1584,11 @@ mod tests {
         coding.extend(["--tool-set", "coding"]);
         let run = parse(&coding).expect("parses");
         let prepared = prepare_run(&run).expect("prepared");
-        assert_eq!(prepared.config.tool_set, ToolSet::CodingV1);
+        assert_eq!(prepared.config.tool_set, ToolSet::CodingV2);
+        assert_eq!(
+            prepared.task.system,
+            default_system_prompt_for(&prepared.config.tool_limits, ToolSet::CodingV2)
+        );
         assert!(prepared.task.system.contains("- edit_file: "));
         // A system file still wins.
         let dir = private_tempdir().expect("temp dir");
@@ -1596,6 +1600,9 @@ mod tests {
         assert_eq!(prepare_run(&run).expect("prepared").task.system, "Mine.");
         let mut wrong = base.to_vec();
         wrong.extend(["--tool-set", "coding_v1"]);
+        assert!(parse(&wrong).is_err());
+        let mut wrong = base.to_vec();
+        wrong.extend(["--tool-set", "coding_v2"]);
         assert!(parse(&wrong).is_err());
     }
 

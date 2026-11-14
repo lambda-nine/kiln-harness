@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "section-config",
+  "description": "Make seven section-scoped changes in a 49 KiB INI file of 224 sections that repeat the same keys, including multi-line values, an insertion after a continued value and a section rename, leaving every other byte unchanged.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 600,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

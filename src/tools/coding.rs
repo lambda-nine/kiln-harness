@@ -1,5 +1,6 @@
-//! The [`ToolSet::CodingV1`] tools: `read_file` with line ranges,
-//! `edit_file` and `search`.
+//! The coding tools of [`ToolSet::CodingV1`] and [`ToolSet::CodingV2`]:
+//! `read_file` with line ranges, `edit_file` and `search`. The two sets
+//! differ only in how `edit_file` takes its edits.
 //!
 //! Each reaches the workspace only through fixed argv the harness builds,
 //! with the model's text as exactly one argv entry (a validated path or a
@@ -12,6 +13,7 @@
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
@@ -25,13 +27,19 @@ use super::{
 };
 use crate::api::{Execution, ExecutionState, SandboxApi};
 use crate::provider::ToolDefinition;
+use crate::tools::ToolSet;
 
 /// The most files one `grep` execution searches.
 const GREP_CHUNK_FILES: usize = 256;
 
 /// Replace `read_file` in the base tools with the coding one, then append
-/// `edit_file` and `search` after `workspace_diff`.
-pub(super) fn extend_definitions(tools: &mut Vec<ToolDefinition>, limits: &ToolLimits) {
+/// `edit_file` and `search` after `workspace_diff`, as `tool_set`
+/// describes them.
+pub(super) fn extend_definitions(
+    tools: &mut Vec<ToolDefinition>,
+    limits: &ToolLimits,
+    tool_set: ToolSet,
+) {
     let file_kib = limits.max_file_bytes / 1024;
     if let Some(read) = tools.iter_mut().find(|tool| tool.name == "read_file") {
         *read = ToolDefinition {
@@ -55,39 +63,10 @@ pub(super) fn extend_definitions(tools: &mut Vec<ToolDefinition>, limits: &ToolL
             }),
         };
     }
-    tools.push(ToolDefinition {
-        name: "edit_file".to_string(),
-        description: format!(
-            "Replace exact text in one /workspace file of at most {file_kib} KiB (path as for \
-             read_file). Each old_text must occur exactly once in the current file unless \
-             replace_all is true, which replaces every non-overlapping occurrence. Edits are \
-             matched against the file before any of them applies, may not overlap, and apply \
-             together or not at all. Matching is byte-exact: no whitespace or line-ending \
-             normalization."
-        ),
-        input_schema: json!({
-            "type": "object",
-            "required": ["path", "edits"],
-            "additionalProperties": false,
-            "properties": {
-                "path": {"type": "string"},
-                "edits": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": MAX_EDITS,
-                    "items": {
-                        "type": "object",
-                        "required": ["old_text", "new_text"],
-                        "additionalProperties": false,
-                        "properties": {
-                            "old_text": {"type": "string"},
-                            "new_text": {"type": "string"},
-                            "replace_all": {"type": "boolean"}
-                        }
-                    }
-                }
-            }
-        }),
+    tools.push(if tool_set == ToolSet::CodingV1 {
+        edit_definition_v1(file_kib)
+    } else {
+        edit_definition_v2(file_kib)
     });
     tools.push(ToolDefinition {
         name: "search".to_string(),
@@ -113,6 +92,79 @@ pub(super) fn extend_definitions(tools: &mut Vec<ToolDefinition>, limits: &ToolL
     });
 }
 
+/// `edit_file`'s `edits` array, as both coding sets describe it.
+fn edits_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": MAX_EDITS,
+        "items": {
+            "type": "object",
+            "required": ["old_text", "new_text"],
+            "additionalProperties": false,
+            "properties": {
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+                "replace_all": {"type": "boolean"}
+            }
+        }
+    })
+}
+
+/// [`ToolSet::CodingV1`]'s `edit_file`: its edits only as `edits`.
+fn edit_definition_v1(file_kib: usize) -> ToolDefinition {
+    ToolDefinition {
+        name: "edit_file".to_string(),
+        description: format!(
+            "Replace exact text in one /workspace file of at most {file_kib} KiB (path as for \
+             read_file). Each old_text must occur exactly once in the current file unless \
+             replace_all is true, which replaces every non-overlapping occurrence. Edits are \
+             matched against the file before any of them applies, may not overlap, and apply \
+             together or not at all. Matching is byte-exact: no whitespace or line-ending \
+             normalization."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path", "edits"],
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string"},
+                "edits": edits_schema()
+            }
+        }),
+    }
+}
+
+/// [`ToolSet::CodingV2`]'s `edit_file`: one edit as top-level fields, or
+/// several as `edits`.
+fn edit_definition_v2(file_kib: usize) -> ToolDefinition {
+    ToolDefinition {
+        name: "edit_file".to_string(),
+        description: format!(
+            "Replace exact text in one /workspace file of at most {file_kib} KiB (path as for \
+             read_file). For one edit, give old_text and new_text; old_text must occur exactly \
+             once in the current file unless replace_all is true, which replaces every \
+             non-overlapping occurrence. For several edits to the same file, give edits \
+             instead: an array of {{old_text, new_text, replace_all}} objects, each matched as \
+             above, all against the file before any applies, not overlapping, and applied \
+             together or not at all. Give one form, not both. Matching is byte-exact: no \
+             whitespace or line-ending normalization."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+                "replace_all": {"type": "boolean"},
+                "edits": edits_schema()
+            }
+        }),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CodingReadFileArgs {
@@ -127,6 +179,65 @@ struct CodingReadFileArgs {
 struct EditFileArgs {
     path: String,
     edits: Vec<EditArgs>,
+}
+
+/// [`ToolSet::CodingV2`]'s `edit_file` arguments: one edit as top-level
+/// fields, or `edits`, checked by hand so a mangled array gets a message
+/// that says how to fix it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditFileV2Args {
+    path: String,
+    old_text: Option<String>,
+    new_text: Option<String>,
+    replace_all: Option<bool>,
+    edits: Option<Value>,
+}
+
+/// [`EditFileV2Args`]'s field names alone, so an unknown field is
+/// reported before any field's value is looked at.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Only deserialized, never read.
+struct EditFileV2Fields {
+    path: Option<IgnoredAny>,
+    old_text: Option<IgnoredAny>,
+    new_text: Option<IgnoredAny>,
+    replace_all: Option<IgnoredAny>,
+    edits: Option<IgnoredAny>,
+}
+
+/// What [`ToolSet::CodingV2`]'s `edit_file` says of each field sent as an
+/// explicit `null`, in the order they are checked. `Option` would read a
+/// null as absent, which would pick the call's form for it.
+const EDIT_V2_NULLS: [(&str, &str); 5] = [
+    ("path", "path is null; give a string"),
+    (
+        "old_text",
+        "old_text is null; leave it out or give a string",
+    ),
+    (
+        "new_text",
+        "new_text is null; leave it out or give a string",
+    ),
+    (
+        "replace_all",
+        "replace_all is null; leave it out or give a boolean",
+    ),
+    (
+        "edits",
+        "edits is null; leave it out or give an array of edits",
+    ),
+];
+
+/// How an `edit_file` call gave its edits, which its messages follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditForm {
+    /// An `edits` array: messages name an edit by its index.
+    List,
+    /// One edit as top-level fields ([`ToolSet::CodingV2`]): messages name
+    /// no index.
+    Single,
 }
 
 /// One `edit_file` edit.
@@ -204,29 +315,122 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 format!("edits must hold 1 to {MAX_EDITS} edits"),
             ));
         }
-        for (index, edit) in args.edits.iter().enumerate() {
-            let problem = if edit.old_text.is_empty() {
-                Some("old_text is empty")
-            } else if edit.old_text == edit.new_text {
-                Some("new_text equals old_text")
-            } else if edit.old_text.len() > self.limits.max_file_bytes
-                || edit.new_text.len() > self.limits.max_file_bytes
-            {
-                Some("text exceeds the per-file limit")
-            } else {
-                None
-            };
-            if let Some(problem) = problem {
+        self.check_edit_list(&args.edits)?;
+        Ok(ToolPlan::Edit {
+            path,
+            edits: args.edits,
+            form: EditForm::List,
+        })
+    }
+
+    /// [`ToolSet::CodingV2`]'s `edit_file`: one edit as top-level
+    /// `old_text`, `new_text` and `replace_all`, or [`Self::plan_edit`]'s
+    /// `edits`, never both.
+    pub(super) fn plan_edit_v2(&self, arguments: Value) -> Result<ToolPlan, ToolRun> {
+        // Unknown fields first, then explicit nulls, then each value.
+        EditFileV2Fields::deserialize(&arguments)
+            .map_err(|error| ToolRun::rejected("invalid_arguments", error.to_string()))?;
+        for (field, message) in EDIT_V2_NULLS {
+            if arguments.get(field).is_some_and(Value::is_null) {
+                return Err(ToolRun::rejected("invalid_arguments", message));
+            }
+        }
+        let args: EditFileV2Args = parse_arguments(arguments)?;
+        let path = workspace_path(&args.path, false)
+            .map_err(|message| ToolRun::rejected("invalid_path", message))?;
+        let single =
+            args.old_text.is_some() || args.new_text.is_some() || args.replace_all.is_some();
+        if let Some(edits) = args.edits {
+            // A model that sends the array as JSON text is told the fix,
+            // and the text is not parsed. This comes before the both-forms
+            // check: the live failures sent such a string beside new_text.
+            if edits.is_string() {
+                return Err(ToolRun::rejected(
+                    "invalid_arguments",
+                    "edits must be a JSON array of {old_text, new_text, replace_all} objects, \
+                     not a string; for one edit, give old_text and new_text as top-level \
+                     fields instead",
+                ));
+            }
+            if single {
+                return Err(ToolRun::rejected(
+                    "invalid_arguments",
+                    "give old_text and new_text for one edit, or edits for several, not both",
+                ));
+            }
+            let edits: Vec<EditArgs> = serde_json::from_value(edits).map_err(|error| {
+                ToolRun::rejected("invalid_arguments", format!("edits: {error}"))
+            })?;
+            if edits.is_empty() || edits.len() > MAX_EDITS {
+                return Err(ToolRun::rejected(
+                    "invalid_arguments",
+                    format!("edits must hold 1 to {MAX_EDITS} edits"),
+                ));
+            }
+            self.check_edit_list(&edits)?;
+            return Ok(ToolPlan::Edit {
+                path,
+                edits,
+                form: EditForm::List,
+            });
+        }
+        let (old_text, new_text) = match (args.old_text, args.new_text) {
+            (Some(old_text), Some(new_text)) => (old_text, new_text),
+            (old_text, new_text) => {
+                let missing = match (old_text, new_text) {
+                    (None, None) => "old_text and new_text are missing",
+                    (None, _) => "old_text is missing",
+                    _ => "new_text is missing",
+                };
+                return Err(ToolRun::rejected(
+                    "invalid_arguments",
+                    format!(
+                        "{missing}; give old_text and new_text for one edit, or edits for several"
+                    ),
+                ));
+            }
+        };
+        let edit = EditArgs {
+            old_text,
+            new_text,
+            replace_all: args.replace_all.unwrap_or(false),
+        };
+        if let Some(problem) = self.edit_problem(&edit) {
+            return Err(ToolRun::rejected("invalid_arguments", problem));
+        }
+        Ok(ToolPlan::Edit {
+            path,
+            edits: vec![edit],
+            form: EditForm::Single,
+        })
+    }
+
+    /// Refuse the first edit of a list with a problem, naming its index.
+    fn check_edit_list(&self, edits: &[EditArgs]) -> Result<(), ToolRun> {
+        for (index, edit) in edits.iter().enumerate() {
+            if let Some(problem) = self.edit_problem(edit) {
                 return Err(ToolRun::rejected(
                     "invalid_arguments",
                     format!("edit {index}: {problem}"),
                 ));
             }
         }
-        Ok(ToolPlan::Edit {
-            path,
-            edits: args.edits,
-        })
+        Ok(())
+    }
+
+    /// What is wrong with one edit before the file is read, if anything.
+    fn edit_problem(&self, edit: &EditArgs) -> Option<&'static str> {
+        if edit.old_text.is_empty() {
+            Some("old_text is empty")
+        } else if edit.old_text == edit.new_text {
+            Some("new_text equals old_text")
+        } else if edit.old_text.len() > self.limits.max_file_bytes
+            || edit.new_text.len() > self.limits.max_file_bytes
+        {
+            Some("text exceeds the per-file limit")
+        } else {
+            None
+        }
     }
 
     pub(super) fn plan_search(arguments: Value) -> Result<SearchPlan, ToolRun> {
@@ -379,11 +583,13 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     }
 
     /// Read the whole file, apply every edit on the host, and write the
-    /// result back with `dd`, or refuse and write nothing.
+    /// result back with `dd`, or refuse and write nothing, in messages that
+    /// follow the call's `form`.
     pub(super) async fn edit_file(
         &self,
         path: String,
         edits: Vec<EditArgs>,
+        form: EditForm,
         deadline: Instant,
     ) -> ToolRun {
         let max_file_bytes = self.limits.max_file_bytes;
@@ -430,7 +636,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         let (edited, replacements) = match apply_edits(content, &edits, max_out) {
             Ok(edited) => edited,
             Err(refusal) => {
-                let (kind, message) = refusal.describe(max_out);
+                let (kind, message) = refusal.describe(max_out, form);
                 return refused_after(&[&read], kind, message);
             }
         };
@@ -923,15 +1129,21 @@ pub(crate) enum EditRefusal {
 
 impl EditRefusal {
     /// The result's `error` kind and message, for an edited file limited to
-    /// `max_out` bytes.
-    pub(crate) fn describe(&self, max_out: usize) -> (&'static str, String) {
+    /// `max_out` bytes. A call that gave one edit as top-level fields
+    /// ([`EditForm::Single`]) is not told an edit index.
+    pub(crate) fn describe(&self, max_out: usize, form: EditForm) -> (&'static str, String) {
+        let edit = |index: &usize| match form {
+            EditForm::List => format!("edit {index}: "),
+            EditForm::Single => String::new(),
+        };
         match self {
-            Self::NoMatch(index) => ("no_match", format!("edit {index}: old_text was not found")),
+            Self::NoMatch(index) => ("no_match", format!("{}old_text was not found", edit(index))),
             Self::NotUnique(index, _) => (
                 "not_unique",
                 format!(
-                    "edit {index}: old_text occurs more than once; include more surrounding text \
-                     or set replace_all"
+                    "{}old_text occurs more than once; include more surrounding text or set \
+                     replace_all",
+                    edit(index)
                 ),
             ),
             Self::Overlap(first, second) => (
@@ -940,7 +1152,14 @@ impl EditRefusal {
             ),
             Self::TooManyReplacements => (
                 "too_many_replacements",
-                format!("the edits make more than {MAX_REPLACEMENTS} replacements"),
+                match form {
+                    EditForm::List => {
+                        format!("the edits make more than {MAX_REPLACEMENTS} replacements")
+                    }
+                    EditForm::Single => {
+                        format!("the edit makes more than {MAX_REPLACEMENTS} replacements")
+                    }
+                },
             ),
             Self::TooLarge => (
                 "file_too_large",
@@ -1061,8 +1280,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        EditArgs, EditRefusal, LineSlice, apply_edits, encoded_len, grep_line, json_char_len,
-        slice_lines,
+        EditArgs, EditForm, EditRefusal, LineSlice, apply_edits, encoded_len, grep_line,
+        json_char_len, slice_lines,
     };
     use crate::tools::{MAX_REPLACEMENTS, SEARCH_TEXT_BYTES};
 
@@ -1284,7 +1503,44 @@ mod tests {
             ),
         ];
         for (refusal, kind, message) in messages {
-            assert_eq!(refusal.describe(MAX), (kind, message.to_string()));
+            assert_eq!(
+                refusal.describe(MAX, EditForm::List),
+                (kind, message.to_string())
+            );
+        }
+    }
+
+    /// One edit given as top-level fields can only be edit 0, so its
+    /// messages name no index.
+    #[test]
+    fn single_edit_refusals_name_no_edit() {
+        let messages = [
+            (
+                EditRefusal::NoMatch(0),
+                "no_match",
+                "old_text was not found",
+            ),
+            (
+                EditRefusal::NotUnique(0, 2),
+                "not_unique",
+                "old_text occurs more than once; include more surrounding text or set replace_all",
+            ),
+            (
+                EditRefusal::TooManyReplacements,
+                "too_many_replacements",
+                "the edit makes more than 10000 replacements",
+            ),
+            (
+                EditRefusal::TooLarge,
+                "file_too_large",
+                "the edited file would exceed 64 KiB",
+            ),
+        ];
+        for (refusal, kind, message) in messages {
+            assert_eq!(
+                refusal.describe(MAX, EditForm::Single),
+                (kind, message.to_string())
+            );
         }
     }
 

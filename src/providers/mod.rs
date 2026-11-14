@@ -85,16 +85,28 @@ pub fn default_system_prompt(limits: &ToolLimits) -> String {
 }
 
 /// The default system prompt for a session with `tool_set`: for
-/// [`ToolSet::Base`] exactly [`default_system_prompt`]; for
-/// [`ToolSet::CodingV1`] the same template with the coding tools listed,
-/// then a paragraph on when to prefer them.
+/// [`ToolSet::Base`] exactly [`default_system_prompt`]; for a coding set
+/// the same template with the coding tools listed, then a paragraph on when
+/// to prefer them. [`ToolSet::CodingV2`]'s `edit_file` line leads with the
+/// one-edit form.
 #[must_use]
 pub fn default_system_prompt_for(limits: &ToolLimits, tool_set: ToolSet) -> String {
     match tool_set {
         ToolSet::Base => default_system_prompt(limits),
         ToolSet::CodingV1 => fill_prompt(&coding_template(), limits),
+        ToolSet::CodingV2 => fill_prompt(&coding_v2_template(), limits),
     }
 }
+
+/// [`ToolSet::CodingV1`]'s `edit_file` line, as the coding template has it.
+const CODING_V1_EDIT_LINE: &str = "- edit_file: replace exact text in a file of at most \
+     {file_kib} KiB; each old_text must match once unless replace_all is set, and all edits \
+     apply or none.\n";
+
+/// [`ToolSet::CodingV2`]'s `edit_file` line.
+const CODING_V2_EDIT_LINE: &str = "- edit_file: replace exact text in a file of at most \
+     {file_kib} KiB: old_text and new_text for one edit, or edits (an array) for several; \
+     old_text must match once unless replace_all is set, and all edits apply or none.\n";
 
 /// The base tool lines the coding template changes, and what it puts in
 /// their place.
@@ -128,6 +140,14 @@ fn coding_template() -> String {
             debug_assert_eq!(template.matches(from).count(), 1, "{from}");
             template.replacen(from, to, 1)
         })
+}
+
+/// [`coding_template`] with [`CODING_V2_EDIT_LINE`] in place of
+/// [`CODING_V1_EDIT_LINE`].
+fn coding_v2_template() -> String {
+    let template = coding_template();
+    debug_assert_eq!(template.matches(CODING_V1_EDIT_LINE).count(), 1);
+    template.replacen(CODING_V1_EDIT_LINE, CODING_V2_EDIT_LINE, 1)
 }
 
 fn fill_prompt(template: &str, limits: &ToolLimits) -> String {
@@ -223,5 +243,38 @@ mod tests {
         ));
         assert!(coding.contains("at most 64 KiB; each old_text"));
         assert!(coding.len() < 3072);
+    }
+
+    /// The v1 coding prompt is the one its recordings were made with.
+    #[test]
+    fn the_coding_v1_prompt_is_unchanged() {
+        let coding = default_system_prompt_for(&ToolLimits::default(), ToolSet::CodingV1);
+        assert!(coding.contains(
+            "\n- edit_file: replace exact text in a file of at most 64 KiB; each old_text must \
+             match once unless replace_all is set, and all edits apply or none.\n- search: "
+        ));
+    }
+
+    #[test]
+    fn the_coding_v2_prompt_differs_only_in_its_edit_file_line() {
+        let limits = ToolLimits::default();
+        let v1 = default_system_prompt_for(&limits, ToolSet::CodingV1);
+        let v2 = default_system_prompt_for(&limits, ToolSet::CodingV2);
+        assert!(!v2.contains('{'), "{v2}");
+        let edit_line = "- edit_file: replace exact text in a file of at most 64 KiB: old_text \
+                         and new_text for one edit, or edits (an array) for several; old_text \
+                         must match once unless replace_all is set, and all edits apply or none.";
+        let v1_lines = v1.lines().collect::<Vec<_>>();
+        let v2_lines = v2.lines().collect::<Vec<_>>();
+        assert_eq!(v1_lines.len(), v2_lines.len());
+        for (v1, v2) in v1_lines.iter().zip(&v2_lines) {
+            if v1.starts_with("- edit_file: ") {
+                assert_eq!(*v2, edit_line);
+            } else {
+                assert_eq!(v1, v2);
+            }
+        }
+        assert!(v2_lines.contains(&edit_line));
+        assert!(v2.len() < 3072);
     }
 }

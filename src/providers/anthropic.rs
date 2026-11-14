@@ -527,7 +527,7 @@ impl AnthropicProvider {
             // execution context describes them, in every tool set.
             let registry = ToolRegistry::new(ToolLimits::default());
             for context in [ExecContext::WorkspaceV1, ExecContext::WorkspaceStreamV1] {
-                for tool_set in [ToolSet::Base, ToolSet::CodingV1] {
+                for tool_set in [ToolSet::Base, ToolSet::CodingV1, ToolSet::CodingV2] {
                     for tool in registry.definitions_in(context, tool_set) {
                         strict_input_schema(&tool.input_schema).map_err(|problem| {
                             AnthropicError(format!("tool {}: {problem}", tool.name))

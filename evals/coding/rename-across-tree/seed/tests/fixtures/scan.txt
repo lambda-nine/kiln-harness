@@ -1,0 +1,6 @@
+# A small scan: PATH BYTES.
+docs/a.txt 512
+docs/b.txt 1536
+src/main.c 20480
+src/big.bin 3145728
+img/logo.png 1048576

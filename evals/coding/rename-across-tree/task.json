@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "rename-across-tree",
+  "description": "Rename a shell function at its definition, calls, indirect references and comments across a 36-file project, while printed text, a same-named variable, same-named awk helpers, look-alike names and non-shell files stay byte for byte.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 600,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

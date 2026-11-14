@@ -70,10 +70,11 @@ pub enum JournalEvent {
         /// off, so journals without it are byte-identical to before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compaction: Option<CompactionPolicy>,
-        /// The tools the model had (`--tool-set`): `coding_v1` adds
-        /// `edit_file`, `search` and line ranges in `read_file`. Absent is
-        /// the base set, so journals recorded with it are byte-identical to
-        /// before.
+        /// The tools the model had (`--tool-set`): `coding_v1` and
+        /// `coding_v2` add `edit_file`, `search` and line ranges in
+        /// `read_file`, and differ in how `edit_file` takes its edits.
+        /// Absent is the base set, so journals recorded with it are
+        /// byte-identical to before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_set: Option<String>,
     },

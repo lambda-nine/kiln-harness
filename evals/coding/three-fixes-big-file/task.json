@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "three-fixes-big-file",
+  "description": "Find three bugs, reported only by their symptoms, in a 50 KiB, 1,385-line awk invoicing program (a CSV quote parser early on, a rounding helper in the middle, a JSON escaper near the end) and fix each inside its own function, leaving every other line byte for byte; hidden inputs run all ten reports against the fixed reference.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 600,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

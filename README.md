@@ -72,7 +72,7 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 | `read_file` | base | Reads a bounded prefix of a `/workspace` file |
 | `read_file` with `start_line`, `line_count` | coding | Reads whole lines, at most 5,000, from the file's first 1 MiB, byte for byte |
 | `write_file` | base | Replaces a `/workspace` file with bounded UTF-8 text |
-| `edit_file` | coding | Replaces exact text in a `/workspace` file: up to 32 edits, each matching once or with `replace_all`, all applied or none |
+| `edit_file` | coding | Replaces exact text in a `/workspace` file: one edit as `old_text` and `new_text`, or up to 32 as `edits`, each matching once or with `replace_all`, all applied or none |
 | `search` | coding | Finds lines containing a string, or an extended regex, in the files under a `/workspace` path, as `path:line:text` in path order |
 | `list_dir` | base | Lists entry names in a `/workspace` directory |
 | `workspace_diff` | base | Lists files added or removed since the session started |
@@ -81,8 +81,10 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 `--tool-set coding`. With `coding` the model gets all seven, and the
 default system prompt lists them and suggests editing and searching over
 rewriting and rereading whole files. The journal records the set
-(`coding_v1`), replay uses the recorded one and refuses a configuration with
-another, and eval reports record it with each run's tool calls by name. A
+(`coding_v2`), replay uses the recorded one and refuses a configuration with
+another, and eval reports record it with each run's tool calls by name.
+Journals recorded with the earlier set `coding_v1`, whose `edit_file` takes
+its edits only as an `edits` array, still replay with its tools. A
 base session's model requests and journal are byte-identical to those of a
 build without tool sets. Every tool reaches the sandbox through fixed argv
 with the model's text as one argument or as stdin; see

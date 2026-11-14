@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "add-parameter",
+  "description": "Give a shell logging function an optional third argument and pass a per-file component at 24 call sites across 8 scripts, including continued and multi-line calls and calls before redirections, while documentation, commented-out calls, look-alike names and the tests stay byte for byte.",
+  "check_timeout_secs": 30,
+  "session_timeout_secs": 600,
+  "max_steps": 40,
+  "max_tool_calls": 80
+}

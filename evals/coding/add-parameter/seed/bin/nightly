@@ -1,0 +1,35 @@
+#!/bin/sh
+# nightly: run every job listed in etc/nightly.conf, in order.
+ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
+. "$ROOT/lib/log.sh"
+. "$ROOT/lib/fs/prune.sh"
+. "$ROOT/etc/nightly.conf"
+
+usage() {
+  cat <<EOF
+usage: nightly [-n]
+Runs the jobs in etc/nightly.conf. With -n, only says what it would run.
+Jobs log with lines such as: log_event info "backup started"
+EOF
+}
+
+# step LEVEL TEXT: log a line about the run itself.
+step() {
+  log_event "$1" "$2"
+}
+
+dry=0
+case $1 in
+  -n) dry=1 ;;
+  '') ;;
+  *) usage >&2; exit 2 ;;
+esac
+for job in $JOBS; do
+  if [ $dry = 1 ]; then echo "would run $job"; continue; fi
+  step info "starting $job"
+  case $job in
+    prune) prune_old "$BACKUP_DIR" "$KEEP_DAYS" >/dev/null ;;
+    *) sh "$ROOT/bin/$job.sh" || log_event warn "$job failed with status $?" ;;
+  esac
+done
+log_event info "all jobs finished at $(date +%H:%M)"

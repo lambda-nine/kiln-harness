@@ -590,8 +590,8 @@ pub struct Manifest {
     /// missing in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// The tools every run's model had (`--tool-set`): `base` or
-    /// `coding_v1`. Always written; older files, which had only the base
+    /// The tools every run's model had (`--tool-set`): `base`, `coding_v1`
+    /// or `coding_v2`. Always written; older files, which had only the base
     /// tools, read as `base`.
     #[serde(default = "base_tool_set")]
     pub tool_set: String,

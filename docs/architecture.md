@@ -1071,12 +1071,16 @@ by default (`--max-truncation-recoveries`).
 `HarnessConfig::tool_set` (`--tool-set base|coding`) picks the tools the
 model gets. `base`, the default, is the five tools above, with requests,
 journals and replay byte-identical to builds before tool sets existed.
-`coding` is the set `coding_v1`: the base list with `read_file` replaced by
+`coding` is the set `coding_v2`: the base list with `read_file` replaced by
 a version that also takes line ranges, then `edit_file` and `search` after
-`workspace_diff`. Its definitions, its limits below, and the default system
-prompt's tool list (which adds a line for each new tool and a sentence
-preferring `edit_file` and ranged reads) belong to the name: changing any of
-them needs a new name. Under `base`, `edit_file` and `search` are unknown
+`workspace_diff`. A coding set's definitions, its limits below, and the
+default system prompt's tool list (which adds a line for each new tool and a
+sentence preferring `edit_file` and ranged reads) belong to its name:
+changing any of them needs a new name. `coding_v1`, the first coding set, is
+`coding_v2` except for `edit_file`, which takes its edits only as an `edits`
+array and names every refused edit by its index; it is kept unchanged, its
+definitions, prompt and messages included, so its journals replay, and only
+replay selects it. Under `base`, `edit_file` and `search` are unknown
 tools, and `read_file` with `start_line` fails argument parsing exactly as
 before.
 
@@ -1152,6 +1156,18 @@ stdin limits. Edits apply together or not at all; inserted text is never
 matched again. Refusals, in that order, are `no_match`, `not_unique`,
 `too_many_replacements`, `overlapping_edits` and `file_too_large`, each
 naming the edits by their 0-based index.
+
+In `coding_v2` a call gives one edit as top-level `old_text`, `new_text`
+and optional `replace_all`, or several as `edits`, never both; only `path`
+is required. A call with `edits` and any of the top-level edit fields is
+refused `invalid_arguments`, as is `edits` sent as a string (JSON text of
+the array), which is not parsed: the message says to send an array, or the
+top-level fields for one edit. A top-level edit without `old_text` or
+`new_text` is refused naming what is missing. A call in the one-edit form
+is checked and applied exactly as a one-element `edits` would be, but its
+messages name no edit index ("old_text was not found"); the error kinds are
+the same. `coding_v1` takes only `edits`, and refuses a top-level edit
+field as an unknown field.
 
 **`search` ordering.** Results never depend on the order the file system
 lists entries in. The file list is parsed as NUL-separated names under
@@ -1368,7 +1384,8 @@ For a task with a seed or a check it also records `seed` (each file's path
 and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
 replay is self-contained. Both are omitted when absent, so a journal without
 them is byte-identical to one written before they existed, and the schema
-stays 1. `tool_set` names the tool set when it is not base (`coding_v1`),
+stays 1. `tool_set` names the tool set when it is not base (`coding_v1` or
+`coding_v2`),
 and is omitted otherwise, so base journals are byte-identical to before; a
 journal naming a set this build does not know is refused before anything
 else in it is checked or replayed. `exec_context` names where every execution ran: new sessions
@@ -1618,7 +1635,8 @@ files, which could not compact, so `eval compare` notes any difference in
 it, off included. With it, each result line carries `compactions` (omitted
 when 0), and `report.md` adds a "Compactions (mean)" column; without it the
 report is unchanged.
-The manifest and report always record `tool_set` (`base` or `coding_v1`);
+The manifest and report always record `tool_set` (`base`, `coding_v1` or
+`coding_v2`);
 an older file reads as `base`, the only set it could have used, so `eval
 compare` notes any difference. Each result line carries
 `tool_calls_by_name`, the run's tool calls per recorded tool name
