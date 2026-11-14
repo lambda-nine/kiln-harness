@@ -352,8 +352,9 @@ calls. Every check has 30 seconds.
   JSON backslashes), in functions early, in the middle and near the end of
   the file. The check requires every line outside those three functions to
   be unchanged and the file to end with a newline; a function runs from its
-  `function NAME(` line, spacing free, to the next top-level function or
-  block, less the comment and blank lines just before that. It builds the
+  `function NAME(` line, spacing free, to the first line after it that is
+  exactly `}` (the prompt asks for the closing brace at the start of its
+  own line), so an indented closing brace fails. It builds the
   reference by putting the fixed functions into the agent's file, and
   compares all ten reports on seven hidden inputs with it: stdout, stderr
   and exit status.

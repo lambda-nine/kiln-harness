@@ -1054,6 +1054,12 @@ async fn coding_v2_edit_calls_are_checked_on_the_host() {
             "invalid_arguments",
             "path is null; give a string".to_string(),
         ),
+        // Positional arguments, which serde would otherwise accept.
+        (
+            json!(["notes.txt", "beta", "BETA", null, null]),
+            "invalid_arguments",
+            "the arguments must be a JSON object".to_string(),
+        ),
         // Unknown fields are reported before nulls, even one serde reads
         // after a null.
         (
@@ -2305,6 +2311,7 @@ fn coding_checks_refuse_plausible_wrong_answers() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn larger_coding_checks_refuse_wrong_answers_and_accept_equivalent_edits() {
     let run = |task: &HostTask, script: &str| {
         let script = format!("cd {} || exit 1\n{script}", task.workspace.display());
@@ -2357,9 +2364,11 @@ fn larger_coding_checks_refuse_wrong_answers_and_accept_equivalent_edits() {
             "grep -v '^ *https://admin.example.com$' app.ini > a.new; mv a.new app.ini",
         ),
         // three-fixes-big-file: no final newline; the refund fix moved to
-        // the caller; a comment outside the functions edited. Spacing before
-        // a function's parenthesis, an indented closing brace and a comment
-        // inside a fixed function are fine.
+        // the caller; a comment outside the functions edited; top-level code
+        // added just after a fixed function's closing brace; that brace
+        // indented (the prompt keeps it at the start of its own line).
+        // Spacing before a function's parenthesis and a comment inside a
+        // fixed function are fine.
         (
             "three-fixes-big-file",
             false,
@@ -2381,15 +2390,28 @@ fn larger_coding_checks_refuse_wrong_answers_and_accept_equivalent_edits() {
         ),
         (
             "three-fixes-big-file",
-            true,
-            "sed 's/^function round_div(/function round_div (/' invoice.awk > i.new \
-             && mv i.new invoice.awk",
+            false,
+            "awk '{ print } /^function round_div\\(/ { f = 1 } f && /^}$/ { print \"0 { }\"; f = 0 }' \
+             invoice.awk > i.new && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            false,
+            "awk '{ print } /^function round_div\\(/ { f = 1 } \
+             f && /^}$/ { print \"  BEGIN { untouched = 123 }\"; f = 0 }' \
+             invoice.awk > i.new && mv i.new invoice.awk",
+        ),
+        (
+            "three-fixes-big-file",
+            false,
+            "awk '/^function json_str\\(/ { f = 1 } f && /^}$/ { print \"  }\"; f = 0; next } \
+             { print }' invoice.awk > i.new && mv i.new invoice.awk",
         ),
         (
             "three-fixes-big-file",
             true,
-            "awk '/^function json_str\\(/ { f = 1 } f && /^}$/ { print \"  }\"; f = 0; next } \
-             { print }' invoice.awk > i.new && mv i.new invoice.awk",
+            "sed 's/^function round_div(/function round_div (/' invoice.awk > i.new \
+             && mv i.new invoice.awk",
         ),
         (
             "three-fixes-big-file",

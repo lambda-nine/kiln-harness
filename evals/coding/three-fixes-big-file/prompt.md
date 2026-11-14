@@ -8,6 +8,6 @@ Three bugs have been reported:
    the csv report gives the line a tax of `-1.44`; it should be `-1.45`, the exact mirror of the `1.45` that selling one widget pays.
 3. The json report writes a description of `Cable 3\4 adapter` as `"Cable 3\4 adapter"`, which is not valid JSON. It should be `"Cable 3\\4 adapter"`.
 
-Each bug is in a different function. Fix each one in the function that has it, so that every report gives the answer the manual describes for every input, not only for these examples. Change nothing outside those three functions: every other line of the file stays byte for byte as it is.
+Each bug is in a different function. Fix each one in the function that has it, so that every report gives the answer the manual describes for every input, not only for these examples. Change nothing outside those three functions: every other line of the file stays byte for byte as it is. Keep each function's closing `}` on a line of its own at the start of the line.
 
 Leave no other files in `/workspace` (no backup, sample or temporary files; `/tmp` is fine for scratch files). Commands you run start in `/workspace`; the sandbox has busybox `sh`, `awk`, `sed`, `grep` and the other standard tools, and no network.

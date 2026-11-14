@@ -327,7 +327,15 @@ impl<A: SandboxApi> ToolSession<'_, A> {
     /// `old_text`, `new_text` and `replace_all`, or [`Self::plan_edit`]'s
     /// `edits`, never both.
     pub(super) fn plan_edit_v2(&self, arguments: Value) -> Result<ToolPlan, ToolRun> {
-        // Unknown fields first, then explicit nulls, then each value.
+        // An object first (serde would also take a positional array, whose
+        // nulls the field checks below cannot see), then unknown fields,
+        // then explicit nulls, then each value.
+        if !arguments.is_object() {
+            return Err(ToolRun::rejected(
+                "invalid_arguments",
+                "the arguments must be a JSON object",
+            ));
+        }
         EditFileV2Fields::deserialize(&arguments)
             .map_err(|error| ToolRun::rejected("invalid_arguments", error.to_string()))?;
         for (field, message) in EDIT_V2_NULLS {

@@ -11,28 +11,26 @@ export LC_ALL
 [ "$(tr -d '\000' <invoice.awk | wc -c)" = "$(wc -c <invoice.awk)" ] || { echo "NUL bytes"; exit 1; }
 tmp=$(mktemp -d) || exit 2
 # split.awk cuts out each of the three functions with a bug: from its
-# "function NAME(" line (spacing free) up to the next top-level function or
-# BEGIN or END block, less the blank lines and column-0 comments just before
-# that (the next function's own comment). With mode=outside each one becomes
-# a marker line; with mode=ref, the fixed function from the directory d.
+# "function NAME(" line (spacing free) to the first line after it that is
+# exactly "}" (the prompt asks for the closing brace at the start of its own
+# line). With mode=outside each one becomes a marker line; with mode=ref, the
+# fixed function from the directory d.
 cat >"$tmp/split.awk" <<'END_SPLIT'
 { line[NR] = $0 }
 END {
   n = NR
   i = 1
   while (i <= n) {
-    if (line[i] !~ /^[ \t]*function[ \t]+(csv_split|round_div|json_str)[ \t]*\(/) {
+    if (line[i] !~ /^function[ \t]+(csv_split|round_div|json_str)[ \t]*\(/) {
       print line[i]
       i++
       continue
     }
     name = line[i]
-    sub(/^[ \t]*function[ \t]+/, "", name)
+    sub(/^function[ \t]+/, "", name)
     sub(/[ \t]*\(.*/, "", name)
     j = i + 1
-    while (j <= n && line[j] !~ /^[ \t]*function[ \t]/ && line[j] !~ /^(BEGIN|END)([ \t{]|$)/) j++
-    k = j - 1
-    while (k > i && (line[k] ~ /^[ \t]*$/ || line[k] ~ /^#/)) k--
+    while (j <= n && line[j] != "}") j++
     if (mode == "ref") {
       f = d "/" name
       while ((getline l < f) > 0) print l
@@ -40,14 +38,14 @@ END {
     } else {
       print "@@ " name
     }
-    i = k + 1
+    i = j + 1
   }
 }
 END_SPLIT
 # Each of the three functions is there once, and every line outside them is
 # as it was.
 for fn in csv_split round_div json_str; do
-  [ "$(awk -v fn="$fn" '$0 ~ ("^[ \t]*function[ \t]+" fn "[ \t]*[(]") { n++ } END { print n + 0 }' invoice.awk)" = 1 ] ||
+  [ "$(awk -v fn="$fn" '$0 ~ ("^function[ \t]+" fn "[ \t]*[(]") { n++ } END { print n + 0 }' invoice.awk)" = 1 ] ||
     { rm -rf "$tmp"; echo "$fn"; exit 1; }
 done
 outside=$(awk -v mode=outside -f "$tmp/split.awk" invoice.awk | sha256sum | cut -d ' ' -f 1)
