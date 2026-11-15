@@ -104,6 +104,7 @@ fn base_config() -> HarnessConfig {
         max_steps: 12,
         max_tool_calls: 20,
         max_truncation_recoveries: 0,
+        max_refused_calls_per_turn: 0,
         ..HarnessConfig::default()
     }
 }

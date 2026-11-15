@@ -1042,6 +1042,7 @@ fn distinct_config() -> HarnessConfig {
         max_total_output_tokens: 666,
         max_total_model_output_bytes: 7777,
         max_truncation_recoveries: 5,
+        max_refused_calls_per_turn: 13,
         tool_limits: ToolLimits {
             timeout: Duration::from_millis(1234),
             max_argv_bytes: 101,
@@ -1078,6 +1079,7 @@ fn limits_round_trip_every_model_visible_setting() {
     assert_eq!(restored.max_model_arguments_bytes, 1);
     assert_eq!(restored.max_final_answer_bytes, 1000);
     assert_eq!(restored.max_total_model_output_bytes, 7777);
+    assert_eq!(restored.max_refused_calls_per_turn, 13);
     assert_eq!(restored.session_timeout, recorded.session_timeout);
     assert_eq!(restored.tool_limits.timeout, recorded.tool_limits.timeout);
     assert_eq!(

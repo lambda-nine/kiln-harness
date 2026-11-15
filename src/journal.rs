@@ -315,6 +315,12 @@ pub struct SessionLimits {
     /// fatal. Skipped when 0, so such journals stay byte-identical.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub max_truncation_recoveries: u32,
+    /// Absent from journals written before turn-cap refusals existed; they
+    /// load with 0, their meaning then: a response with more calls than
+    /// `max_tool_calls_per_turn` is fatal. Skipped when 0, so such
+    /// journals stay byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_refused_calls_per_turn: u32,
     pub max_model_arguments_bytes: usize,
     pub max_final_answer_bytes: usize,
     pub tool_limits: RecordedToolLimits,
@@ -1004,6 +1010,15 @@ struct RespondedTurn {
     disposition: Disposition,
 }
 
+/// The parts of one `tool_executed` that [`Grammar::record_tool`] checks
+/// besides the call.
+#[derive(Clone, Copy)]
+struct RecordedRun<'a> {
+    ok: bool,
+    result: &'a Value,
+    execution_ids: &'a [String],
+}
+
 /// What the engine does with one response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Disposition {
@@ -1049,7 +1064,11 @@ fn engine_accepts(
         text_bytes > 0 && text_bytes <= limits.max_final_answer_bytes
     } else {
         let mut call_ids = std::collections::BTreeSet::new();
-        response.tool_calls.len() <= limits.max_tool_calls_per_turn as usize
+        response.tool_calls.len()
+            <= crate::engine::turn_call_ceiling(
+                limits.max_tool_calls_per_turn,
+                limits.max_refused_calls_per_turn,
+            )
             && response.tool_calls.iter().all(|call| {
                 crate::engine::call_id_is_valid(&call.call_id) && call_ids.insert(&call.call_id)
             })
@@ -1271,9 +1290,20 @@ impl Grammar {
                 turn,
                 index,
                 call,
+                ok,
                 result,
+                execution_ids,
                 ..
-            } => self.record_tool(*turn, *index, call, result)?,
+            } => self.record_tool(
+                *turn,
+                *index,
+                call,
+                RecordedRun {
+                    ok: *ok,
+                    result,
+                    execution_ids,
+                },
+            )?,
             JournalEvent::CheckCompleted { stdout, stderr, .. } => {
                 if stdout.len() > CHECK_OUTPUT_BYTES || stderr.len() > CHECK_OUTPUT_BYTES {
                     return Err("check_completed output is longer than 4 KiB");
@@ -1529,8 +1559,9 @@ impl Grammar {
         turn: u32,
         index: u32,
         call: &ToolCall,
-        result: &Value,
+        run: RecordedRun<'_>,
     ) -> Result<(), &'static str> {
+        let result = run.result;
         let Some(last) = self
             .last_response
             .as_mut()
@@ -1551,7 +1582,11 @@ impl Grammar {
             }
         }
         let limits = self.context.as_ref().ok_or("no session context")?.limits;
-        if index > limits.max_tool_calls_per_turn {
+        let ceiling = crate::engine::turn_call_ceiling(
+            limits.max_tool_calls_per_turn,
+            limits.max_refused_calls_per_turn,
+        );
+        if usize::try_from(index).map_or(true, |index| index > ceiling) {
             return Err("tool_executed beyond max_tool_calls_per_turn");
         }
         if self.tool_calls >= limits.max_tool_calls {
@@ -1566,6 +1601,21 @@ impl Grammar {
         };
         if expected != call {
             return Err("tool_executed call differs from the sanitized response call");
+        }
+        // A call past the cap never runs; its result is fixed by its
+        // position alone.
+        if index > limits.max_tool_calls_per_turn {
+            let refusal = crate::engine::turn_cap_refusal(
+                limits.max_tool_calls_per_turn,
+                index,
+                u32::try_from(last.calls.len()).unwrap_or(u32::MAX),
+                limits.tool_limits.max_result_bytes,
+            );
+            if run.ok || !run.execution_ids.is_empty() || *result != refusal {
+                return Err(
+                    "tool_executed beyond max_tool_calls_per_turn must be the turn-cap refusal",
+                );
+            }
         }
         last.results.push(ToolResult {
             call_id: call.call_id.clone(),

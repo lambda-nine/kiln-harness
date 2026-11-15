@@ -294,7 +294,10 @@ it is not a hostile multi-tenant boundary.
   calls run, and none of its content reaches the history or the audit),
   within a bounded number of recoveries per session (default 2, at most 16),
   after which truncation fails the session; a turn that fills the context
-  window always does. Malformed or repeated provider call IDs fail the session; unregistered
+  window always does. Calls past the per-turn cap, within a bounded
+  allowance (default 24, at most 64), run nothing and get a model-visible
+  `too_many_calls_in_turn` result; more than both together fail the turn
+  before any call runs. Malformed or repeated provider call IDs fail the session; unregistered
   tool names only produce a model-visible `unknown_tool` result. Configured and
   recorded limits are capped by fixed ceilings before any sandbox exists.
 

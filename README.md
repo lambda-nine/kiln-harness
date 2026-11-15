@@ -234,7 +234,8 @@ The model must support tool calling through the API. Small local models do
 better when the prompt says to use the tools; otherwise some answer from
 memory, which the harness accepts as a final answer. `--system-file`
 replaces the default system prompt, which describes the sandbox and the
-tools. Limits default to 40 steps, 120 tool calls (8 per turn), a 900-second
+tools. Limits default to 40 steps, 120 tool calls (8 per turn, with up to
+24 more in one response answered with an error), a 900-second
 session, a 30-second tool timeout, 16,384 output tokens per request, and
 2,000,000 input and 600,000 output tokens per session; each has a flag, and
 the hard ceilings in `docs/architecture.md` still apply. The sandbox expiry
@@ -246,7 +247,12 @@ model is told to keep its reasoning short; `--max-truncation-recoveries`
 (default 2, at most 16, 0 to make truncation fatal) bounds how often that
 happens per session, each one using a step, and the next truncation then
 fails the session. A response that fills the model's context window always
-fails it. Lower `--max-output-tokens` only for models that do not think. `--temperature`
+fails it. Calls past `--max-tool-calls-per-turn` in one response do not
+run: each gets a `too_many_calls_in_turn` error telling the model to send
+it again in a later turn, and counts toward `--max-tool-calls`;
+`--max-refused-calls-per-turn` (default 24, at most 64) bounds how many,
+and a response with more than both together ends the session, as any
+response over the cap does with 0. Lower `--max-output-tokens` only for models that do not think. `--temperature`
 (default 0) and `--seed` are forwarded. Output matches `demo`. The audit
 defaults to `audit/run.jsonl` and the journal to
 `journal/run-<unix_ms>.jsonl`, which `replay` reruns without the model

@@ -597,7 +597,10 @@ fn recorded_limits_bound_what_may_follow() {
     );
     assert_rejected_because(
         "two calls in a turn under max_tool_calls_per_turn 1",
-        with_limits(valid(), |limits| limits.max_tool_calls_per_turn = 1),
+        with_limits(valid(), |limits| {
+            limits.max_tool_calls_per_turn = 1;
+            limits.max_refused_calls_per_turn = 0;
+        }),
         "after a response the engine refuses",
     );
     assert_rejected_because(

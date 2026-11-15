@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, sleep, sleep_until, timeout_at};
@@ -40,6 +40,8 @@ const MAX_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_STEPS: u32 = 1000;
 pub const MAX_TOOL_CALLS: u32 = 10_000;
 pub const MAX_TOOL_CALLS_PER_TURN: u32 = 64;
+/// Ceiling for [`HarnessConfig::max_refused_calls_per_turn`].
+pub const MAX_REFUSED_CALLS_PER_TURN: u32 = 64;
 pub const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 pub const MAX_TOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Ceiling for each byte limit.
@@ -231,6 +233,11 @@ pub struct HarnessConfig {
     /// session may discard and go on from, in total, not per streak. Each
     /// uses a step. 0 makes every such stop fatal.
     pub max_truncation_recoveries: u32,
+    /// Calls past `max_tool_calls_per_turn` in one response that are
+    /// answered with the [`turn_cap_refusal`] error instead of running;
+    /// a response with more calls than both together ends the session.
+    /// 0 ends the session at any response over the cap.
+    pub max_refused_calls_per_turn: u32,
     pub tool_limits: ToolLimits,
     /// How long kilnd may leave the sandbox idle before reclaiming it, when
     /// the daemon supports expiry. A heartbeat renews it during provider
@@ -265,6 +272,7 @@ impl Default for HarnessConfig {
             max_total_output_tokens: 200_000,
             max_total_model_output_bytes: 8 << 20,
             max_truncation_recoveries: 2,
+            max_refused_calls_per_turn: 24,
             tool_limits: ToolLimits::default(),
             sandbox_idle_timeout: Duration::from_secs(120),
             sandbox_lifetime_margin: Duration::from_secs(60),
@@ -289,6 +297,7 @@ impl HarnessConfig {
             max_total_output_tokens: self.max_total_output_tokens,
             max_total_model_output_bytes: self.max_total_model_output_bytes,
             max_truncation_recoveries: self.max_truncation_recoveries,
+            max_refused_calls_per_turn: self.max_refused_calls_per_turn,
             max_model_arguments_bytes: self.max_model_arguments_bytes,
             max_final_answer_bytes: self.max_final_answer_bytes,
             tool_limits: RecordedToolLimits {
@@ -346,6 +355,7 @@ impl HarnessConfig {
         self.max_total_output_tokens = limits.max_total_output_tokens;
         self.max_total_model_output_bytes = limits.max_total_model_output_bytes;
         self.max_truncation_recoveries = limits.max_truncation_recoveries;
+        self.max_refused_calls_per_turn = limits.max_refused_calls_per_turn;
         self.max_model_arguments_bytes = limits.max_model_arguments_bytes;
         self.max_final_answer_bytes = limits.max_final_answer_bytes;
         let tools = &limits.tool_limits;
@@ -1342,7 +1352,14 @@ where
                 },
             )
         };
-        if tool_calls.len() > config.max_tool_calls_per_turn as usize {
+        // Calls past the per-turn cap are answered with an error, up to the
+        // refusal allowance; a response past both ends the session.
+        if tool_calls.len()
+            > turn_call_ceiling(
+                config.max_tool_calls_per_turn,
+                config.max_refused_calls_per_turn,
+            )
+        {
             reject_turn(audit)?;
             return Err(HarnessError::TurnToolBudget(config.max_tool_calls_per_turn));
         }
@@ -1395,6 +1412,7 @@ where
             provider_content,
         });
 
+        let call_count = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
         let mut results = Vec::with_capacity(prepared.len());
         for (position, call) in prepared.into_iter().enumerate() {
             let index = u32::try_from(position + 1).unwrap_or(u32::MAX);
@@ -1402,7 +1420,11 @@ where
             let audit_call_id = format!("call-{turn}-{index}");
             let next_tool_calls = progress.tool_calls.saturating_add(1);
             let over_budget = next_tool_calls > config.max_tool_calls;
-            let rejected = over_budget || !call.registered || call.arguments.is_none();
+            // Decided by position alone, so the grammar and replay predict
+            // it, and it wins over the other host-side rejections.
+            let over_turn_cap = index > config.max_tool_calls_per_turn;
+            let rejected =
+                over_budget || over_turn_cap || !call.registered || call.arguments.is_none();
             audit.append(
                 session_id,
                 Some(sandbox_id),
@@ -1440,7 +1462,23 @@ where
             // never after the session deadline.
             let tool_deadline = deadline.min(Instant::now() + tool_rpc_budget(config));
 
-            let mut run = if call.arguments.is_none() {
+            let mut run = if over_turn_cap {
+                ToolRun {
+                    ok: false,
+                    result: turn_cap_refusal(
+                        config.max_tool_calls_per_turn,
+                        index,
+                        call_count,
+                        config.tool_limits.max_result_bytes,
+                    ),
+                    execution_ids: Vec::new(),
+                    stdout: empty_output(),
+                    stderr: empty_output(),
+                    stop: None,
+                    live: None,
+                    earlier: None,
+                }
+            } else if call.arguments.is_none() {
                 rejected_tool_run("model_arguments_too_large")
             } else if !call.registered {
                 // Misnamed tools are model mistakes: report and continue.
@@ -2439,6 +2477,7 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
         && config.max_total_output_tokens <= MAX_TOTAL_TOKENS
         && config.max_total_model_output_bytes <= MAX_TOTAL_MODEL_OUTPUT_BYTES
         && config.max_truncation_recoveries <= MAX_TRUNCATION_RECOVERIES
+        && config.max_refused_calls_per_turn <= MAX_REFUSED_CALLS_PER_TURN
         && tools.max_manifest_entries <= MAX_MANIFEST_ENTRIES
         && byte_limits.iter().all(|limit| *limit <= MAX_BYTE_LIMIT)
         && config.sandbox_idle_timeout <= MAX_SANDBOX_IDLE_TIMEOUT
@@ -2653,6 +2692,47 @@ fn session_id() -> Result<String, HarnessError> {
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
+
+/// The most calls one response may carry before the whole turn is refused:
+/// the per-turn cap plus the calls past it that are answered with
+/// [`turn_cap_refusal`]. Shared with the journal grammar.
+#[must_use]
+pub fn turn_call_ceiling(max_tool_calls_per_turn: u32, max_refused_calls_per_turn: u32) -> usize {
+    let ceiling = max_tool_calls_per_turn.saturating_add(max_refused_calls_per_turn);
+    usize::try_from(ceiling).unwrap_or(usize::MAX)
+}
+
+/// The result of call `index` of `call_count` in one response when `index`
+/// is past the per-turn cap `max_tool_calls_per_turn`: the call does not
+/// run, and the model is told to send it again. It depends only on
+/// recorded values, so the engine, the journal grammar and replay agree
+/// byte for byte. When the message would not fit `max_result_bytes`, the
+/// result is the error alone, which fits the 64-byte minimum.
+#[must_use]
+pub fn turn_cap_refusal(
+    max_tool_calls_per_turn: u32,
+    index: u32,
+    call_count: u32,
+    max_result_bytes: usize,
+) -> Value {
+    let message = format!(
+        "only the first {max_tool_calls_per_turn} tool calls in a turn run; this was call \
+         {index} of {call_count}, so it did not run. Send it again in a later turn."
+    );
+    let result = json!({
+        "ok": false,
+        "error": TOO_MANY_CALLS_IN_TURN,
+        "message": message,
+    });
+    let fits = serde_json::to_vec(&result).is_ok_and(|bytes| bytes.len() <= max_result_bytes);
+    if fits {
+        result
+    } else {
+        json!({"ok": false, "error": TOO_MANY_CALLS_IN_TURN})
+    }
+}
+
+const TOO_MANY_CALLS_IN_TURN: &str = "too_many_calls_in_turn";
 
 fn rejected_tool_run(kind: &str) -> ToolRun {
     ToolRun {

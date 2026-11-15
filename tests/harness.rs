@@ -1400,6 +1400,7 @@ async fn per_turn_call_budget_fails_closed_before_any_exec() {
     ])]);
     let config = HarnessConfig {
         max_tool_calls_per_turn: 2,
+        max_refused_calls_per_turn: 0,
         ..short_lifecycle_config()
     };
     let mut harness = Harness::new(
@@ -2129,6 +2130,7 @@ async fn every_engine_exit_path_writes_a_grammatical_journal() {
         ScriptedProvider::new([ModelResponse::tool_use([diff("a"), diff("b")])]),
         HarnessConfig {
             max_tool_calls_per_turn: 1,
+            max_refused_calls_per_turn: 0,
             ..short_lifecycle_config()
         },
         None,

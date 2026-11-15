@@ -15,9 +15,9 @@ use kiln_harness::compaction::{
 };
 use kiln_harness::engine::{
     CheckOutcome, Harness, HarnessConfig, HarnessError, MAX_OUTPUT_TOKENS_PER_REQUEST,
-    MAX_SANDBOX_IDLE_TIMEOUT, MAX_SANDBOX_LIFETIME_MARGIN, MAX_SESSION_TIMEOUT, MAX_STEPS,
-    MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN, MAX_TOOL_TIMEOUT,
-    MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, MAX_TRUNCATION_RECOVERIES,
+    MAX_REFUSED_CALLS_PER_TURN, MAX_SANDBOX_IDLE_TIMEOUT, MAX_SANDBOX_LIFETIME_MARGIN,
+    MAX_SESSION_TIMEOUT, MAX_STEPS, MAX_TASK_TEXT_BYTES, MAX_TOOL_CALLS, MAX_TOOL_CALLS_PER_TURN,
+    MAX_TOOL_TIMEOUT, MAX_TOTAL_MODEL_OUTPUT_BYTES, MAX_TOTAL_TOKENS, MAX_TRUNCATION_RECOVERIES,
     MIN_SANDBOX_IDLE_TIMEOUT, MIN_SANDBOX_LIFETIME_MARGIN, SessionOutcome, SessionTask,
 };
 use kiln_harness::eval;
@@ -192,6 +192,11 @@ struct ModelArgs {
     /// Tool calls in one model turn.
     #[arg(long, default_value_t = 8)]
     max_tool_calls_per_turn: u32,
+    /// Calls past --max-tool-calls-per-turn in one response that are
+    /// answered with an error instead of ending the session; 0 ends it as
+    /// before.
+    #[arg(long, default_value_t = 24)]
+    max_refused_calls_per_turn: u32,
     /// Wall-clock limit for the session, including sandbox creation.
     #[arg(long, default_value_t = 900)]
     session_timeout_secs: u64,
@@ -526,6 +531,9 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         args.max_tool_calls_per_turn,
         MAX_TOOL_CALLS_PER_TURN,
     )?;
+    if args.max_refused_calls_per_turn > MAX_REFUSED_CALLS_PER_TURN {
+        bail!("--max-refused-calls-per-turn must be between 0 and {MAX_REFUSED_CALLS_PER_TURN}");
+    }
     check_limit(
         "--session-timeout-secs",
         args.session_timeout_secs,
@@ -589,6 +597,7 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         max_steps: args.max_steps,
         max_tool_calls: args.max_tool_calls,
         max_tool_calls_per_turn: args.max_tool_calls_per_turn,
+        max_refused_calls_per_turn: args.max_refused_calls_per_turn,
         session_timeout: Duration::from_secs(args.session_timeout_secs),
         max_output_tokens_per_request: args.max_output_tokens,
         max_truncation_recoveries: args.max_truncation_recoveries,
@@ -1549,6 +1558,51 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "--max-truncation-recoveries must be between 0 and 16"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_calls_per_turn_default_to_24_and_reach_the_engine() {
+        let defaults = model_args("anthropic", None);
+        assert_eq!(defaults.max_refused_calls_per_turn, 24);
+        assert_eq!(
+            model_config(&defaults)
+                .expect("config")
+                .max_refused_calls_per_turn,
+            24
+        );
+        let parse = |command: &str, value: &str| {
+            let mut argv = vec!["kiln-harness", command];
+            if command == "eval" {
+                argv.extend(["run", "--out", "out"]);
+            } else {
+                argv.extend(["--prompt", "x"]);
+            }
+            argv.extend([
+                "--provider",
+                "anthropic",
+                "--max-refused-calls-per-turn",
+                value,
+            ]);
+            match Cli::parse_from(argv).command {
+                Command::Run(run) => run.model,
+                Command::Eval {
+                    command: EvalCommand::Run(run),
+                } => run.model,
+                _ => panic!("parsed as run or eval run"),
+            }
+        };
+        for command in ["run", "eval"] {
+            for value in [0, 5, MAX_REFUSED_CALLS_PER_TURN] {
+                let config = model_config(&parse(command, &value.to_string())).expect("valid");
+                assert_eq!(config.max_refused_calls_per_turn, value, "{command}");
+                assert_eq!(config.limits().max_refused_calls_per_turn, value);
+            }
+            let error = model_config(&parse(command, "65")).expect_err("over the ceiling");
+            assert_eq!(
+                error.to_string(),
+                "--max-refused-calls-per-turn must be between 0 and 64"
             );
         }
     }

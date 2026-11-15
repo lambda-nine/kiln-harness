@@ -6,6 +6,23 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- A response with more tool calls than `--max-tool-calls-per-turn` no
+  longer ends the session outright. The first calls up to the cap run as
+  before; each call after them runs nothing in kilnd and gets the result
+  `{"ok":false,"error":"too_many_calls_in_turn","message":"only the first 8
+  tool calls in a turn run; this was call 9 of 10, so it did not run. Send
+  it again in a later turn."}` (the error alone if the message would not
+  fit the result bound). Refused calls are audited as `tool_call_rejected`
+  and count toward `--max-tool-calls`, like other rejected calls, and a
+  call past the cap gets this result even when it is also unregistered or
+  oversized. `--max-refused-calls-per-turn` (`run` and `eval run`, default
+  24, at most 64) bounds how many; a response with more calls than both
+  together still ends the session before any call runs, and 0 restores the
+  old behavior. `session_started` records `max_refused_calls_per_turn` when
+  it is not 0, and the grammar requires each tool record past the cap to be
+  exactly the engine's refusal. Journals written before it load with 0 and
+  stay byte-identical, and replay reproduces the refusals without running
+  them.
 - `--tool-set coding` now gives the tool set `coding_v2`. It is `coding_v1`
   but for `edit_file`, which also takes one edit as top-level `old_text`,
   `new_text` and `replace_all` (only `path` is required), or several as

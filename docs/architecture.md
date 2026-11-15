@@ -563,7 +563,9 @@ context. `SessionOutcome` and `session_ended` report
 A response without tool calls is then the final answer. `refusal` ends with
 `ModelRefused`, and empty text with `InvalidModelCall`. A response with tool
 calls is checked as a whole before any call runs: `refusal` ends the
-session, as does more than the per-turn call budget. Provider call IDs must
+session, as do more calls than the per-turn cap (`max_tool_calls_per_turn`,
+default 8) and the refusal allowance (`max_refused_calls_per_turn`, default
+24) together. Provider call IDs must
 each match the existing character rule and be unique within the turn; a bad
 ID is a provider protocol fault and fails the session. Assistant text beside
 tool calls shares the final-answer byte limit.
@@ -574,8 +576,19 @@ including one that breaks the name rule, becomes the model-visible result
 `{"ok":false,"error":"unknown_tool"}`: it is recorded as `unknown`, runs
 nothing in kilnd, and the loop continues so the model can recover. Oversized
 arguments are replaced in the history by an `omitted` marker and rejected the
-same way. One `tool_results` message carries every result of the turn under the
-provider's call IDs.
+same way. A call past the per-turn cap, within the allowance, does not run
+either: it is audited as `tool_call_rejected`, reaches no kilnd RPC and
+sends no renew, counts against the session call budget like any other
+rejection, and gets the result
+`{"ok":false,"error":"too_many_calls_in_turn","message":"only the first N
+tool calls in a turn run; this was call I of L, so it did not run. Send it
+again in a later turn."}`, or `{"ok":false,"error":"too_many_calls_in_turn"}`
+alone if that would not fit the result byte bound. It is decided by
+position alone, so it wins over `unknown_tool` and oversized arguments, and
+it depends only on recorded values, so the grammar and replay reproduce it
+byte for byte. With the allowance at 0 any response over the cap ends the
+session, as before the allowance existed. One `tool_results` message carries
+every result of the turn under the provider's call IDs.
 
 ### Compaction
 
@@ -1064,7 +1077,9 @@ cleanup. Configured lifecycle windows are rejected above 60 seconds so
 deadline construction cannot overflow after a sandbox exists.
 
 Both `HarnessConfig` and `run` allow two truncation recoveries per session
-by default (`--max-truncation-recoveries`).
+by default (`--max-truncation-recoveries`), and answer up to 24 calls past
+the per-turn cap in one response with an error instead of ending the
+session (`--max-refused-calls-per-turn`).
 
 ### The coding tool set
 
@@ -1193,8 +1208,8 @@ Every configuration, including limits loaded from a journal, must also stay
 under hard ceilings: 1,000 steps, 10,000 tool calls and 64 per turn, a 6-hour
 session, a 10-minute tool timeout, 16 MiB for each byte limit, 1,000,000
 output tokens per request, 1,000,000,000 tokens for each cumulative
-budget, 256 MiB of model output per session, and 16 truncation recoveries
-per session (0 is allowed).
+budget, 256 MiB of model output per session, 16 truncation recoveries
+per session, and 64 refused calls per turn (0 is allowed for both).
 
 ## Streamed exec
 
@@ -1374,12 +1389,15 @@ carries `compaction`, the policy, and `session_ended` `compactions`, each
 omitted when off or 0, so journals without compaction are byte-identical to
 before. `session_started` records every
 model-visible limit (steps, calls, timeouts, token budgets, truncation
-recoveries, argument and final-answer bounds, and all tool limits);
-lifecycle windows are not recorded. `max_truncation_recoveries` in the
+recoveries, refused calls per turn, argument and final-answer bounds, and
+all tool limits); lifecycle windows are not recorded. `max_truncation_recoveries` in the
 limits and `truncation_recoveries` in `session_ended` are omitted when 0,
 and a journal without them loads with 0, the meaning journals written
 before recovery existed had: truncation is fatal. So those journals, and
-any session with recovery off, stay byte-identical.
+any session with recovery off, stay byte-identical. `max_refused_calls_per_turn`
+is omitted when 0 in the same way: a journal written before the allowance
+existed loads with 0, so a response over the per-turn cap ends it, as it
+did.
 For a task with a seed or a check it also records `seed` (each file's path
 and base64 contents) and `check` (the base64 script and `timeout_ms`), so a
 replay is self-contained. Both are omitted when absent, so a journal without
@@ -1475,12 +1493,17 @@ final answer in the last turn, and with neither output stream longer than
 
 The grammar also applies the engine's acceptance rules with the recorded
 limits. Requests stop at `max_steps`, and tool records at `max_tool_calls` in
-total and `max_tool_calls_per_turn` in a turn. Each response gets the
+total and `max_tool_calls_per_turn` plus `max_refused_calls_per_turn` in a
+turn. A tool record past `max_tool_calls_per_turn` must be the turn-cap
+refusal: `ok` false, no execution IDs, and exactly the result the engine
+builds from the recorded cap, its index, the response's call count, and the
+recorded result byte bound. Each response gets the
 engine's disposition, in the engine's order: accepted, recovered, or
 refused. A response the engine refuses (a token budget, the per-request
 output cap, or the model-output byte budget exceeded, a `max_tokens` stop
 with no recoveries left, a `context_exceeded` or `refusal` stop, invalid or
-repeated call IDs, too many calls, or text over its byte bound) may be
+repeated call IDs, more calls than the cap and the refusal allowance
+together, or text over its byte bound) may be
 recorded, because the engine records it before refusing it, but nothing but
 `session_ended` may follow it and it cannot complete the session. A
 response is recovered when it is within the budgets, its stop is

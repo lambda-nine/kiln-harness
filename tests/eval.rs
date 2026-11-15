@@ -2000,6 +2000,7 @@ async fn todays_demo_journal_matches_the_golden_one() {
         MemoryJournal::default(),
         HarnessConfig {
             max_truncation_recoveries: 0,
+            max_refused_calls_per_turn: 0,
             ..HarnessConfig::default()
         },
     );
