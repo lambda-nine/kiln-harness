@@ -1392,11 +1392,23 @@ pub fn write_journal_lines(path: &std::path::Path, lines: &[String]) {
 /// A temporary directory with mode 0700 whatever the umask, so it passes the
 /// journal's directory rules (a umask such as 0002 would make it
 /// group-writable).
+///
+/// Tests bind kilnd's Unix socket inside it, and a socket path must fit in
+/// `sun_path` (104 bytes on macOS, 108 on Linux). Under a long `TMPDIR` the
+/// directory is made in `/tmp` instead, which is sticky and so passes the
+/// same ancestor rules.
 pub fn private_tempdir() -> std::io::Result<tempfile::TempDir> {
     use std::os::unix::fs::PermissionsExt;
+    // Room for `/.tmpXXXXXX/no-kilnd.sock` and a short subdirectory, within
+    // macOS's 104-byte `sun_path` and its terminating NUL.
+    const SOCKET_ROOM: usize = 48;
+    let mut root = std::env::temp_dir();
+    if root.as_os_str().len() + SOCKET_ROOM > 103 {
+        root = std::path::PathBuf::from("/tmp");
+    }
     let dir = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()?;
+        .tempdir_in(root)?;
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
     Ok(dir)
 }
