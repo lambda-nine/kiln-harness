@@ -6,6 +6,10 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `journal verify` and replay refuse a journal in which a call within the
+  per-turn cap has a `too_many_calls_in_turn` result. Only calls past the
+  cap get that error and no tool returns it, so the engine never records
+  one; before, only replay caught it, as a divergence.
 - `run` and `eval run` take `--max-result-bytes` (default 131072, a
   multiple of 1024 from 16384 to 524288), the bytes in one tool result,
   which the default system prompt states in KiB and the journal records.

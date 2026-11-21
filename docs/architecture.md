@@ -651,7 +651,8 @@ again in a later turn."}`, or `{"ok":false,"error":"too_many_calls_in_turn"}`
 alone if that would not fit the result byte bound. It is decided by
 position alone, so it wins over `unknown_tool` and oversized arguments, and
 it depends only on recorded values, so the grammar and replay reproduce it
-byte for byte. With the allowance at 0 any response over the cap ends the
+byte for byte. No tool returns that error, so `journal verify` refuses a
+call within the cap whose result carries it. With the allowance at 0 any response over the cap ends the
 session, as before the allowance existed. One `tool_results` message carries
 every result of the turn under the provider's call IDs.
 

@@ -1692,6 +1692,15 @@ impl Grammar {
                     "tool_executed beyond max_tool_calls_per_turn must be the turn-cap refusal",
                 );
             }
+        } else if result.get("error").and_then(Value::as_str)
+            == Some(crate::engine::TOO_MANY_CALLS_IN_TURN)
+        {
+            // Only a call past the cap is refused for it; no tool returns
+            // that error, so one within the cap was not recorded by the
+            // engine.
+            return Err(
+                "tool_executed within max_tool_calls_per_turn cannot be the turn-cap refusal",
+            );
         }
         last.results.push(ToolResult {
             call_id: call.call_id.clone(),

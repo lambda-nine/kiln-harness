@@ -2977,7 +2977,8 @@ pub fn turn_cap_refusal(
     }
 }
 
-const TOO_MANY_CALLS_IN_TURN: &str = "too_many_calls_in_turn";
+/// The error of a [`turn_cap_refusal`], which no tool result carries.
+pub(crate) const TOO_MANY_CALLS_IN_TURN: &str = "too_many_calls_in_turn";
 
 fn rejected_tool_run(kind: &str) -> ToolRun {
     ToolRun {

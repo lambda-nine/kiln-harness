@@ -458,6 +458,22 @@ async fn the_grammar_accepts_refusals_and_only_the_exact_ones() {
         }),
         reason,
     );
+    // A call within the cap is never refused for it, in either form.
+    let early = "tool_executed within max_tool_calls_per_turn cannot be the turn-cap refusal";
+    for (index, refusal) in [
+        (8, turn_cap_refusal(8, 8, 10, 131_072)),
+        (1, json!({"ok": false, "error": "too_many_calls_in_turn"})),
+    ] {
+        assert_rejected_because(
+            &format!("call {index} recorded as refused"),
+            with_tool(recorded.clone(), index, |ok, result, ids| {
+                *ok = false;
+                ids.clear();
+                *result = refusal.clone();
+            }),
+            early,
+        );
+    }
     // More calls than the recorded cap and allowance: refused whole.
     for refused in [1, 0] {
         let mut over = recorded.clone();
