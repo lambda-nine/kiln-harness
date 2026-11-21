@@ -72,7 +72,9 @@ assert_clean() {
 
     registry_lines=$(sudo /usr/local/bin/kiln ls | wc -l | tr -d ' ')
     test "$registry_lines" = "1"
-    test -z "$(sudo find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 -print)"
+    # kiln keeps runs/.checkpoints once any checkpoint is captured; the
+    # harness never captures one, so only run directories count here.
+    test -z "$(sudo find /var/lib/kiln/runs -mindepth 1 -maxdepth 1 ! -name .checkpoints -print)"
     if test -d /sys/fs/cgroup/kiln; then
         test -z "$(sudo find /sys/fs/cgroup/kiln -mindepth 1 -type d -print)"
     fi
