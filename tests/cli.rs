@@ -183,6 +183,40 @@ fn verify_rejects_a_complete_journal_with_a_request_after_the_final_answer() {
     assert!(read_journal(&path).is_err());
 }
 
+// Spare security review 2026-11-20, F4: the reader checks only that
+// session IDs agree, so a crafted journal's ID reaches the terminal escaped.
+#[test]
+fn verify_escapes_a_crafted_session_id() {
+    let session = "hs-\u{1b}]52;c;aGk=\u{7}\u{1b}[2J";
+    let ended = JournalEvent::SessionEnded {
+        outcome: "create_failed".to_string(),
+        work_outcome: "create_failed".to_string(),
+        final_answer: None,
+        steps: 0,
+        tool_calls: 0,
+        usage: Usage::default(),
+        sandbox_deleted: true,
+        truncation_recoveries: 0,
+        compactions: 0,
+    };
+    let lines = chained_lines(session, vec![started(), ended]);
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("crafted.jsonl");
+    write_journal_lines(&path, &lines);
+
+    let (ok, stdout) = verify(&path);
+
+    assert!(ok, "{stdout}");
+    assert!(
+        !stdout.contains('\u{1b}') && !stdout.contains('\u{7}'),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("session: hs-\\u{1b}]52;c;aGk=\\u{7}\\u{1b}[2J\n"),
+        "{stdout}"
+    );
+}
+
 #[test]
 fn verify_rejects_tools_before_the_sandbox_or_their_response() {
     let ghost = JournalEvent::ToolExecuted {

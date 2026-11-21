@@ -910,7 +910,7 @@ async fn replay(
         Err(error) => {
             match harness.provider().diverged_at() {
                 Some(turn) => println!("diverged at turn {turn}"),
-                None => println!("replay failed: {error}"),
+                None => println!("{}", replay_failed_line(&error)),
             }
             if matches!(
                 error,
@@ -1013,7 +1013,8 @@ fn verify(path: &Path) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let summary = summarize(&journal);
-    println!("session: {}", journal.session_id());
+    // The reader checks that session IDs agree, not their characters.
+    println!("session: {}", terminal_safe(journal.session_id()));
     println!("records: {}", journal.records.len());
     match &summary.outcome {
         Some(outcome) => println!("status: complete ({outcome})"),
@@ -1217,6 +1218,12 @@ fn with_live<P: Provider>(
     } else {
         harness
     }
+}
+
+/// A failed replay's line. The error can quote a recorded failure message,
+/// which the journal grammar does not constrain.
+fn replay_failed_line(error: &HarnessError) -> String {
+    format!("replay failed: {}", terminal_safe(&error.to_string()))
 }
 
 /// Model text made safe for a terminal: C0 and C1 control characters and
@@ -1556,6 +1563,21 @@ mod tests {
         let error = model_config(&run_args(&["--max-total-output-bytes", "33554432"]))
             .expect_err("over the journal cap");
         assert!(error.to_string().contains("67108864-byte cap"), "{error}");
+    }
+
+    // Spare security review 2026-11-20, F4.
+    #[test]
+    fn a_failed_replay_escapes_a_recorded_failure_message() {
+        let error = HarnessError::Provider(kiln_harness::provider::ProviderError::new(
+            kiln_harness::provider::ProviderErrorKind::Transport,
+            "reset\u{1b}]52;c;aGk=\u{7}\u{9b}2J",
+        ));
+        let line = replay_failed_line(&error);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(
+            line.contains("reset\\u{1b}]52;c;aGk=\\u{7}\\u{9b}2J"),
+            "{line}"
+        );
     }
 
     #[test]

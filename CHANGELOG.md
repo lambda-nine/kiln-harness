@@ -6,6 +6,9 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `journal verify` prints the session ID, and `replay` its `replay failed:`
+  error, with control characters escaped as everything else they print is,
+  so a crafted journal cannot send escape sequences to the terminal.
 - The threat model now names the second endpoint string the audit carries:
   a compaction response's bounded stop reason (1 to 64 bytes of
   `[a-z0-9_]`) in `context_compacted.outcome` as `no_summary:<stop_reason>`.
