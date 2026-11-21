@@ -1015,7 +1015,7 @@ fn config_validation_refuses_bad_values() {
     let good = config("http://127.0.0.1:1/v1");
     good.validate().expect("defaults are valid");
     // The response cap's ceiling is its default, so twice a response fits
-    // one journal line (spare security review 2026-11-20, F2).
+    // one journal line (security review 2026-11-20, F2).
     assert_eq!(good.max_response_bytes, MAX_RESPONSE_BYTES);
     OpenAiCompatConfig {
         max_response_bytes: MAX_RESPONSE_BYTES,

@@ -275,9 +275,9 @@ cannot be enforced without it. Usage accuracy is the server's job and is
 trusted for cost only; the harness also counts model output itself and stops
 a session past `--max-total-output-bytes` (8 MiB by default) whatever usage
 says. Response payloads are capped at 4 MiB less 32 KiB and requests at
-8 MiB; limits whose worst-case journal could pass its 64 MiB cap (about 240
-tool calls, or 16 MiB of output, at the other defaults) are refused; rate
-limits, overload, and transport failures are retried up to three attempts
+8 MiB. The journal is capped at 64 MiB and 8 MiB a line: limits that let one
+record pass a line are refused, and a long session with raised limits can
+still reach the file cap and end with a journal error. Rate limits, overload, and transport failures are retried up to three attempts
 with jittered backoff, honoring `Retry-After`. `--prompt-file` and
 `--system-file` must be regular files; a symlink as the last path component
 is refused. The final answer is printed with control characters escaped.

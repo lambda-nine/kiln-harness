@@ -57,9 +57,11 @@ No harness code depends on kiln files, process layout, or CLI behavior.
 Create shares the 30-second session wall deadline. Every request has
 `owner=kiln-harness` and `session=<session ID>` labels. The session ID is
 `hs-{wall ms}-{pid}-{counter}-{nonce}` in hex, where the counter is the low 32
-bits of a per-process counter and the nonce is 64 bits from the OS, so two
-processes do not compute the same ID even with equal PIDs in separate PID
-namespaces; at most 49 bytes, it fits a create request ID with its prefix. If
+bits of a per-process counter and the nonce is 64 bits from the OS. Two
+processes that share the wall millisecond, PID and counter, as with equal PIDs
+in separate PID namespaces, still get the same ID only if their nonces match:
+about one chance in 2^64 for a pair, or n²/2^65 among n such processes. At
+most 49 bytes, it fits a create request ID with its prefix. If
 the create's response is lost or times out, the harness polls bounded
 non-deleted listings for those labels and deletes every match. A keyed create
 refused `ALREADY_EXISTS` is the exception, described under create retries.
@@ -95,13 +97,22 @@ create: no `request_id`, one attempt, nothing released.
 - **A conflict is someone else's key.** Every attempt sends an equal request,
   so `ALREADY_EXISTS` on a keyed create means another request holds this
   session's key, and a sandbox with this session's labels may be that holder's
-  live one. Label recovery is skipped: nothing is listed or deleted. With the
-  typed reason `request_id_conflict` absence is proven (kilnd would have
-  returned, not refused, a sandbox an equal request made), so the session ends
-  `create_failed` with an `ALREADY_EXISTS` error that says the key is held by
+  live one. Label recovery is skipped, so nothing is listed or deleted. That
+  holds even when cancellation becomes ready as the conflict arrives:
+  cancellation still decides the session's result, but the answered conflict
+  decides cleanup. The typed reason `request_id_conflict` proves absence only
+  for the first attempt, because kilnd would have returned, not refused, a
+  sandbox an equal request made. Then the session ends `create_failed` (or
+  `canceled`), with an `ALREADY_EXISTS` error that says the key is held by
   another request, and the audit's `sandbox_recovered` lists no sandbox with
-  `deleted: true`. Without the typed reason nothing is deleted either, but
-  absence is unproven: `CreateUncertain` and `cleanup_failed`.
+  `deleted: true`. After an earlier attempt whose answer was lost, the conflict
+  says nothing about that attempt: it may still reach kilnd once the holder
+  releases the key. Absence is then unproven, as it is without the typed
+  reason, and the session returns `CreateUncertain` with `cleanup_failed` and
+  `sandbox_deleted: false`. Whenever absence is unconfirmed, here or after
+  work, a failure to write the closing audit or journal record does not
+  replace the `CreateUncertain` or `Cleanup` error. Both writes are tried, and
+  their errors are added to that error's message.
 - **No per-attempt timeout.** An attempt has no client timeout and sends no
   `grpc-timeout`: it runs until it answers, bounded only by the session
   deadline and cancellation, as an unkeyed create always has. So the harness
@@ -1481,53 +1492,60 @@ limits. `complete` is true when the last record is `session_ended`.
 
 ### Journal size
 
-The two caps, 64 MiB per file (`MAX_JOURNAL_BYTES`) and 8 MiB per line
-(`MAX_JOURNAL_LINE_BYTES`), are checked against the limits before a new
-session starts, in `HarnessConfig::validate` and `Harness::run`, so the
-journal cap does not end a session its budgets still allow. A replay keeps
-its recording's limits and skips the check. `JournalBound` computes, with `S`
-steps, `N` tool calls, result bytes `R`, argument bytes `A`, model output
-bytes `O` and final answer bytes `F`:
+A journal has two caps: 64 MiB per file (`MAX_JOURNAL_BYTES`) and 8 MiB per
+line (`MAX_JOURNAL_LINE_BYTES`). Every sink enforces both on each record,
+before writing it, and `read_journal` enforces the same ones. A record that
+would pass either is refused; the chain stays as it was, the session ends with
+a journal error, and cleanup and the audit go on as after any journal failure.
+
+Before a new session starts, `HarnessConfig::validate` and `Harness::run`
+refuse limits that allow one record over a line. With result bytes `R`,
+argument bytes `A` and final answer bytes `F`:
 
 ```text
-total = 8 MiB                      session_started, whatever the task
-      + S × 4 KiB                  model_requested, compaction_requested, and
-                                   the framing of their answers
-      + N × (1.5 KiB + R + I × 32) each tool_executed beside its arguments
-      + min(N × A, O)              arguments in tool_executed
-      + 2 × O                      model_responded, compaction_responded
-      + 64 KiB                     sandbox_ready, check_completed, one failure
-      + 1.5 KiB + 6 × F + 2        session_ended
+tool_executed = 1.5 KiB + R + A + I × 32
+session_ended = 1.5 KiB + 6 × F + 2
 ```
 
-`I`, the execution IDs one call can record, is 102 (two executions plus the
-100 recent executions response-loss recovery reads), plus
-`max_manifest_entries` + 1 with a coding tool set, whose `search` may run one
-`grep` per listed file; each is counted as 32 bytes (kilnd's are 19). Results
-and arguments are bounded as compact JSON, so they are counted as journaled.
-Model output is counted at twice its budget bytes, which covers JSON escaping
-of quotes, backslashes and newlines; a final answer at six bytes per byte,
-the worst escape. A configuration is refused when the total passes 64 MiB, or
-one `tool_executed` (`1.5 KiB + R + A + I × 32`) or the `session_ended` above
-passes 8 MiB. The CLI defaults bound about 48 MiB (50 MiB with `--tool-set
-coding`), which leaves room for about 240 tool calls at the other defaults;
-`--max-total-output-bytes` above about 16 MiB is refused at the defaults.
+`I`, the execution IDs one call can record, is 102: two executions plus the
+100 recent executions that response-loss recovery reads. With a coding tool
+set it is `max_manifest_entries` + 1 more, since `search` may run one `grep`
+per listed file. Each ID is counted as 32 bytes; kilnd's are 19. Results and
+arguments are bounded as compact JSON, so they are counted as journaled. A
+final answer is counted at six bytes per byte, the worst escape. The 1.5 KiB
+is the record's framing and its other fields. The HTTP adapters'
+`max_response_bytes` is at most, and by default, 4 MiB less 32 KiB. A
+response is journaled as its neutral view and, for Anthropic, also as its
+content blocks as received. So one `model_responded` holds about twice the
+body, and the cap keeps that within a line.
 
-The HTTP adapters' `max_response_bytes` is at most, and by default, 4 MiB less
-32 KiB: a response is journaled as its neutral view and, for Anthropic, its
-content blocks as received, neither longer than the body, so one response
-record fits a line.
+These checks bound a record as the engine builds it, not every way a record
+can grow, so a sink can still refuse one. An OpenAI-compatible adapter
+reserializes tool-call arguments, and a number can grow when it does: `1e14`
+becomes `100000000000000.0`. Text dense in control characters other than
+newline and tab takes six bytes per character once escaped. Such a record
+ends the session with a journal error, as above.
 
-What the bound does not cover comes from the model endpoint alone, which is
-trusted for availability only: text dense in control characters other than
-newlines and tabs (six bytes each once escaped), the response that crosses
-`max_total_model_output_bytes` (journaled before the budget ends the
-session), and a library provider's failure message over 64 KiB. To keep the
-journal closable whatever came before, the engine has the sink keep the
-`session_ended` bound (at most one line) of the file cap in reserve: any other
-record that would leave less is refused as over the cap, and `session_ended`
-still fits. `JournalSink::reserve_for_session_end` does this for the built-in
-sinks; a custom sink keeps nothing unless it implements it.
+The whole journal is not checked against the file cap. A long session with
+raised limits, many tool calls with large results or a large output budget,
+can reach 64 MiB and end there with a journal error.
+
+So that a new session can always close its journal, the engine has the sink
+keep the `session_ended` bound above (at most one line) of the file cap in
+reserve, through `JournalSink::reserve_for_session_end`. Any other record that
+would leave less room is refused as over the cap, and `session_ended` still
+fits. The built-in sinks implement it; a custom sink keeps nothing unless it
+does.
+
+A replay keeps the policy its recording was written under, so every journal
+that verifies still replays. It keeps no reserve, and it skips the per-record
+checks, since its limits are the recorded ones. It does run under a fresh
+session ID, which is longer than the one a journal recorded before IDs carried
+a nonce. So the engine has the sink let each record pass both caps by the
+difference, at most `MAX_SESSION_ID_GROWTH` (64 bytes), through
+`JournalSink::allow_session_id_growth`. A replay of a journal recorded within
+that margin of a cap can therefore write a journal that passes it, and
+`journal verify` refuses that journal.
 
 Writers and readers also run one `Grammar` over the events. The recorded task
 must pass the engine's task checks and the recorded limits its hard ceilings.

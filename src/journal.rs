@@ -452,12 +452,29 @@ pub trait JournalSink: Send {
     /// Keep `bytes` of [`MAX_JOURNAL_BYTES`] for the closing
     /// `session_ended`: any other record that would leave less is refused
     /// as over the file cap, so the session can always close its journal.
-    /// The engine calls it before the first record; at most one line is
-    /// kept. The default keeps nothing.
+    /// The engine calls it before the first record of a new session, never
+    /// of a replay; at most one line is kept. The default keeps nothing.
     fn reserve_for_session_end(&mut self, bytes: u64) {
         let _ = bytes;
     }
+
+    /// Let each record pass both caps by `bytes`, at most
+    /// [`MAX_SESSION_ID_GROWTH`]: the most this session's ID is longer than
+    /// the one its recording carried. A replay runs under a fresh session
+    /// ID, which is longer than one recorded before IDs carried a nonce, so
+    /// a recording that fit the caps still replays. The journal it writes
+    /// can then pass them by that much per record, which
+    /// [`read_journal`] refuses. The engine calls it before the first
+    /// record of a replay only. The default allows nothing.
+    fn allow_session_id_growth(&mut self, bytes: u64) {
+        let _ = bytes;
+    }
 }
+
+/// The most a replay's records may pass the journal caps by, each: see
+/// [`JournalSink::allow_session_id_growth`]. A fresh session ID is at most
+/// 49 bytes.
+pub const MAX_SESSION_ID_GROWTH: u64 = 64;
 
 /// Hash-chain and ordering state shared by every sink, so writers refuse
 /// exactly the journals that `read_journal` would reject.
@@ -469,6 +486,8 @@ struct Chain {
     bytes: u64,
     /// Bytes of the file cap kept for `session_ended`.
     end_reserve: u64,
+    /// Bytes each record may pass the caps by (replay only).
+    id_growth: u64,
     closed: bool,
     grammar: Grammar,
 }
@@ -506,11 +525,14 @@ impl Chain {
                 .unwrap_or_else(|| GENESIS_SHA256.to_string()),
             event,
         };
-        let line =
-            encode_bounded(&record, MAX_JOURNAL_LINE_BYTES)?.ok_or(JournalError::LineTooLarge {
-                line: sequence.saturating_add(1),
-                limit: MAX_JOURNAL_LINE_BYTES,
-            })?;
+        let line_limit = MAX_JOURNAL_LINE_BYTES
+            .saturating_add(usize::try_from(self.id_growth).unwrap_or(usize::MAX));
+        let file_limit =
+            MAX_JOURNAL_BYTES.saturating_add(self.id_growth.saturating_mul(sequence + 1));
+        let line = encode_bounded(&record, line_limit)?.ok_or(JournalError::LineTooLarge {
+            line: sequence.saturating_add(1),
+            limit: line_limit,
+        })?;
         let reserve = if matches!(record.event, JournalEvent::SessionEnded { .. }) {
             0
         } else {
@@ -520,10 +542,8 @@ impl Chain {
             .bytes
             .saturating_add(line.len() as u64)
             .saturating_add(1);
-        if total.saturating_add(reserve) > MAX_JOURNAL_BYTES {
-            return Err(JournalError::FileTooLarge {
-                limit: MAX_JOURNAL_BYTES,
-            });
+        if total.saturating_add(reserve) > file_limit {
+            return Err(JournalError::FileTooLarge { limit: file_limit });
         }
         self.grammar.feed(sequence, &record.event)?;
         Ok(Encoded { record, line })
@@ -602,11 +622,19 @@ impl Chain {
     fn reserve_for_session_end(&mut self, bytes: u64) {
         self.end_reserve = bytes.min(MAX_JOURNAL_LINE_BYTES as u64 + 1);
     }
+
+    fn allow_session_id_growth(&mut self, bytes: u64) {
+        self.id_growth = bytes.min(MAX_SESSION_ID_GROWTH);
+    }
 }
 
 impl JournalSink for JsonlJournal {
     fn reserve_for_session_end(&mut self, bytes: u64) {
         self.chain.reserve_for_session_end(bytes);
+    }
+
+    fn allow_session_id_growth(&mut self, bytes: u64) {
+        self.chain.allow_session_id_growth(bytes);
     }
 
     fn append(&mut self, session_id: &str, event: JournalEvent) -> Result<(), JournalError> {
@@ -641,6 +669,10 @@ pub struct MemoryJournal {
 impl JournalSink for MemoryJournal {
     fn reserve_for_session_end(&mut self, bytes: u64) {
         self.chain.reserve_for_session_end(bytes);
+    }
+
+    fn allow_session_id_growth(&mut self, bytes: u64) {
+        self.chain.allow_session_id_growth(bytes);
     }
 
     fn append(&mut self, session_id: &str, event: JournalEvent) -> Result<(), JournalError> {
@@ -2066,7 +2098,7 @@ mod reserve_test {
         chain
     }
 
-    // Spare security review 2026-11-20, F2: session_ended keeps its room.
+    // Security review 2026-11-20, F2: session_ended keeps its room.
     #[test]
     fn only_session_ended_may_use_the_reserve() {
         let line = |event: JournalEvent| {
@@ -2099,5 +2131,67 @@ mod reserve_test {
         let mut chain = Chain::default();
         chain.reserve_for_session_end(u64::MAX);
         assert_eq!(chain.end_reserve, super::MAX_JOURNAL_LINE_BYTES as u64 + 1);
+    }
+
+    fn started_with(system_bytes: usize) -> JournalEvent {
+        let mut event = started();
+        if let JournalEvent::SessionStarted { system, .. } = &mut event {
+            *system = "s".repeat(system_bytes);
+        }
+        event
+    }
+
+    // A replay's records may pass both caps by its session ID's growth over
+    // the recording's, and by no more.
+    #[test]
+    fn a_replay_may_pass_the_caps_by_the_session_id_growth() {
+        let line = super::MAX_JOURNAL_LINE_BYTES;
+        let base = Chain::default()
+            .encode("hs-replay", started_with(0))
+            .expect("fits")
+            .line
+            .len();
+        for growth in [0, 17] {
+            let at = |extra: usize| {
+                let mut chain = Chain::default();
+                chain.allow_session_id_growth(growth as u64);
+                chain.encode("hs-replay", started_with(line + growth + extra - base))
+            };
+            // Both caps are checked before the grammar, which refuses a
+            // system prompt this long: reaching it means the line fit.
+            assert!(
+                matches!(at(0), Err(JournalError::Grammar { .. })),
+                "{:?}",
+                at(0).err()
+            );
+            assert!(matches!(at(1), Err(JournalError::LineTooLarge { .. })));
+        }
+
+        // The file: growth per record written, this one included.
+        let ended_bytes = {
+            let mut chain = nearly_full(MAX_JOURNAL_BYTES / 2, 0);
+            chain
+                .encode("hs-reserve", ended())
+                .expect("fits")
+                .line
+                .len() as u64
+                + 1
+        };
+        let mut chain = nearly_full(ended_bytes - 2 * 17, 0);
+        chain.allow_session_id_growth(17);
+        chain
+            .encode("hs-reserve", ended())
+            .expect("two records' growth");
+        let mut chain = nearly_full(ended_bytes - 2 * 17 - 1, 0);
+        chain.allow_session_id_growth(17);
+        assert!(matches!(
+            chain.encode("hs-reserve", ended()),
+            Err(JournalError::FileTooLarge { .. })
+        ));
+
+        // Growth is at most MAX_SESSION_ID_GROWTH.
+        let mut chain = Chain::default();
+        chain.allow_session_id_growth(u64::MAX);
+        assert_eq!(chain.id_growth, super::MAX_SESSION_ID_GROWTH);
     }
 }

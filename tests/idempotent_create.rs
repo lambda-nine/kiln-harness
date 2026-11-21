@@ -1310,62 +1310,156 @@ async fn a_replacement_between_the_reread_and_the_retry_is_stopped_and_recovered
     assert!(!model_was_asked(&harness));
 }
 
-// Spare security review 2026-11-20, F1 (from its PoC). Another harness
-// process whose session ID collided with this one already holds a live
-// sandbox under the same key and labels, with a slightly different request
-// (here another idle timeout), so kilnd answers request_id_conflict. The key
-// is the other holder's: this session lists and deletes nothing, and ends
-// `create_failed` with absence confirmed, since every attempt sent an equal
-// request and kilnd would have returned a sandbox one of them made.
+// Security review 2026-11-20, F1 (from its PoC). Another harness process
+// whose session ID collided with this one already holds a live sandbox under
+// the same key and labels, with a slightly different request (here another
+// idle timeout), so kilnd answers request_id_conflict. The key is the other
+// holder's: this session lists and deletes nothing. On the first attempt the
+// conflict proves this session's equal request made nothing, so it ends
+// `create_failed` with absence confirmed. After an attempt whose answer was
+// lost it proves nothing about that attempt, which may still reach kilnd once
+// the holder releases the key: the create is uncertain and nothing is
+// claimed deleted.
 #[tokio::test(start_paused = true)]
 async fn a_key_conflict_leaves_the_other_holders_sandbox_alone() {
     for conflict_on in [1, 2] {
         let fake = FakeApi::keyed(true);
         let mut api = Hooked::new(&fake);
-        let other = fake.clone();
-        api.on_create = Arc::new(move |call, request| {
-            if call < conflict_on {
-                return Some(unavailable());
-            }
-            (call == conflict_on).then(|| {
-                let mut foreign = request.clone();
-                foreign.expiry = foreign.expiry.map(|mut policy| {
-                    policy.idle_timeout_ms += 1;
-                    policy
-                });
-                other.state().creates.push(foreign);
-                reasoned(Code::AlreadyExists, "request_id_conflict")
-            })
-        });
+        api.on_create = conflict_hook(&fake, conflict_on, None);
         let mut harness = api.session();
         let error = harness
             .run(&SessionTask::demo(), CancellationToken::new())
             .await
             .expect_err("conflict");
-        let state = fake.state();
-        assert!(state.deleted.is_empty(), "{:?}", state.deleted);
-        assert!(state.deletes_released.is_empty());
-        assert_eq!(state.list_attempts, 0, "nothing is listed");
-        drop(state);
-        assert!(
-            matches!(
-                &error,
-                HarnessError::Api(e) if e.code == Code::AlreadyExists
-                    && e.reason.as_deref() == Some("request_id_conflict")
-                    && e.message.starts_with("create request ID is held by another request")
-            ),
-            "{error}"
-        );
-        assert_eq!(recovered(&harness), Some((Vec::new(), true, conflict_on)));
-        assert_eq!(
-            finished(&harness),
-            (
-                "create_failed".to_string(),
-                "create_failed".to_string(),
-                true,
-                None
-            )
-        );
+        assert_nothing_listed_or_deleted(&fake);
+        let held = |e: &ApiError| {
+            e.code == Code::AlreadyExists
+                && e.reason.as_deref() == Some("request_id_conflict")
+                && e.message
+                    .starts_with("create request ID is held by another request")
+        };
+        if conflict_on == 1 {
+            assert!(matches!(&error, HarnessError::Api(e) if held(e)), "{error}");
+            assert_eq!(recovered(&harness), Some((Vec::new(), true, 1)));
+            assert_eq!(
+                finished(&harness),
+                (
+                    "create_failed".to_string(),
+                    "create_failed".to_string(),
+                    true,
+                    None
+                )
+            );
+        } else {
+            assert!(
+                matches!(&error, HarnessError::CreateUncertain(e) if held(e)),
+                "{error}"
+            );
+            assert_eq!(recovered(&harness), Some((Vec::new(), false, 2)));
+            assert_eq!(
+                finished(&harness),
+                (
+                    "cleanup_failed".to_string(),
+                    "create_failed".to_string(),
+                    false,
+                    None
+                )
+            );
+            assert_eq!(ended_deleted(&harness), Some(false));
+        }
+        assert!(!model_was_asked(&harness));
+    }
+}
+
+/// A create hook: attempts before `conflict_on` lose their answer; that one
+/// plants another holder of the key, cancels `cancel` if given, and answers
+/// `ALREADY_EXISTS request_id_conflict`.
+fn conflict_hook(
+    fake: &FakeApi,
+    conflict_on: u32,
+    cancel: Option<CancellationToken>,
+) -> Arc<CreateHook> {
+    let other = fake.clone();
+    Arc::new(move |call, request| {
+        if call < conflict_on {
+            return Some(unavailable());
+        }
+        (call == conflict_on).then(|| {
+            let mut foreign = request.clone();
+            foreign.expiry = foreign.expiry.map(|mut policy| {
+                policy.idle_timeout_ms += 1;
+                policy
+            });
+            other.state().creates.push(foreign);
+            if let Some(cancel) = &cancel {
+                cancel.cancel();
+            }
+            reasoned(Code::AlreadyExists, "request_id_conflict")
+        })
+    })
+}
+
+fn assert_nothing_listed_or_deleted(fake: &FakeApi) {
+    let state = fake.state();
+    assert!(state.deleted.is_empty(), "{:?}", state.deleted);
+    assert!(state.deletes_released.is_empty());
+    assert_eq!(state.list_attempts, 0, "nothing is listed");
+}
+
+/// `sandbox_deleted` of the journal's `session_ended`.
+fn ended_deleted<A: SandboxApi>(harness: &Over<A>) -> Option<bool> {
+    harness
+        .journal()
+        .records
+        .iter()
+        .find_map(|record| match &record.event {
+            JournalEvent::SessionEnded {
+                sandbox_deleted, ..
+            } => Some(*sandbox_deleted),
+            _ => None,
+        })
+}
+
+// Cancellation that becomes ready as the conflict arrives wins the
+// session's result, but the conflict still decides cleanup: no listing and
+// no deletion, so the other holder's sandbox survives. On the first attempt
+// absence is proven and the session ends canceled; after a lost answer it is
+// not, and the create is uncertain.
+#[tokio::test(start_paused = true)]
+async fn a_conflict_that_cancellation_outruns_still_leaves_the_sandbox_alone() {
+    for conflict_on in [1, 2] {
+        let fake = FakeApi::keyed(true);
+        let cancel = CancellationToken::new();
+        let mut api = Hooked::new(&fake);
+        api.on_create = conflict_hook(&fake, conflict_on, Some(cancel.clone()));
+        let mut harness = api.session();
+        let result = harness.run(&SessionTask::demo(), cancel).await;
+        assert_nothing_listed_or_deleted(&fake);
+        assert_eq!(api.creates.load(Ordering::SeqCst), conflict_on);
+        if conflict_on == 1 {
+            assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+            assert_eq!(recovered(&harness), Some((Vec::new(), true, 1)));
+            assert_eq!(
+                finished(&harness),
+                ("canceled".to_string(), "canceled".to_string(), true, None)
+            );
+        } else {
+            assert!(
+                matches!(&result, Err(HarnessError::CreateUncertain(e))
+                    if e.code == Code::AlreadyExists),
+                "{result:?}"
+            );
+            assert_eq!(recovered(&harness), Some((Vec::new(), false, 2)));
+            assert_eq!(
+                finished(&harness),
+                (
+                    "cleanup_failed".to_string(),
+                    "canceled".to_string(),
+                    false,
+                    None
+                )
+            );
+        }
         assert!(!model_was_asked(&harness));
     }
 }
@@ -1401,4 +1495,81 @@ async fn an_untyped_conflict_deletes_nothing_and_stays_uncertain() {
     assert!(matches!(error, HarnessError::CreateUncertain(_)), "{error}");
     assert_eq!(recovered(&harness), Some((Vec::new(), false, 1)));
     assert_eq!(finished(&harness).0, "cleanup_failed");
+}
+
+/// An audit that refuses `session_finished`.
+#[derive(Default)]
+struct RefusingAudit(MemoryAudit);
+
+impl kiln_harness::audit::AuditSink for RefusingAudit {
+    fn append(
+        &mut self,
+        session_id: &str,
+        sandbox_id: Option<&str>,
+        event: AuditEvent,
+    ) -> Result<(), kiln_harness::audit::AuditError> {
+        if matches!(event, AuditEvent::SessionFinished { .. }) {
+            return Err(std::io::Error::other("injected audit failure").into());
+        }
+        self.0.append(session_id, sandbox_id, event)
+    }
+}
+
+/// A journal that refuses `session_ended`.
+#[derive(Default)]
+struct RefusingJournal(MemoryJournal);
+
+impl kiln_harness::journal::JournalSink for RefusingJournal {
+    fn append(
+        &mut self,
+        session_id: &str,
+        event: JournalEvent,
+    ) -> Result<(), kiln_harness::journal::JournalError> {
+        if matches!(event, JournalEvent::SessionEnded { .. }) {
+            return Err(std::io::Error::other("injected journal failure").into());
+        }
+        self.0.append(session_id, event)
+    }
+}
+
+// With absence unconfirmed, a failure to record the end does not hide it:
+// both writes are tried, the create stays uncertain, and the recording
+// failures are kept in its message.
+#[tokio::test(start_paused = true)]
+async fn an_unconfirmed_create_outranks_a_failure_to_record_it() {
+    let fake = FakeApi::keyed(true);
+    fake.state().features.remove(&Feature::TypedReasons);
+    let mut api = Hooked::new(&fake);
+    api.on_create =
+        Arc::new(|call, _| (call == 1).then(|| api_error(Code::AlreadyExists, "already exists")));
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::demo(),
+        RefusingAudit::default(),
+        RefusingJournal::default(),
+        HarnessConfig::default(),
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("conflict");
+    let HarnessError::CreateUncertain(error) = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(error.code, Code::AlreadyExists);
+    assert!(
+        error
+            .message
+            .contains("already exists; recording the outcome also failed")
+            && error.message.contains("injected audit failure")
+            && error.message.contains("injected journal failure"),
+        "{}",
+        error.message
+    );
+    assert_nothing_listed_or_deleted(&fake);
+    // Both were tried: the recovery record landed before the refusals.
+    assert!(harness.audit().0.records.iter().any(|record| matches!(
+        record.event,
+        AuditEvent::SandboxRecovered { deleted: false, .. }
+    )));
 }

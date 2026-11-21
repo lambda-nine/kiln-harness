@@ -20,9 +20,8 @@ use crate::api::{
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::compaction::{CompactionPolicy, compaction_due, message_bytes, swapped_history};
 use crate::journal::{
-    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, MAX_JOURNAL_BYTES,
-    MAX_JOURNAL_LINE_BYTES, RecordedCheck, RecordedSeedFile, RecordedToolLimits, SessionLimits,
-    compaction_request_sha256, request_sha256,
+    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, MAX_JOURNAL_LINE_BYTES, RecordedCheck,
+    RecordedSeedFile, RecordedToolLimits, SessionLimits, compaction_request_sha256, request_sha256,
 };
 use crate::live::{LiveOutput, LivePump};
 use crate::provider::{
@@ -331,19 +330,22 @@ impl HarnessConfig {
         });
     }
 
-    /// Check every limit against its hard ceilings, and the journal the
-    /// limits allow against the journal caps, exactly as [`Harness::run`]
-    /// does before any sandbox exists.
+    /// Check every limit against its hard ceilings, and that one
+    /// `tool_executed` or `session_ended` record the limits allow fits a
+    /// journal line, exactly as [`Harness::run`] does before any sandbox
+    /// exists.
     ///
     /// # Errors
     ///
     /// Returns an error when a limit is zero, over its ceiling, or a
-    /// duration is not whole milliseconds, or when the limits allow a
-    /// journal record or file over [`MAX_JOURNAL_LINE_BYTES`] or
-    /// [`MAX_JOURNAL_BYTES`] (see [`JournalBound`]).
+    /// duration is not whole milliseconds, or when the result, argument or
+    /// final answer limits allow a `tool_executed` or `session_ended`
+    /// record over [`MAX_JOURNAL_LINE_BYTES`]. The whole journal is not
+    /// checked against its file cap; see `docs/architecture.md`, "Journal
+    /// size".
     pub fn validate(&self) -> Result<(), HarnessError> {
         validate_config(self)?;
-        JournalBound::of(self).check()
+        RecordBound::of(self).check()
     }
 
     /// Replace every recorded limit with the given ones. Lifecycle windows
@@ -559,22 +561,29 @@ where
         task: &SessionTask,
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
-        // A new session's limits must fit the journal caps. A replay keeps
-        // the limits its recording ran under and skips this check, so
-        // journals recorded before it still replay.
+        // A new session's largest records must fit a journal line. A
+        // replay keeps the limits its recording ran under and skips this
+        // check, so journals recorded before it still replay.
         self.config.validate()?;
-        self.run_in_context(task, ExecContext::WorkspaceStreamV1, cancel)
-            .await
+        self.run_in_context(
+            task,
+            ExecContext::WorkspaceStreamV1,
+            JournalCaps::Fresh,
+            cancel,
+        )
+        .await
     }
 
-    /// [`Harness::run`] with every execution in `exec_context`. Only replay
-    /// calls it with anything but [`ExecContext::WorkspaceStreamV1`], with
+    /// [`Harness::run`] with every execution in `exec_context` and the
+    /// journal cap policy `caps`. Only replay calls it with anything but
+    /// [`ExecContext::WorkspaceStreamV1`] and [`JournalCaps::Fresh`], with
     /// the context its journal recorded.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn run_in_context(
         &mut self,
         task: &SessionTask,
         exec_context: ExecContext,
+        caps: JournalCaps,
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
         validate_config(&self.config)?;
@@ -678,9 +687,21 @@ where
                 features: capabilities.feature_names(),
             },
         )?;
-        // Whatever the records before it, session_ended always fits.
-        self.journal
-            .reserve_for_session_end(JournalBound::of(&self.config).session_ended);
+        match caps {
+            // Whatever the records before it, a new session's
+            // session_ended always fits.
+            JournalCaps::Fresh => self
+                .journal
+                .reserve_for_session_end(RecordBound::of(&self.config).session_ended),
+            // A replay keeps the caps its recording was written under: no
+            // reserve, and room for a session ID longer than the recorded
+            // one, so every journal that fit them still replays.
+            JournalCaps::Replay {
+                recorded_session_id_bytes,
+            } => self.journal.allow_session_id_growth(
+                session_id.len().saturating_sub(recorded_session_id_bytes) as u64,
+            ),
+        }
         let started = self.journal.append(
             &session_id,
             JournalEvent::SessionStarted {
@@ -726,7 +747,7 @@ where
         // activity anchor, on the early side, when the first attempt was sent.
         let request = sandbox_request(&session_id, expiry, request_id);
         let create_sent = Instant::now();
-        let (create, create_attempts) =
+        let (create, create_attempts, key_conflict) =
             create_with_retries(&self.api, &request, &self.config, deadline, &cancel).await;
         let sandbox = match create {
             Ok(sandbox) => sandbox,
@@ -734,22 +755,20 @@ where
                 // A settled answer names a sandbox kilnd has finished with,
                 // but only the listing proves it absent.
                 let settled = matches!(stop, CreateStop::Settled(..));
-                // ALREADY_EXISTS on a keyed create: another request holds
-                // this session's key, and whatever carries this session's
-                // labels may be that holder's live sandbox, so nothing is
-                // listed or deleted. `Some(true)` when the typed reason is
-                // request_id_conflict: every attempt sent an equal request,
-                // and kilnd returns, never refuses, the sandbox an equal
-                // request made, so none of this session's attempts made one.
-                let key_conflict = match &stop {
-                    CreateStop::Failed(error)
-                        if request.request_id.is_some()
-                            && error.code == tonic::Code::AlreadyExists =>
-                    {
-                        Some(error.typed_reason(typed_reasons) == Some("request_id_conflict"))
-                    }
-                    _ => None,
-                };
+                // ALREADY_EXISTS on a keyed create, even one cancellation
+                // outran: another request holds this session's key, and
+                // whatever carries this session's labels may be that
+                // holder's live sandbox, so nothing is listed or deleted.
+                // Every attempt sent an equal request, and kilnd returns,
+                // never refuses, the sandbox an equal request made, so the
+                // typed reason request_id_conflict proves the refused
+                // attempt made none. It proves absence only on the first
+                // attempt: an earlier one whose answer was lost may still
+                // reach kilnd once the holder releases the key.
+                let conflict_proves_absence = key_conflict.as_ref().map(|conflict| {
+                    create_attempts == 1
+                        && conflict.typed_reason(typed_reasons) == Some("request_id_conflict")
+                });
                 let (mut error, interrupted, work_outcome) = match stop {
                     CreateStop::Failed(error) | CreateStop::Settled(_, error) => {
                         (error, None, "create_failed")
@@ -760,15 +779,20 @@ where
                         "create_failed",
                     ),
                     CreateStop::Canceled => (
-                        ApiError::new(
-                            tonic::Code::Cancelled,
-                            "create canceled before its response",
-                        ),
+                        // The conflict, when one was answered, says more
+                        // than that the create was canceled.
+                        key_conflict.clone().unwrap_or_else(|| {
+                            ApiError::new(
+                                tonic::Code::Cancelled,
+                                "create canceled before its response",
+                            )
+                        }),
                         Some(HarnessError::Canceled),
                         "canceled",
                     ),
                 };
-                let deadline_expired = interrupted.is_some();
+                // A dropped or timed-out create may still be in flight.
+                let in_flight = interrupted.is_some() && key_conflict.is_none();
                 let recovery_deadline = lifecycle_deadline(self.config.lifecycle_timeout);
                 let recovery = if key_conflict.is_some() {
                     Ok(Vec::new())
@@ -783,18 +807,19 @@ where
                 };
                 let recovered_ids = recovery.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
                 let recovered = !recovered_ids.is_empty();
-                let unambiguous = settled
-                    || key_conflict == Some(true)
-                    || unambiguous_create_error(&error, typed_reasons);
-                if key_conflict == Some(true) {
+                let unambiguous = match conflict_proves_absence {
+                    Some(proven) => proven,
+                    None => settled || unambiguous_create_error(&error, typed_reasons),
+                };
+                if key_conflict.is_some() {
                     error.message = format!(
                         "create request ID is held by another request; its sandbox was \
                          left alone: {}",
                         error.message
                     );
                 }
-                let absence_confirmed = recovery.is_ok()
-                    && (settled || recovered || (!deadline_expired && unambiguous));
+                let absence_confirmed =
+                    recovery.is_ok() && (settled || recovered || (!in_flight && unambiguous));
                 let recovery_audit = self.audit.append(
                     &session_id,
                     None,
@@ -822,15 +847,27 @@ where
                 let finish_journal = self
                     .journal
                     .append(&session_id, terminal.journal_event(None, &progress));
+                // Unconfirmed absence outranks a failure to record it; that
+                // failure stays in the message.
+                let recording = [
+                    recovery_audit.as_ref().err().map(ToString::to_string),
+                    finish_audit.as_ref().err().map(ToString::to_string),
+                    finish_journal.as_ref().err().map(ToString::to_string),
+                ];
                 if let Err(cleanup_error) = recovery {
-                    return Err(HarnessError::Cleanup(cleanup_error));
+                    return Err(HarnessError::Cleanup(with_recording_failures(
+                        cleanup_error,
+                        recording,
+                    )));
+                }
+                if !absence_confirmed {
+                    return Err(HarnessError::CreateUncertain(with_recording_failures(
+                        error, recording,
+                    )));
                 }
                 recovery_audit?;
                 finish_audit?;
                 finish_journal?;
-                if !recovered && (deadline_expired || !unambiguous) {
-                    return Err(HarnessError::CreateUncertain(error));
-                }
                 return Err(interrupted.unwrap_or(HarnessError::Api(error)));
             }
         };
@@ -1155,12 +1192,36 @@ where
             .append(&session_id, terminal.journal_event(final_answer, &progress));
 
         if let Err(error) = cleanup {
-            return Err(HarnessError::Cleanup(error));
+            return Err(HarnessError::Cleanup(with_recording_failures(
+                error,
+                [
+                    finish_audit.as_ref().err().map(ToString::to_string),
+                    finish_journal.as_ref().err().map(ToString::to_string),
+                ],
+            )));
         }
         finish_audit?;
         finish_journal?;
         body
     }
+}
+
+/// `error` with every failure to record the session's end added to its
+/// message: an unconfirmed cleanup is the error a caller must see first,
+/// and the audit or journal failure beside it is kept, not dropped.
+fn with_recording_failures<const N: usize>(
+    mut error: ApiError,
+    failures: [Option<String>; N],
+) -> ApiError {
+    let failures = failures.into_iter().flatten().collect::<Vec<_>>();
+    if !failures.is_empty() {
+        error.message = format!(
+            "{}; recording the outcome also failed: {}",
+            error.message,
+            failures.join("; ")
+        );
+    }
+    error
 }
 
 struct LoopContext<'a, 'r, A: SandboxApi> {
@@ -2569,54 +2630,56 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
     Ok(())
 }
 
-/// The most journal bytes a session's limits allow, and its largest
-/// records, checked against [`MAX_JOURNAL_BYTES`] and
-/// [`MAX_JOURNAL_LINE_BYTES`] before a new session starts.
+/// The largest `tool_executed` and `session_ended` records a session's
+/// limits allow, checked against [`MAX_JOURNAL_LINE_BYTES`] before a new
+/// session starts.
 ///
-/// With `S` steps, `N` tool calls, result bytes `R`, argument bytes `A`,
-/// model output bytes `O` and final answer bytes `F`:
+/// With result bytes `R`, argument bytes `A` and final answer bytes `F`:
 ///
 /// ```text
-/// total = LINE                                session_started, any task
-///       + S × 4 KiB                           per turn: model_requested,
-///                                             compaction_requested and the
-///                                             framing of their answers
-///       + N × (1.5 KiB + R + I × 32)          tool_executed beside arguments
-///       + min(N × A, O)                       arguments in tool_executed
-///       + 2 × O                               model_responded and
-///                                             compaction_responded content
-///       + 64 KiB                              sandbox_ready, check_completed,
-///                                             one failure message
-///       + session_ended                       1 KiB + 6 × F + 2
+/// tool_executed = 1.5 KiB + R + A + I × 32
+/// session_ended = 1.5 KiB + 6 × F + 2
 /// ```
 ///
 /// `I`, the execution IDs one call can record, is 102 (two executions plus
 /// the 100 response-loss recovery can list), and with a coding tool set
-/// also one more than `max_manifest_entries`: `search` runs `find` and
-/// then one `grep` per chunk, at most one per listed file. An ID is counted as 32
-/// bytes; kilnd's are 19. A result, the arguments and model output are
-/// counted as encoded: the result and arguments are bounded as compact
-/// JSON, and output is twice its budget bytes, which covers JSON escaping
-/// of quotes, backslashes and newlines. A final answer is counted at its
-/// worst escape, six bytes per control byte. Text dense in other control
-/// characters, a response the budget ends only after it is journaled, and a
-/// provider failure message over 64 KiB can pass this bound; they come from
-/// the model endpoint alone, which is trusted for availability only, and
-/// the journal reserves `session_ended` so the session still closes.
+/// also one more than `max_manifest_entries`: `search` runs `find` and then
+/// one `grep` per chunk, at most one per listed file. An ID is counted as 32
+/// bytes; kilnd's are 19. A result and the arguments are bounded as compact
+/// JSON, so they are counted as journaled; a final answer is counted at its
+/// worst escape, six bytes per control byte. The 1.5 KiB is a record's
+/// framing (sequence, time, session ID, `prev_sha256`, keys) and the
+/// record's other fields.
+///
+/// These bound one record as the engine builds it, not every way a record
+/// can grow: a provider that reserializes model arguments (an
+/// OpenAI-compatible `1e14` becomes `100000000000000.0`) can pass them. The
+/// sink still enforces both caps, so such a record is refused and the
+/// session ends with a journal error; cleanup and the audit are unaffected.
+/// The whole journal is not bounded: a long session with raised limits can
+/// reach the file cap, [`MAX_JOURNAL_BYTES`](crate::journal::MAX_JOURNAL_BYTES).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JournalBound {
-    /// The whole journal at most, `session_ended` included.
-    pub total: u64,
+struct RecordBound {
     /// One `tool_executed` record at most.
-    pub tool_executed: u64,
-    /// The closing `session_ended` record at most; the journal keeps this
-    /// much of its file cap for it (at most one line).
-    pub session_ended: u64,
+    tool_executed: u64,
+    /// The closing `session_ended` record at most; a new session's journal
+    /// keeps this much of its file cap for it (at most one line).
+    session_ended: u64,
+}
+
+/// How a session's journal meets the journal caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JournalCaps {
+    /// A new session: the journal keeps room for `session_ended`.
+    Fresh,
+    /// A replay: no reserve, as before there was one, and each record may
+    /// pass the caps by what this session's ID is longer than the
+    /// recording's.
+    Replay { recorded_session_id_bytes: usize },
 }
 
 /// Framing of one record: sequence, time, session ID, `prev_sha256`, keys.
 const JOURNAL_RECORD_BYTES: u64 = 512;
-const JOURNAL_TURN_BYTES: u64 = 4 << 10;
 /// A call's `turn`, `index`, `ok`, audit call ID, call ID (at most 64
 /// bytes), tool name, and its framing in `model_responded`, with a record's.
 const JOURNAL_CALL_BYTES: u64 = JOURNAL_RECORD_BYTES + (1 << 10);
@@ -2624,15 +2687,13 @@ const JOURNAL_EXECUTION_ID_BYTES: u64 = 32;
 /// Two executions (`read_file`'s `stat` and `head`, `edit_file`'s `head`
 /// and `dd`) plus the most recent executions recovery reads.
 const JOURNAL_CALL_EXECUTIONS: u64 = 2 + 100;
-const JOURNAL_TAIL_BYTES: u64 = 64 << 10;
-/// `session_ended` beside its final answer: outcomes, counters, usage.
-const JOURNAL_END_BYTES: u64 = 1 << 10;
+/// `session_ended` beside its final answer and a record's framing:
+/// outcomes, counters, usage.
+const JOURNAL_END_BYTES: u64 = JOURNAL_RECORD_BYTES + (1 << 10);
 
-impl JournalBound {
-    #[must_use]
-    pub fn of(config: &HarnessConfig) -> Self {
+impl RecordBound {
+    fn of(config: &HarnessConfig) -> Self {
         let tools = &config.tool_limits;
-        let calls = u64::from(config.max_tool_calls);
         let mut executions = JOURNAL_CALL_EXECUTIONS;
         if config.tool_set != ToolSet::Base {
             executions = executions.saturating_add(tools.max_manifest_entries as u64 + 1);
@@ -2641,24 +2702,10 @@ impl JournalBound {
             .saturating_add(tools.max_result_bytes as u64)
             .saturating_add(config.max_model_arguments_bytes as u64)
             .saturating_add(executions.saturating_mul(JOURNAL_EXECUTION_ID_BYTES));
-        let session_ended = JOURNAL_RECORD_BYTES
-            .saturating_add(JOURNAL_END_BYTES)
+        let session_ended = JOURNAL_END_BYTES
             .saturating_add((config.max_final_answer_bytes as u64).saturating_mul(6))
             .saturating_add(2);
-        let output = config.max_total_model_output_bytes;
-        let arguments = calls
-            .saturating_mul(config.max_model_arguments_bytes as u64)
-            .min(output);
-        let per_call = tool_executed - config.max_model_arguments_bytes as u64;
-        let total = (MAX_JOURNAL_LINE_BYTES as u64)
-            .saturating_add(u64::from(config.max_steps).saturating_mul(JOURNAL_TURN_BYTES))
-            .saturating_add(calls.saturating_mul(per_call))
-            .saturating_add(arguments)
-            .saturating_add(output.saturating_mul(2))
-            .saturating_add(JOURNAL_TAIL_BYTES)
-            .saturating_add(session_ended);
         Self {
-            total,
             tool_executed,
             session_ended,
         }
@@ -2677,13 +2724,6 @@ impl JournalBound {
                 "session_ended can reach {} bytes, over the {line}-byte journal line cap; lower \
                  max_final_answer_bytes",
                 self.session_ended
-            )
-        } else if self.total > MAX_JOURNAL_BYTES {
-            format!(
-                "these limits allow a journal of {} bytes, over its {MAX_JOURNAL_BYTES}-byte \
-                 cap; lower max_tool_calls, max_total_model_output_bytes, max_steps or \
-                 max_result_bytes",
-                self.total
             )
         } else {
             return Ok(());
@@ -3055,13 +3095,20 @@ fn check_settled(sandbox: Sandbox, request_id: Option<&str>) -> Result<Sandbox, 
 /// Cancellation wins: every wait polls it first, and it is checked again
 /// after each Create and Health answer, before any other early return, and
 /// before an attempt is counted.
+/// Send the create, retrying a keyed one as the rules allow. Returns the
+/// result, the attempts sent and, when an attempt of a keyed create was
+/// answered `ALREADY_EXISTS`, that error. The conflict is returned even when
+/// cancellation, which then wins the result, became ready as it arrived: it
+/// shows another request holds the key, so the caller must not run label
+/// recovery whatever the result. A conflict is never retried, so it is
+/// always the last attempt's answer.
 async fn create_with_retries<A: SandboxApi>(
     api: &A,
     request: &SandboxRequest,
     config: &HarnessConfig,
     deadline: Instant,
     cancel: &CancellationToken,
-) -> (Result<Sandbox, CreateStop>, u32) {
+) -> (Result<Sandbox, CreateStop>, u32, Option<ApiError>) {
     let keyed = request.request_id.is_some();
     let mut attempts = 0_u32;
     let mut sleeps = 0_u32;
@@ -3069,12 +3116,12 @@ async fn create_with_retries<A: SandboxApi>(
     loop {
         // An RPC that is never polled is not an attempt.
         if cancel.is_cancelled() {
-            return (Err(CreateStop::Canceled), attempts);
+            return (Err(CreateStop::Canceled), attempts, None);
         }
         attempts += 1;
         let result = tokio::select! {
             biased;
-            () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
+            () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts, None),
             result = timeout_at(deadline, api.create(request.clone())) => result,
         };
         let error = match result {
@@ -3084,16 +3131,28 @@ async fn create_with_retries<A: SandboxApi>(
                 return (
                     check_settled(sandbox, request.request_id.as_deref()),
                     attempts,
+                    None,
                 );
+            }
+            // A keyed conflict is kept for the caller even when
+            // cancellation became ready as it arrived; cancellation still
+            // wins the result.
+            Ok(Err(error)) if keyed && error.code == tonic::Code::AlreadyExists => {
+                let stop = if cancel.is_cancelled() {
+                    CreateStop::Canceled
+                } else {
+                    CreateStop::Failed(error.clone())
+                };
+                return (Err(stop), attempts, Some(error));
             }
             // Cancellation that arrived while Create was failing outranks
             // the deadline, the attempt cap and the retry rules.
-            _ if cancel.is_cancelled() => return (Err(CreateStop::Canceled), attempts),
+            _ if cancel.is_cancelled() => return (Err(CreateStop::Canceled), attempts, None),
             Ok(Err(error)) => error,
-            Err(_) => return (Err(CreateStop::Deadline), attempts),
+            Err(_) => return (Err(CreateStop::Deadline), attempts, None),
         };
         if !keyed || !retryable_create_error(&error) || attempts >= MAX_CREATE_ATTEMPTS {
-            return (Err(CreateStop::Failed(error)), attempts);
+            return (Err(CreateStop::Failed(error)), attempts, None);
         }
         let window_end =
             *window_end.get_or_insert_with(|| Instant::now() + config.lifecycle_timeout);
@@ -3104,24 +3163,24 @@ async fn create_with_retries<A: SandboxApi>(
             // Whichever ends first decides: the window with the last create
             // error, or the session deadline, during the sleep, as `Deadline`.
             if wake >= window_end && window_end <= deadline {
-                return (Err(CreateStop::Failed(error)), attempts);
+                return (Err(CreateStop::Failed(error)), attempts, None);
             }
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
+                () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts, None),
                 slept = timeout_at(deadline, sleep_until(wake)) => {
                     if slept.is_err() {
-                        return (Err(CreateStop::Deadline), attempts);
+                        return (Err(CreateStop::Deadline), attempts, None);
                     }
                 }
             }
             let health = tokio::select! {
                 biased;
-                () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts),
+                () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts, None),
                 health = timeout_at(window_end.min(deadline), api.health()) => health,
             };
             if cancel.is_cancelled() {
-                return (Err(CreateStop::Canceled), attempts);
+                return (Err(CreateStop::Canceled), attempts, None);
             }
             match health {
                 Ok(Ok(health))
@@ -3132,12 +3191,12 @@ async fn create_with_retries<A: SandboxApi>(
                 }
                 Ok(Err(_)) => {}
                 Err(_) if Instant::now() >= deadline => {
-                    return (Err(CreateStop::Deadline), attempts);
+                    return (Err(CreateStop::Deadline), attempts, None);
                 }
                 // Not serving, or a daemon that no longer lists the feature
                 // (perhaps an older one after a restart) would ignore the
                 // key; or the window closed during the read.
-                Ok(Ok(_)) | Err(_) => return (Err(CreateStop::Failed(error)), attempts),
+                Ok(Ok(_)) | Err(_) => return (Err(CreateStop::Failed(error)), attempts, None),
             }
         }
     }
@@ -3384,8 +3443,8 @@ mod session_id_test {
 }
 
 #[cfg(test)]
-mod journal_bound_test {
-    use super::{HarnessConfig, HarnessError, JournalBound, MAX_JOURNAL_BYTES, ToolSet};
+mod record_bound_test {
+    use super::{HarnessConfig, HarnessError, RecordBound, ToolSet};
     use crate::journal::MAX_JOURNAL_LINE_BYTES;
 
     fn refused(config: &HarnessConfig) -> String {
@@ -3399,24 +3458,13 @@ mod journal_bound_test {
     fn the_library_defaults_fit_and_the_formula_adds_up() {
         let config = HarnessConfig::default();
         config.validate().expect("defaults fit");
-        let bound = JournalBound::of(&config);
+        let bound = RecordBound::of(&config);
         // 512 + 1 KiB + 128 KiB result + 64 KiB arguments + 102 IDs.
         assert_eq!(
             bound.tool_executed,
             1536 + (128 << 10) + (64 << 10) + 102 * 32
         );
         assert_eq!(bound.session_ended, 1536 + 6 * (64 << 10) + 2);
-        let per_call = bound.tool_executed - (64 << 10);
-        assert_eq!(
-            bound.total,
-            (8 << 20)
-                + 8 * (4 << 10)
-                + 6 * per_call
-                + 6 * (64 << 10)
-                + 2 * (8 << 20)
-                + (64 << 10)
-                + bound.session_ended
-        );
     }
 
     #[test]
@@ -3427,23 +3475,20 @@ mod journal_bound_test {
             ..HarnessConfig::default()
         };
         assert_eq!(
-            JournalBound::of(&coding).tool_executed - JournalBound::of(&base).tool_executed,
+            RecordBound::of(&coding).tool_executed - RecordBound::of(&base).tool_executed,
             513 * 32
         );
     }
 
     #[test]
-    fn each_cap_refuses_the_limits_that_pass_it() {
+    fn a_record_over_one_line_is_refused() {
         // One record: a result plus arguments over a line.
-        let mut config = HarnessConfig {
-            max_tool_calls: 1,
-            ..HarnessConfig::default()
-        };
+        let mut config = HarnessConfig::default();
         config.tool_limits.max_result_bytes = 8 << 20;
         assert!(refused(&config).contains("tool_executed"));
         config.tool_limits.max_result_bytes = (8 << 20) - (64 << 10) - 1536 - 102 * 32;
         assert_eq!(
-            JournalBound::of(&config).tool_executed,
+            RecordBound::of(&config).tool_executed,
             MAX_JOURNAL_LINE_BYTES as u64
         );
         config.validate().expect("exactly one line fits");
@@ -3454,15 +3499,20 @@ mod journal_bound_test {
             ..HarnessConfig::default()
         };
         assert!(refused(&config).contains("session_ended"));
+    }
 
-        // The file: the calls' results add up past 64 MiB.
-        let mut config = HarnessConfig {
-            max_tool_calls: 300,
-            ..HarnessConfig::default()
-        };
-        assert!(JournalBound::of(&config).total > MAX_JOURNAL_BYTES);
-        assert!(refused(&config).contains("journal of"));
-        config.max_tool_calls = 200;
-        config.validate().expect("200 calls fit");
+    // The whole journal is not bounded: many calls, much output, or both
+    // are accepted, and only the sink's file cap stops a journal that
+    // reaches it.
+    #[test]
+    fn the_whole_journal_is_not_checked_against_the_file_cap() {
+        for (calls, output) in [(300, 8 << 20), (10_000, 8 << 20), (120, 256 << 20)] {
+            let config = HarnessConfig {
+                max_tool_calls: calls,
+                max_total_model_output_bytes: output,
+                ..HarnessConfig::default()
+            };
+            config.validate().expect("accepted");
+        }
     }
 }

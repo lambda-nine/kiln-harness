@@ -183,11 +183,11 @@ fn verify_rejects_a_complete_journal_with_a_request_after_the_final_answer() {
     assert!(read_journal(&path).is_err());
 }
 
-// Spare security review 2026-11-20, F4: the reader checks only that
+// Security review 2026-11-20, F4: the reader checks only that
 // session IDs agree, so a crafted journal's ID reaches the terminal escaped.
 #[test]
 fn verify_escapes_a_crafted_session_id() {
-    let session = "hs-\u{1b}]52;c;aGk=\u{7}\u{1b}[2J";
+    let session = "hs-\u{1b}]52;c;aGk=\u{7}\u{1b}[2J\nrecords: 0\t";
     let ended = JournalEvent::SessionEnded {
         outcome: "create_failed".to_string(),
         work_outcome: "create_failed".to_string(),
@@ -207,14 +207,55 @@ fn verify_escapes_a_crafted_session_id() {
     let (ok, stdout) = verify(&path);
 
     assert!(ok, "{stdout}");
+    assert!(!stdout.contains(['\u{1b}', '\u{7}', '\t']), "{stdout:?}");
+    // The forged line never starts a line of its own.
+    assert!(!stdout.contains("\nrecords: 0"), "{stdout}");
     assert!(
-        !stdout.contains('\u{1b}') && !stdout.contains('\u{7}'),
-        "{stdout:?}"
-    );
-    assert!(
-        stdout.contains("session: hs-\\u{1b}]52;c;aGk=\\u{7}\\u{1b}[2J\n"),
+        stdout.contains("session: hs-\\u{1b}]52;c;aGk=\\u{7}\\u{1b}[2J\\u{a}records: 0\\u{9}\n"),
         "{stdout}"
     );
+}
+
+// Security review 2026-11-20, F4: Serde names an unknown variant as the
+// journal wrote it, so `journal verify` and `replay` print the error chain
+// escaped, on one line, newline and tab included.
+#[test]
+fn verify_and_replay_escape_an_unknown_variant_in_their_errors() {
+    let lines = chained_lines("hs-crafted", vec![started(), completed(0)]);
+    let crafted = lines[1].replacen(
+        r#""event":"session_ended""#,
+        r#""event":"bogus\u001b]52;c;aGk=\u0007\nforged: line\t2""#,
+        1,
+    );
+    assert_ne!(crafted, lines[1]);
+    let temp = common::private_tempdir().expect("tempdir");
+    let dir = temp.path();
+    let path = dir.join("crafted.jsonl");
+    write_journal_lines(&path, &[lines[0].clone(), crafted]);
+
+    let verify = cli(&["journal".as_ref(), "verify".as_ref(), path.as_os_str()]);
+    let replay = replay_cli(
+        dir,
+        &path,
+        &dir.join("replay-audit.jsonl"),
+        &dir.join("replay.jsonl"),
+    );
+    for (name, output) in [("verify", verify), ("replay", replay)] {
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unknown variant"), "{name}: {stderr}");
+        assert!(
+            stderr.contains(r"bogus\u{1b}]52;c;aGk=\u{7}\u{a}forged: line\u{9}2"),
+            "{name}: {stderr}"
+        );
+        assert!(
+            !stderr.contains(['\u{1b}', '\u{7}', '\t']),
+            "{name}: {stderr:?}"
+        );
+        // One line: the forged one never starts a line of its own.
+        assert_eq!(stderr.trim_end().lines().count(), 1, "{name}: {stderr:?}");
+    }
+    assert!(!dir.join("replay.jsonl").exists());
 }
 
 #[test]

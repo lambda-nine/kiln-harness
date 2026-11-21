@@ -18,7 +18,9 @@ use thiserror::Error;
 use crate::api::SandboxApi;
 use crate::audit::AuditSink;
 use crate::compaction::CompactionPolicy;
-use crate::engine::{CheckOutcome, Harness, HarnessError, SessionOutcome, SessionTask};
+use crate::engine::{
+    CheckOutcome, Harness, HarnessError, JournalCaps, SessionOutcome, SessionTask,
+};
 use crate::journal::JournalSink;
 use crate::journal::{
     Grammar, JournalEvent, LoadedJournal, RecordedSeedFile, SessionLimits,
@@ -90,6 +92,9 @@ pub struct ReplayProvider {
     recorded_check: Option<CheckOutcome>,
     /// The replayed check's verdict differed from the recorded one.
     check_diverged: bool,
+    /// Bytes of the recording's session ID; the replay runs under a fresh
+    /// one, whose journal records may be longer by the difference.
+    recorded_session_id_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +175,7 @@ impl ReplayProvider {
             unexpected: 0,
             recorded_check: None,
             check_diverged: false,
+            recorded_session_id_bytes: journal.session_id().len(),
         };
         // The grammar has paired every request with one answer in turn order.
         let mut pending: Option<Pending> = None;
@@ -568,6 +574,9 @@ where
         }
         let task = self.provider().task();
         let exec_context = self.provider().exec_context;
-        self.run_in_context(&task, exec_context, cancel).await
+        let caps = JournalCaps::Replay {
+            recorded_session_id_bytes: self.provider().recorded_session_id_bytes,
+        };
+        self.run_in_context(&task, exec_context, caps, cancel).await
     }
 }

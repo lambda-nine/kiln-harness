@@ -371,7 +371,16 @@ async fn main() -> Result<ExitCode> {
             live,
         } => {
             let journal = journal.unwrap_or_else(|| default_journal("replay"));
-            replay(cli.socket, &from, &audit, &journal, live).await
+            // The error can quote the journal (Serde names an unknown
+            // variant as written), so it is printed here, escaped, rather
+            // than raw by the runtime; the exit status is the same.
+            match replay(cli.socket, &from, &audit, &journal, live).await {
+                Ok(code) => Ok(code),
+                Err(error) => {
+                    eprintln!("Error: {}", error_line(error.chain()));
+                    Ok(ExitCode::FAILURE)
+                }
+            }
         }
         Command::Journal {
             command: JournalCommand::Verify { path },
@@ -1001,20 +1010,21 @@ fn refuse_aliases(paths: &[(&str, FileIdentity)]) -> Result<()> {
 }
 
 fn verify(path: &Path) -> ExitCode {
+    // Errors can quote the journal, so they are printed escaped.
     let journal = match read_journal(path) {
         Ok(journal) => journal,
         Err(error) => {
-            eprintln!("invalid: {error}");
+            eprintln!("invalid: {}", error_line(sources(&error)));
             return ExitCode::FAILURE;
         }
     };
     if let Err(error) = ReplayProvider::from_journal(&journal) {
-        eprintln!("invalid: {error}");
+        eprintln!("invalid: {}", error_line(sources(&error)));
         return ExitCode::FAILURE;
     }
     let summary = summarize(&journal);
     // The reader checks that session IDs agree, not their characters.
-    println!("session: {}", terminal_safe(journal.session_id()));
+    println!("session: {}", terminal_safe_line(journal.session_id()));
     println!("records: {}", journal.records.len());
     match &summary.outcome {
         Some(outcome) => println!("status: complete ({outcome})"),
@@ -1223,7 +1233,42 @@ fn with_live<P: Provider>(
 /// A failed replay's line. The error can quote a recorded failure message,
 /// which the journal grammar does not constrain.
 fn replay_failed_line(error: &HarnessError) -> String {
-    format!("replay failed: {}", terminal_safe(&error.to_string()))
+    format!("replay failed: {}", error_line(sources(error)))
+}
+
+/// `error` and each of its sources, outermost first.
+fn sources<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |error| error.source())
+}
+
+/// An error chain on one terminal-safe line, as `anyhow` shows it with
+/// `{:#}`: each message joined by `: `, outermost first, leaving out a
+/// source whose message the line already holds. Every message is escaped
+/// with [`terminal_safe_line`], since a chain can quote untrusted input,
+/// such as Serde naming a journal's unknown variant.
+fn error_line<'a>(chain: impl Iterator<Item = &'a (dyn std::error::Error + 'static)>) -> String {
+    let mut line = String::new();
+    for error in chain {
+        let message = error.to_string();
+        if line.contains(&message) {
+            continue;
+        }
+        if !line.is_empty() {
+            line.push_str(": ");
+        }
+        line.push_str(&message);
+    }
+    terminal_safe_line(&line)
+}
+
+/// [`terminal_safe`] for text that must stay on one line, such as a
+/// session ID or an error: newline and tab are escaped too.
+fn terminal_safe_line(text: &str) -> String {
+    terminal_safe(text)
+        .replace('\n', "\\u{a}")
+        .replace('\t', "\\u{9}")
 }
 
 /// Model text made safe for a terminal: C0 and C1 control characters and
@@ -1540,16 +1585,31 @@ mod tests {
         }
     }
 
-    // Spare security review 2026-11-20, F2: the limits a configuration
-    // allows must fit the journal caps.
+    // Only single records are checked against the journal line cap; the
+    // whole journal is not checked against its file cap, so raised limits
+    // the hard ceilings allow are accepted.
     #[test]
-    fn cli_defaults_fit_the_journal_and_raised_limits_that_do_not_are_refused() {
+    fn cli_defaults_and_raised_call_limits_are_accepted() {
         for tool_set in ["base", "coding"] {
-            model_config(&run_args(&["--tool-set", tool_set])).expect("defaults fit");
+            model_config(&run_args(&["--tool-set", tool_set])).expect("defaults");
         }
-        // The review's example: every flag within its ceiling, but 2000
-        // maximum-size results alone are 250 MiB.
-        let error = model_config(&run_args(&[
+        // As `eval run --task stak-interp --max-tool-calls 300` builds its
+        // base, before the task's own override applies.
+        let config = model_config(&run_args(&[
+            "--tool-set",
+            "coding",
+            "--max-tool-calls",
+            "300",
+        ]))
+        .expect("300 calls");
+        let tasks = kiln_harness::eval::load_tasks(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/hard"),
+            &["stak-interp".to_string()],
+            &config,
+        )
+        .expect("stak-interp loads");
+        assert_eq!(tasks[0].config(&config).max_tool_calls, 120);
+        model_config(&run_args(&[
             "--max-steps",
             "200",
             "--max-tool-calls",
@@ -1557,15 +1617,10 @@ mod tests {
             "--max-total-output-bytes",
             "67108864",
         ]))
-        .expect_err("over the journal cap");
-        assert!(error.to_string().contains("journal"), "{error}");
-        // So is output alone: twice 32 MiB plus the rest.
-        let error = model_config(&run_args(&["--max-total-output-bytes", "33554432"]))
-            .expect_err("over the journal cap");
-        assert!(error.to_string().contains("67108864-byte cap"), "{error}");
+        .expect("raised limits");
     }
 
-    // Spare security review 2026-11-20, F4.
+    // Security review 2026-11-20, F4.
     #[test]
     fn a_failed_replay_escapes_a_recorded_failure_message() {
         let error = HarnessError::Provider(kiln_harness::provider::ProviderError::new(

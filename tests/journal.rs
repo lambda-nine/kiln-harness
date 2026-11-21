@@ -836,6 +836,153 @@ async fn the_public_run_is_always_a_live_workspace_session() {
     }
 }
 
+/// Collects what the engine journals, with neither cap nor reserve, so a
+/// test can write the journal a build without them would have.
+#[derive(Default)]
+struct Collected(Vec<JournalEvent>);
+
+impl JournalSink for Collected {
+    fn append(&mut self, _session_id: &str, event: JournalEvent) -> Result<(), JournalError> {
+        self.0.push(event);
+        Ok(())
+    }
+}
+
+/// `events` as journal lines under `session_id`, every record at
+/// `unix_ms`: chained when `chain`, otherwise with the genesis hash in every
+/// record, which has the same length.
+fn rechained(session_id: &str, unix_ms: u64, events: &[JournalEvent], chain: bool) -> Vec<String> {
+    let mut prev = GENESIS_SHA256.to_string();
+    events
+        .iter()
+        .enumerate()
+        .map(|(sequence, event)| {
+            let line = serde_json::to_string(&JournalRecord {
+                sequence: sequence as u64,
+                unix_ms,
+                session_id: session_id.to_string(),
+                prev_sha256: prev.clone(),
+                event: event.clone(),
+            })
+            .expect("encode");
+            if chain {
+                prev = sha256_hex(line.as_bytes());
+            }
+            line
+        })
+        .collect()
+}
+
+fn journal_bytes(lines: &[String]) -> u64 {
+    lines.iter().map(|line| line.len() as u64 + 1).sum()
+}
+
+// A journal written before session IDs carried a nonce and before the
+// session_ended reserve: its ID is the old, shorter form, it allowed a 1 MiB
+// final answer (a 6 MiB reserve today), and it ends within 100 bytes of the
+// file cap. It still verifies, and it still replays: a replay keeps no
+// reserve, and its records may pass the caps by what its fresh session ID is
+// longer than the recorded one.
+#[tokio::test(start_paused = true)]
+async fn a_legacy_journal_at_the_file_cap_verifies_and_replays() {
+    const LEGACY_ID: &str = "hs-19a9f3c2b10-1f4a-0";
+    const UNIX_MS: u64 = 1_763_600_000_000;
+    const READS: u32 = 8;
+    const FILE_BYTES: usize = (8 << 20) - (128 << 10);
+    let fake = || {
+        let api = FakeApi::default();
+        for index in 0..READS {
+            api.state()
+                .files
+                .insert(format!("/workspace/big{index}"), vec![b'x'; FILE_BYTES]);
+        }
+        api
+    };
+    let mut config = short_lifecycle_config();
+    config.max_tool_calls = READS;
+    config.max_final_answer_bytes = 1 << 20;
+    config.tool_limits.max_file_bytes = 8 << 20;
+    config.tool_limits.max_result_bytes = (8 << 20) - (96 << 10);
+    let reads = (0..READS).map(|index| {
+        ToolCall::new(
+            format!("c{index}"),
+            "read_file",
+            json!({ "path": format!("big{index}") }),
+        )
+    });
+    let mut recording = Harness::new(
+        fake(),
+        ScriptedProvider::new([
+            ModelResponse::tool_use(reads),
+            ModelResponse::final_text("x"),
+        ]),
+        MemoryAudit::default(),
+        Collected::default(),
+        config,
+    );
+    recording
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect("recording");
+    let mut events = recording.journal().0.clone();
+
+    // The final answer is journaled twice and hashed into no request, so
+    // its length sets the journal's size without changing the replay.
+    let target = MAX_JOURNAL_BYTES - 100;
+    let grown = target - journal_bytes(&rechained(LEGACY_ID, UNIX_MS, &events, false));
+    let answer = "x".repeat(1 + usize::try_from(grown / 2).expect("fits"));
+    for event in &mut events {
+        match event {
+            JournalEvent::ModelResponded { response, .. } if response.text.is_some() => {
+                response.text = Some(answer.clone());
+            }
+            JournalEvent::SessionEnded { final_answer, .. } => {
+                *final_answer = Some(answer.clone());
+            }
+            _ => {}
+        }
+    }
+    let lines = rechained(LEGACY_ID, UNIX_MS, &events, true);
+    let size = journal_bytes(&lines);
+    assert!((target..=MAX_JOURNAL_BYTES).contains(&size), "{size}");
+
+    let temp = common::private_tempdir().expect("temp dir");
+    let path = temp.path().join("legacy.jsonl");
+    common::write_journal_lines(&path, &lines);
+    let journal = read_journal(&path).expect("the legacy journal verifies");
+    assert_eq!(journal.session_id(), LEGACY_ID);
+    let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    assert_eq!(provider.limits().max_final_answer_bytes, 1 << 20);
+    let config = provider.replay_config(short_lifecycle_config());
+    let mut replay = Harness::new(
+        fake(),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    let outcome = replay
+        .replay(CancellationToken::new())
+        .await
+        .expect("the legacy journal replays");
+
+    assert_eq!(outcome.final_answer, answer);
+    assert_eq!(replay.provider().diverged_at(), None);
+    assert!(replay.provider().exhausted());
+    // Every record is longer by the session IDs' difference, which takes
+    // the replay's own journal past the file cap by at most that much each.
+    let written = &replay.journal().lines;
+    assert_eq!(written.len(), lines.len());
+    let growth = (outcome.session_id.len() - LEGACY_ID.len()) as u64;
+    assert!(growth > 0);
+    let replayed = journal_bytes(written);
+    assert!(replayed > MAX_JOURNAL_BYTES, "{replayed}");
+    assert!(
+        replayed <= MAX_JOURNAL_BYTES + growth * written.len() as u64,
+        "{replayed}"
+    );
+}
+
 #[tokio::test]
 async fn a_legacy_replay_still_checks_that_kilnd_ran_it_as_sent() {
     // The expected metadata is the legacy one: a daemon that reports a cwd
@@ -1262,8 +1409,8 @@ async fn limits_exactly_at_the_ceilings_are_accepted() {
         },
         ..short_lifecycle_config()
     };
-    // Every ceiling is inclusive, but together they allow a journal far over
-    // its caps, so a new session refuses them before any sandbox.
+    // Every ceiling is inclusive, but a result at its ceiling cannot fit
+    // one journal line, so a new session refuses it before any sandbox.
     let api = FakeApi::default();
     let mut harness = Harness::new(
         api.clone(),
@@ -1275,22 +1422,21 @@ async fn limits_exactly_at_the_ceilings_are_accepted() {
     let error = harness
         .run(&SessionTask::demo(), CancellationToken::new())
         .await
-        .expect_err("the journal bound refuses the ceilings together");
+        .expect_err("one tool_executed record would pass a line");
     assert!(
-        matches!(&error, HarnessError::InvalidModelCall(problem) if problem.contains("journal")),
+        matches!(&error, HarnessError::InvalidModelCall(problem)
+            if problem.contains("tool_executed") && problem.contains("journal line cap")),
         "{error}"
     );
     assert!(api.state().creates.is_empty());
 
-    // Each journal-sized limit at a value that fits, every other at its
-    // ceiling.
+    // The limits one record holds at values that fit a line, every other
+    // at its ceiling: the whole journal is not checked against its cap.
     let config = HarnessConfig {
-        max_tool_calls: 100,
         max_model_arguments_bytes: 1 << 20,
         max_final_answer_bytes: 1 << 20,
-        max_total_model_output_bytes: 8 << 20,
         tool_limits: ToolLimits {
-            max_result_bytes: 64 << 10,
+            max_result_bytes: 4 << 20,
             ..ceilings.tool_limits.clone()
         },
         ..ceilings

@@ -6,36 +6,55 @@ change the CLI or audit format.
 
 ## Unreleased
 
-- `journal verify` prints the session ID, and `replay` its `replay failed:`
-  error, with control characters escaped as everything else they print is,
-  so a crafted journal cannot send escape sequences to the terminal.
+- `journal verify` and `replay` print the session ID and every error they
+  report (`invalid:`, `replay failed:`, and `replay`'s `Error:` line, with
+  each source in the chain) escaped and on one line. Control characters,
+  newline and tab included, are shown as `\u{..}`, so a crafted journal,
+  such as one whose unknown variant name Serde quotes, cannot send escape
+  sequences to the terminal or forge an output line. `replay`'s own errors
+  are now printed as one `Error: a: b` line rather than the runtime's
+  multi-line form; the exit status is unchanged.
 - The threat model now names the second endpoint string the audit carries:
   a compaction response's bounded stop reason (1 to 64 bytes of
   `[a-z0-9_]`) in `context_compacted.outcome` as `no_summary:<stop_reason>`.
   The audit is unchanged.
-- A new session's limits must fit the journal caps (64 MiB per file, 8 MiB
-  per line). `HarnessConfig::validate` and `Harness::run` compute the
-  journal the limits allow (`JournalBound`; formula in
-  `docs/architecture.md`, "Journal size") and refuse a configuration whose
-  bound, one `tool_executed` record or `session_ended` passes a cap,
-  instead of letting the journal cap end the session mid-run. The CLI
-  defaults bound about 48 MiB; at the other defaults, more than about 240
-  tool calls or 16 MiB of `--max-total-output-bytes` is now refused. Replay
-  keeps its recording's limits unchecked. The engine has the journal keep
-  room for `session_ended` (`JournalSink::reserve_for_session_end`, a no-op
-  by default), so a full journal still closes. The HTTP adapters'
+- A new session refuses limits that allow one journal record over the 8 MiB
+  line cap: `HarnessConfig::validate` and `Harness::run` check the largest
+  `tool_executed` (result, arguments and execution IDs) and `session_ended`
+  (final answer at six bytes per byte), as `docs/architecture.md`, "Journal
+  size", describes. The whole journal is not checked against the 64 MiB file
+  cap. A long session with raised limits can still reach it and end with a
+  journal error, and a record that grows past these bounds when it is built
+  (a provider reserializing arguments, say) is still refused by the sink.
+  Cleanup and the audit are unaffected either way. A new session's journal
+  keeps room for `session_ended` (`JournalSink::reserve_for_session_end`, a
+  no-op by default), so a full journal still closes. A replay keeps no
+  reserve and skips the check. Its records may pass both caps by what its
+  fresh session ID is longer than the recorded one
+  (`JournalSink::allow_session_id_growth`, at most 64 bytes a record), so
+  every journal that verifies still replays. The HTTP adapters'
   `max_response_bytes` is now at most, and by default, 4 MiB less 32 KiB
-  (was 4 MiB by default, 64 MiB at most), so a response fits one line.
+  (was 4 MiB by default, 64 MiB at most), so a response, journaled about
+  twice over by the Anthropic adapter, fits one line.
 - Session IDs carry a 64-bit nonce from the OS:
-  `hs-{wall ms}-{pid}-{counter}-{nonce}`, at most 49 bytes, with the
-  counter kept to 32 bits. Two harness processes with the same PID in
-  separate PID namespaces, starting in the same millisecond, no longer share
-  a create key and `session` label. A keyed create refused `ALREADY_EXISTS`
-  no longer runs label recovery, which could delete the key holder's live
-  sandbox: nothing is listed or deleted. With the typed reason
-  `request_id_conflict` the session ends `create_failed` (was
-  `cleanup_failed` with `CreateUncertain`) with an error that says the key is
-  held by another request; without it, `CreateUncertain` as before.
+  `hs-{wall ms}-{pid}-{counter}-{nonce}`, at most 49 bytes, with the counter
+  kept to 32 bits. Two harness processes with the same PID in separate PID
+  namespaces, starting in the same millisecond, now share a create key and
+  `session` label only if their nonces collide (about one chance in 2^64).
+  A keyed create refused `ALREADY_EXISTS` no longer runs label recovery,
+  which could delete the key holder's live sandbox. Nothing is listed or
+  deleted, even when cancellation becomes ready as the refusal arrives. With
+  the typed reason `request_id_conflict` on the first attempt, the session
+  ends `create_failed` (was `cleanup_failed` with `CreateUncertain`), or
+  `canceled`, with an error that says the key is held by another request.
+  After an earlier attempt's answer was lost, or without the typed reason,
+  it ends `CreateUncertain` and `cleanup_failed` with `sandbox_deleted:
+  false`. When absence is unconfirmed, a failure to write the closing audit
+  or journal record no longer replaces the `CreateUncertain` or `Cleanup`
+  error; it is added to that error's message.
+- `HarnessError` has a new variant, `SessionId`, for when the OS cannot supply
+  the nonce. `HarnessError` is not `#[non_exhaustive]`, so an exhaustive
+  `match` on it must add an arm.
 - Bring the docs in step with the code: `--strict-tools` lists every bound it
   removes, the coding tool set's included; the architecture diagram names
   the anthropic provider; the integration script's description lists what it
