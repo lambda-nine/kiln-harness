@@ -455,7 +455,9 @@ pub trait JournalSink: Send {
     /// The engine calls it before the first record of a new session, never
     /// of a replay; at most one line is kept. It clears any
     /// [`JournalSink::allow_session_id_growth`] allowance. The default keeps
-    /// nothing.
+    /// nothing. Both hooks default to a no-op, so a sink that keeps state for
+    /// either must override both: with only this one overridden, selecting
+    /// the other policy would leave this reserve in place.
     fn reserve_for_session_end(&mut self, bytes: u64) {
         let _ = bytes;
     }
@@ -472,7 +474,8 @@ pub trait JournalSink: Send {
     /// covers the session ID's growth only: other metadata a replay
     /// regenerates, such as expiry fields a daemon newly advertises, can
     /// still push a recording that sits at a cap over it. The default allows
-    /// nothing.
+    /// nothing. As with [`JournalSink::reserve_for_session_end`], a sink
+    /// that keeps state for either hook must override both.
     fn allow_session_id_growth(&mut self, bytes: u64) {
         let _ = bytes;
     }

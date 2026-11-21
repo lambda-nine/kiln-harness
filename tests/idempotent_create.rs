@@ -899,7 +899,7 @@ struct Hooked {
     healths: Arc<AtomicU32>,
     on_create: Arc<CreateHook>,
     on_health: Arc<dyn Fn(u32) + Send + Sync>,
-    /// A create whose hook answers stays pending for one poll first, so an
+    /// A create stays pending for one poll after its hook runs, so its
     /// answer and a cancellation the hook fires are both ready when the
     /// engine next looks.
     answer_after_a_poll: bool,
@@ -937,10 +937,11 @@ impl SandboxApi for Hooked {
 
     async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
         let call = self.creates.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(error) = (self.on_create)(call, &request) {
-            if self.answer_after_a_poll {
-                tokio::task::yield_now().await;
-            }
+        let answer = (self.on_create)(call, &request);
+        if self.answer_after_a_poll {
+            tokio::task::yield_now().await;
+        }
+        if let Some(error) = answer {
             return Err(error);
         }
         self.inner.create(request).await
@@ -1603,6 +1604,79 @@ async fn a_conflict_ready_beside_cancellation_still_leaves_the_sandbox_alone() {
         finished(&harness),
         ("canceled".to_string(), "canceled".to_string(), true, None)
     );
+}
+
+// The READY counterpart: a sandbox answered beside cancellation is this
+// session's, known by ID. It goes to the normal cleanup, which deletes it by
+// ID and verifies absence, never to label recovery. While listing fails
+// throughout, the delete is still sent and the ID still audited; deletion is
+// then unconfirmed.
+#[tokio::test(start_paused = true)]
+async fn a_sandbox_ready_beside_cancellation_is_deleted_by_id() {
+    for listing_recovers in [true, false] {
+        let fake = FakeApi::keyed(true);
+        fake.state().list_failures = if listing_recovers { 1 } else { u32::MAX };
+        let cancel = CancellationToken::new();
+        let mut api = Hooked::new(&fake);
+        let canceler = cancel.clone();
+        api.on_create = Arc::new(move |_, _| {
+            canceler.cancel();
+            None
+        });
+        api.answer_after_a_poll = true;
+        let mut harness = api.session();
+        let result = harness.run(&SessionTask::demo(), cancel).await;
+
+        let id = "sb-0000000000000001";
+        assert_eq!(api.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(recovered(&harness), None, "no label recovery");
+        let created = harness
+            .audit()
+            .records
+            .iter()
+            .find(|record| matches!(record.event, AuditEvent::SandboxCreated { .. }))
+            .expect("sandbox_created");
+        assert_eq!(created.sandbox_id.as_deref(), Some(id));
+        assert_eq!(
+            harness
+                .audit()
+                .records
+                .last()
+                .and_then(|record| record.sandbox_id.as_deref()),
+            Some(id)
+        );
+        assert!(fake.state().delete_attempts >= 1, "deleted by ID");
+        if listing_recovers {
+            assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+            assert_eq!(fake.state().deleted, [id]);
+            // A held READY create is cleaned up as one, its key released.
+            assert_eq!(
+                finished(&harness),
+                (
+                    "canceled".to_string(),
+                    "canceled".to_string(),
+                    true,
+                    Some(true)
+                )
+            );
+            assert_eq!(ended_deleted(&harness), Some(true));
+        } else {
+            assert!(
+                matches!(result, Err(HarnessError::Cleanup(_))),
+                "{result:?}"
+            );
+            assert_eq!(
+                finished(&harness),
+                (
+                    "cleanup_failed".to_string(),
+                    "canceled".to_string(),
+                    false,
+                    Some(false)
+                )
+            );
+            assert_eq!(ended_deleted(&harness), Some(false));
+        }
+    }
 }
 
 // A definite refusal proves only that its own attempt made nothing: after an

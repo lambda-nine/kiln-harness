@@ -6,16 +6,17 @@ change the CLI or audit format.
 
 ## Unreleased
 
-- `journal verify` and `replay` print the session ID, the recorded tool set
-  and check result (`tool set:`, `check:`, so a check error's reason), and
-  every error they report (`invalid:`, `replay failed:`, and `replay`'s
-  `Error:` line, with each source in the chain) escaped and on one line;
-  `run` and `demo` print their `check:` line the same way. Control characters,
-  newline and tab included, are shown as `\u{..}`, so a crafted journal,
-  such as one whose unknown variant name Serde quotes, cannot send escape
-  sequences to the terminal or forge an output line. `replay`'s own errors
-  are now printed as one `Error: a: b` line rather than the runtime's
-  multi-line form; the exit status is unchanged.
+- `journal verify` and `replay` print the session ID and every error they
+  report (`invalid:`, `replay failed:`, and `replay`'s `Error:` line, with
+  each source in the chain) escaped and on one line. So do `journal
+  verify`'s recorded tool set and check result (`tool set:`, `check:`, so a
+  check error's reason), and the `check:` line `run`, `demo` and `replay`
+  print for the check they run. Control characters, newline and tab
+  included, are shown as `\u{..}`, so a crafted journal, such as one whose
+  unknown variant name Serde quotes, cannot send escape sequences to the
+  terminal or forge an output line. `replay`'s own errors are now printed as
+  one `Error: a: b` line rather than the runtime's multi-line form; the exit
+  status is unchanged.
 - The threat model now names the second endpoint string the audit carries:
   a compaction response's bounded stop reason (1 to 64 bytes of
   `[a-z0-9_]`) in `context_compacted.outcome` as `no_summary:<stop_reason>`.
@@ -50,12 +51,16 @@ change the CLI or audit format.
   A keyed create refused `ALREADY_EXISTS` no longer runs label recovery,
   which could delete the key holder's live sandbox. Nothing is listed or
   deleted, even when cancellation is ready as the refusal arrives: an answer
-  already there is read before the request is dropped. With the typed reason
+  already there is read before the request is dropped. A `READY` sandbox
+  read that way is held and deleted by ID, with absence verified, rather
+  than dropped for label recovery, which would lose its ID from the audit
+  and leave it behind if listing failed; an attempt still pending is dropped
+  as an in-flight create, as before. With the typed reason
   `request_id_conflict` on the first attempt, the session ends
   `create_failed` (was `cleanup_failed` with `CreateUncertain`), with an
   error that says the key is held by another request; if cancellation
-  coincides, it ends `canceled` with `HarnessError::Canceled`, as any
-  canceled create does. After an earlier attempt's answer was lost, or
+  coincides, it ends `canceled` with `HarnessError::Canceled`. After an
+  earlier attempt's answer was lost, or
   without the typed reason, it ends `CreateUncertain` and `cleanup_failed`
   with `sandbox_deleted: false`. Any other definite refusal (such as
   `RESOURCE_EXHAUSTED`) likewise proves absence only on the first attempt:

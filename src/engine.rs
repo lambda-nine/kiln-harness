@@ -3113,7 +3113,8 @@ fn check_settled(sandbox: Sandbox, request_id: Option<&str>) -> Result<Sandbox, 
 /// cancellation, which then wins the result, became ready as it arrived: it
 /// shows another request holds the key, so the caller must not run label
 /// recovery whatever the result. A conflict is never retried, so it is
-/// always the last attempt's answer.
+/// always the last attempt's answer. A sandbox answered as cancellation
+/// arrived is still returned, for the caller's cleanup to delete by ID.
 async fn create_with_retries<A: SandboxApi>(
     api: &A,
     request: &SandboxRequest,
@@ -3142,24 +3143,27 @@ async fn create_with_retries<A: SandboxApi>(
             () = cancel.cancelled() => {
                 // The answer and cancellation can both be ready by the time
                 // this runs, and the biased select then takes cancellation.
-                // An answer already there is read before the RPC is dropped,
-                // without waiting, so a conflict still keeps label recovery
-                // away from the key holder's sandbox. An RPC never polled
-                // is not started here.
+                // So a started RPC is polled once more, without waiting,
+                // before it is dropped. `polled` shows only that the future
+                // ran, not that the request was sent: tonic waits for the
+                // transport before sending, so this read can be what
+                // submits the first Create. Either way, an answer it
+                // completes with is handled below exactly as one that won
+                // the select: a READY sandbox goes to the caller, whose
+                // cleanup deletes it by ID, a conflict keeps label recovery
+                // away from the key holder's sandbox, and any other answer
+                // yields to cancellation. One still pending is dropped as an
+                // in-flight create, as if cancellation had come a moment
+                // later. An RPC never polled is not started here.
                 let ready = if polled.load(Ordering::Relaxed) {
                     create.as_mut().now_or_never()
                 } else {
                     None
                 };
-                let conflict = match ready {
-                    Some(Ok(Err(error)))
-                        if keyed && error.code == tonic::Code::AlreadyExists =>
-                    {
-                        Some(error)
-                    }
-                    _ => None,
-                };
-                return (Err(CreateStop::Canceled), attempts, conflict);
+                match ready {
+                    Some(result) => result,
+                    None => return (Err(CreateStop::Canceled), attempts, None),
+                }
             }
             result = &mut create => result,
         };

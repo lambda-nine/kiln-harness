@@ -104,24 +104,35 @@ create: no `request_id`, one attempt, nothing released.
   session's key, and a sandbox with this session's labels may be that holder's
   live one. Label recovery is skipped, so nothing is listed or deleted. That
   holds even when cancellation becomes ready as the conflict arrives, or is
-  ready beside it when the harness next looks: before dropping a started
-  attempt on cancellation, the harness reads an answer already there without
-  waiting. Cancellation still decides the session's result, but the answered
-  conflict decides cleanup. The typed reason `request_id_conflict` proves
+  ready beside it when the harness next looks (see the next item).
+  Cancellation still decides the session's result, but the answered conflict
+  decides cleanup. The typed reason `request_id_conflict` proves
   absence only for the first attempt, because kilnd would have returned, not
   refused, a sandbox an equal request made. Then the audit's
   `sandbox_recovered` lists no sandbox with `deleted: true`, and the session
   ends `create_failed` with an `ALREADY_EXISTS` error that says the key is
   held by another request; if cancellation coincides, it ends `canceled` with
-  a plain `HarnessError::Canceled`, as any canceled create does. After an
-  earlier attempt whose answer was lost, the conflict
-  says nothing about that attempt: it may still reach kilnd once the holder
-  releases the key. Absence is then unproven, as it is without the typed
+  a plain `HarnessError::Canceled`. After an earlier attempt whose answer was
+  lost, the conflict says nothing about that attempt: it may still reach
+  kilnd once the holder releases the key. Absence is then unproven, as it is without the typed
   reason, and the session returns `CreateUncertain` with `cleanup_failed` and
   `sandbox_deleted: false`. Whenever absence is unconfirmed, here or after
   work, a failure to write the closing audit or journal record does not
   replace the `CreateUncertain` or `Cleanup` error. Both writes are tried, and
   their errors are added to that error's message.
+- **An answer beside cancellation.** An attempt's answer and cancellation can
+  both be ready when the harness next looks, and cancellation is checked
+  first. Before dropping a started attempt, the harness polls it once more
+  without waiting. That the attempt was started shows only that its future
+  ran, not that the request was sent: tonic waits for the transport before
+  sending, so this last poll can be what submits the first Create. If the
+  poll completes, its answer is handled as one that came first: a `READY`
+  sandbox is held, and since the session is canceled before any work, the
+  normal cleanup deletes it by ID and verifies its absence; a conflict skips
+  label recovery as above; any other answer yields to cancellation. If it is
+  still pending, the attempt is dropped as an in-flight create, as if
+  cancellation had come a moment later, and label recovery decides cleanup.
+  The harness does not split the RPC into separate send and receive steps.
 - **No per-attempt timeout.** An attempt has no client timeout and sends no
   `grpc-timeout`: it runs until it answers, bounded only by the session
   deadline and cancellation, as an unkeyed create always has. So the harness
