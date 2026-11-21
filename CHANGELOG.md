@@ -6,6 +6,19 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- A new session's limits must fit the journal caps (64 MiB per file, 8 MiB
+  per line). `HarnessConfig::validate` and `Harness::run` compute the
+  journal the limits allow (`JournalBound`; formula in
+  `docs/architecture.md`, "Journal size") and refuse a configuration whose
+  bound, one `tool_executed` record or `session_ended` passes a cap,
+  instead of letting the journal cap end the session mid-run. The CLI
+  defaults bound about 48 MiB; at the other defaults, more than about 240
+  tool calls or 16 MiB of `--max-total-output-bytes` is now refused. Replay
+  keeps its recording's limits unchecked. The engine has the journal keep
+  room for `session_ended` (`JournalSink::reserve_for_session_end`, a no-op
+  by default), so a full journal still closes. The HTTP adapters'
+  `max_response_bytes` is now at most, and by default, 4 MiB less 32 KiB
+  (was 4 MiB by default, 64 MiB at most), so a response fits one line.
 - Session IDs carry a 64-bit nonce from the OS:
   `hs-{wall ms}-{pid}-{counter}-{nonce}`, at most 49 bytes, with the
   counter kept to 32 bits. Two harness processes with the same PID in

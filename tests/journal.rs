@@ -1240,7 +1240,7 @@ async fn recorded_limits_above_the_hard_ceilings_are_rejected_before_create() {
 
 #[tokio::test]
 async fn limits_exactly_at_the_ceilings_are_accepted() {
-    let config = HarnessConfig {
+    let ceilings = HarnessConfig {
         max_steps: MAX_STEPS,
         max_tool_calls: MAX_TOOL_CALLS,
         max_tool_calls_per_turn: MAX_TOOL_CALLS_PER_TURN,
@@ -1261,6 +1261,39 @@ async fn limits_exactly_at_the_ceilings_are_accepted() {
             max_manifest_entries: 512,
         },
         ..short_lifecycle_config()
+    };
+    // Every ceiling is inclusive, but together they allow a journal far over
+    // its caps, so a new session refuses them before any sandbox.
+    let api = FakeApi::default();
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::demo(),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        ceilings.clone(),
+    );
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("the journal bound refuses the ceilings together");
+    assert!(
+        matches!(&error, HarnessError::InvalidModelCall(problem) if problem.contains("journal")),
+        "{error}"
+    );
+    assert!(api.state().creates.is_empty());
+
+    // Each journal-sized limit at a value that fits, every other at its
+    // ceiling.
+    let config = HarnessConfig {
+        max_tool_calls: 100,
+        max_model_arguments_bytes: 1 << 20,
+        max_final_answer_bytes: 1 << 20,
+        max_total_model_output_bytes: 8 << 20,
+        tool_limits: ToolLimits {
+            max_result_bytes: 64 << 10,
+            ..ceilings.tool_limits.clone()
+        },
+        ..ceilings
     };
     let mut harness = Harness::new(
         FakeApi::default(),

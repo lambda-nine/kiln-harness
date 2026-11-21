@@ -12,7 +12,7 @@ use kiln_harness::provider::{
     Message, ModelRequest, Provider, ProviderErrorKind, StopReason, ToolCall, ToolDefinition,
     ToolResult, Usage,
 };
-use kiln_harness::providers::openai_compat::{parse_response, request_body};
+use kiln_harness::providers::openai_compat::{MAX_RESPONSE_BYTES, parse_response, request_body};
 use kiln_harness::providers::{OpenAiCompatConfig, OpenAiCompatProvider, SecretString};
 use kiln_harness::replay::ReplayProvider;
 use kiln_harness::tools::{ToolLimits, ToolRegistry};
@@ -1014,6 +1014,15 @@ fn config_validation_refuses_bad_values() {
     assert!(OpenAiCompatConfig::new("not a url", "m").is_err());
     let good = config("http://127.0.0.1:1/v1");
     good.validate().expect("defaults are valid");
+    // The response cap's ceiling is its default, so twice a response fits
+    // one journal line (spare security review 2026-11-20, F2).
+    assert_eq!(good.max_response_bytes, MAX_RESPONSE_BYTES);
+    OpenAiCompatConfig {
+        max_response_bytes: MAX_RESPONSE_BYTES,
+        ..good.clone()
+    }
+    .validate()
+    .expect("the ceiling is inclusive");
     let bad = [
         OpenAiCompatConfig {
             model: String::new(),
@@ -1036,7 +1045,7 @@ fn config_validation_refuses_bad_values() {
             ..good.clone()
         },
         OpenAiCompatConfig {
-            max_response_bytes: (64 << 20) + 1,
+            max_response_bytes: MAX_RESPONSE_BYTES + 1,
             ..good.clone()
         },
         OpenAiCompatConfig {

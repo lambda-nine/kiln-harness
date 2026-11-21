@@ -28,8 +28,17 @@ use serde_json::Value;
 use super::SecretString;
 use crate::provider::{CompactionResponse, ModelResponse, ProviderError, ProviderErrorKind};
 
-/// Ceiling for `max_response_bytes` and `max_request_bytes`.
+/// Ceiling for `max_request_bytes`.
 pub const MAX_BODY_BYTES: usize = 64 << 20;
+/// Ceiling, and default, for `max_response_bytes`: 4 MiB less 32 KiB. A
+/// response is journaled in one `model_responded` (or
+/// `compaction_responded`) line as its neutral view and, for Anthropic, its
+/// content blocks as received, neither longer than the body's own JSON, so
+/// twice the body plus 64 KiB of framing fits
+/// [`MAX_JOURNAL_LINE_BYTES`](crate::journal::MAX_JOURNAL_LINE_BYTES).
+pub const MAX_RESPONSE_BYTES: usize = (crate::journal::MAX_JOURNAL_LINE_BYTES - (64 << 10)) / 2;
+const _: () =
+    assert!(2 * MAX_RESPONSE_BYTES + (64 << 10) <= crate::journal::MAX_JOURNAL_LINE_BYTES);
 /// Ceiling for `max_attempts`.
 pub const MAX_ATTEMPTS: u32 = 8;
 /// Ceiling for `connect_timeout`, `retry_base_delay`, and `retry_max_delay`.
@@ -124,12 +133,16 @@ pub(crate) struct Transport {
 impl Transport {
     /// Check every bound and delay.
     pub(crate) fn check(&self) -> Result<(), String> {
-        for (name, bytes) in [
-            ("max_response_bytes", self.max_response_bytes),
-            ("max_request_bytes", self.max_request_bytes),
+        for (name, bytes, ceiling) in [
+            (
+                "max_response_bytes",
+                self.max_response_bytes,
+                MAX_RESPONSE_BYTES,
+            ),
+            ("max_request_bytes", self.max_request_bytes, MAX_BODY_BYTES),
         ] {
-            if bytes == 0 || bytes > MAX_BODY_BYTES {
-                return Err(format!("{name} must be within 1..={MAX_BODY_BYTES}"));
+            if bytes == 0 || bytes > ceiling {
+                return Err(format!("{name} must be within 1..={ceiling}"));
             }
         }
         if !(1..=MAX_ATTEMPTS).contains(&self.max_attempts) {
@@ -688,7 +701,7 @@ mod tests {
     fn transport() -> Transport {
         Transport {
             connect_timeout: Duration::from_secs(10),
-            max_response_bytes: 4 << 20,
+            max_response_bytes: MAX_RESPONSE_BYTES,
             max_request_bytes: 8 << 20,
             max_attempts: 3,
             retry_base_delay: Duration::from_millis(500),

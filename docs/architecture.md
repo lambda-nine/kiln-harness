@@ -725,7 +725,8 @@ call IDs are copied only when they pass the engine's rule (at most 64
 bytes) and are otherwise replaced by `call-<turn>-<index>`.
 
 The body is read chunk by chunk and abandoned at `max_response_bytes` (4 MiB
-by default, at most 64 MiB); a declared `Content-Length` over the cap is
+less 32 KiB by default and at most, so a response fits one journal line; see
+"Journal size"); a declared `Content-Length` over the cap is
 refused before reading. The cap counts decoded HTTP payload bytes; with no
 decompression enabled that is the body exactly as the server sent it.
 Transfer framing (chunk headers and extensions, HTTP/2 frames) is not
@@ -1477,6 +1478,56 @@ accepts lines up to 8 MiB. It requires schema 1, `session_started` first and
 only once, one session ID, contiguous sequences, an intact chain, a newline
 after every record, and nothing after `session_ended`. Writers enforce the same
 limits. `complete` is true when the last record is `session_ended`.
+
+### Journal size
+
+The two caps, 64 MiB per file (`MAX_JOURNAL_BYTES`) and 8 MiB per line
+(`MAX_JOURNAL_LINE_BYTES`), are checked against the limits before a new
+session starts, in `HarnessConfig::validate` and `Harness::run`, so the
+journal cap does not end a session its budgets still allow. A replay keeps
+its recording's limits and skips the check. `JournalBound` computes, with `S`
+steps, `N` tool calls, result bytes `R`, argument bytes `A`, model output
+bytes `O` and final answer bytes `F`:
+
+```text
+total = 8 MiB                      session_started, whatever the task
+      + S × 4 KiB                  model_requested, compaction_requested, and
+                                   the framing of their answers
+      + N × (1.5 KiB + R + I × 32) each tool_executed beside its arguments
+      + min(N × A, O)              arguments in tool_executed
+      + 2 × O                      model_responded, compaction_responded
+      + 64 KiB                     sandbox_ready, check_completed, one failure
+      + 1.5 KiB + 6 × F + 2        session_ended
+```
+
+`I`, the execution IDs one call can record, is 102 (two executions plus the
+100 recent executions response-loss recovery reads), plus
+`max_manifest_entries` + 1 with a coding tool set, whose `search` may run one
+`grep` per listed file; each is counted as 32 bytes (kilnd's are 19). Results
+and arguments are bounded as compact JSON, so they are counted as journaled.
+Model output is counted at twice its budget bytes, which covers JSON escaping
+of quotes, backslashes and newlines; a final answer at six bytes per byte,
+the worst escape. A configuration is refused when the total passes 64 MiB, or
+one `tool_executed` (`1.5 KiB + R + A + I × 32`) or the `session_ended` above
+passes 8 MiB. The CLI defaults bound about 48 MiB (50 MiB with `--tool-set
+coding`), which leaves room for about 240 tool calls at the other defaults;
+`--max-total-output-bytes` above about 16 MiB is refused at the defaults.
+
+The HTTP adapters' `max_response_bytes` is at most, and by default, 4 MiB less
+32 KiB: a response is journaled as its neutral view and, for Anthropic, its
+content blocks as received, neither longer than the body, so one response
+record fits a line.
+
+What the bound does not cover comes from the model endpoint alone, which is
+trusted for availability only: text dense in control characters other than
+newlines and tabs (six bytes each once escaped), the response that crosses
+`max_total_model_output_bytes` (journaled before the budget ends the
+session), and a library provider's failure message over 64 KiB. To keep the
+journal closable whatever came before, the engine has the sink keep the
+`session_ended` bound (at most one line) of the file cap in reserve: any other
+record that would leave less is refused as over the cap, and `session_ended`
+still fits. `JournalSink::reserve_for_session_end` does this for the built-in
+sinks; a custom sink keeps nothing unless it implements it.
 
 Writers and readers also run one `Grammar` over the events. The recorded task
 must pass the engine's task checks and the recorded limits its hard ceilings.

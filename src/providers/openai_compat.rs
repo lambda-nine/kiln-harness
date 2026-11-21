@@ -90,7 +90,7 @@ use super::http::{
 };
 pub use super::http::{
     ERROR_EXCERPT_BYTES, MAX_ATTEMPTS, MAX_BODY_BYTES, MAX_CONFIG_DELAY,
-    MAX_OUTPUT_BYTES_PER_TOKEN, MAX_TOOL_NAME_BYTES,
+    MAX_OUTPUT_BYTES_PER_TOKEN, MAX_RESPONSE_BYTES, MAX_TOOL_NAME_BYTES,
 };
 use crate::engine::call_id_is_valid;
 use crate::provider::{
@@ -144,7 +144,7 @@ impl OpenAiCompatConfig {
             temperature: 0.0,
             seed: None,
             connect_timeout: Duration::from_secs(10),
-            max_response_bytes: 4 << 20,
+            max_response_bytes: http::MAX_RESPONSE_BYTES,
             max_request_bytes: 8 << 20,
             max_attempts: 3,
             retry_base_delay: Duration::from_millis(500),

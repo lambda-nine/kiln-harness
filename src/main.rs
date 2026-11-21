@@ -1517,6 +1517,47 @@ mod tests {
         assert_eq!(base_url_host(&args), None);
     }
 
+    fn run_args(extra: &[&str]) -> ModelArgs {
+        let mut argv = vec![
+            "kiln-harness",
+            "run",
+            "--provider",
+            "anthropic",
+            "--prompt",
+            "x",
+        ];
+        argv.extend(extra);
+        match Cli::parse_from(argv).command {
+            Command::Run(run) => run.model,
+            _ => panic!("parsed as run"),
+        }
+    }
+
+    // Spare security review 2026-11-20, F2: the limits a configuration
+    // allows must fit the journal caps.
+    #[test]
+    fn cli_defaults_fit_the_journal_and_raised_limits_that_do_not_are_refused() {
+        for tool_set in ["base", "coding"] {
+            model_config(&run_args(&["--tool-set", tool_set])).expect("defaults fit");
+        }
+        // The review's example: every flag within its ceiling, but 2000
+        // maximum-size results alone are 250 MiB.
+        let error = model_config(&run_args(&[
+            "--max-steps",
+            "200",
+            "--max-tool-calls",
+            "2000",
+            "--max-total-output-bytes",
+            "67108864",
+        ]))
+        .expect_err("over the journal cap");
+        assert!(error.to_string().contains("journal"), "{error}");
+        // So is output alone: twice 32 MiB plus the rest.
+        let error = model_config(&run_args(&["--max-total-output-bytes", "33554432"]))
+            .expect_err("over the journal cap");
+        assert!(error.to_string().contains("67108864-byte cap"), "{error}");
+    }
+
     #[test]
     fn truncation_recoveries_default_to_two_and_reach_the_engine() {
         let defaults = model_args("anthropic", None);

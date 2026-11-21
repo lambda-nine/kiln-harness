@@ -448,6 +448,15 @@ pub trait JournalSink: Send {
     /// journal limit, breaks the single-session record order, or cannot be
     /// persisted.
     fn append(&mut self, session_id: &str, event: JournalEvent) -> Result<(), JournalError>;
+
+    /// Keep `bytes` of [`MAX_JOURNAL_BYTES`] for the closing
+    /// `session_ended`: any other record that would leave less is refused
+    /// as over the file cap, so the session can always close its journal.
+    /// The engine calls it before the first record; at most one line is
+    /// kept. The default keeps nothing.
+    fn reserve_for_session_end(&mut self, bytes: u64) {
+        let _ = bytes;
+    }
 }
 
 /// Hash-chain and ordering state shared by every sink, so writers refuse
@@ -458,6 +467,8 @@ struct Chain {
     prev_sha256: Option<String>,
     session_id: Option<String>,
     bytes: u64,
+    /// Bytes of the file cap kept for `session_ended`.
+    end_reserve: u64,
     closed: bool,
     grammar: Grammar,
 }
@@ -500,11 +511,16 @@ impl Chain {
                 line: sequence.saturating_add(1),
                 limit: MAX_JOURNAL_LINE_BYTES,
             })?;
+        let reserve = if matches!(record.event, JournalEvent::SessionEnded { .. }) {
+            0
+        } else {
+            self.end_reserve
+        };
         let total = self
             .bytes
             .saturating_add(line.len() as u64)
             .saturating_add(1);
-        if total > MAX_JOURNAL_BYTES {
+        if total.saturating_add(reserve) > MAX_JOURNAL_BYTES {
             return Err(JournalError::FileTooLarge {
                 limit: MAX_JOURNAL_BYTES,
             });
@@ -582,7 +598,17 @@ impl JsonlJournal {
     }
 }
 
+impl Chain {
+    fn reserve_for_session_end(&mut self, bytes: u64) {
+        self.end_reserve = bytes.min(MAX_JOURNAL_LINE_BYTES as u64 + 1);
+    }
+}
+
 impl JournalSink for JsonlJournal {
+    fn reserve_for_session_end(&mut self, bytes: u64) {
+        self.chain.reserve_for_session_end(bytes);
+    }
+
     fn append(&mut self, session_id: &str, event: JournalEvent) -> Result<(), JournalError> {
         let encoded = self.chain.encode(session_id, event)?;
         let mut bytes = Vec::with_capacity(encoded.line.len() + 1);
@@ -613,6 +639,10 @@ pub struct MemoryJournal {
 }
 
 impl JournalSink for MemoryJournal {
+    fn reserve_for_session_end(&mut self, bytes: u64) {
+        self.chain.reserve_for_session_end(bytes);
+    }
+
     fn append(&mut self, session_id: &str, event: JournalEvent) -> Result<(), JournalError> {
         let encoded = self.chain.encode(session_id, event)?;
         let line = encoded.line.clone();
@@ -1971,4 +2001,103 @@ fn unix_ms() -> Result<u64, JournalError> {
             .as_millis(),
     )
     .map_err(|_| JournalError::Clock)
+}
+
+#[cfg(test)]
+mod reserve_test {
+    use super::{Chain, JOURNAL_SCHEMA, JournalError, JournalEvent, MAX_JOURNAL_BYTES};
+    use crate::engine::HarnessConfig;
+    use crate::provider::{ProviderInfo, Usage};
+    use crate::tools::{ToolLimits, ToolRegistry};
+
+    fn started() -> JournalEvent {
+        JournalEvent::SessionStarted {
+            schema: JOURNAL_SCHEMA,
+            harness_version: "0.1.0".to_string(),
+            provider: ProviderInfo {
+                name: "test".to_string(),
+                model: "test".to_string(),
+            },
+            system: "system".to_string(),
+            task: "task".to_string(),
+            tools: ToolRegistry::new(ToolLimits::default())
+                .definitions()
+                .to_vec(),
+            limits: HarnessConfig::default().limits(),
+            seed: Vec::new(),
+            check: None,
+            exec_context: None,
+            compaction: None,
+            tool_set: None,
+        }
+    }
+
+    fn ready() -> JournalEvent {
+        JournalEvent::SandboxReady {
+            sandbox_id: "sb-1".to_string(),
+            baseline_file_count: 0,
+            expiry_lifetime_ms: None,
+            expiry_idle_ms: None,
+        }
+    }
+
+    fn ended() -> JournalEvent {
+        JournalEvent::SessionEnded {
+            outcome: "create_failed".to_string(),
+            work_outcome: "create_failed".to_string(),
+            final_answer: None,
+            steps: 0,
+            tool_calls: 0,
+            usage: Usage::default(),
+            sandbox_deleted: true,
+            truncation_recoveries: 0,
+            compactions: 0,
+        }
+    }
+
+    /// A chain with `session_started` written and `room` bytes left under
+    /// the file cap.
+    fn nearly_full(room: u64, reserve: u64) -> Chain {
+        let mut chain = Chain::default();
+        chain.reserve_for_session_end(reserve);
+        let encoded = chain.encode("hs-reserve", started()).expect("started");
+        chain.commit(encoded);
+        chain.bytes = MAX_JOURNAL_BYTES - room;
+        chain
+    }
+
+    // Spare security review 2026-11-20, F2: session_ended keeps its room.
+    #[test]
+    fn only_session_ended_may_use_the_reserve() {
+        let line = |event: JournalEvent| {
+            let mut chain = nearly_full(MAX_JOURNAL_BYTES / 2, 0);
+            chain.encode("hs-reserve", event).expect("fits").line.len() as u64 + 1
+        };
+        let (ready_bytes, ended_bytes) = (line(ready()), line(ended()));
+        assert!(ready_bytes > ended_bytes / 2, "{ready_bytes} {ended_bytes}");
+        let room = ready_bytes + ended_bytes / 2;
+
+        // Without a reserve, sandbox_ready takes the room session_ended
+        // needed.
+        let mut chain = nearly_full(room, 0);
+        let encoded = chain.encode("hs-reserve", ready()).expect("fits");
+        chain.commit(encoded);
+        assert!(matches!(
+            chain.encode("hs-reserve", ended()),
+            Err(JournalError::FileTooLarge { .. })
+        ));
+
+        // With one, sandbox_ready is refused and session_ended still fits.
+        let mut chain = nearly_full(room, ended_bytes);
+        assert!(matches!(
+            chain.encode("hs-reserve", ready()),
+            Err(JournalError::FileTooLarge { .. })
+        ));
+        chain.encode("hs-reserve", ended()).expect("reserved");
+
+        // A reserve is at most one line.
+        let mut chain = Chain::default();
+        chain.reserve_for_session_end(u64::MAX);
+        assert_eq!(chain.end_reserve, super::MAX_JOURNAL_LINE_BYTES as u64 + 1);
+    }
 }

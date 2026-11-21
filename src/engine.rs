@@ -20,8 +20,9 @@ use crate::api::{
 use crate::audit::{AuditError, AuditEvent, AuditSink, ContentSummary, OutputEvidence};
 use crate::compaction::{CompactionPolicy, compaction_due, message_bytes, swapped_history};
 use crate::journal::{
-    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, RecordedCheck, RecordedSeedFile,
-    RecordedToolLimits, SessionLimits, compaction_request_sha256, request_sha256,
+    JOURNAL_SCHEMA, JournalError, JournalEvent, JournalSink, MAX_JOURNAL_BYTES,
+    MAX_JOURNAL_LINE_BYTES, RecordedCheck, RecordedSeedFile, RecordedToolLimits, SessionLimits,
+    compaction_request_sha256, request_sha256,
 };
 use crate::live::{LiveOutput, LivePump};
 use crate::provider::{
@@ -330,15 +331,19 @@ impl HarnessConfig {
         });
     }
 
-    /// Check every limit against its hard ceilings, exactly as
-    /// [`Harness::run`] does before any sandbox exists.
+    /// Check every limit against its hard ceilings, and the journal the
+    /// limits allow against the journal caps, exactly as [`Harness::run`]
+    /// does before any sandbox exists.
     ///
     /// # Errors
     ///
     /// Returns an error when a limit is zero, over its ceiling, or a
-    /// duration is not whole milliseconds.
+    /// duration is not whole milliseconds, or when the limits allow a
+    /// journal record or file over [`MAX_JOURNAL_LINE_BYTES`] or
+    /// [`MAX_JOURNAL_BYTES`] (see [`JournalBound`]).
     pub fn validate(&self) -> Result<(), HarnessError> {
-        validate_config(self)
+        validate_config(self)?;
+        JournalBound::of(self).check()
     }
 
     /// Replace every recorded limit with the given ones. Lifecycle windows
@@ -554,6 +559,10 @@ where
         task: &SessionTask,
         cancel: CancellationToken,
     ) -> Result<SessionOutcome, HarnessError> {
+        // A new session's limits must fit the journal caps. A replay keeps
+        // the limits its recording ran under and skips this check, so
+        // journals recorded before it still replay.
+        self.config.validate()?;
         self.run_in_context(task, ExecContext::WorkspaceStreamV1, cancel)
             .await
     }
@@ -669,6 +678,9 @@ where
                 features: capabilities.feature_names(),
             },
         )?;
+        // Whatever the records before it, session_ended always fits.
+        self.journal
+            .reserve_for_session_end(JournalBound::of(&self.config).session_ended);
         let started = self.journal.append(
             &session_id,
             JournalEvent::SessionStarted {
@@ -2557,6 +2569,129 @@ fn validate_config(config: &HarnessConfig) -> Result<(), HarnessError> {
     Ok(())
 }
 
+/// The most journal bytes a session's limits allow, and its largest
+/// records, checked against [`MAX_JOURNAL_BYTES`] and
+/// [`MAX_JOURNAL_LINE_BYTES`] before a new session starts.
+///
+/// With `S` steps, `N` tool calls, result bytes `R`, argument bytes `A`,
+/// model output bytes `O` and final answer bytes `F`:
+///
+/// ```text
+/// total = LINE                                session_started, any task
+///       + S × 4 KiB                           per turn: model_requested,
+///                                             compaction_requested and the
+///                                             framing of their answers
+///       + N × (1.5 KiB + R + I × 32)          tool_executed beside arguments
+///       + min(N × A, O)                       arguments in tool_executed
+///       + 2 × O                               model_responded and
+///                                             compaction_responded content
+///       + 64 KiB                              sandbox_ready, check_completed,
+///                                             one failure message
+///       + session_ended                       1 KiB + 6 × F + 2
+/// ```
+///
+/// `I`, the execution IDs one call can record, is 102 (two executions plus
+/// the 100 response-loss recovery can list), and with a coding tool set
+/// also one more than `max_manifest_entries`: `search` runs `find` and
+/// then one `grep` per chunk, at most one per listed file. An ID is counted as 32
+/// bytes; kilnd's are 19. A result, the arguments and model output are
+/// counted as encoded: the result and arguments are bounded as compact
+/// JSON, and output is twice its budget bytes, which covers JSON escaping
+/// of quotes, backslashes and newlines. A final answer is counted at its
+/// worst escape, six bytes per control byte. Text dense in other control
+/// characters, a response the budget ends only after it is journaled, and a
+/// provider failure message over 64 KiB can pass this bound; they come from
+/// the model endpoint alone, which is trusted for availability only, and
+/// the journal reserves `session_ended` so the session still closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalBound {
+    /// The whole journal at most, `session_ended` included.
+    pub total: u64,
+    /// One `tool_executed` record at most.
+    pub tool_executed: u64,
+    /// The closing `session_ended` record at most; the journal keeps this
+    /// much of its file cap for it (at most one line).
+    pub session_ended: u64,
+}
+
+/// Framing of one record: sequence, time, session ID, `prev_sha256`, keys.
+const JOURNAL_RECORD_BYTES: u64 = 512;
+const JOURNAL_TURN_BYTES: u64 = 4 << 10;
+/// A call's `turn`, `index`, `ok`, audit call ID, call ID (at most 64
+/// bytes), tool name, and its framing in `model_responded`, with a record's.
+const JOURNAL_CALL_BYTES: u64 = JOURNAL_RECORD_BYTES + (1 << 10);
+const JOURNAL_EXECUTION_ID_BYTES: u64 = 32;
+/// Two executions (`read_file`'s `stat` and `head`, `edit_file`'s `head`
+/// and `dd`) plus the most recent executions recovery reads.
+const JOURNAL_CALL_EXECUTIONS: u64 = 2 + 100;
+const JOURNAL_TAIL_BYTES: u64 = 64 << 10;
+/// `session_ended` beside its final answer: outcomes, counters, usage.
+const JOURNAL_END_BYTES: u64 = 1 << 10;
+
+impl JournalBound {
+    #[must_use]
+    pub fn of(config: &HarnessConfig) -> Self {
+        let tools = &config.tool_limits;
+        let calls = u64::from(config.max_tool_calls);
+        let mut executions = JOURNAL_CALL_EXECUTIONS;
+        if config.tool_set != ToolSet::Base {
+            executions = executions.saturating_add(tools.max_manifest_entries as u64 + 1);
+        }
+        let tool_executed = JOURNAL_CALL_BYTES
+            .saturating_add(tools.max_result_bytes as u64)
+            .saturating_add(config.max_model_arguments_bytes as u64)
+            .saturating_add(executions.saturating_mul(JOURNAL_EXECUTION_ID_BYTES));
+        let session_ended = JOURNAL_RECORD_BYTES
+            .saturating_add(JOURNAL_END_BYTES)
+            .saturating_add((config.max_final_answer_bytes as u64).saturating_mul(6))
+            .saturating_add(2);
+        let output = config.max_total_model_output_bytes;
+        let arguments = calls
+            .saturating_mul(config.max_model_arguments_bytes as u64)
+            .min(output);
+        let per_call = tool_executed - config.max_model_arguments_bytes as u64;
+        let total = (MAX_JOURNAL_LINE_BYTES as u64)
+            .saturating_add(u64::from(config.max_steps).saturating_mul(JOURNAL_TURN_BYTES))
+            .saturating_add(calls.saturating_mul(per_call))
+            .saturating_add(arguments)
+            .saturating_add(output.saturating_mul(2))
+            .saturating_add(JOURNAL_TAIL_BYTES)
+            .saturating_add(session_ended);
+        Self {
+            total,
+            tool_executed,
+            session_ended,
+        }
+    }
+
+    fn check(self) -> Result<(), HarnessError> {
+        let line = MAX_JOURNAL_LINE_BYTES as u64;
+        let problem = if self.tool_executed > line {
+            format!(
+                "a tool_executed record can reach {} bytes, over the {line}-byte journal line \
+                 cap; lower max_result_bytes or max_model_arguments_bytes",
+                self.tool_executed
+            )
+        } else if self.session_ended > line {
+            format!(
+                "session_ended can reach {} bytes, over the {line}-byte journal line cap; lower \
+                 max_final_answer_bytes",
+                self.session_ended
+            )
+        } else if self.total > MAX_JOURNAL_BYTES {
+            format!(
+                "these limits allow a journal of {} bytes, over its {MAX_JOURNAL_BYTES}-byte \
+                 cap; lower max_tool_calls, max_total_model_output_bytes, max_steps or \
+                 max_result_bytes",
+                self.total
+            )
+        } else {
+            return Ok(());
+        };
+        Err(HarnessError::InvalidModelCall(problem))
+    }
+}
+
 /// The provider call-ID rule, shared with the journal grammar.
 pub(crate) fn call_id_is_valid(call_id: &str) -> bool {
     !call_id.is_empty()
@@ -3245,5 +3380,89 @@ mod session_id_test {
         }
         // 64 draws of 64 bits: a repeat is a 2^-52 event, not a flake.
         assert_eq!(nonces.len(), ids.len());
+    }
+}
+
+#[cfg(test)]
+mod journal_bound_test {
+    use super::{HarnessConfig, HarnessError, JournalBound, MAX_JOURNAL_BYTES, ToolSet};
+    use crate::journal::MAX_JOURNAL_LINE_BYTES;
+
+    fn refused(config: &HarnessConfig) -> String {
+        match config.validate() {
+            Err(HarnessError::InvalidModelCall(problem)) => problem,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_library_defaults_fit_and_the_formula_adds_up() {
+        let config = HarnessConfig::default();
+        config.validate().expect("defaults fit");
+        let bound = JournalBound::of(&config);
+        // 512 + 1 KiB + 128 KiB result + 64 KiB arguments + 102 IDs.
+        assert_eq!(
+            bound.tool_executed,
+            1536 + (128 << 10) + (64 << 10) + 102 * 32
+        );
+        assert_eq!(bound.session_ended, 1536 + 6 * (64 << 10) + 2);
+        let per_call = bound.tool_executed - (64 << 10);
+        assert_eq!(
+            bound.total,
+            (8 << 20)
+                + 8 * (4 << 10)
+                + 6 * per_call
+                + 6 * (64 << 10)
+                + 2 * (8 << 20)
+                + (64 << 10)
+                + bound.session_ended
+        );
+    }
+
+    #[test]
+    fn a_coding_tool_set_counts_one_grep_per_listed_file() {
+        let base = HarnessConfig::default();
+        let coding = HarnessConfig {
+            tool_set: ToolSet::CodingV2,
+            ..HarnessConfig::default()
+        };
+        assert_eq!(
+            JournalBound::of(&coding).tool_executed - JournalBound::of(&base).tool_executed,
+            513 * 32
+        );
+    }
+
+    #[test]
+    fn each_cap_refuses_the_limits_that_pass_it() {
+        // One record: a result plus arguments over a line.
+        let mut config = HarnessConfig {
+            max_tool_calls: 1,
+            ..HarnessConfig::default()
+        };
+        config.tool_limits.max_result_bytes = 8 << 20;
+        assert!(refused(&config).contains("tool_executed"));
+        config.tool_limits.max_result_bytes = (8 << 20) - (64 << 10) - 1536 - 102 * 32;
+        assert_eq!(
+            JournalBound::of(&config).tool_executed,
+            MAX_JOURNAL_LINE_BYTES as u64
+        );
+        config.validate().expect("exactly one line fits");
+
+        // session_ended: a final answer escaped six times over a line.
+        let config = HarnessConfig {
+            max_final_answer_bytes: (8 << 20) / 6,
+            ..HarnessConfig::default()
+        };
+        assert!(refused(&config).contains("session_ended"));
+
+        // The file: the calls' results add up past 64 MiB.
+        let mut config = HarnessConfig {
+            max_tool_calls: 300,
+            ..HarnessConfig::default()
+        };
+        assert!(JournalBound::of(&config).total > MAX_JOURNAL_BYTES);
+        assert!(refused(&config).contains("journal of"));
+        config.max_tool_calls = 200;
+        config.validate().expect("200 calls fit");
     }
 }

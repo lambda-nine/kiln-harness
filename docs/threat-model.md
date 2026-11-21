@@ -252,7 +252,8 @@ it is not a hostile multi-tenant boundary.
   endpoint. Base URLs with userinfo, a query, or a fragment are refused.
 - Provider responses are bounded in decoded HTTP payload bytes: requests over
   `max_request_bytes` are not sent, response bodies are read only up to
-  `max_response_bytes` (4 MiB by default, 64 MiB at most) with no
+  `max_response_bytes` (4 MiB less 32 KiB by default and at most, so a
+  response fits one journal line) with no
   decompression, error bodies to 64 KiB, and unauthenticated error messages
   quote at most 512 bytes, without control characters. Transfer framing
   (chunk headers and extensions, HTTP/2 frames) is below that count; it is

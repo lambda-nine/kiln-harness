@@ -375,7 +375,7 @@ impl AnthropicConfig {
             strict_tools: false,
             clear_thinking: None,
             connect_timeout: Duration::from_secs(10),
-            max_response_bytes: 4 << 20,
+            max_response_bytes: http::MAX_RESPONSE_BYTES,
             max_request_bytes: 8 << 20,
             max_attempts: 3,
             retry_base_delay: Duration::from_millis(500),
