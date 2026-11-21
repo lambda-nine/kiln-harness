@@ -1305,12 +1305,20 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         else {
             return execution_error(&stat, "invalid_stat_output");
         };
+        // A result limit below the read size bounds the read: no more than
+        // fits is read, and the content is cut to fit as JSON, as a line
+        // range is. At the default limits it never is.
+        let fit = self
+            .limits
+            .max_result_bytes
+            .saturating_sub(RESULT_RESERVE_BYTES);
+        let read_bytes = max_bytes.min(fit);
         let read = match self
             .run(
                 vec![
                     "/usr/bin/head".to_string(),
                     "-c".to_string(),
-                    max_bytes.to_string(),
+                    read_bytes.to_string(),
                     "--".to_string(),
                     path,
                 ],
@@ -1326,8 +1334,12 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         if !read.succeeded() {
             return combine_execution_error(&stat, &read, "read_failed");
         }
-        let utf8 = std::str::from_utf8(&read.stdout.data).is_ok();
-        let content = String::from_utf8_lossy(&read.stdout.data);
+        let mut returned = read.stdout.data.as_slice();
+        if read_bytes < max_bytes {
+            returned = &returned[..coding::json_fitting_prefix(returned, fit)];
+        }
+        let utf8 = std::str::from_utf8(returned).is_ok();
+        let content = String::from_utf8_lossy(returned);
         let mut run = ToolRun {
             ok: true,
             result: json!({
@@ -1335,8 +1347,8 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 "content": content,
                 "utf8": utf8,
                 "file_bytes": size,
-                "returned_bytes": read.stdout.data.len(),
-                "truncated": size > read.stdout.data.len() as u64
+                "returned_bytes": returned.len(),
+                "truncated": size > returned.len() as u64
             }),
             execution_ids: vec![stat.id.clone(), read.id.clone()],
             stdout: merge_evidence(evidence(&stat.stdout), evidence(&read.stdout)),
@@ -1345,7 +1357,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             live: None,
             earlier: None,
         };
-        if size > max_bytes as u64 {
+        if size > read_bytes as u64 || returned.len() < read.stdout.data.len() {
             run.stdout.truncated = true;
         }
         run

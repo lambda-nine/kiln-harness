@@ -599,6 +599,10 @@ pub struct Manifest {
     /// older files, where it is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_refused_calls_per_turn: Option<u32>,
+    /// Bytes in one tool result (`--max-result-bytes`); missing in older
+    /// files, where it is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_result_bytes: Option<u64>,
     /// The tools every run's model had (`--tool-set`): `base`, `coding_v1`
     /// or `coding_v2`. Always written; older files, which had only the base
     /// tools, read as `base`.
@@ -781,6 +785,9 @@ pub struct Report {
     /// As in [`Manifest::max_refused_calls_per_turn`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_refused_calls_per_turn: Option<u32>,
+    /// As in [`Manifest::max_result_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_result_bytes: Option<u64>,
     /// As in [`Manifest::tool_set`]: `base` for an older report.
     #[serde(default = "base_tool_set")]
     pub tool_set: String,
@@ -1005,6 +1012,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         max_output_tokens: manifest.max_output_tokens,
         max_tool_calls_per_turn: manifest.max_tool_calls_per_turn,
         max_refused_calls_per_turn: manifest.max_refused_calls_per_turn,
+        max_result_bytes: manifest.max_result_bytes,
         tool_set: manifest.tool_set.clone(),
         pricing_version: pricing.map(|pricing| pricing.version.clone()),
         unpriced_reason: manifest.unpriced_reason.clone(),
@@ -1110,6 +1118,9 @@ fn write_report_header(text: &mut String, report: &Report) {
     }
     if let Some(calls) = report.max_refused_calls_per_turn {
         let _ = writeln!(text, "- Extra calls refused per response: {calls}");
+    }
+    if let Some(bytes) = report.max_result_bytes {
+        let _ = writeln!(text, "- Tool result limit: {bytes} bytes");
     }
     let _ = writeln!(text, "- Tool set: {}", cell(&report.tool_set));
     if let Some(stopped) = &report.stopped {
@@ -1461,29 +1472,38 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
     }
 }
 
-/// Notes a difference in the per-turn call cap or refusal limit, only when
-/// both reports recorded it.
+/// Notes a difference in the per-turn call cap, refusal limit or tool
+/// result limit, only when both reports recorded it.
 fn write_call_limit_notes(text: &mut String, base: &Report, new: &Report) {
+    let calls = "pass rates and tool calls";
     let limits = [
         (
             "Tool calls run per response",
-            base.max_tool_calls_per_turn,
-            new.max_tool_calls_per_turn,
+            base.max_tool_calls_per_turn.map(u64::from),
+            new.max_tool_calls_per_turn.map(u64::from),
+            calls,
         ),
         (
             "Extra calls refused per response",
-            base.max_refused_calls_per_turn,
-            new.max_refused_calls_per_turn,
+            base.max_refused_calls_per_turn.map(u64::from),
+            new.max_refused_calls_per_turn.map(u64::from),
+            calls,
+        ),
+        (
+            "Tool result limits",
+            base.max_result_bytes,
+            new.max_result_bytes,
+            "pass rates, tool calls and tokens",
         ),
     ];
-    for (name, base_calls, new_calls) in limits {
-        if let (Some(base_calls), Some(new_calls)) = (base_calls, new_calls)
-            && base_calls != new_calls
+    for (name, base_limit, new_limit, measures) in limits {
+        if let (Some(base_limit), Some(new_limit)) = (base_limit, new_limit)
+            && base_limit != new_limit
         {
             let _ = writeln!(
                 text,
-                "\n{name} differ ({base_calls} → {new_calls}); pass rates and tool calls are \
-                 not directly comparable."
+                "\n{name} differ ({base_limit} → {new_limit}); {measures} are not directly \
+                 comparable."
             );
         }
     }
@@ -2267,6 +2287,7 @@ where
         max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
         max_tool_calls_per_turn: Some(options.base_config.max_tool_calls_per_turn),
         max_refused_calls_per_turn: Some(options.base_config.max_refused_calls_per_turn),
+        max_result_bytes: Some(options.base_config.tool_limits.max_result_bytes as u64),
         tool_set: options.base_config.tool_set.report_name().to_string(),
         pricing: options.pricing.map(PricingRecord::from),
         unpriced_reason: options.unpriced_reason.clone(),

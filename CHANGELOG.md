@@ -6,6 +6,17 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `run` and `eval run` take `--max-result-bytes` (default 131072, a
+  multiple of 1024 from 16384 to 524288), the bytes in one tool result,
+  which the default system prompt states in KiB and the journal records.
+  Lowering it lets a long session with many calls fit the journal's 64 MiB
+  file cap. A whole-file `read_file` under a limit below its read size
+  returns the start that fits as JSON, marked truncated, where it would
+  have been refused as `tool_result_too_large`; at the default limits
+  nothing changes. `eval run` and `eval selftest` record the limit in
+  `manifest.json` and `report.json` as `max_result_bytes`, `report.md`
+  lists it, and `eval compare` notes a difference only when both reports
+  recorded it.
 - `eval run` and `eval selftest` record the per-turn call cap and refusal
   limit in `manifest.json` and `report.json` as `max_tool_calls_per_turn`
   and `max_refused_calls_per_turn`, and `report.md` lists them. Older files

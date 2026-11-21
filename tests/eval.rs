@@ -3283,6 +3283,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         max_output_tokens: None,
         max_tool_calls_per_turn: None,
         max_refused_calls_per_turn: None,
+        max_result_bytes: None,
         tool_set: "base".to_string(),
         pricing: None,
         unpriced_reason: None,
@@ -4178,6 +4179,57 @@ fn per_turn_call_limits_reach_the_manifest_report_and_comparison() {
 }
 
 #[test]
+fn the_tool_result_limit_reaches_the_manifest_report_and_comparison() {
+    let mut lowered = manifest(&["a"], 1);
+    lowered.max_result_bytes = Some(16_384);
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let older = eval::report(&runs, &manifest(&["a"], 1));
+    let new = eval::report(&runs, &lowered);
+    assert_eq!(new.max_result_bytes, Some(16_384));
+
+    let json = serde_json::to_value(&lowered).expect("manifest JSON");
+    assert_eq!(json["max_result_bytes"], json!(16_384));
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, lowered);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+
+    // Files written before the field existed have no key and parse.
+    let unset = serde_json::to_value(&older).expect("report JSON");
+    assert!(unset.get("max_result_bytes").is_none(), "{unset}");
+    let parsed: Report = serde_json::from_value(unset).expect("an older report parses");
+    assert_eq!(parsed.max_result_bytes, None);
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown.contains("- Tool result limit: 16384 bytes\n"),
+        "{markdown}"
+    );
+    let markdown = eval::report_markdown(&older);
+    assert!(!markdown.contains("Tool result limit"), "{markdown}");
+
+    let mut raised = new.clone();
+    raised.max_result_bytes = Some(131_072);
+    let differing = eval::compare(&raised, &new);
+    assert!(
+        differing.contains(
+            "\n\nTool result limits differ (131072 → 16384); pass rates, tool calls and tokens \
+             are not directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    // An older report did not record it: unknown is not a difference.
+    for same in [
+        eval::compare(&new, &new),
+        eval::compare(&older, &new),
+        eval::compare(&new, &older),
+    ] {
+        assert!(!same.contains("Tool result limits differ"), "{same}");
+    }
+}
+
+#[test]
 fn clear_thinking_reaches_the_manifest_report_and_comparison() {
     let mut kept = manifest(&["a"], 1);
     kept.clear_thinking = Some("keep 2".to_string());
@@ -4300,6 +4352,11 @@ async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
             Some(config().max_tool_calls_per_turn),
             Some(config().max_refused_calls_per_turn)
         )
+    );
+    // And the tool result limit.
+    assert_eq!(
+        read_manifest(&out).max_result_bytes,
+        Some(config().tool_limits.max_result_bytes as u64)
     );
     let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
     let rows = markdown

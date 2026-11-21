@@ -197,6 +197,10 @@ struct ModelArgs {
     /// before.
     #[arg(long, default_value_t = 24)]
     max_refused_calls_per_turn: u32,
+    /// Bytes in one tool result returned to the model and recorded in the
+    /// journal; a multiple of 1024, from 16384 to 524288.
+    #[arg(long, default_value_t = 131_072)]
+    max_result_bytes: u32,
     /// Wall-clock limit for the session, including sandbox creation.
     #[arg(long, default_value_t = 900)]
     session_timeout_secs: u64,
@@ -529,6 +533,11 @@ fn prepare_run(args: &RunArgs) -> Result<PreparedRun> {
     })
 }
 
+/// The smallest `--max-result-bytes`.
+const MIN_RESULT_BYTES: u32 = 16 << 10;
+/// The largest `--max-result-bytes`.
+const MAX_RESULT_BYTES: u32 = 512 << 10;
+
 /// Check the shared provider and limit flags and build the configuration
 /// they ask for.
 fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
@@ -543,6 +552,7 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
     if args.max_refused_calls_per_turn > MAX_REFUSED_CALLS_PER_TURN {
         bail!("--max-refused-calls-per-turn must be between 0 and {MAX_REFUSED_CALLS_PER_TURN}");
     }
+    check_result_bytes(args.max_result_bytes)?;
     check_limit(
         "--session-timeout-secs",
         args.session_timeout_secs,
@@ -615,6 +625,7 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
         max_total_model_output_bytes: args.max_total_output_bytes,
         tool_limits: ToolLimits {
             timeout: Duration::from_secs(args.tool_timeout_secs),
+            max_result_bytes: args.max_result_bytes as usize,
             ..ToolLimits::default()
         },
         sandbox_idle_timeout: Duration::from_secs(args.sandbox_idle_timeout_secs),
@@ -625,6 +636,20 @@ fn model_config(args: &ModelArgs) -> Result<HarnessConfig> {
     };
     config.validate()?;
     Ok(config)
+}
+
+/// Refuse a `--max-result-bytes` outside its range or not in whole KiB:
+/// the system prompt states the bound in KiB, so it must be exact.
+fn check_result_bytes(max_result_bytes: u32) -> Result<()> {
+    if !(MIN_RESULT_BYTES..=MAX_RESULT_BYTES).contains(&max_result_bytes)
+        || max_result_bytes % 1024 != 0
+    {
+        bail!(
+            "--max-result-bytes must be a multiple of 1024 from {MIN_RESULT_BYTES} to \
+             {MAX_RESULT_BYTES}"
+        );
+    }
+    Ok(())
 }
 
 /// The policy `--compact-at` asks for, refused in range or in combination
@@ -1721,6 +1746,101 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "--max-refused-calls-per-turn must be between 0 and 64"
+            );
+        }
+    }
+
+    #[test]
+    fn the_result_limit_defaults_to_128_kib_and_reaches_the_engine() {
+        let defaults = model_args("anthropic", None);
+        assert_eq!(defaults.max_result_bytes, 131_072);
+        let config = model_config(&defaults).expect("config");
+        assert_eq!(config.tool_limits.max_result_bytes, 128 << 10);
+        // Every other tool limit is the engine's default, as before.
+        let engine_defaults = HarnessConfig {
+            tool_limits: ToolLimits {
+                timeout: Duration::from_secs(30),
+                ..ToolLimits::default()
+            },
+            ..HarnessConfig::default()
+        };
+        assert_eq!(
+            config.limits().tool_limits,
+            engine_defaults.limits().tool_limits
+        );
+        let parse = |command: &str, value: &str| {
+            let mut argv = vec!["kiln-harness", command];
+            if command == "eval" {
+                argv.extend(["run", "--out", "out"]);
+            } else {
+                argv.extend(["--prompt", "x"]);
+            }
+            argv.extend(["--provider", "anthropic", "--max-result-bytes", value]);
+            match Cli::parse_from(argv).command {
+                Command::Run(run) => run.model,
+                Command::Eval {
+                    command: EvalCommand::Run(run),
+                } => run.model,
+                _ => panic!("parsed as run or eval run"),
+            }
+        };
+        for command in ["run", "eval"] {
+            for value in [MIN_RESULT_BYTES, 32_768, 131_072, 263_168, MAX_RESULT_BYTES] {
+                let config = model_config(&parse(command, &value.to_string())).expect("valid");
+                assert_eq!(
+                    config.tool_limits.max_result_bytes, value as usize,
+                    "{command}"
+                );
+                assert_eq!(config.limits().tool_limits.max_result_bytes, value as usize);
+            }
+            for value in ["16383", "524289", "20000", "15360", "525312", "0"] {
+                let error = model_config(&parse(command, value)).expect_err(value);
+                assert_eq!(
+                    error.to_string(),
+                    "--max-result-bytes must be a multiple of 1024 from 16384 to 524288",
+                    "{command} {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_result_limit_reaches_the_default_prompt_in_kib() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "kiln-harness",
+                "run",
+                "--provider",
+                "anthropic",
+                "--base-url",
+                "http://127.0.0.1:8788",
+                "--prompt",
+                "x",
+            ];
+            argv.extend(extra);
+            match Cli::parse_from(argv).command {
+                Command::Run(run) => prepare_run(&run).expect("prepared").task.system,
+                _ => panic!("parsed as run"),
+            }
+        };
+        let limits = ToolLimits {
+            timeout: Duration::from_secs(30),
+            ..ToolLimits::default()
+        };
+        for (tool_set, set) in [("base", ToolSet::Base), ("coding", ToolSet::CodingV2)] {
+            // The default prompt is the one every earlier run had.
+            let default = parse(&["--tool-set", tool_set]);
+            assert_eq!(default, default_system_prompt_for(&limits, set));
+            assert_eq!(
+                default,
+                parse(&["--tool-set", tool_set, "--max-result-bytes", "131072"])
+            );
+            assert!(default.contains("at most 128 KiB;"), "{default}");
+            let lowered = parse(&["--tool-set", tool_set, "--max-result-bytes", "32768"]);
+            assert!(lowered.contains("at most 32 KiB;"), "{lowered}");
+            assert_eq!(
+                lowered,
+                default.replace("at most 128 KiB;", "at most 32 KiB;")
             );
         }
     }

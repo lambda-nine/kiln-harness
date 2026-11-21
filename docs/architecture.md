@@ -1066,7 +1066,7 @@ of headroom. Without the flag, requests are byte for byte as before.
 | Tool | kilnd executions | Validation |
 |---|---:|---|
 | `exec` | 1 (streamed) | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s; stopped past 8 MiB of either output |
-| `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned |
+| `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned, and under a result limit below that the start that fits it as JSON |
 | `write_file` | 1 | `/workspace` file path; fixed `dd` argv and bounded stdin; at most 64 KiB |
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |
 | `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline |
@@ -1566,7 +1566,14 @@ ends the session with a journal error, as above.
 
 The whole journal is not checked against the file cap. A long session with
 raised limits, many tool calls with large results or a large output budget,
-can reach 64 MiB and end there with a journal error.
+can reach 64 MiB and end there with a journal error. A call costs the journal
+at most its result (`R`), about 1.5 KiB of framing and fields, and its
+arguments twice, once in `model_responded` and once in `tool_executed`. With
+small arguments, calls whose results reach the default 128 KiB bound fill the
+file after about 500; at 16 KiB, after about 3,700. Lowering
+`--max-result-bytes` (16 KiB to 512 KiB, in whole KiB) is how a long run with
+many calls fits the cap; raising it to 512 KiB leaves room for about 120 calls
+that use it all.
 
 So that a new session can always close its journal, the engine has the sink
 keep the `session_ended` bound above (at most one line) of the file cap in
@@ -1793,7 +1800,8 @@ They also record `max_tool_calls_per_turn` and `max_refused_calls_per_turn`
 (the per-turn call cap and how many calls past it are refused, 0 included),
 absent in older files, where they are unknown, so `eval compare` notes a
 difference only when both reports recorded it; each run's journal records
-them too.
+them too. So is `max_result_bytes` (`--max-result-bytes`, the bytes in one
+tool result), and `report.md` gives it as "Tool result limit".
 The manifest and report always record `tool_set` (`base`, `coding_v1` or
 `coding_v2`);
 an older file reads as `base`, the only set it could have used, so `eval

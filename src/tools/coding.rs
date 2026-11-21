@@ -1003,6 +1003,31 @@ pub(crate) fn encoded_len(text: &str) -> usize {
     2 + text.chars().map(json_char_len).sum::<usize>()
 }
 
+/// The length of the longest start of `data` whose lossy decoding is at
+/// most `budget` bytes as a JSON string, cut between characters and invalid
+/// sequences, each of which decodes to one U+FFFD.
+pub(crate) fn json_fitting_prefix(data: &[u8], budget: usize) -> usize {
+    let mut used = 2;
+    let mut end = 0;
+    for chunk in data.utf8_chunks() {
+        for character in chunk.valid().chars() {
+            used += json_char_len(character);
+            if used > budget {
+                return end;
+            }
+            end += character.len_utf8();
+        }
+        if !chunk.invalid().is_empty() {
+            used += json_char_len(char::REPLACEMENT_CHARACTER);
+            if used > budget {
+                return end;
+            }
+            end += chunk.invalid().len();
+        }
+    }
+    end
+}
+
 /// What a ranged read returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LineSlice {
@@ -1289,7 +1314,7 @@ mod tests {
 
     use super::{
         EditArgs, EditForm, EditRefusal, LineSlice, apply_edits, encoded_len, grep_line,
-        json_char_len, slice_lines,
+        json_char_len, json_fitting_prefix, slice_lines,
     };
     use crate::tools::{MAX_REPLACEMENTS, SEARCH_TEXT_BYTES};
 
@@ -1564,6 +1589,40 @@ mod tests {
             encoded_len(&text),
             serde_json::to_string(&text).expect("encode").len()
         );
+    }
+
+    #[test]
+    fn a_fitting_prefix_is_the_longest_that_encodes_within_the_budget() {
+        // Escapes, a multibyte character, an invalid byte, and a character
+        // cut short at the end, each of the last two one U+FFFD.
+        let data = b"a\"\n\x01\xc3\xa9\xff\xe2\x82\xac\xf0\x9f\x98";
+        // Each piece's end, and the encoded length of everything before it,
+        // quotes included.
+        let pieces = [
+            (1, 3),
+            (2, 5),
+            (3, 7),
+            (4, 13),
+            (6, 15),
+            (7, 18),
+            (10, 21),
+            (13, 24),
+        ];
+        for (end, encoded) in pieces {
+            let text = String::from_utf8_lossy(&data[..end]);
+            assert_eq!(serde_json::to_string(&text).expect("encode").len(), encoded);
+            assert_eq!(json_fitting_prefix(data, encoded), end);
+            assert_eq!(json_fitting_prefix(data, encoded + 1), end);
+            let shorter = pieces
+                .iter()
+                .rev()
+                .find(|(at, _)| *at < end)
+                .map_or(0, |(at, _)| *at);
+            assert_eq!(json_fitting_prefix(data, encoded - 1), shorter, "{end}");
+        }
+        assert_eq!(json_fitting_prefix(data, 2), 0);
+        assert_eq!(json_fitting_prefix(data, 0), 0);
+        assert_eq!(json_fitting_prefix(b"", 2), 0);
     }
 
     fn slice(data: &[u8], eof: bool, start: u32, count: u32) -> Option<LineSlice> {

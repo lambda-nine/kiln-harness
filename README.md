@@ -252,7 +252,13 @@ run: each gets a `too_many_calls_in_turn` error telling the model to send
 it again in a later turn, and counts toward `--max-tool-calls`;
 `--max-refused-calls-per-turn` (default 24, at most 64) bounds how many,
 and a response with more than both together ends the session, as any
-response over the cap does with 0. Lower `--max-output-tokens` only for models that do not think. `--temperature`
+response over the cap does with 0. `--max-result-bytes` (default 131072,
+128 KiB; a multiple of 1024 from 16384 to 524288) bounds one tool result
+as the model sees it and the journal records it, and the default system
+prompt states it in KiB. Each result counts toward the journal's 64 MiB
+file cap, so a long run with many calls fits by lowering it (see "Journal
+size" in `docs/architecture.md`); a whole-file `read_file` then returns the
+start that fits, marked truncated. Lower `--max-output-tokens` only for models that do not think. `--temperature`
 (default 0) and `--seed` are forwarded. Output matches `demo`. The audit
 defaults to `audit/run.jsonl` and the journal to
 `journal/run-<unix_ms>.jsonl`, which `replay` reruns without the model
