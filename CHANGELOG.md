@@ -6,6 +6,16 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Session IDs carry a 64-bit nonce from the OS:
+  `hs-{wall ms}-{pid}-{counter}-{nonce}`, at most 49 bytes, with the
+  counter kept to 32 bits. Two harness processes with the same PID in
+  separate PID namespaces, starting in the same millisecond, no longer share
+  a create key and `session` label. A keyed create refused `ALREADY_EXISTS`
+  no longer runs label recovery, which could delete the key holder's live
+  sandbox: nothing is listed or deleted. With the typed reason
+  `request_id_conflict` the session ends `create_failed` (was
+  `cleanup_failed` with `CreateUncertain`) with an error that says the key is
+  held by another request; without it, `CreateUncertain` as before.
 - Bring the docs in step with the code: `--strict-tools` lists every bound it
   removes, the coding tool set's included; the architecture diagram names
   the anthropic provider; the integration script's description lists what it

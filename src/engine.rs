@@ -432,6 +432,9 @@ pub enum HarnessError {
     Cleanup(ApiError),
     #[error("create outcome is ambiguous after recovery window: {0}")]
     CreateUncertain(ApiError),
+    /// The session ID could not be made; nothing was created.
+    #[error("session ID: {0}")]
+    SessionId(String),
     /// kilnd reclaimed or deleted the sandbox before the session ended, or
     /// it could not be renewed for long enough that kilnd probably has.
     /// Cleanup still runs and verifies absence.
@@ -719,7 +722,23 @@ where
                 // A settled answer names a sandbox kilnd has finished with,
                 // but only the listing proves it absent.
                 let settled = matches!(stop, CreateStop::Settled(..));
-                let (error, interrupted, work_outcome) = match stop {
+                // ALREADY_EXISTS on a keyed create: another request holds
+                // this session's key, and whatever carries this session's
+                // labels may be that holder's live sandbox, so nothing is
+                // listed or deleted. `Some(true)` when the typed reason is
+                // request_id_conflict: every attempt sent an equal request,
+                // and kilnd returns, never refuses, the sandbox an equal
+                // request made, so none of this session's attempts made one.
+                let key_conflict = match &stop {
+                    CreateStop::Failed(error)
+                        if request.request_id.is_some()
+                            && error.code == tonic::Code::AlreadyExists =>
+                    {
+                        Some(error.typed_reason(typed_reasons) == Some("request_id_conflict"))
+                    }
+                    _ => None,
+                };
+                let (mut error, interrupted, work_outcome) = match stop {
                     CreateStop::Failed(error) | CreateStop::Settled(_, error) => {
                         (error, None, "create_failed")
                     }
@@ -739,16 +758,29 @@ where
                 };
                 let deadline_expired = interrupted.is_some();
                 let recovery_deadline = lifecycle_deadline(self.config.lifecycle_timeout);
-                let recovery = recover_session_sandboxes(
-                    &self.api,
-                    &session_id,
-                    recovery_deadline,
-                    self.config.lifecycle_retry_delay,
-                )
-                .await;
+                let recovery = if key_conflict.is_some() {
+                    Ok(Vec::new())
+                } else {
+                    recover_session_sandboxes(
+                        &self.api,
+                        &session_id,
+                        recovery_deadline,
+                        self.config.lifecycle_retry_delay,
+                    )
+                    .await
+                };
                 let recovered_ids = recovery.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
                 let recovered = !recovered_ids.is_empty();
-                let unambiguous = settled || unambiguous_create_error(&error, typed_reasons);
+                let unambiguous = settled
+                    || key_conflict == Some(true)
+                    || unambiguous_create_error(&error, typed_reasons);
+                if key_conflict == Some(true) {
+                    error.message = format!(
+                        "create request ID is held by another request; its sandbox was \
+                         left alone: {}",
+                        error.message
+                    );
+                }
                 let absence_confirmed = recovery.is_ok()
                     && (settled || recovered || (!deadline_expired && unambiguous));
                 let recovery_audit = self.audit.append(
@@ -2677,16 +2709,40 @@ fn sandbox_request(
     }
 }
 
+/// A fresh session ID: `hs-{wall ms}-{pid}-{counter}-{nonce}`, all hex.
+///
+/// The ID is the create's idempotency key and its `session` label, so it
+/// must not collide with another process's, which wall time, PID and the
+/// per-process counter alone do not ensure across PID namespaces. The
+/// 64-bit nonce comes from the OS. The counter is kept to its low 32 bits,
+/// which keeps every ID a valid create request ID once prefixed
+/// (`kiln-harness:` plus at most 49 bytes, within kilnd's 64).
 fn session_id() -> Result<String, HarnessError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| HarnessError::Deadline)?
         .as_millis();
     let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(format!(
-        "hs-{millis:x}-{:x}-{counter:x}",
-        std::process::id()
+    let mut nonce = [0_u8; 8];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| HarnessError::SessionId(format!("OS randomness unavailable: {error}")))?;
+    Ok(format_session_id(
+        millis,
+        std::process::id(),
+        counter,
+        u64::from_le_bytes(nonce),
     ))
+}
+
+/// The longest ID [`session_id`] makes until the wall clock needs a 12th
+/// hex digit, in the year 2527: `hs-`, 11 + 8 + 8 + 16 hex digits and three
+/// dashes. With the `kiln-harness:` prefix it is a valid create request ID.
+#[cfg(test)]
+const MAX_SESSION_ID_BYTES: usize = 49;
+
+fn format_session_id(millis: u128, pid: u32, counter: u64, nonce: u64) -> String {
+    let counter = counter & u64::from(u32::MAX);
+    format!("hs-{millis:x}-{pid:x}-{counter:x}-{nonce:016x}")
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -3152,5 +3208,42 @@ mod heartbeat_test {
         let heartbeat = Heartbeat::for_idle_ms(1_500);
         assert_eq!(heartbeat.interval, Duration::from_secs(1));
         assert_eq!(heartbeat.max_failures, 1);
+    }
+}
+
+#[cfg(test)]
+mod session_id_test {
+    use super::{MAX_SESSION_ID_BYTES, format_session_id, session_id};
+    use crate::api::request_id_is_valid;
+
+    #[test]
+    fn the_longest_id_is_a_valid_request_id_and_label() {
+        // The wall clock's last 11-digit millisecond, the largest PID, and
+        // a counter past 32 bits, which is kept to its low half.
+        let longest = format_session_id(0xfff_ffff_ffff, u32::MAX, u64::MAX, u64::MAX);
+        assert_eq!(longest, "hs-fffffffffff-ffffffff-ffffffff-ffffffffffffffff");
+        assert_eq!(longest.len(), MAX_SESSION_ID_BYTES);
+        assert!(request_id_is_valid(&format!("kiln-harness:{longest}")));
+        // The nonce is always 16 digits, so IDs never run together.
+        assert_eq!(format_session_id(1, 2, 3, 4), "hs-1-2-3-0000000000000004");
+    }
+
+    #[test]
+    fn ids_carry_a_fresh_nonce() {
+        let ids = (0..64)
+            .map(|_| session_id().expect("session ID"))
+            .collect::<Vec<_>>();
+        let mut nonces = std::collections::BTreeSet::new();
+        for id in &ids {
+            let fields = id.split('-').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 5, "{id}");
+            assert_eq!(fields[0], "hs");
+            assert_eq!(fields[4].len(), 16, "{id}");
+            assert!(fields[4].bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(id.len() <= MAX_SESSION_ID_BYTES, "{id}");
+            nonces.insert(fields[4].to_string());
+        }
+        // 64 draws of 64 bits: a repeat is a 2^-52 event, not a flake.
+        assert_eq!(nonces.len(), ids.len());
     }
 }

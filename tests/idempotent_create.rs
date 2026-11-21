@@ -306,7 +306,6 @@ async fn refusals_are_not_retried_and_keep_todays_result() {
     for (error, uncertain) in [
         (api_error(Code::InvalidArgument, "bad request_id"), false),
         (reasoned(Code::ResourceExhausted, "request_id_quota"), false),
-        (reasoned(Code::AlreadyExists, "request_id_conflict"), true),
         (api_error(Code::FailedPrecondition, "not serving"), false),
         (api_error(Code::PermissionDenied, "denied"), false),
         (api_error(Code::Unimplemented, "unimplemented"), true),
@@ -337,6 +336,26 @@ async fn refusals_are_not_retried_and_keep_todays_result() {
         }
         assert!(never_released(&api));
     }
+    // A conflict is another request's key: nothing is listed or deleted, and
+    // since this session's equal request made nothing, absence holds.
+    let conflict = reasoned(Code::AlreadyExists, "request_id_conflict");
+    let api = FakeApi::keyed(true);
+    api.state()
+        .create_script
+        .push_back(CreateScript::Err(conflict.clone()));
+    let mut harness = session(&api, HarnessConfig::default());
+    let result = run(&mut harness).await.expect_err("create refused");
+    assert_eq!(api.state().create_requests.len(), 1);
+    assert_eq!(api.state().list_attempts, 0);
+    assert!(
+        matches!(&result, HarnessError::Api(e) if e.code == conflict.code
+            && e.reason == conflict.reason
+            && e.message.ends_with(&conflict.message)),
+        "{result}"
+    );
+    assert_eq!(recovered(&harness), Some((Vec::new(), true, 1)));
+    assert_eq!(finished(&harness).0, "create_failed");
+    assert!(never_released(&api));
 }
 
 // 6. Health is reread before every retry.
@@ -1289,4 +1308,97 @@ async fn a_replacement_between_the_reread_and_the_retry_is_stopped_and_recovered
         )
     );
     assert!(!model_was_asked(&harness));
+}
+
+// Spare security review 2026-11-20, F1 (from its PoC). Another harness
+// process whose session ID collided with this one already holds a live
+// sandbox under the same key and labels, with a slightly different request
+// (here another idle timeout), so kilnd answers request_id_conflict. The key
+// is the other holder's: this session lists and deletes nothing, and ends
+// `create_failed` with absence confirmed, since every attempt sent an equal
+// request and kilnd would have returned a sandbox one of them made.
+#[tokio::test(start_paused = true)]
+async fn a_key_conflict_leaves_the_other_holders_sandbox_alone() {
+    for conflict_on in [1, 2] {
+        let fake = FakeApi::keyed(true);
+        let mut api = Hooked::new(&fake);
+        let other = fake.clone();
+        api.on_create = Arc::new(move |call, request| {
+            if call < conflict_on {
+                return Some(unavailable());
+            }
+            (call == conflict_on).then(|| {
+                let mut foreign = request.clone();
+                foreign.expiry = foreign.expiry.map(|mut policy| {
+                    policy.idle_timeout_ms += 1;
+                    policy
+                });
+                other.state().creates.push(foreign);
+                reasoned(Code::AlreadyExists, "request_id_conflict")
+            })
+        });
+        let mut harness = api.session();
+        let error = harness
+            .run(&SessionTask::demo(), CancellationToken::new())
+            .await
+            .expect_err("conflict");
+        let state = fake.state();
+        assert!(state.deleted.is_empty(), "{:?}", state.deleted);
+        assert!(state.deletes_released.is_empty());
+        assert_eq!(state.list_attempts, 0, "nothing is listed");
+        drop(state);
+        assert!(
+            matches!(
+                &error,
+                HarnessError::Api(e) if e.code == Code::AlreadyExists
+                    && e.reason.as_deref() == Some("request_id_conflict")
+                    && e.message.starts_with("create request ID is held by another request")
+            ),
+            "{error}"
+        );
+        assert_eq!(recovered(&harness), Some((Vec::new(), true, conflict_on)));
+        assert_eq!(
+            finished(&harness),
+            (
+                "create_failed".to_string(),
+                "create_failed".to_string(),
+                true,
+                None
+            )
+        );
+        assert!(!model_was_asked(&harness));
+    }
+}
+
+// Without typed reasons ALREADY_EXISTS on a keyed create is still taken as
+// another request's key, so nothing is deleted, but absence is not proven:
+// the session ends `cleanup_failed` with the create uncertain.
+#[tokio::test(start_paused = true)]
+async fn an_untyped_conflict_deletes_nothing_and_stays_uncertain() {
+    let fake = FakeApi::keyed(true);
+    fake.state().features.remove(&Feature::TypedReasons);
+    let mut api = Hooked::new(&fake);
+    let other = fake.clone();
+    api.on_create = Arc::new(move |call, request| {
+        (call == 1).then(|| {
+            let mut foreign = request.clone();
+            foreign.expiry = None;
+            other.state().creates.push(foreign);
+            api_error(Code::AlreadyExists, "already exists")
+        })
+    });
+    let mut harness = api.session();
+    let error = harness
+        .run(&SessionTask::demo(), CancellationToken::new())
+        .await
+        .expect_err("conflict");
+    assert!(
+        fake.state().deleted.is_empty(),
+        "{:?}",
+        fake.state().deleted
+    );
+    assert_eq!(fake.state().list_attempts, 0);
+    assert!(matches!(error, HarnessError::CreateUncertain(_)), "{error}");
+    assert_eq!(recovered(&harness), Some((Vec::new(), false, 1)));
+    assert_eq!(finished(&harness).0, "cleanup_failed");
 }

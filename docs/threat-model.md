@@ -337,8 +337,11 @@ it is not a hostile multi-tenant boundary.
   connection; the server may still finish generating.
 - Cancellation races active provider and tool RPCs. Dropping an Exec RPC asks
   kilnd to cancel its daemon-owned execution; sandbox deletion then provides
-  the cleanup barrier. Create response loss is recovered by unique session
-  labels. Lifecycle recovery may outlive the work deadline; its default is 10
+  the cleanup barrier. Create response loss is recovered by session labels,
+  unique per session because the session ID carries a 64-bit nonce from the
+  OS besides wall time, PID and a counter. A keyed create refused
+  `ALREADY_EXISTS` lists and deletes nothing, since the key and the labels
+  then belong to another request. Lifecycle recovery may outlive the work deadline; its default is 10
   seconds and configurations above 60 seconds are rejected. Exhaustion is an
   explicit `Cleanup` or `CreateUncertain` error.
 - SIGKILL, host loss, or a harness crash can prevent client-side delete. On a

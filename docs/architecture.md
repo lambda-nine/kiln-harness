@@ -54,9 +54,15 @@ No harness code depends on kiln files, process layout, or CLI behavior.
    cancellation, a create deadline whose sandbox was never observed, and a
    sandbox that expired.
 
-Create shares the 30-second session wall deadline. Every request has unique
-`owner` and `session` labels. If its response is lost or times out, the harness
-polls bounded non-deleted listings for those labels and deletes every match.
+Create shares the 30-second session wall deadline. Every request has
+`owner=kiln-harness` and `session=<session ID>` labels. The session ID is
+`hs-{wall ms}-{pid}-{counter}-{nonce}` in hex, where the counter is the low 32
+bits of a per-process counter and the nonce is 64 bits from the OS, so two
+processes do not compute the same ID even with equal PIDs in separate PID
+namespaces; at most 49 bytes, it fits a create request ID with its prefix. If
+the create's response is lost or times out, the harness polls bounded
+non-deleted listings for those labels and deletes every match. A keyed create
+refused `ALREADY_EXISTS` is the exception, described under create retries.
 Cancellation drops an active create RPC and is treated the same way: recovery
 runs, then the session returns `Canceled`. Cancellation during the baseline
 drops that RPC, records any execution evidence kilnd exposes, and goes through
@@ -86,6 +92,16 @@ create: no `request_id`, one attempt, nothing released.
   `ALREADY_EXISTS request_id_conflict`, `FAILED_PRECONDITION`,
   `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED` and `NOT_FOUND`, and
   goes through recovery and classification as before.
+- **A conflict is someone else's key.** Every attempt sends an equal request,
+  so `ALREADY_EXISTS` on a keyed create means another request holds this
+  session's key, and a sandbox with this session's labels may be that holder's
+  live one. Label recovery is skipped: nothing is listed or deleted. With the
+  typed reason `request_id_conflict` absence is proven (kilnd would have
+  returned, not refused, a sandbox an equal request made), so the session ends
+  `create_failed` with an `ALREADY_EXISTS` error that says the key is held by
+  another request, and the audit's `sandbox_recovered` lists no sandbox with
+  `deleted: true`. Without the typed reason nothing is deleted either, but
+  absence is unproven: `CreateUncertain` and `cleanup_failed`.
 - **No per-attempt timeout.** An attempt has no client timeout and sends no
   `grpc-timeout`: it runs until it answers, bounded only by the session
   deadline and cancellation, as an unkeyed create always has. So the harness
