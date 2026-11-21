@@ -6,6 +6,10 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- The tested kiln pin moves to `7b6a477`, which `scripts/integration-vm.sh`
+  requires. That kiln refuses invalid create input before allocating
+  anything; the harness's sandbox spec is within its limits. The minimum
+  stays `5cada84`.
 - `run` and `eval run` default to `--tool-set coding`: the model gets
   `edit_file`, `search` and line ranges in `read_file` unless
   `--tool-set base` is passed, which gives exactly the earlier default
