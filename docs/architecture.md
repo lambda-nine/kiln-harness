@@ -1072,8 +1072,9 @@ of headroom. Without the flag, requests are byte for byte as before.
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |
 | `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline; lists that would not fit the result bound keep, in path order, what fits in it less 1 KiB, each list half and the other's unused share, marked `truncated` with `added_total` and `removed_total` |
 
-These five are the base tool set, the default. `--tool-set coding` (see
-[The coding tool set](#the-coding-tool-set)) gives the model `read_file`
+These five are the base tool set, the library's default and `--tool-set
+base`. The CLI's default, `--tool-set coding` (see
+[The coding tool set](#the-coding-tool-set)), gives the model `read_file`
 with line ranges, `edit_file` and `search` as well.
 
 In a streaming session the `exec` tool's description ends "A command whose
@@ -1155,8 +1156,10 @@ session (`--max-refused-calls-per-turn`).
 ### The coding tool set
 
 `HarnessConfig::tool_set` (`--tool-set base|coding`) picks the tools the
-model gets. `base`, the default, is the five tools above, with requests,
-journals and replay byte-identical to builds before tool sets existed.
+model gets. `base`, `ToolSet`'s default and so the library's, is the five
+tools above, with requests, journals and replay byte-identical to builds
+before tool sets existed. `run` and `eval run` default to `coding`; pass
+`--tool-set base` for the base tools.
 `coding` is the set `coding_v2`: the base list with `read_file` replaced by
 a version that also takes line ranges, then `edit_file` and `search` after
 `workspace_diff`. A coding set's definitions, its limits below, and the

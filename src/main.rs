@@ -178,9 +178,10 @@ struct ModelArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = ToolSetArg::Base,
-        help = "Tools the model gets: base (exec, read_file, write_file, list_dir, \
-                workspace_diff) or coding (adds edit_file, search and line ranges in read_file)"
+        default_value_t = ToolSetArg::Coding,
+        help = "Tools the model gets: coding, the default (the base tools plus edit_file, \
+                search and line ranges in read_file), or base (exec, read_file, write_file, \
+                list_dir, workspace_diff)"
     )]
     tool_set: ToolSetArg,
     /// Model turns per session.
@@ -1862,7 +1863,10 @@ mod tests {
             "--prompt",
             "x",
         ];
-        let run = parse(&base).expect("parses");
+        // The coding tools are the default; base is asked for.
+        let mut base_set = base.to_vec();
+        base_set.extend(["--tool-set", "base"]);
+        let run = parse(&base_set).expect("parses");
         assert_eq!(
             model_config(&run.model).expect("config").tool_set,
             ToolSet::Base
@@ -1872,16 +1876,23 @@ mod tests {
             prepared.task.system,
             default_system_prompt_for(&prepared.config.tool_limits, ToolSet::Base)
         );
+        assert!(!prepared.task.system.contains("- edit_file: "));
         let mut coding = base.to_vec();
         coding.extend(["--tool-set", "coding"]);
-        let run = parse(&coding).expect("parses");
-        let prepared = prepare_run(&run).expect("prepared");
-        assert_eq!(prepared.config.tool_set, ToolSet::CodingV2);
-        assert_eq!(
-            prepared.task.system,
-            default_system_prompt_for(&prepared.config.tool_limits, ToolSet::CodingV2)
-        );
-        assert!(prepared.task.system.contains("- edit_file: "));
+        for argv in [&base[..], &coding[..]] {
+            let run = parse(argv).expect("parses");
+            assert_eq!(
+                model_config(&run.model).expect("config").tool_set,
+                ToolSet::CodingV2
+            );
+            let prepared = prepare_run(&run).expect("prepared");
+            assert_eq!(prepared.config.tool_set, ToolSet::CodingV2);
+            assert_eq!(
+                prepared.task.system,
+                default_system_prompt_for(&prepared.config.tool_limits, ToolSet::CodingV2)
+            );
+            assert!(prepared.task.system.contains("- edit_file: "));
+        }
         // A system file still wins.
         let dir = private_tempdir().expect("temp dir");
         let system = dir.path().join("system.md");

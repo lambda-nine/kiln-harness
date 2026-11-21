@@ -6,6 +6,12 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `run` and `eval run` default to `--tool-set coding`: the model gets
+  `edit_file`, `search` and line ranges in `read_file` unless
+  `--tool-set base` is passed, which gives exactly the earlier default
+  requests and journals. The library's `ToolSet::default()` stays `Base`,
+  and replay still uses the recorded set. An `eval compare` of a new run
+  against an earlier default run notes the different tool sets.
 - `exec` output that escapes past the tool result bound (quotes, tabs,
   control bytes) is cut to fit instead of being refused whole as
   `tool_result_too_large`: each stream keeps the start of its text that

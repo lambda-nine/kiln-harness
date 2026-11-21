@@ -77,8 +77,8 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 | `list_dir` | base | Lists entry names in a `/workspace` directory |
 | `workspace_diff` | base | Lists files added or removed since the session started; lists over the result bound are cut to fit, with their totals |
 
-`run` and `eval run` take `--tool-set base` (the default) or
-`--tool-set coding`. With `coding` the model gets all seven, and the
+`run` and `eval run` take `--tool-set coding` (the default) or
+`--tool-set base`. With `coding` the model gets all seven, and the
 default system prompt lists them and suggests editing and searching over
 rewriting and rereading whole files. The journal records the set
 (`coding_v2`), replay uses the recorded one and refuses a configuration with
