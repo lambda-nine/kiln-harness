@@ -26,7 +26,8 @@ the same advisory, with credit if you want it.
 In scope:
 
 - the agent loop and its budgets (steps, calls, input, output, deadlines)
-- the five typed tools and how their arguments reach kilnd
+- the typed tools (the base set and `--tool-set coding`) and how their
+  arguments reach kilnd
 - the audit log: anything that writes credentials, file contents or provider
   call IDs into it, or lets untrusted input corrupt it
 - sandbox lifecycle: a session that ends without its sandbox being deleted
@@ -47,5 +48,6 @@ reviewed adversarially by AI models but not audited. **It is not a boundary
 for hostile multi-tenant workloads.** Don't use it to separate mutually
 untrusted users.
 
-The current milestone has only a deterministic scripted provider; no live
-model provider is implemented. See [docs/threat-model.md](docs/threat-model.md).
+Besides the deterministic scripted provider, `run` drives live models through
+the `openai-compat` and `anthropic` providers; every model response is
+untrusted input. See [docs/threat-model.md](docs/threat-model.md).
