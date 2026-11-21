@@ -64,9 +64,7 @@ fn api() -> FakeApi {
         state
             .files
             .insert("/workspace/matches.txt".to_string(), many_matches());
-        // Long output on both streams, as a build log has. Output that
-        // escapes to more than half again its size can pass any limit,
-        // the default included, and is refused whole as before.
+        // Long output on both streams, as a build log has.
         state.sh_handler = Some(Arc::new(|_: &[u8], _: &mut BTreeMap<String, Vec<u8>>| {
             ShAnswer {
                 stdout: "compiling module 42 of 9000\n".repeat(50_000).into_bytes(),
@@ -406,4 +404,176 @@ async fn a_workspace_diff_of_escaped_paths_is_cut_to_fit_at_the_default() {
     let (api, added, removed) = replaced_workspace(360, &stem);
     let diff = diff_after_replacing(&api, 128 << 10).await;
     assert_cut_to_fit(&diff, &added, &removed, 128 << 10);
+}
+
+/// Output on each stream that doubles when escaped: quotes and tabs.
+fn escaping(byte_count: usize) -> Vec<u8> {
+    "\"\t".repeat(byte_count / 2).into_bytes()
+}
+
+fn exec_api(stdout: Vec<u8>, stderr: Vec<u8>) -> FakeApi {
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(Arc::new(
+        move |_: &[u8], _: &mut BTreeMap<String, Vec<u8>>| ShAnswer {
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            ..ShAnswer::exit(0)
+        },
+    ));
+    api
+}
+
+fn exec_script() -> Vec<ModelResponse> {
+    vec![
+        ModelResponse::tool_use([call(
+            "exec",
+            "exec",
+            json!({"argv": ["/bin/sh", "-s"], "stdin": "print"}),
+        )]),
+        ModelResponse::final_text("done"),
+    ]
+}
+
+async fn exec_result(api: &FakeApi, max_result_bytes: usize) -> Value {
+    let config = config(ToolSet::Base, max_result_bytes);
+    let task = SessionTask::new(
+        default_system_prompt_for(&config.tool_limits, config.tool_set),
+        "Print it.",
+    );
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new(exec_script()),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the session completes");
+    results(&harness.journal().records)["exec"].clone()
+}
+
+/// Output that escapes past the bound keeps the start of each stream that
+/// fits, both shown, each marked cut.
+fn assert_exec_cut(exec: &Value, stdout: &[u8], stderr: &[u8], bound: usize) {
+    assert!(encoded(exec) <= bound, "{}", encoded(exec));
+    assert!(encoded(exec) > bound - 16, "{}", encoded(exec));
+    assert_eq!(exec["ok"], true, "{exec}");
+    for (name, raw) in [("stdout", stdout), ("stderr", stderr)] {
+        let text = exec[name].as_str().expect("text");
+        assert!(text.len() > bound / 8, "{name}: {}", text.len());
+        assert_eq!(text.as_bytes(), &raw[..text.len()], "{name}");
+        assert_eq!(exec[format!("{name}_model_truncated")], true, "{name}");
+        assert_eq!(exec[format!("{name}_truncated")], true, "{name}");
+        assert_eq!(exec[format!("{name}_observed_bytes")], raw.len(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn exec_output_that_escapes_past_the_limit_is_cut_to_fit() {
+    let (stdout, stderr) = (escaping(200_000), escaping(150_000));
+    for bound in [MIN, 128 << 10, MAX] {
+        let exec = exec_result(&exec_api(stdout.clone(), stderr.clone()), bound).await;
+        assert_exec_cut(&exec, &stdout, &stderr, bound);
+        // The two streams share the room evenly when both are long.
+        let (out, err) = (
+            exec["stdout"].as_str().map(str::len),
+            exec["stderr"].as_str().map(str::len),
+        );
+        assert!(
+            out.zip(err)
+                .is_some_and(|(out, err)| out.abs_diff(err) <= 2),
+            "{out:?} {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_escaping_stream_takes_the_room_the_other_leaves() {
+    // A third of the bound in control bytes, six bytes each escaped
+    // (`\u0001`), is twice the bound on its own.
+    let stdout = vec![1_u8; 200_000];
+    let bound = 128 << 10;
+    let exec = exec_result(&exec_api(stdout.clone(), b"one line\n".to_vec()), bound).await;
+    assert!(
+        encoded(&exec) <= bound && encoded(&exec) > bound - 16,
+        "{}",
+        encoded(&exec)
+    );
+    assert_eq!(exec["stderr"], "one line\n");
+    assert_eq!(exec["stderr_model_truncated"], false);
+    let text = exec["stdout"].as_str().expect("text");
+    assert_eq!(text.as_bytes(), &stdout[..text.len()]);
+    // Nearly all of the bound, at six bytes a byte.
+    assert!(text.len() > (bound - 1024) / 6, "{}", text.len());
+    assert_eq!(exec["stdout_model_truncated"], true);
+}
+
+#[tokio::test]
+async fn exec_output_that_fits_is_as_it_was() {
+    // Escaping that still fits, and plain output cut only by its third.
+    for (stdout, stderr) in [
+        (escaping(20_000), escaping(20_000)),
+        (b"x".repeat(100_000), b"y".repeat(100_000)),
+    ] {
+        let exec = exec_result(&exec_api(stdout.clone(), stderr.clone()), 128 << 10).await;
+        let third = (128 << 10) / 3;
+        for (name, raw) in [("stdout", &stdout), ("stderr", &stderr)] {
+            let end = raw.len().min(third);
+            assert_eq!(
+                exec[name].as_str().map(str::as_bytes),
+                Some(&raw[..end]),
+                "{name}"
+            );
+            assert_eq!(
+                exec[format!("{name}_model_truncated")],
+                raw.len() > third,
+                "{name}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cut_exec_result_is_journaled_and_replays_the_same() {
+    let temp = common::private_tempdir().expect("temp dir");
+    let path = temp.path().join("cut-exec.jsonl");
+    let (stdout, stderr) = (escaping(100_000), escaping(100_000));
+    let config = config(ToolSet::Base, 32 << 10);
+    let task = SessionTask::new(
+        default_system_prompt_for(&config.tool_limits, config.tool_set),
+        "Print it.",
+    );
+    let mut harness = Harness::new(
+        exec_api(stdout.clone(), stderr.clone()),
+        ScriptedProvider::new(exec_script()),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        config,
+    );
+    harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the session completes");
+    drop(harness);
+
+    let journal = read_journal(&path).expect("the journal verifies");
+    let original = results(&journal.records);
+    assert_exec_cut(&original["exec"], &stdout, &stderr, 32 << 10);
+    let provider = ReplayProvider::from_journal(&journal).expect("replayable");
+    let replay_config = provider.replay_config(short_lifecycle_config());
+    let mut replay = Harness::new(
+        exec_api(stdout, stderr),
+        provider,
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        replay_config,
+    );
+    replay
+        .replay(CancellationToken::new())
+        .await
+        .expect("the replay completes");
+    assert_eq!(replay.provider().diverged_at(), None);
+    assert_eq!(results(&replay.journal().records), original);
 }

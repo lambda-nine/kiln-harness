@@ -6,6 +6,12 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `exec` output that escapes past the tool result bound (quotes, tabs,
+  control bytes) is cut to fit instead of being refused whole as
+  `tool_result_too_large`: each stream keeps the start of its text that
+  fits, the two sharing the room, with `stdout_model_truncated` or
+  `stderr_model_truncated` and the matching `*_truncated` set. A result
+  that fits is unchanged, and the result has no new fields.
 - `workspace_diff` cuts `added` and `removed` lists that would not fit the
   tool result bound instead of failing with `tool_result_too_large`: each
   keeps a start of its sorted list, the two sharing the room, and the

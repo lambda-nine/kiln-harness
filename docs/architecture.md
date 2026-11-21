@@ -1066,7 +1066,7 @@ of headroom. Without the flag, requests are byte for byte as before.
 
 | Tool | kilnd executions | Validation |
 |---|---:|---|
-| `exec` | 1 (streamed) | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s; stopped past 8 MiB of either output |
+| `exec` | 1 (streamed) | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s; stopped past 8 MiB of either output; each stream shows at most a third of the result bound, and output that escapes past the bound keeps, cut between characters, the start of each stream that fits, half the room each and the other's unused share, marked model-truncated |
 | `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned, and under a result limit below that the start that fits it as JSON |
 | `write_file` | 1 | `/workspace` file path; fixed `dd` argv and bounded stdin; at most 64 KiB |
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |

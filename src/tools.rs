@@ -1250,7 +1250,16 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                 .run(plan.argv, plan.stdin, plan.timeout, deadline)
                 .await
             {
-                Ok(execution) => execution_run(&execution, self.limits.max_result_bytes / 3),
+                Ok(execution) => {
+                    let mut run = execution_run(&execution, self.limits.max_result_bytes / 3);
+                    fit_exec_output(
+                        &mut run,
+                        &execution,
+                        self.limits.max_result_bytes / 3,
+                        self.limits.max_result_bytes,
+                    );
+                    run
+                }
                 Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
             };
         }
@@ -1265,13 +1274,26 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             )
             .await;
         let stopped = streamed.live.as_ref().and_then(|live| live.stopped.clone());
+        let mut settled = None;
         let mut run = match streamed.execution {
-            Ok(execution) => execution_run(&execution, self.limits.max_result_bytes / 3),
+            Ok(execution) => {
+                let run = execution_run(&execution, self.limits.max_result_bytes / 3);
+                settled = Some(execution);
+                run
+            }
             Err(error) => tool_error_run(error, "kilnd_error", self.typed_reasons),
         };
         // The cutoff fired: the result says so, whatever kilnd's row did.
         if let (Some(stopped), Value::Object(result)) = (stopped, &mut run.result) {
             result.insert("stopped".to_string(), Value::String(stopped));
+        }
+        if let Some(execution) = &settled {
+            fit_exec_output(
+                &mut run,
+                execution,
+                self.limits.max_result_bytes / 3,
+                self.limits.max_result_bytes,
+            );
         }
         run.live = streamed.live.map(Box::new);
         run
@@ -2257,6 +2279,61 @@ fn execution_run(execution: &Execution, text_limit: usize) -> ToolRun {
     run.stdout.truncated |= stdout.truncated;
     run.stderr.truncated |= stderr.truncated;
     run
+}
+
+/// Cut an `exec` result's two streams, already at most `text_limit` raw
+/// bytes each (a third of the bound), so the result fits `max_result_bytes` as JSON.
+/// Output that escapes heavily (quotes, tabs, control bytes) can grow past
+/// the bound; each stream then keeps the start of its text that fits, half
+/// the room each and what one leaves to the other, marked model-truncated.
+/// A result that fits is left exactly as it was.
+fn fit_exec_output(
+    run: &mut ToolRun,
+    execution: &Execution,
+    text_limit: usize,
+    max_result_bytes: usize,
+) {
+    let encoded_size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |b| b.len());
+    if encoded_size(&run.result) <= max_result_bytes {
+        return;
+    }
+    let Value::Object(result) = &mut run.result else {
+        return;
+    };
+    // The raw bytes each stream's text was decoded from.
+    let stdout_raw = &execution.stdout.data[..execution.stdout.data.len().min(text_limit)];
+    let stderr_raw = &execution.stderr.data[..execution.stderr.data.len().min(text_limit)];
+    for name in ["stdout", "stderr"] {
+        result.insert(name.to_string(), Value::String(String::new()));
+    }
+    // Everything else, with both streams as "" (two bytes each, which the
+    // stream budgets below count again).
+    let fixed = encoded_size(&Value::Object(result.clone()));
+    let budget = max_result_bytes.saturating_sub(fixed).saturating_add(4);
+    let encoded_prefix =
+        |raw: &[u8], end: usize| coding::encoded_len(&String::from_utf8_lossy(&raw[..end]));
+    let half = coding::json_fitting_prefix(stdout_raw, budget / 2);
+    let err_end = coding::json_fitting_prefix(
+        stderr_raw,
+        budget.saturating_sub(encoded_prefix(stdout_raw, half)),
+    );
+    let out_end = coding::json_fitting_prefix(
+        stdout_raw,
+        budget.saturating_sub(encoded_prefix(stderr_raw, err_end)),
+    );
+    for (name, raw, end, evidence) in [
+        ("stdout", stdout_raw, out_end, &mut run.stdout),
+        ("stderr", stderr_raw, err_end, &mut run.stderr),
+    ] {
+        let text = String::from_utf8_lossy(&raw[..end]).into_owned();
+        result.insert(name.to_string(), Value::String(text));
+        if end < raw.len() {
+            for flag in ["model_truncated", "truncated"] {
+                result.insert(format!("{name}_{flag}"), Value::Bool(true));
+            }
+            evidence.truncated = true;
+        }
+    }
 }
 
 fn execution_error(execution: &Execution, kind: &str) -> ToolRun {
