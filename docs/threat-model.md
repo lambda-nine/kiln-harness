@@ -202,12 +202,17 @@ it is not a hostile multi-tenant boundary.
   recorded, but never a tool, the audit, or the terminal. On current models
   a `thinking` block holds no chain-of-thought text by default (its
   `thinking` field is empty unless a summary is requested, which this
-  adapter does not do), only a signature. The served model name is the one
-  endpoint string the audit carries; it must be 1..=256 bytes of letters,
-  digits, and `._:@/-` or the response is refused. Opaque numbers that
-  could not be echoed exactly are refused rather than silently changed,
-  and only a well-formed `message` envelope with a known stop reason is
-  accepted: an error body or an unknown stop never becomes a final answer.
+  adapter does not do), only a signature. The audit carries two endpoint
+  strings, both bounded labels: the served model name, which must be
+  1..=256 bytes of letters, digits, and `._:@/-` or the response is
+  refused, and, in `context_compacted.outcome` (`no_summary:<stop_reason>`)
+  after a compaction response without a summary, its stop reason, which
+  must be 1..=64 bytes of `[a-z0-9_]` or the response is refused (engine
+  and journal grammar alike). Neither can carry an escape sequence or bulk
+  data. Opaque numbers that could not be echoed exactly are refused rather
+  than silently changed, and only a well-formed `message` envelope with a
+  known stop reason is accepted: an error body or an unknown stop never
+  becomes a final answer.
   Strict tool schemas are a request-side transform only; every bound they
   drop is still enforced by the harness's own argument validation.
 - A compaction summary (`--compact-at`) is untrusted model output, like any

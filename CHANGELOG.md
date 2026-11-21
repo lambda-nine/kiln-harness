@@ -6,6 +6,10 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- The threat model now names the second endpoint string the audit carries:
+  a compaction response's bounded stop reason (1 to 64 bytes of
+  `[a-z0-9_]`) in `context_compacted.outcome` as `no_summary:<stop_reason>`.
+  The audit is unchanged.
 - A new session's limits must fit the journal caps (64 MiB per file, 8 MiB
   per line). `HarnessConfig::validate` and `Harness::run` compute the
   journal the limits allow (`JournalBound`; formula in
