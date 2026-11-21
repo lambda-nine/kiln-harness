@@ -1748,11 +1748,13 @@ fn lost_then_answered(on: u32, cancel: Option<CancellationToken>) -> Arc<CreateH
 // A READY answer that echoes another key, or none, speaks only for its own
 // attempt. After an attempt whose answer was lost, that one may still reach
 // kilnd, so empty listings leave the create uncertain, whether the answer
-// won the select or was read beside cancellation. On the first attempt the
-// empty listing still proves absence.
+// won the select or was read beside cancellation. Uncanceled, on the first
+// attempt the empty listing still proves absence. Canceled, the answer is
+// treated as still pending in both orderings: cancellation fired during the
+// poll that answers, or ready beside the answer before the next poll.
 #[tokio::test(start_paused = true)]
 async fn a_rejected_echo_after_a_lost_answer_leaves_the_create_uncertain() {
-    for canceled in [false, true] {
+    for (canceled, after_a_poll) in [(false, false), (true, false), (true, true)] {
         for answered_on in [1, 2] {
             let fake = FakeApi::keyed(true);
             {
@@ -1765,10 +1767,12 @@ async fn a_rejected_echo_after_a_lost_answer_leaves_the_create_uncertain() {
             let cancel = CancellationToken::new();
             let mut api = Hooked::new(&fake);
             api.on_create = lost_then_answered(answered_on, canceled.then(|| cancel.clone()));
-            api.answer_after_a_poll = canceled;
+            api.answer_after_a_poll = after_a_poll;
             let mut harness = api.session();
             let result = harness.run(&SessionTask::demo(), cancel).await;
-            let case = format!("canceled {canceled}, answered on {answered_on}");
+            let case = format!(
+                "canceled {canceled}, after a poll {after_a_poll}, answered on {answered_on}"
+            );
             let work_outcome = if canceled {
                 "canceled"
             } else {
@@ -1813,22 +1817,28 @@ async fn a_rejected_echo_after_a_lost_answer_leaves_the_create_uncertain() {
 
 // Beside cancellation, a settled or rejected sandbox is not held: the
 // attempt is dropped as in flight, and recovery finds the row by its labels,
-// deletes it and verifies absence, so the session ends canceled.
+// deletes it and verifies absence, so the session ends canceled. That holds
+// whether cancellation fires during the poll that answers, so the answer
+// wins the select, or is ready beside the answer before the next poll.
 #[tokio::test(start_paused = true)]
 async fn a_rejected_sandbox_beside_cancellation_is_recovered_and_canceled() {
-    for script in [
+    for (script, after_a_poll) in [
         CreateScript::Settled(SandboxState::Failed, "boot failed".to_string()),
         CreateScript::EchoRequestId("kiln-harness:another".to_string()),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|script| [(script.clone(), false), (script, true)])
+    {
         let fake = FakeApi::keyed(true);
         fake.state().create_script.push_back(script.clone());
         let cancel = CancellationToken::new();
         let mut api = Hooked::new(&fake);
         api.on_create = lost_then_answered(1, Some(cancel.clone()));
-        api.answer_after_a_poll = true;
+        api.answer_after_a_poll = after_a_poll;
         let mut harness = api.session();
         let result = harness.run(&SessionTask::demo(), cancel).await;
         let id = "sb-0000000000000001".to_string();
+        let script = format!("{script:?}, after a poll {after_a_poll}");
         assert!(
             matches!(result, Err(HarnessError::Canceled)),
             "{script:?}: {result:?}"

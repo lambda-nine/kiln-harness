@@ -3156,9 +3156,17 @@ async fn create_with_retries<A: SandboxApi>(
             }
             result = &mut create => result,
         };
+        // Cancellation that arrived during the poll that answered is
+        // handled as if it had been seen first, so both orderings agree.
+        // It outranks the deadline, the attempt cap and the retry rules.
+        if cancel.is_cancelled() {
+            let (result, conflict) =
+                answer_beside_cancellation(Some(result), keyed, request.request_id.as_deref());
+            return (result, attempts, conflict);
+        }
         let error = match result {
             // A held sandbox goes to the caller, whose cleanup deletes it by
-            // ID whether or not the session was canceled meanwhile.
+            // ID.
             Ok(Ok(sandbox)) => {
                 return (
                     check_settled(sandbox, request.request_id.as_deref()),
@@ -3166,20 +3174,15 @@ async fn create_with_retries<A: SandboxApi>(
                     None,
                 );
             }
-            // A keyed conflict is kept for the caller even when
-            // cancellation became ready as it arrived; cancellation still
-            // wins the result.
+            // A keyed conflict is kept for the caller, whose cleanup must
+            // not run label recovery.
             Ok(Err(error)) if keyed && error.code == tonic::Code::AlreadyExists => {
-                let stop = if cancel.is_cancelled() {
-                    CreateStop::Canceled
-                } else {
-                    CreateStop::Failed(error.clone())
-                };
-                return (Err(stop), attempts, Some(error));
+                return (
+                    Err(CreateStop::Failed(error.clone())),
+                    attempts,
+                    Some(error),
+                );
             }
-            // Cancellation that arrived while Create was failing outranks
-            // the deadline, the attempt cap and the retry rules.
-            _ if cancel.is_cancelled() => return (Err(CreateStop::Canceled), attempts, None),
             Ok(Err(error)) => error,
             Err(_) => return (Err(CreateStop::Deadline), attempts, None),
         };
@@ -3234,8 +3237,10 @@ async fn create_with_retries<A: SandboxApi>(
     }
 }
 
-/// The cancellation arm's last look at a started Create attempt, polled
-/// once more without waiting before it is dropped: the answer and
+/// What a Create attempt's answer means once the session is canceled:
+/// either the cancellation arm's last look at a started attempt, polled
+/// once more without waiting before it is dropped, or an answer that won
+/// the select while cancellation arrived during that poll. The answer and
 /// cancellation can both be ready when the biased select runs, and it then
 /// takes cancellation. That the attempt was polled shows only that its
 /// future ran, not that the request was sent: tonic waits for the transport
@@ -3244,10 +3249,10 @@ async fn create_with_retries<A: SandboxApi>(
 /// the caller keeps label recovery away from the key holder's sandbox, and
 /// a READY sandbox [`check_settled`] accepts as this session's (keyed, one
 /// that echoes its key), returned held for the caller's cleanup to delete
-/// by ID. Anything else, a rejected or settled
-/// sandbox, a refusal, a retryable error or the deadline included, is
-/// treated as an answer still pending: `Canceled`, an in-flight create as
-/// if cancellation had come a moment later, so recovery decides cleanup.
+/// by ID. Anything else, a rejected or settled sandbox, a refusal, a
+/// retryable error or the deadline included, is treated as an answer still
+/// pending: `Canceled`, an in-flight create as if cancellation had come a
+/// moment later, so recovery decides cleanup.
 /// That is deliberately conservative: a definite refusal beside
 /// cancellation may end uncertain.
 fn answer_beside_cancellation(

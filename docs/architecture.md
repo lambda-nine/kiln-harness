@@ -125,15 +125,20 @@ create: no `request_id`, one attempt, nothing released.
   first. Before dropping a started attempt, the harness polls it once more
   without waiting. That the attempt was started shows only that its future
   ran, not that the request was sent: tonic waits for the transport before
-  sending, so this last poll can be what submits the first Create. Only two
-  answers it completes with are kept. A keyed conflict skips label recovery
-  as above. A `READY` sandbox that echoes this session's key, one the settled
-  check below accepts, is held, and since the session is canceled before any
-  work, the normal cleanup deletes it by ID and verifies its absence. Every
+  sending, so this last poll can be what submits the first Create. An answer
+  that wins the select while cancellation arrives during that same poll is
+  handled the same way, so both orderings agree. Only two answers are kept.
+  A keyed conflict skips label recovery as above. A `READY` sandbox the
+  settled check below accepts (when keyed, one that echoes this session's
+  key) is held, and since the session is canceled before any work, the
+  normal cleanup deletes it by ID and verifies its absence. Every
   other answer (a rejected or settled sandbox, a refusal, a retryable error
   or the deadline) is treated as one still pending: the attempt is dropped as
   an in-flight create, as if cancellation had come a moment later, and label
-  recovery decides cleanup; with no row found the create is uncertain. This
+  recovery decides cleanup. A recovery that succeeds and finds no row ends
+  `CreateUncertain`; one whose listing fails throughout, or whose delete of a
+  recovered row cannot be verified, ends `Cleanup`; both record
+  `cleanup_failed`. This
   is deliberately conservative: a definite refusal beside cancellation may
   end `CreateUncertain`. The harness does not split the RPC into separate
   send and receive steps. An attempt that cancellation outran before its
@@ -177,10 +182,12 @@ create: no `request_id`, one attempt, nothing released.
   what its listing proves, not the state kilnd reported; if recovery cannot
   confirm it the outcome is `cleanup_failed`. Like a definite refusal, such an
   answer speaks only for its own attempt: on a retry, after an attempt whose
-  answer was lost, an empty listing proves nothing about that attempt, and
-  the session returns `CreateUncertain` with `cleanup_failed` unless recovery
-  found and deleted a row. The same check guards an unkeyed
-  create, which kilnd never answers `OK` without `READY`.
+  answer was lost, an empty listing proves nothing about that attempt. A
+  recovery that succeeds and finds no row then returns `CreateUncertain`; one
+  whose listing fails throughout, or whose delete of a recovered row cannot
+  be verified, returns `Cleanup`. Both record `cleanup_failed`. The same
+  check guards an unkeyed create, which kilnd never answers `OK` without
+  `READY`.
 - **Release.** With `FEATURE_REQUEST_ID_RELEASE` also listed (decided once, at
   session start), the normal cleanup after a `READY` create that took exactly
   one attempt asks kilnd to give up the key: every delete sends

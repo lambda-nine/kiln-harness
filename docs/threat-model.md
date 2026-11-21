@@ -407,8 +407,9 @@ it is not a hostile multi-tenant boundary.
   check, so the session stops before any work, and label recovery deletes
   both rows before the session ends; a brief duplicate can exist in between.
   The key is released only by the normal cleanup after a `READY` create whose
-  response is held, that took exactly one attempt, and after absence is
-  confirmed, never by recovery. After a retry an attempt the harness gave up
+  response is held and that took exactly one attempt, never by recovery:
+  kilnd releases it with a delete that removed the sandbox, and the harness
+  sends its extra releasing deletes only after confirming absence. After a retry an attempt the harness gave up
   on (a transport failure that may still deliver it) could reach kilnd late,
   so the key is kept: within kilnd's request-record retention such an attempt
   is answered from the retained `DELETED` row and creates nothing. A create
@@ -416,8 +417,13 @@ it is not a hostile multi-tenant boundary.
   releases, with one exception: a `READY` answer that echoes this session's
   key and is already there when cancellation wins is held, so the normal
   cleanup deletes it by ID, verifies its absence, and releases the key under
-  the rules above. On legacy kiln a create that crashed before its backend ID was
-  published settles as an ambiguous `FAILED` row that Delete refuses; the
+  the rules above. The order matters for the audit: every delete in that
+  cleanup asks kilnd to release the key, and kilnd can release it while
+  handling the Delete, before the harness has confirmed by listing that the
+  sandbox is gone. A release kilnd reported is recorded even if that listing
+  then never succeeds, so `request_id_released: true` can stand beside
+  `sandbox_deleted: false`. On legacy kiln a create that crashed before its
+  backend ID was published settles as an ambiguous `FAILED` row that Delete refuses; the
   harness reports it as `cleanup_failed`, never as a clean failure. The key is
   `kiln-harness:<session ID>` and carries no secret.
 - The audit JSONL file is append-only by open mode, not tamper-proof. A trusted
