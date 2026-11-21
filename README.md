@@ -309,8 +309,9 @@ and the audit records which model served each turn as `served_model`.
 Every attempt then counts against the token budgets, including one that
 was declined, so `--max-output-tokens` limits one model call with all its
 attempts. `--strict-tools` marks the tool schemas `strict` and
-sends them without the bounds strict mode refuses (`maxItems`, `minimum`,
-and `minItems` above 1); the harness still enforces those bounds itself. A
+sends them without the size and range bounds strict mode refuses
+(`minItems` above 1, `maxItems`, `minimum`, `maximum`, the exclusive bounds,
+`minLength` and `maxLength`); the harness still enforces those bounds itself. A
 schema construct strict mode does not support and the harness would not
 enforce, such as `pattern` or `multipleOf`, is refused before the session
 starts rather than dropped. It is off by default. `--clear-thinking N`
@@ -457,9 +458,14 @@ the installed kilnd and kiln at the commits in
 [Pinned control plane](#pinned-control-plane), and Ubuntu's `acl` package (`setfacl` and
 `getfacl`, which the script requires so the Linux ACL tests run).
 
-It requires no active sandboxes or running executions, verifies all five tool
-results and execution links, replays the recorded journal against a second
-sandbox, and runs the `demo`, `journal verify`, and `replay` commands.
+It runs Linux clippy and the host suite twice (with the invoking user's
+umask and with `umask 0002`), then requires no active sandboxes or running
+executions. Against the installed kilnd it verifies all five base tool results
+and execution links, the fixed working directory and environment, live
+streaming and the runaway-output cutoff, the coding tool set, the eval
+self-test on two starter tasks, and two eval runs side by side; it replays
+the recorded journal against a second sandbox, and runs the `demo`,
+`journal verify`, and `replay` commands.
 Afterwards, node reservations and the set of non-deleted sandboxes must match
 a snapshot taken before the run, since a node may keep sandboxes the test does
 not own. kiln's registry, run directories, cgroups, and shim/init processes are

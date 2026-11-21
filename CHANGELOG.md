@@ -6,6 +6,11 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- Bring the docs in step with the code: `--strict-tools` lists every bound it
+  removes, the coding tool set's included; the architecture diagram names
+  the anthropic provider; the integration script's description lists what it
+  runs; and `SECURITY.md` covers the coding tools and the live providers. No
+  behaviour changes.
 - A response with more tool calls than `--max-tool-calls-per-turn` no
   longer ends the session outright. The first calls up to the cap run as
   before; each call after them runs nothing in kilnd and gets the result

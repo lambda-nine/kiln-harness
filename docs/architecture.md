@@ -1,7 +1,7 @@
 # Architecture
 
 ```text
-scripted, replay, or network provider (openai-compat over HTTP)
+scripted, replay, or network provider (openai-compat or anthropic over HTTP)
         │ ModelRequest ▲ ModelResponse (text, tool calls, stop reason, usage)
         ▼              │
 agent loop ── steps/calls/tokens/deadline ──┬─ append-only audit
@@ -758,8 +758,11 @@ rewritten keyword by keyword. Supported keywords (`type`, `properties`,
 Size and range bounds strict mode refuses (`minItems` above 1, `maxItems`,
 `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `minLength`,
 `maxLength`) are removed, because the typed tools enforce them; for the
-built-in tools that is `exec.argv.maxItems`, `exec.timeout_ms.minimum`, and
-`read_file.max_bytes.minimum`, while `exec.argv.minItems: 1` stays. An
+base tools that is `exec.argv.maxItems`, `exec.timeout_ms.minimum`, and
+`read_file.max_bytes.minimum`, while `exec.argv.minItems: 1` stays. The
+coding set also loses `read_file`'s `start_line` and `line_count` minimums,
+`edit_file.edits.maxItems`, and `search.max_results`' `minimum` and
+`maximum`, while `edit_file.edits.minItems: 1` stays. An
 object schema without `required` gets `"required": []`. Any other keyword
 (`pattern`, `multipleOf`, `$ref`, `$defs`, `format`, `oneOf`, ...), tuple
 `items`, an `enum` or `const` member that is not a string, integer,
@@ -795,7 +798,8 @@ order, and numbers are exact because a response whose opaque content holds
 one serde_json cannot hold exactly (a float, or an integer outside 64 bits)
 is refused, `tool_use` inputs included, since they are echoed from the
 blocks too. Current block types carry none, and the registered tools take
-only strings, string arrays, and integers, so nothing valid is lost.
+only strings, integers, booleans, and arrays and objects of those, so
+nothing valid is lost.
 
 The response must be the success envelope: `type: "message"`,
 `role: "assistant"`, a valid `model` (now required), a `content` array, and
