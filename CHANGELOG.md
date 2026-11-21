@@ -6,6 +6,13 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `workspace_diff` cuts `added` and `removed` lists that would not fit the
+  tool result bound instead of failing with `tool_result_too_large`: each
+  keeps a start of its sorted list, the two sharing the room, and the
+  result adds `"truncated": true` with `added_total` and `removed_total`.
+  A diff that fits is unchanged. At the default 128 KiB only paths heavy
+  with escaped characters reach the bound; at a lowered
+  `--max-result-bytes` a few hundred changed files can.
 - `journal verify` and replay refuse a journal in which a call within the
   per-turn cap has a `too_many_calls_in_turn` result. Only calls past the
   cap get that error and no tool returns it, so the engine never records

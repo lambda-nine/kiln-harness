@@ -304,3 +304,106 @@ async fn a_lowered_limit_is_journaled_and_replays_under_it() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
 }
+
+/// A workspace whose seed files are all replaced: `count` removed and
+/// `count` added paths, each `stem` plus its number.
+fn replaced_workspace(count: usize, stem: &str) -> (FakeApi, Vec<String>, Vec<String>) {
+    let name = |side: &str, index: usize| format!("{side}{stem}{index:04}");
+    let removed: Vec<String> = (0..count).map(|index| name("old", index)).collect();
+    let added: Vec<String> = (0..count).map(|index| name("new", index)).collect();
+    let api = FakeApi::default();
+    {
+        let mut state = api.state();
+        for path in &removed {
+            state
+                .files
+                .insert(format!("/workspace/{path}"), b"x".to_vec());
+        }
+        let fresh = added.clone();
+        state.sh_handler = Some(Arc::new(
+            move |_: &[u8], files: &mut BTreeMap<String, Vec<u8>>| {
+                files.clear();
+                for path in &fresh {
+                    files.insert(format!("/workspace/{path}"), b"y".to_vec());
+                }
+                ShAnswer::exit(0)
+            },
+        ));
+    }
+    (api, added, removed)
+}
+
+async fn diff_after_replacing(api: &FakeApi, max_result_bytes: usize) -> Value {
+    let config = config(ToolSet::Base, max_result_bytes);
+    let task = SessionTask::new(
+        default_system_prompt_for(&config.tool_limits, config.tool_set),
+        "Replace the files.",
+    );
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new(vec![
+            ModelResponse::tool_use([call(
+                "replace",
+                "exec",
+                json!({"argv": ["/bin/sh", "-s"], "stdin": "replace"}),
+            )]),
+            ModelResponse::tool_use([call("diff", "workspace_diff", json!({}))]),
+            ModelResponse::final_text("done"),
+        ]),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the session completes");
+    results(&harness.journal().records)["diff"].clone()
+}
+
+fn strings(value: &Value) -> Vec<String> {
+    serde_json::from_value(value.clone()).expect("a list of paths")
+}
+
+/// Lists over the bound are cut to fit, each a start of its sorted list,
+/// with the totals; the budget is shared, so both lists show.
+fn assert_cut_to_fit(diff: &Value, added: &[String], removed: &[String], bound: usize) {
+    assert!(encoded(diff) <= bound, "{}", encoded(diff));
+    assert_eq!(diff["ok"], true);
+    assert_eq!(diff["truncated"], true);
+    assert_eq!(diff["added_total"], added.len());
+    assert_eq!(diff["removed_total"], removed.len());
+    let (kept_added, kept_removed) = (strings(&diff["added"]), strings(&diff["removed"]));
+    assert!(!kept_added.is_empty() && kept_added.len() < added.len());
+    assert!(!kept_removed.is_empty() && kept_removed.len() < removed.len());
+    assert_eq!(kept_added, added[..kept_added.len()]);
+    assert_eq!(kept_removed, removed[..kept_removed.len()]);
+    // Within a path or two of the bound, less the reserve for the rest.
+    assert!(encoded(diff) > bound - 1024 - 2 * 600, "{}", encoded(diff));
+}
+
+#[tokio::test]
+async fn a_workspace_diff_over_the_limit_is_cut_to_fit_and_says_so() {
+    // 300 paths a side, about 24 KiB of JSON together: over the minimum.
+    let (api, added, removed) = replaced_workspace(300, "-generated-module-source-file-");
+    let diff = diff_after_replacing(&api, MIN).await;
+    assert_cut_to_fit(&diff, &added, &removed, MIN);
+
+    // The same diff under the default is whole and exactly as before.
+    let (api, added, removed) = replaced_workspace(300, "-generated-module-source-file-");
+    let diff = diff_after_replacing(&api, 128 << 10).await;
+    assert_eq!(
+        diff,
+        json!({"ok": true, "added": added, "removed": removed})
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_diff_of_escaped_paths_is_cut_to_fit_at_the_default() {
+    // 360 paths a side within the manifest's 64 KiB each, mostly quotes,
+    // so the two lists encode to over the default 128 KiB.
+    let stem = format!("-{}-", "\"".repeat(140));
+    let (api, added, removed) = replaced_workspace(360, &stem);
+    let diff = diff_after_replacing(&api, 128 << 10).await;
+    assert_cut_to_fit(&diff, &added, &removed, 128 << 10);
+}

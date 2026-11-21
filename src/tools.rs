@@ -1422,11 +1422,33 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             Ok(manifest) => {
                 let added: Vec<_> = manifest.files.difference(&self.baseline).cloned().collect();
                 let removed: Vec<_> = self.baseline.difference(&manifest.files).cloned().collect();
+                let mut result = json!({"ok": true, "added": added, "removed": removed});
+                let mut stdout = manifest.stdout;
+                // Lists over the result bound are cut to fit, in order, with
+                // their totals; lists that fit are as they always were.
+                if serde_json::to_vec(&result)
+                    .map_or(true, |bytes| bytes.len() > self.limits.max_result_bytes)
+                {
+                    let budget = self
+                        .limits
+                        .max_result_bytes
+                        .saturating_sub(RESULT_RESERVE_BYTES);
+                    let (kept_added, kept_removed) = fitting_paths(&added, &removed, budget);
+                    result = json!({
+                        "ok": true,
+                        "added": added[..kept_added],
+                        "removed": removed[..kept_removed],
+                        "truncated": true,
+                        "added_total": added.len(),
+                        "removed_total": removed.len(),
+                    });
+                    stdout.truncated = true;
+                }
                 ToolRun {
                     ok: true,
-                    result: json!({"ok": true, "added": added, "removed": removed}),
+                    result,
                     execution_ids: manifest.execution_ids,
-                    stdout: manifest.stdout,
+                    stdout,
                     stderr: manifest.stderr,
                     stop: None,
                     live: None,
@@ -2124,6 +2146,40 @@ fn manifest_error(execution: &Execution, message: impl Into<String>) -> ToolErro
         stdout: evidence(&execution.stdout),
         stderr: evidence(&execution.stderr),
     }
+}
+
+/// The bytes of a JSON array of the first `count` of `paths`.
+fn path_list_bytes(paths: &[String], count: usize) -> usize {
+    2 + count.saturating_sub(1)
+        + paths[..count]
+            .iter()
+            .map(|path| coding::encoded_len(path))
+            .sum::<usize>()
+}
+
+/// The most of `paths`, from the start, whose JSON array fits `budget`.
+fn paths_fitting(paths: &[String], budget: usize) -> usize {
+    let mut bytes = 2;
+    for (count, path) in paths.iter().enumerate() {
+        bytes += coding::encoded_len(path) + usize::from(count > 0);
+        if bytes > budget {
+            return count;
+        }
+    }
+    paths.len()
+}
+
+/// How many of `added` and `removed`, each from its start, `workspace_diff`
+/// keeps so both arrays together fit `budget`: each list gets half, and
+/// what one leaves unused goes to the other.
+fn fitting_paths(added: &[String], removed: &[String], budget: usize) -> (usize, usize) {
+    let half = paths_fitting(added, budget / 2);
+    let kept_removed = paths_fitting(removed, budget.saturating_sub(path_list_bytes(added, half)));
+    let kept_added = paths_fitting(
+        added,
+        budget.saturating_sub(path_list_bytes(removed, kept_removed)),
+    );
+    (kept_added, kept_removed)
 }
 
 /// Resolve a model-supplied file path to an absolute `/workspace` path.
@@ -2960,6 +3016,40 @@ fn base_definitions(streaming: bool) -> Vec<ToolDefinition> {
 mod tests {
     use super::workspace_path;
 
+    #[test]
+    fn workspace_diff_lists_share_the_budget_and_keep_their_order() {
+        use super::{fitting_paths, path_list_bytes};
+        let names = |prefix: &str, count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!("{prefix}{index:04}"))
+                .collect()
+        };
+        // Each name is 10 bytes as JSON (8 and quotes), 11 with its comma.
+        let added = names("addd", 100);
+        let removed = names("remv", 100);
+        assert_eq!(path_list_bytes(&added, 0), 2);
+        assert_eq!(path_list_bytes(&added, 1), 12);
+        assert_eq!(path_list_bytes(&added, 3), 2 + 3 * 10 + 2);
+        // Both fit whole.
+        let whole = path_list_bytes(&added, 100) + path_list_bytes(&removed, 100);
+        assert_eq!(fitting_paths(&added, &removed, whole), (100, 100));
+        // Neither does: an even split, each array at most half.
+        let (kept_added, kept_removed) = fitting_paths(&added, &removed, 1000);
+        assert_eq!((kept_added, kept_removed), (45, 45));
+        assert!(path_list_bytes(&added, 46) + path_list_bytes(&removed, 45) > 1000);
+        // A short list leaves the rest of the budget to the other.
+        let few = names("remv", 3);
+        let (kept_added, kept_few) = fitting_paths(&added, &few, 600);
+        assert_eq!(kept_few, 3);
+        assert!(path_list_bytes(&added, kept_added) + path_list_bytes(&few, 3) <= 600);
+        assert!(path_list_bytes(&added, kept_added + 1) + path_list_bytes(&few, 3) > 600);
+        let (kept_few, kept_removed) = fitting_paths(&few, &removed, 600);
+        assert_eq!(kept_few, 3);
+        assert!(path_list_bytes(&few, 3) + path_list_bytes(&removed, kept_removed + 1) > 600);
+        // No room: nothing kept, and no panic.
+        assert_eq!(fitting_paths(&added, &removed, 0), (0, 0));
+        assert_eq!(fitting_paths(&[], &[], 0), (0, 0));
+    }
     #[test]
     fn workspace_prefixed_paths_resolve_like_relative_ones() {
         for (raw, expected) in [

@@ -1070,7 +1070,7 @@ of headroom. Without the flag, requests are byte for byte as before.
 | `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned, and under a result limit below that the start that fits it as JSON |
 | `write_file` | 1 | `/workspace` file path; fixed `dd` argv and bounded stdin; at most 64 KiB |
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only |
-| `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline |
+| `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline; lists that would not fit the result bound keep, in path order, what fits in it less 1 KiB, each list half and the other's unused share, marked `truncated` with `added_total` and `removed_total` |
 
 These five are the base tool set, the default. `--tool-set coding` (see
 [The coding tool set](#the-coding-tool-set)) gives the model `read_file`
