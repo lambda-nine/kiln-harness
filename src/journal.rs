@@ -453,7 +453,9 @@ pub trait JournalSink: Send {
     /// `session_ended`: any other record that would leave less is refused
     /// as over the file cap, so the session can always close its journal.
     /// The engine calls it before the first record of a new session, never
-    /// of a replay; at most one line is kept. The default keeps nothing.
+    /// of a replay; at most one line is kept. It clears any
+    /// [`JournalSink::allow_session_id_growth`] allowance. The default keeps
+    /// nothing.
     fn reserve_for_session_end(&mut self, bytes: u64) {
         let _ = bytes;
     }
@@ -462,10 +464,15 @@ pub trait JournalSink: Send {
     /// [`MAX_SESSION_ID_GROWTH`]: the most this session's ID is longer than
     /// the one its recording carried. A replay runs under a fresh session
     /// ID, which is longer than one recorded before IDs carried a nonce, so
-    /// a recording that fit the caps still replays. The journal it writes
-    /// can then pass them by that much per record, which
+    /// a recording that fit the caps is not refused for its ID alone. The
+    /// journal it writes can then pass them by that much per record, which
     /// [`read_journal`] refuses. The engine calls it before the first
-    /// record of a replay only. The default allows nothing.
+    /// record of a replay only. It clears any
+    /// [`JournalSink::reserve_for_session_end`] reserve. The allowance
+    /// covers the session ID's growth only: other metadata a replay
+    /// regenerates, such as expiry fields a daemon newly advertises, can
+    /// still push a recording that sits at a cap over it. The default allows
+    /// nothing.
     fn allow_session_id_growth(&mut self, bytes: u64) {
         let _ = bytes;
     }
@@ -619,12 +626,16 @@ impl JsonlJournal {
 }
 
 impl Chain {
+    // The two cap policies are exclusive: a sink reused for another session
+    // keeps nothing of the one it ran before.
     fn reserve_for_session_end(&mut self, bytes: u64) {
         self.end_reserve = bytes.min(MAX_JOURNAL_LINE_BYTES as u64 + 1);
+        self.id_growth = 0;
     }
 
     fn allow_session_id_growth(&mut self, bytes: u64) {
         self.id_growth = bytes.min(MAX_SESSION_ID_GROWTH);
+        self.end_reserve = 0;
     }
 }
 
@@ -2193,5 +2204,31 @@ mod reserve_test {
         let mut chain = Chain::default();
         chain.allow_session_id_growth(u64::MAX);
         assert_eq!(chain.id_growth, super::MAX_SESSION_ID_GROWTH);
+    }
+
+    // Selecting one cap policy clears the other, so a sink reused across a
+    // fresh session and a replay carries neither's allowance into the next.
+    #[test]
+    fn selecting_a_cap_policy_clears_the_other() {
+        let mut chain = Chain::default();
+        chain.reserve_for_session_end(1024);
+        chain.allow_session_id_growth(17);
+        assert_eq!((chain.end_reserve, chain.id_growth), (0, 17));
+        chain.reserve_for_session_end(1024);
+        assert_eq!((chain.end_reserve, chain.id_growth), (1024, 0));
+
+        // Through the sinks that forward to their chain.
+        let mut journal = super::MemoryJournal::default();
+        super::JournalSink::allow_session_id_growth(&mut journal, 17);
+        super::JournalSink::reserve_for_session_end(&mut journal, 1024);
+        assert_eq!(
+            (journal.chain.end_reserve, journal.chain.id_growth),
+            (1024, 0)
+        );
+        super::JournalSink::allow_session_id_growth(&mut journal, 17);
+        assert_eq!(
+            (journal.chain.end_reserve, journal.chain.id_growth),
+            (0, 17)
+        );
     }
 }

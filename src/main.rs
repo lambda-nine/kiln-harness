@@ -1038,7 +1038,7 @@ fn verify(path: &Path) -> ExitCode {
     println!("turns: {}", summary.turns);
     println!("tool calls: {}", summary.tool_calls);
     if let Some(tool_set) = &summary.tool_set {
-        println!("tool set: {}", terminal_safe(tool_set));
+        println!("tool set: {}", terminal_safe_line(tool_set));
     }
     if summary.compactions > 0 {
         println!("compactions: {}", summary.compactions);
@@ -1047,7 +1047,7 @@ fn verify(path: &Path) -> ExitCode {
         println!("seed: {} files", summary.seed_files);
     }
     if let Some(check) = &summary.check {
-        println!("check: {}", terminal_safe(&check.to_string()));
+        println!("check: {}", terminal_safe_line(&check.to_string()));
     }
     println!(
         "usage: input {}, output {}, cache read {}, cache creation {}",
@@ -1374,7 +1374,7 @@ async fn eval_run(socket: PathBuf, args: &EvalRunArgs) -> Result<ExitCode> {
         let _ = writeln!(stderr, "progress output: {error}");
     }
     if let Some(stopped) = &summary.stopped {
-        let _ = writeln!(stderr, "stopped early: {stopped}");
+        let _ = writeln!(stderr, "stopped early: {}", terminal_safe_line(stopped));
     }
     if summary.stopped.is_some() || printer_error.is_some() {
         return Ok(ExitCode::FAILURE);
@@ -1498,7 +1498,7 @@ async fn eval_selftest(
         .await?;
     warn_if_unhealthy(&api, config.lifecycle_timeout).await;
     if let Some(stopped) = &summary.stopped {
-        eprintln!("stopped early: {stopped}");
+        eprintln!("stopped early: {}", terminal_safe_line(stopped));
     }
     Ok(if summary.ok() {
         ExitCode::SUCCESS
@@ -1520,7 +1520,7 @@ fn print_outcome(outcome: &SessionOutcome) {
         outcome.usage.input_tokens, outcome.usage.output_tokens
     );
     if let Some(check) = &outcome.check {
-        println!("check: {}", terminal_safe(&check.to_string()));
+        println!("check: {}", terminal_safe_line(&check.to_string()));
     }
 }
 

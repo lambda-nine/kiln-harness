@@ -93,19 +93,28 @@ create: no `request_id`, one attempt, nothing released.
   once, notably `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED request_id_quota`,
   `ALREADY_EXISTS request_id_conflict`, `FAILED_PRECONDITION`,
   `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED` and `NOT_FOUND`, and
-  goes through recovery and classification as before.
+  goes through recovery and classification as before, except that a definite
+  refusal proves absence only on the first attempt. A retry follows an
+  attempt whose answer was lost, and the refusal says nothing about that
+  attempt, so with no row recovered the session returns `CreateUncertain`
+  with `cleanup_failed` and `sandbox_deleted: false`; a recovered row is
+  deleted and verified as always.
 - **A conflict is someone else's key.** Every attempt sends an equal request,
   so `ALREADY_EXISTS` on a keyed create means another request holds this
   session's key, and a sandbox with this session's labels may be that holder's
   live one. Label recovery is skipped, so nothing is listed or deleted. That
-  holds even when cancellation becomes ready as the conflict arrives:
-  cancellation still decides the session's result, but the answered conflict
-  decides cleanup. The typed reason `request_id_conflict` proves absence only
-  for the first attempt, because kilnd would have returned, not refused, a
-  sandbox an equal request made. Then the session ends `create_failed` (or
-  `canceled`), with an `ALREADY_EXISTS` error that says the key is held by
-  another request, and the audit's `sandbox_recovered` lists no sandbox with
-  `deleted: true`. After an earlier attempt whose answer was lost, the conflict
+  holds even when cancellation becomes ready as the conflict arrives, or is
+  ready beside it when the harness next looks: before dropping a started
+  attempt on cancellation, the harness reads an answer already there without
+  waiting. Cancellation still decides the session's result, but the answered
+  conflict decides cleanup. The typed reason `request_id_conflict` proves
+  absence only for the first attempt, because kilnd would have returned, not
+  refused, a sandbox an equal request made. Then the audit's
+  `sandbox_recovered` lists no sandbox with `deleted: true`, and the session
+  ends `create_failed` with an `ALREADY_EXISTS` error that says the key is
+  held by another request; if cancellation coincides, it ends `canceled` with
+  a plain `HarnessError::Canceled`, as any canceled create does. After an
+  earlier attempt whose answer was lost, the conflict
   says nothing about that attempt: it may still reach kilnd once the holder
   releases the key. Absence is then unproven, as it is without the typed
   reason, and the session returns `CreateUncertain` with `cleanup_failed` and
@@ -1537,15 +1546,19 @@ would leave less room is refused as over the cap, and `session_ended` still
 fits. The built-in sinks implement it; a custom sink keeps nothing unless it
 does.
 
-A replay keeps the policy its recording was written under, so every journal
-that verifies still replays. It keeps no reserve, and it skips the per-record
-checks, since its limits are the recorded ones. It does run under a fresh
-session ID, which is longer than the one a journal recorded before IDs carried
-a nonce. So the engine has the sink let each record pass both caps by the
-difference, at most `MAX_SESSION_ID_GROWTH` (64 bytes), through
-`JournalSink::allow_session_id_growth`. A replay of a journal recorded within
-that margin of a cap can therefore write a journal that passes it, and
-`journal verify` refuses that journal.
+A replay keeps the policy its recording was written under. It keeps no
+reserve, and it skips the per-record checks, since its limits are the recorded
+ones. It does run under a fresh session ID, which is longer than the one a
+journal recorded before IDs carried a nonce. So the engine has the sink let
+each record pass both caps by the difference, at most `MAX_SESSION_ID_GROWTH`
+(64 bytes), through `JournalSink::allow_session_id_growth`. A replay of a
+journal recorded within that margin of a cap can therefore write a journal
+that passes it, and `journal verify` refuses that journal. The allowance
+covers the session ID's growth only. A replay regenerates other metadata too,
+such as the expiry fields of `sandbox_ready`, which a daemon that newly
+advertises them fills in; that growth has no allowance, so a recording that
+sits at a cap can still pass it during replay, and the replay then ends with a
+journal error. Selecting either policy clears the other's.
 
 Writers and readers also run one `Grammar` over the events. The recorded task
 must pass the engine's task checks and the recorded limits its hard ceilings.

@@ -899,6 +899,10 @@ struct Hooked {
     healths: Arc<AtomicU32>,
     on_create: Arc<CreateHook>,
     on_health: Arc<dyn Fn(u32) + Send + Sync>,
+    /// A create whose hook answers stays pending for one poll first, so an
+    /// answer and a cancellation the hook fires are both ready when the
+    /// engine next looks.
+    answer_after_a_poll: bool,
 }
 
 impl Hooked {
@@ -909,6 +913,7 @@ impl Hooked {
             healths: Arc::default(),
             on_create: Arc::new(|_, _| None),
             on_health: Arc::new(|_| {}),
+            answer_after_a_poll: false,
         }
     }
 
@@ -933,6 +938,9 @@ impl SandboxApi for Hooked {
     async fn create(&self, request: SandboxRequest) -> Result<Sandbox, ApiError> {
         let call = self.creates.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(error) = (self.on_create)(call, &request) {
+            if self.answer_after_a_poll {
+                tokio::task::yield_now().await;
+            }
             return Err(error);
         }
         self.inner.create(request).await
@@ -1572,4 +1580,78 @@ async fn an_unconfirmed_create_outranks_a_failure_to_record_it() {
         record.event,
         AuditEvent::SandboxRecovered { deleted: false, .. }
     )));
+}
+
+// The other ordering: the conflict and cancellation are both ready before
+// the engine polls again, so its biased select takes cancellation first. The
+// ready answer is still read before the RPC is dropped, and nothing is
+// listed or deleted.
+#[tokio::test(start_paused = true)]
+async fn a_conflict_ready_beside_cancellation_still_leaves_the_sandbox_alone() {
+    let fake = FakeApi::keyed(true);
+    let cancel = CancellationToken::new();
+    let mut api = Hooked::new(&fake);
+    api.on_create = conflict_hook(&fake, 1, Some(cancel.clone()));
+    api.answer_after_a_poll = true;
+    let mut harness = api.session();
+    let result = harness.run(&SessionTask::demo(), cancel).await;
+    assert!(matches!(result, Err(HarnessError::Canceled)), "{result:?}");
+    assert_nothing_listed_or_deleted(&fake);
+    assert_eq!(fake.state().creates.len(), 1, "the holder's row survives");
+    assert_eq!(recovered(&harness), Some((Vec::new(), true, 1)));
+    assert_eq!(
+        finished(&harness),
+        ("canceled".to_string(), "canceled".to_string(), true, None)
+    );
+}
+
+// A definite refusal proves only that its own attempt made nothing: after an
+// attempt whose answer was lost, a quota refusal on the retry leaves the
+// create uncertain when recovery finds no row. On the first attempt it still
+// proves absence.
+#[tokio::test(start_paused = true)]
+async fn a_refusal_after_a_lost_answer_leaves_the_create_uncertain() {
+    for refused_on in [1, 2] {
+        let fake = FakeApi::keyed(true);
+        let mut api = Hooked::new(&fake);
+        api.on_create = Arc::new(move |call, _| {
+            if call < refused_on {
+                Some(unavailable())
+            } else {
+                (call == refused_on).then(|| reasoned(Code::ResourceExhausted, "request_id_quota"))
+            }
+        });
+        let mut harness = api.session();
+        let error = harness
+            .run(&SessionTask::demo(), CancellationToken::new())
+            .await
+            .expect_err("refused");
+        assert!(fake.state().deleted.is_empty());
+        if refused_on == 1 {
+            assert!(
+                matches!(&error, HarnessError::Api(e) if e.code == Code::ResourceExhausted),
+                "{error}"
+            );
+            assert_eq!(recovered(&harness), Some((Vec::new(), true, 1)));
+            assert_eq!(finished(&harness).0, "create_failed");
+            assert_eq!(ended_deleted(&harness), Some(true));
+        } else {
+            assert!(
+                matches!(&error, HarnessError::CreateUncertain(e)
+                    if e.code == Code::ResourceExhausted),
+                "{error}"
+            );
+            assert_eq!(recovered(&harness), Some((Vec::new(), false, 2)));
+            assert_eq!(
+                finished(&harness),
+                (
+                    "cleanup_failed".to_string(),
+                    "create_failed".to_string(),
+                    false,
+                    None
+                )
+            );
+            assert_eq!(ended_deleted(&harness), Some(false));
+        }
+    }
 }

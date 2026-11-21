@@ -507,3 +507,52 @@ async fn verify_rejects_completion_beyond_the_recorded_step_limit() {
 
     assert!(!ok, "{stdout}");
 }
+
+// A recorded check's error reason is free text, so `journal verify` prints
+// its `check:` line escaped and on one line, newline and tab included.
+#[tokio::test]
+async fn verify_prints_a_multiline_check_reason_on_one_line() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let path = temp.path().join("checked.jsonl");
+    let task = SessionTask {
+        check: Some(kiln_harness::engine::TaskCheck {
+            script: b"exit 0\n".to_vec(),
+            timeout: Duration::from_secs(5),
+        }),
+        ..SessionTask::demo()
+    };
+    let mut harness = Harness::new(
+        FakeApi::default(),
+        ScriptedProvider::new([ModelResponse::final_text("done")]),
+        MemoryAudit::default(),
+        JsonlJournal::open(&path).expect("journal"),
+        short_lifecycle_config(),
+    );
+    harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("checked session");
+    let journal = read_journal(&path).expect("journal verifies");
+    let mut events: Vec<_> = journal.records.iter().map(|r| r.event.clone()).collect();
+    let checked = events
+        .iter_mut()
+        .find_map(|event| match event {
+            JournalEvent::CheckCompleted { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .expect("check_completed");
+    *checked = kiln_harness::engine::CheckOutcome::Error {
+        reason: "rpc failed\nusage: input 0\tforged".to_string(),
+    };
+    write_journal_lines(&path, &chained_lines(journal.session_id(), events));
+
+    let (ok, stdout) = verify(&path);
+
+    assert!(ok, "{stdout}");
+    assert!(!stdout.contains('\t'), "{stdout:?}");
+    assert!(!stdout.contains("\nusage: input 0\t"), "{stdout}");
+    assert!(
+        stdout.contains("check: error (rpc failed\\u{a}usage: input 0\\u{9}forged)\n"),
+        "{stdout}"
+    );
+}

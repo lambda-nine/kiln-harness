@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -695,7 +696,9 @@ where
                 .reserve_for_session_end(RecordBound::of(&self.config).session_ended),
             // A replay keeps the caps its recording was written under: no
             // reserve, and room for a session ID longer than the recorded
-            // one, so every journal that fit them still replays.
+            // one. The room covers the ID's growth only; other regenerated
+            // metadata, such as expiry fields a daemon newly advertises, can
+            // still push a recording that sits at a cap over it.
             JournalCaps::Replay {
                 recorded_session_id_bytes,
             } => self.journal.allow_session_id_growth(
@@ -807,9 +810,18 @@ where
                 };
                 let recovered_ids = recovery.as_ref().map_or_else(|_| Vec::new(), Clone::clone);
                 let recovered = !recovered_ids.is_empty();
+                // A definite refusal proves only that its own attempt made
+                // nothing. Every retry follows an ambiguous attempt (the
+                // retried codes and the definite refusals are disjoint),
+                // which may still reach kilnd, so a refusal proves absence
+                // only on the first attempt, as a conflict does.
                 let unambiguous = match conflict_proves_absence {
                     Some(proven) => proven,
-                    None => settled || unambiguous_create_error(&error, typed_reasons),
+                    None => {
+                        settled
+                            || (create_attempts == 1
+                                && unambiguous_create_error(&error, typed_reasons))
+                    }
                 };
                 if key_conflict.is_some() {
                     error.message = format!(
@@ -2674,7 +2686,7 @@ pub(crate) enum JournalCaps {
     Fresh,
     /// A replay: no reserve, as before there was one, and each record may
     /// pass the caps by what this session's ID is longer than the
-    /// recording's.
+    /// recording's. Nothing else a replay regenerates has an allowance.
     Replay { recorded_session_id_bytes: usize },
 }
 
@@ -3119,10 +3131,37 @@ async fn create_with_retries<A: SandboxApi>(
             return (Err(CreateStop::Canceled), attempts, None);
         }
         attempts += 1;
+        let polled = AtomicBool::new(false);
+        let create = async {
+            polled.store(true, Ordering::Relaxed);
+            timeout_at(deadline, api.create(request.clone())).await
+        };
+        tokio::pin!(create);
         let result = tokio::select! {
             biased;
-            () = cancel.cancelled() => return (Err(CreateStop::Canceled), attempts, None),
-            result = timeout_at(deadline, api.create(request.clone())) => result,
+            () = cancel.cancelled() => {
+                // The answer and cancellation can both be ready by the time
+                // this runs, and the biased select then takes cancellation.
+                // An answer already there is read before the RPC is dropped,
+                // without waiting, so a conflict still keeps label recovery
+                // away from the key holder's sandbox. An RPC never polled
+                // is not started here.
+                let ready = if polled.load(Ordering::Relaxed) {
+                    create.as_mut().now_or_never()
+                } else {
+                    None
+                };
+                let conflict = match ready {
+                    Some(Ok(Err(error)))
+                        if keyed && error.code == tonic::Code::AlreadyExists =>
+                    {
+                        Some(error)
+                    }
+                    _ => None,
+                };
+                return (Err(CreateStop::Canceled), attempts, conflict);
+            }
+            result = &mut create => result,
         };
         let error = match result {
             // A held sandbox goes to the caller, whose cleanup deletes it by

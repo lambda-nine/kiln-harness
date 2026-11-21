@@ -6,9 +6,11 @@ change the CLI or audit format.
 
 ## Unreleased
 
-- `journal verify` and `replay` print the session ID and every error they
-  report (`invalid:`, `replay failed:`, and `replay`'s `Error:` line, with
-  each source in the chain) escaped and on one line. Control characters,
+- `journal verify` and `replay` print the session ID, the recorded tool set
+  and check result (`tool set:`, `check:`, so a check error's reason), and
+  every error they report (`invalid:`, `replay failed:`, and `replay`'s
+  `Error:` line, with each source in the chain) escaped and on one line;
+  `run` and `demo` print their `check:` line the same way. Control characters,
   newline and tab included, are shown as `\u{..}`, so a crafted journal,
   such as one whose unknown variant name Serde quotes, cannot send escape
   sequences to the terminal or forge an output line. `replay`'s own errors
@@ -31,8 +33,12 @@ change the CLI or audit format.
   no-op by default), so a full journal still closes. A replay keeps no
   reserve and skips the check. Its records may pass both caps by what its
   fresh session ID is longer than the recorded one
-  (`JournalSink::allow_session_id_growth`, at most 64 bytes a record), so
-  every journal that verifies still replays. The HTTP adapters'
+  (`JournalSink::allow_session_id_growth`, at most 64 bytes a record). That
+  allowance covers the session ID only: other metadata a replay regenerates,
+  such as expiry fields a daemon newly advertises in `sandbox_ready`, can
+  still push a recording that sits at a cap over it, and the replay then
+  ends with a journal error. Selecting either policy on a sink clears the
+  other's. The HTTP adapters'
   `max_response_bytes` is now at most, and by default, 4 MiB less 32 KiB
   (was 4 MiB by default, 64 MiB at most), so a response, journaled about
   twice over by the Anthropic adapter, fits one line.
@@ -43,15 +49,28 @@ change the CLI or audit format.
   `session` label only if their nonces collide (about one chance in 2^64).
   A keyed create refused `ALREADY_EXISTS` no longer runs label recovery,
   which could delete the key holder's live sandbox. Nothing is listed or
-  deleted, even when cancellation becomes ready as the refusal arrives. With
-  the typed reason `request_id_conflict` on the first attempt, the session
-  ends `create_failed` (was `cleanup_failed` with `CreateUncertain`), or
-  `canceled`, with an error that says the key is held by another request.
-  After an earlier attempt's answer was lost, or without the typed reason,
-  it ends `CreateUncertain` and `cleanup_failed` with `sandbox_deleted:
-  false`. When absence is unconfirmed, a failure to write the closing audit
+  deleted, even when cancellation is ready as the refusal arrives: an answer
+  already there is read before the request is dropped. With the typed reason
+  `request_id_conflict` on the first attempt, the session ends
+  `create_failed` (was `cleanup_failed` with `CreateUncertain`), with an
+  error that says the key is held by another request; if cancellation
+  coincides, it ends `canceled` with `HarnessError::Canceled`, as any
+  canceled create does. After an earlier attempt's answer was lost, or
+  without the typed reason, it ends `CreateUncertain` and `cleanup_failed`
+  with `sandbox_deleted: false`. Any other definite refusal (such as
+  `RESOURCE_EXHAUSTED`) likewise proves absence only on the first attempt:
+  after a lost answer, a refusal on the retry with no row found by label
+  recovery now ends `CreateUncertain` and `cleanup_failed` with
+  `sandbox_deleted: false` (was `create_failed` with `sandbox_deleted:
+  true`). When absence is unconfirmed, a failure to write the closing audit
   or journal record no longer replaces the `CreateUncertain` or `Cleanup`
   error; it is added to that error's message.
+- When an eval replay leaves its sandbox's deletion unconfirmed, the suite's
+  stop reason (`stopped` in the report and manifest) now carries the
+  replay's error after "the replay's sandbox deletion was not confirmed: ",
+  including any failure to record the outcome that the engine added to it.
+  `eval run` and `eval selftest` print their `stopped early:` line escaped
+  and on one line. The report's fields are unchanged.
 - `HarnessError` has a new variant, `SessionId`, for when the OS cannot supply
   the nonce. `HarnessError` is not `#[non_exhaustive]`, so an exhaustive
   `match` on it must add an arm.

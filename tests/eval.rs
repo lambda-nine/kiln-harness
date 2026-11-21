@@ -2523,6 +2523,8 @@ struct FleetState {
     unconfirmed_deletes: u32,
     /// The sandboxes left unconfirmed.
     unconfirmed: Vec<String>,
+    /// How many sandboxes, in creation order, `unconfirmed_deletes` spares.
+    unconfirmed_from: usize,
     /// Like kilnd's Health lane: at most this many Health calls at once,
     /// each taking `health_delay`; more are refused `RESOURCE_EXHAUSTED`.
     health_cap: Option<u32>,
@@ -2540,6 +2542,7 @@ impl Fleet {
                 reconnects: 0,
                 unconfirmed_deletes: 0,
                 unconfirmed: Vec::new(),
+                unconfirmed_from: 0,
                 health_cap: None,
                 health_delay: Duration::ZERO,
                 health_in_flight: 0,
@@ -2640,7 +2643,14 @@ impl SandboxApi for Fleet {
         let api = self.sandbox(sandbox_id);
         {
             let mut state = self.state();
-            if state.unconfirmed_deletes > 0 && !state.unconfirmed.iter().any(|id| id == sandbox_id)
+            let created = state
+                .sandboxes
+                .iter()
+                .position(|(id, _)| id == sandbox_id)
+                .unwrap_or_default();
+            if state.unconfirmed_deletes > 0
+                && created >= state.unconfirmed_from
+                && !state.unconfirmed.iter().any(|id| id == sandbox_id)
             {
                 state.unconfirmed_deletes -= 1;
                 state.unconfirmed.push(sandbox_id.to_string());
@@ -5145,4 +5155,55 @@ fn compact_at_reaches_the_report_and_comparison_and_older_files_parse() {
     for same in [eval::compare(&new, &new), eval::compare(&older, &older)] {
         assert!(!same.contains("Compaction differs"), "{same}");
     }
+}
+
+// The replay's own cleanup error reaches the stop reason in full, so the
+// report says why its sandbox may remain, not only that it may.
+#[tokio::test]
+async fn an_unconfirmed_replay_cleanup_stops_the_suite_with_its_error() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = one_task(&temp.path().join("tasks"));
+    let out = temp.path().join("out");
+    let api = Fleet::new(out_txt_handler());
+    {
+        let mut state = api.state();
+        state.unconfirmed_deletes = 1;
+        state.unconfirmed_from = 1;
+    }
+    let mut options = at(&out, 2, 1);
+    options.replay = true;
+    let summary = tokio::time::timeout(
+        SUITE_LIMIT,
+        eval::run_suite(
+            &api,
+            &tasks,
+            &options,
+            || {
+                Ok(SideBySide::answering(vec![ModelResponse::final_text(
+                    "done",
+                )]))
+            },
+            &CancellationToken::new(),
+            &mut |_| Ok(()),
+        ),
+    )
+    .await
+    .expect("the suite drains")
+    .expect("the suite stops cleanly");
+
+    let stopped = summary.stopped.clone().expect("stopped");
+    let prefix = "task alpha trial 1: the replay's sandbox deletion was not confirmed: \
+                  sandbox cleanup failed after session outcome: ";
+    assert!(stopped.starts_with(prefix), "{stopped}");
+    assert!(stopped.len() > prefix.len(), "{stopped}");
+    // The run cleaned up; the replay's sandbox was left.
+    assert_eq!(api.lifecycles(), [(1, 1), (1, 0)]);
+    let lines = read_lines(&out.join("results.jsonl"));
+    assert_eq!(lines.len(), 1, "trial 2 never starts");
+    assert_eq!(lines[0].outcome, "completed");
+    assert_eq!(read_manifest(&out).stopped, summary.stopped);
+    assert_eq!(
+        eval::read_report(&out).expect("report").stopped,
+        summary.stopped
+    );
 }

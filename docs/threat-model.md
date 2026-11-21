@@ -106,8 +106,10 @@ it is not a hostile multi-tenant boundary.
   stalled verification is surfaced as unconfirmed cleanup.
 - Create recovery classifies typed gRPC status codes: invalid argument, resource
   exhausted, failed precondition, permission denied, and unauthenticated are
-  definite rejections only after successful recovery listings. Other codes and
-  local transport/protocol failures remain ambiguous without a recovered row,
+  definite rejections only after successful recovery listings, and only on
+  the first create attempt: a retry follows an attempt whose answer was lost,
+  and a refusal says nothing about that attempt. Other codes and local
+  transport/protocol failures remain ambiguous without a recovered row,
   except `UNIMPLEMENTED` with a typed `backend_unsupported:*` reason, which
   kilnd sends before allocating anything.
 - Daemon features are used only when a `SERVING` Health response lists them,

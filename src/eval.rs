@@ -2433,8 +2433,10 @@ where
             match replay_run(api, loaded, &options.base_config, dir, cancel).await {
                 Ok(replayed) => {
                     let mut stops = Vec::new();
-                    if replayed.unconfirmed {
-                        stops.push("the replay's sandbox deletion was not confirmed".to_string());
+                    if let Some(error) = replayed.unconfirmed {
+                        stops.push(format!(
+                            "the replay's sandbox deletion was not confirmed: {error}"
+                        ));
                     }
                     if let Some(error) = replayed.output_error {
                         stops.push(format!("replay outputs: {error}"));
@@ -2506,8 +2508,9 @@ fn known_empty(path: &Path) -> bool {
 struct Replayed {
     /// `matched`, `diverged_turn:<n>`, `diverged_check` or `failed`.
     status: String,
-    /// The replay left a sandbox's deletion unconfirmed.
-    unconfirmed: bool,
+    /// The replay left a sandbox's deletion unconfirmed: its error, with
+    /// any failure to record the outcome that the engine added to it.
+    unconfirmed: Option<String>,
     /// The replay's audit or journal could not be written.
     output_error: Option<String>,
 }
@@ -2523,7 +2526,7 @@ async fn replay_run<A: SandboxApi + Clone>(
     let Ok(provider) = ReplayProvider::from_journal(recorded) else {
         return Ok(Replayed {
             status: "failed".to_string(),
-            unconfirmed: false,
+            unconfirmed: None,
             output_error: None,
         });
     };
@@ -2551,7 +2554,11 @@ async fn replay_run<A: SandboxApi + Clone>(
     };
     Ok(Replayed {
         status,
-        unconfirmed: result.as_ref().is_err_and(cleanup_unconfirmed),
+        unconfirmed: result
+            .as_ref()
+            .err()
+            .filter(|error| cleanup_unconfirmed(error))
+            .map(ToString::to_string),
         output_error: sink_error(&result),
     })
 }
