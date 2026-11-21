@@ -52,24 +52,33 @@ change the CLI or audit format.
   which could delete the key holder's live sandbox. Nothing is listed or
   deleted, even when cancellation is ready as the refusal arrives: an answer
   already there is read before the request is dropped. A `READY` sandbox
-  read that way is held and deleted by ID, with absence verified, rather
-  than dropped for label recovery, which would lose its ID from the audit
-  and leave it behind if listing failed; an attempt still pending is dropped
-  as an in-flight create, as before. With the typed reason
+  read that way that echoes this session's key is held and deleted by ID,
+  then verified absent (or, if listing keeps failing, reported
+  `cleanup_failed` with its ID audited), rather than dropped for label
+  recovery, which would lose its ID from the audit and leave it behind if
+  listing failed. Any other answer read that way, a rejected sandbox or a
+  definite refusal included, is treated like one still pending: the attempt
+  is dropped as an in-flight create, as before, so with no row found the
+  create ends `CreateUncertain`. With the typed reason
   `request_id_conflict` on the first attempt, the session ends
   `create_failed` (was `cleanup_failed` with `CreateUncertain`), with an
   error that says the key is held by another request; if cancellation
   coincides, it ends `canceled` with `HarnessError::Canceled`. After an
-  earlier attempt's answer was lost, or
-  without the typed reason, it ends `CreateUncertain` and `cleanup_failed`
-  with `sandbox_deleted: false`. Any other definite refusal (such as
+  earlier attempt's answer was lost, or without the typed reason, it ends
+  `CreateUncertain` and `cleanup_failed` with `sandbox_deleted: false`. Any other definite refusal (such as
   `RESOURCE_EXHAUSTED`) likewise proves absence only on the first attempt:
   after a lost answer, a refusal on the retry with no row found by label
   recovery now ends `CreateUncertain` and `cleanup_failed` with
   `sandbox_deleted: false` (was `create_failed` with `sandbox_deleted:
-  true`). When absence is unconfirmed, a failure to write the closing audit
-  or journal record no longer replaces the `CreateUncertain` or `Cleanup`
-  error; it is added to that error's message.
+  true`). A settled or rejected `OK` answer (not `READY`, or echoing another
+  key or none) on a retry is held to the same rule. When absence is
+  unconfirmed, a failure to write the closing audit or journal record no
+  longer replaces the `CreateUncertain` or `Cleanup` error; it is added to
+  that error's message.
+- `session_finished.request_id_released` keeps a release a delete reported
+  even when cleanup then cannot confirm absence (was `false`), so it can be
+  `true` beside `sandbox_deleted: false`; the session still ends `Cleanup`
+  and `cleanup_failed`.
 - When an eval replay leaves its sandbox's deletion unconfirmed, the suite's
   stop reason (`stopped` in the report and manifest) now carries the
   replay's error after "the replay's sandbox deletion was not confirmed: ",

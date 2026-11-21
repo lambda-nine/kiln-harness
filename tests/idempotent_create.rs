@@ -1671,7 +1671,9 @@ async fn a_sandbox_ready_beside_cancellation_is_deleted_by_id() {
                     "cleanup_failed".to_string(),
                     "canceled".to_string(),
                     false,
-                    Some(false)
+                    // The delete reported the key released; absence alone
+                    // stays unconfirmed.
+                    Some(true)
                 )
             );
             assert_eq!(ended_deleted(&harness), Some(false));
@@ -1727,5 +1729,122 @@ async fn a_refusal_after_a_lost_answer_leaves_the_create_uncertain() {
             );
             assert_eq!(ended_deleted(&harness), Some(false));
         }
+    }
+}
+
+/// A hook whose earlier calls are lost to `UNAVAILABLE` and whose call
+/// `on` reaches the fake, optionally canceling `cancel` first.
+fn lost_then_answered(on: u32, cancel: Option<CancellationToken>) -> Arc<CreateHook> {
+    Arc::new(move |call, _| {
+        if call == on
+            && let Some(cancel) = &cancel
+        {
+            cancel.cancel();
+        }
+        (call < on).then(unavailable)
+    })
+}
+
+// A READY answer that echoes another key, or none, speaks only for its own
+// attempt. After an attempt whose answer was lost, that one may still reach
+// kilnd, so empty listings leave the create uncertain, whether the answer
+// won the select or was read beside cancellation. On the first attempt the
+// empty listing still proves absence.
+#[tokio::test(start_paused = true)]
+async fn a_rejected_echo_after_a_lost_answer_leaves_the_create_uncertain() {
+    for canceled in [false, true] {
+        for answered_on in [1, 2] {
+            let fake = FakeApi::keyed(true);
+            {
+                let mut state = fake.state();
+                state.suppress_create_record = true;
+                state
+                    .create_script
+                    .push_back(CreateScript::EchoRequestId(String::new()));
+            }
+            let cancel = CancellationToken::new();
+            let mut api = Hooked::new(&fake);
+            api.on_create = lost_then_answered(answered_on, canceled.then(|| cancel.clone()));
+            api.answer_after_a_poll = canceled;
+            let mut harness = api.session();
+            let result = harness.run(&SessionTask::demo(), cancel).await;
+            let case = format!("canceled {canceled}, answered on {answered_on}");
+            let work_outcome = if canceled {
+                "canceled"
+            } else {
+                "create_failed"
+            };
+            assert_eq!(api.creates.load(Ordering::SeqCst), answered_on, "{case}");
+            assert!(fake.state().deleted.is_empty(), "{case}");
+            if answered_on == 1 && !canceled {
+                assert!(
+                    matches!(&result, Err(HarnessError::Api(e)) if e.code == Code::Unknown),
+                    "{case}: {result:?}"
+                );
+                assert_eq!(recovered(&harness), Some((Vec::new(), true, 1)), "{case}");
+                assert_eq!(ended_deleted(&harness), Some(true), "{case}");
+            } else {
+                // Beside cancellation even the first attempt's rejected
+                // answer is treated as one still pending.
+                assert!(
+                    matches!(result, Err(HarnessError::CreateUncertain(_))),
+                    "{case}: {result:?}"
+                );
+                assert_eq!(
+                    recovered(&harness),
+                    Some((Vec::new(), false, answered_on)),
+                    "{case}"
+                );
+                assert_eq!(
+                    finished(&harness),
+                    (
+                        "cleanup_failed".to_string(),
+                        work_outcome.to_string(),
+                        false,
+                        None
+                    ),
+                    "{case}"
+                );
+                assert_eq!(ended_deleted(&harness), Some(false), "{case}");
+            }
+        }
+    }
+}
+
+// Beside cancellation, a settled or rejected sandbox is not held: the
+// attempt is dropped as in flight, and recovery finds the row by its labels,
+// deletes it and verifies absence, so the session ends canceled.
+#[tokio::test(start_paused = true)]
+async fn a_rejected_sandbox_beside_cancellation_is_recovered_and_canceled() {
+    for script in [
+        CreateScript::Settled(SandboxState::Failed, "boot failed".to_string()),
+        CreateScript::EchoRequestId("kiln-harness:another".to_string()),
+    ] {
+        let fake = FakeApi::keyed(true);
+        fake.state().create_script.push_back(script.clone());
+        let cancel = CancellationToken::new();
+        let mut api = Hooked::new(&fake);
+        api.on_create = lost_then_answered(1, Some(cancel.clone()));
+        api.answer_after_a_poll = true;
+        let mut harness = api.session();
+        let result = harness.run(&SessionTask::demo(), cancel).await;
+        let id = "sb-0000000000000001".to_string();
+        assert!(
+            matches!(result, Err(HarnessError::Canceled)),
+            "{script:?}: {result:?}"
+        );
+        assert_eq!(fake.state().deleted, [id.clone()], "{script:?}");
+        assert!(
+            fake.state()
+                .deletes_released
+                .iter()
+                .all(|released| !released)
+        );
+        assert_eq!(recovered(&harness), Some((vec![id], true, 1)), "{script:?}");
+        assert_eq!(
+            finished(&harness),
+            ("canceled".to_string(), "canceled".to_string(), true, None),
+            "{script:?}"
+        );
     }
 }

@@ -110,9 +110,12 @@ it is not a hostile multi-tenant boundary.
   `backend_unsupported:*` reason, which kilnd sends before allocating
   anything. Each proves absence only after successful recovery listings, and
   only on the first create attempt: a retry follows an attempt whose answer
-  was lost, and a refusal says nothing about that attempt. Other codes and
-  local transport/protocol failures remain ambiguous without a recovered
-  row.
+  was lost, and a refusal says nothing about that attempt. A settled or
+  rejected `OK` answer is held to the same first-attempt rule. Other codes
+  and local transport/protocol failures remain ambiguous without a recovered
+  row, except `ALREADY_EXISTS` with the typed reason `request_id_conflict`
+  on the first attempt, which proves that attempt made nothing and skips
+  label recovery, since the labelled sandbox may be the key holder's.
 - Daemon features are used only when a `SERVING` Health response lists them,
   read once per session before create. Typed `kilnd-reason` tokens are read
   only from the metadata entry, only when the daemon lists typed reasons, and
@@ -410,7 +413,10 @@ it is not a hostile multi-tenant boundary.
   so the key is kept: within kilnd's request-record retention such an attempt
   is answered from the retained `DELETED` row and creates nothing. A create
   ended by cancellation or the deadline goes to recovery, which never
-  releases. On legacy kiln a create that crashed before its backend ID was
+  releases, with one exception: a `READY` answer that echoes this session's
+  key and is already there when cancellation wins is held, so the normal
+  cleanup deletes it by ID, verifies its absence, and releases the key under
+  the rules above. On legacy kiln a create that crashed before its backend ID was
   published settles as an ambiguous `FAILED` row that Delete refuses; the
   harness reports it as `cleanup_failed`, never as a clean failure. The key is
   `kiln-harness:<session ID>` and carries no secret.

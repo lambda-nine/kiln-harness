@@ -756,8 +756,11 @@ where
             Ok(sandbox) => sandbox,
             Err(stop) => {
                 // A settled answer names a sandbox kilnd has finished with,
-                // but only the listing proves it absent.
-                let settled = matches!(stop, CreateStop::Settled(..));
+                // but only the listing proves it absent. Like a definite
+                // refusal, it speaks only for its own attempt: after an
+                // earlier attempt whose answer was lost, that one may still
+                // reach kilnd, so it proves nothing on a retry.
+                let settled = matches!(stop, CreateStop::Settled(..)) && create_attempts == 1;
                 // ALREADY_EXISTS on a keyed create, even one cancellation
                 // outran: another request holds this session's key, and
                 // whatever carries this session's labels may be that
@@ -1167,12 +1170,11 @@ where
             release,
         )
         .await;
+        // A release kilnd reported is kept even when absence is not
+        // confirmed; `sandbox_deleted` alone reports absence.
+        let request_id_released = release.then_some(cleanup.request_id_released);
+        let cleanup = cleanup.absence;
         let deleted = cleanup.is_ok();
-        let request_id_released = release.then(|| {
-            cleanup
-                .as_ref()
-                .is_ok_and(|outcome| outcome.request_id_released)
-        });
         let work_outcome = match &body {
             Ok(_) => "completed",
             Err(HarnessError::Canceled) => "canceled",
@@ -3141,29 +3143,16 @@ async fn create_with_retries<A: SandboxApi>(
         let result = tokio::select! {
             biased;
             () = cancel.cancelled() => {
-                // The answer and cancellation can both be ready by the time
-                // this runs, and the biased select then takes cancellation.
-                // So a started RPC is polled once more, without waiting,
-                // before it is dropped. `polled` shows only that the future
-                // ran, not that the request was sent: tonic waits for the
-                // transport before sending, so this read can be what
-                // submits the first Create. Either way, an answer it
-                // completes with is handled below exactly as one that won
-                // the select: a READY sandbox goes to the caller, whose
-                // cleanup deletes it by ID, a conflict keeps label recovery
-                // away from the key holder's sandbox, and any other answer
-                // yields to cancellation. One still pending is dropped as an
-                // in-flight create, as if cancellation had come a moment
-                // later. An RPC never polled is not started here.
-                let ready = if polled.load(Ordering::Relaxed) {
-                    create.as_mut().now_or_never()
-                } else {
-                    None
-                };
-                match ready {
-                    Some(result) => result,
-                    None => return (Err(CreateStop::Canceled), attempts, None),
+                if !polled.load(Ordering::Relaxed) {
+                    // Never started, so not an attempt.
+                    return (Err(CreateStop::Canceled), attempts - 1, None);
                 }
+                let (result, conflict) = answer_beside_cancellation(
+                    create.as_mut().now_or_never(),
+                    keyed,
+                    request.request_id.as_deref(),
+                );
+                return (result, attempts, conflict);
             }
             result = &mut create => result,
         };
@@ -3245,11 +3234,47 @@ async fn create_with_retries<A: SandboxApi>(
     }
 }
 
-/// What a confirmed cleanup reports beside absence.
-#[derive(Debug, Clone, Copy, Default)]
+/// The cancellation arm's last look at a started Create attempt, polled
+/// once more without waiting before it is dropped: the answer and
+/// cancellation can both be ready when the biased select runs, and it then
+/// takes cancellation. That the attempt was polled shows only that its
+/// future ran, not that the request was sent: tonic waits for the transport
+/// before sending, so this read can be what submits the first Create. Only
+/// two answers are kept: a keyed conflict, returned beside `Canceled` so
+/// the caller keeps label recovery away from the key holder's sandbox, and
+/// a READY sandbox [`check_settled`] accepts as this session's (keyed, one
+/// that echoes its key), returned held for the caller's cleanup to delete
+/// by ID. Anything else, a rejected or settled
+/// sandbox, a refusal, a retryable error or the deadline included, is
+/// treated as an answer still pending: `Canceled`, an in-flight create as
+/// if cancellation had come a moment later, so recovery decides cleanup.
+/// That is deliberately conservative: a definite refusal beside
+/// cancellation may end uncertain.
+fn answer_beside_cancellation(
+    ready: Option<Result<Result<Sandbox, ApiError>, Elapsed>>,
+    keyed: bool,
+    request_id: Option<&str>,
+) -> (Result<Sandbox, CreateStop>, Option<ApiError>) {
+    match ready {
+        Some(Ok(Err(error))) if keyed && error.code == tonic::Code::AlreadyExists => {
+            (Err(CreateStop::Canceled), Some(error))
+        }
+        Some(Ok(Ok(sandbox))) => match check_settled(sandbox, request_id) {
+            Ok(sandbox) => (Ok(sandbox), None),
+            Err(_) => (Err(CreateStop::Canceled), None),
+        },
+        _ => (Err(CreateStop::Canceled), None),
+    }
+}
+
+/// How a cleanup went.
+#[derive(Debug)]
 struct CleanupOutcome {
-    /// kilnd confirmed the create's request ID released. Always false when
-    /// release was not asked for.
+    /// Confirmed absence, or the last error when it could not be confirmed.
+    absence: Result<(), ApiError>,
+    /// kilnd confirmed the create's request ID released, whether or not
+    /// absence was then confirmed. Always false when release was not asked
+    /// for.
     request_id_released: bool,
 }
 
@@ -3257,19 +3282,24 @@ struct CleanupOutcome {
 /// With `release`, every delete asks kilnd to release the create's request
 /// ID, and, if none reported it released, up to [`EXTRA_RELEASE_DELETES`]
 /// more are sent once absence is confirmed (a delete that left the row
-/// `DELETING` releases nothing). Release never makes cleanup fail.
+/// `DELETING` releases nothing). Release never makes cleanup fail, and a
+/// release a delete reported is kept even when absence is not confirmed.
 async fn cleanup_sandbox<A: SandboxApi>(
     api: &A,
     sandbox_id: &str,
     deadline: Instant,
     retry_delay: Duration,
     release: bool,
-) -> Result<CleanupOutcome, ApiError> {
+) -> CleanupOutcome {
     let mut last_error = deadline_api("sandbox cleanup deadline expired");
     let mut released = false;
+    let unconfirmed = |error, released| CleanupOutcome {
+        absence: Err(error),
+        request_id_released: released,
+    };
     loop {
         if Instant::now() >= deadline {
-            return Err(last_error);
+            return unconfirmed(last_error, released);
         }
         match timeout_at(deadline, api.delete(sandbox_id, release)).await {
             Ok(Ok(deleted)) => {
@@ -3286,9 +3316,10 @@ async fn cleanup_sandbox<A: SandboxApi>(
                 if release && !released {
                     released = release_after_absence(api, sandbox_id, deadline, retry_delay).await;
                 }
-                return Ok(CleanupOutcome {
+                return CleanupOutcome {
+                    absence: Ok(()),
                     request_id_released: released,
-                });
+                };
             }
             Ok(Ok(_)) => {}
             Ok(Err(error)) => last_error = error,
@@ -3298,7 +3329,7 @@ async fn cleanup_sandbox<A: SandboxApi>(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(last_error);
+            return unconfirmed(last_error, released);
         }
         sleep(retry_delay.min(remaining)).await;
     }
@@ -3366,7 +3397,9 @@ async fn recover_session_sandboxes<A: SandboxApi>(
                 for sandbox in matches {
                     recovered.insert(sandbox.id.clone());
                     // Never release here: the create's outcome was not held.
-                    cleanup_sandbox(api, &sandbox.id, deadline, retry_delay, false).await?;
+                    cleanup_sandbox(api, &sandbox.id, deadline, retry_delay, false)
+                        .await
+                        .absence?;
                 }
             }
             Ok(Err(error)) => last_error = error,

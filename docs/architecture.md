@@ -125,14 +125,19 @@ create: no `request_id`, one attempt, nothing released.
   first. Before dropping a started attempt, the harness polls it once more
   without waiting. That the attempt was started shows only that its future
   ran, not that the request was sent: tonic waits for the transport before
-  sending, so this last poll can be what submits the first Create. If the
-  poll completes, its answer is handled as one that came first: a `READY`
-  sandbox is held, and since the session is canceled before any work, the
-  normal cleanup deletes it by ID and verifies its absence; a conflict skips
-  label recovery as above; any other answer yields to cancellation. If it is
-  still pending, the attempt is dropped as an in-flight create, as if
-  cancellation had come a moment later, and label recovery decides cleanup.
-  The harness does not split the RPC into separate send and receive steps.
+  sending, so this last poll can be what submits the first Create. Only two
+  answers it completes with are kept. A keyed conflict skips label recovery
+  as above. A `READY` sandbox that echoes this session's key, one the settled
+  check below accepts, is held, and since the session is canceled before any
+  work, the normal cleanup deletes it by ID and verifies its absence. Every
+  other answer (a rejected or settled sandbox, a refusal, a retryable error
+  or the deadline) is treated as one still pending: the attempt is dropped as
+  an in-flight create, as if cancellation had come a moment later, and label
+  recovery decides cleanup; with no row found the create is uncertain. This
+  is deliberately conservative: a definite refusal beside cancellation may
+  end `CreateUncertain`. The harness does not split the RPC into separate
+  send and receive steps. An attempt that cancellation outran before its
+  first poll sent nothing and is not counted.
 - **No per-attempt timeout.** An attempt has no client timeout and sends no
   `grpc-timeout`: it runs until it answers, bounded only by the session
   deadline and cancellation, as an unkeyed create always has. So the harness
@@ -170,7 +175,11 @@ create: no `request_id`, one attempt, nothing released.
   `UNKNOWN` for an echo mismatch, with no `kilnd-reason`), work outcome
   `create_failed`. Label recovery runs as for any failed create, and absence is
   what its listing proves, not the state kilnd reported; if recovery cannot
-  confirm it the outcome is `cleanup_failed`. The same check guards an unkeyed
+  confirm it the outcome is `cleanup_failed`. Like a definite refusal, such an
+  answer speaks only for its own attempt: on a retry, after an attempt whose
+  answer was lost, an empty listing proves nothing about that attempt, and
+  the session returns `CreateUncertain` with `cleanup_failed` unless recovery
+  found and deleted a row. The same check guards an unkeyed
   create, which kilnd never answers `OK` without `READY`.
 - **Release.** With `FEATURE_REQUEST_ID_RELEASE` also listed (decided once, at
   session start), the normal cleanup after a `READY` create that took exactly
@@ -189,7 +198,9 @@ create: no `request_id`, one attempt, nothing released.
   was never asked for. A late attempt then finds kilnd's retained `DELETED`
   row and creates nothing. Release never makes cleanup fail: absence is the
   cleanup result, and `session_finished` reports `request_id_released` beside
-  it.
+  it. A release a delete reported is kept even when absence is then never
+  confirmed, so `request_id_released: true` can stand beside
+  `sandbox_deleted: false`.
 
 `sandbox_created` records `request_id` (only when keyed) and `create_attempts`;
 `sandbox_recovered` records `create_attempts`. The journal is unchanged, and a
