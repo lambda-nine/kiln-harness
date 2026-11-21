@@ -6,6 +6,11 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `eval run` and `eval selftest` record the per-turn call cap and refusal
+  limit in `manifest.json` and `report.json` as `max_tool_calls_per_turn`
+  and `max_refused_calls_per_turn`, and `report.md` lists them. Older files
+  lack them and still parse; `eval compare` notes a difference only when
+  both reports recorded it.
 - `journal verify` and `replay` print the session ID and every error they
   report (`invalid:`, `replay failed:`, and `replay`'s `Error:` line, with
   each source in the chain) escaped and on one line. So do `journal

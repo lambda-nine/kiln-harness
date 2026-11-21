@@ -590,6 +590,15 @@ pub struct Manifest {
     /// missing in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Tool calls run per response (`--max-tool-calls-per-turn`); missing
+    /// in older files, where it is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls_per_turn: Option<u32>,
+    /// Calls past that cap answered with an error instead of ending the
+    /// session (`--max-refused-calls-per-turn`), 0 included; missing in
+    /// older files, where it is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_refused_calls_per_turn: Option<u32>,
     /// The tools every run's model had (`--tool-set`): `base`, `coding_v1`
     /// or `coding_v2`. Always written; older files, which had only the base
     /// tools, read as `base`.
@@ -766,6 +775,12 @@ pub struct Report {
     /// As in [`Manifest::max_output_tokens`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// As in [`Manifest::max_tool_calls_per_turn`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls_per_turn: Option<u32>,
+    /// As in [`Manifest::max_refused_calls_per_turn`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_refused_calls_per_turn: Option<u32>,
     /// As in [`Manifest::tool_set`]: `base` for an older report.
     #[serde(default = "base_tool_set")]
     pub tool_set: String,
@@ -988,6 +1003,8 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         clear_thinking: manifest.clear_thinking.clone(),
         compact_at: manifest.compact_at,
         max_output_tokens: manifest.max_output_tokens,
+        max_tool_calls_per_turn: manifest.max_tool_calls_per_turn,
+        max_refused_calls_per_turn: manifest.max_refused_calls_per_turn,
         tool_set: manifest.tool_set.clone(),
         pricing_version: pricing.map(|pricing| pricing.version.clone()),
         unpriced_reason: manifest.unpriced_reason.clone(),
@@ -1087,6 +1104,12 @@ fn write_report_header(text: &mut String, report: &Report) {
     }
     if let Some(tokens) = report.max_output_tokens {
         let _ = writeln!(text, "- Output limit per response: {tokens} tokens");
+    }
+    if let Some(calls) = report.max_tool_calls_per_turn {
+        let _ = writeln!(text, "- Tool calls run per response: {calls}");
+    }
+    if let Some(calls) = report.max_refused_calls_per_turn {
+        let _ = writeln!(text, "- Extra calls refused per response: {calls}");
     }
     let _ = writeln!(text, "- Tool set: {}", cell(&report.tool_set));
     if let Some(stopped) = &report.stopped {
@@ -1425,6 +1448,7 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
              rates and tokens are not directly comparable."
         );
     }
+    write_call_limit_notes(text, base, new);
     if let (Some(base_version), Some(new_version)) = (&base.pricing_version, &new.pricing_version)
         && base_version != new_version
     {
@@ -1434,6 +1458,34 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
             cell(base_version),
             cell(new_version)
         );
+    }
+}
+
+/// Notes a difference in the per-turn call cap or refusal limit, only when
+/// both reports recorded it.
+fn write_call_limit_notes(text: &mut String, base: &Report, new: &Report) {
+    let limits = [
+        (
+            "Tool calls run per response",
+            base.max_tool_calls_per_turn,
+            new.max_tool_calls_per_turn,
+        ),
+        (
+            "Extra calls refused per response",
+            base.max_refused_calls_per_turn,
+            new.max_refused_calls_per_turn,
+        ),
+    ];
+    for (name, base_calls, new_calls) in limits {
+        if let (Some(base_calls), Some(new_calls)) = (base_calls, new_calls)
+            && base_calls != new_calls
+        {
+            let _ = writeln!(
+                text,
+                "\n{name} differ ({base_calls} → {new_calls}); pass rates and tool calls are \
+                 not directly comparable."
+            );
+        }
     }
 }
 
@@ -2213,6 +2265,8 @@ where
             .as_ref()
             .map(|policy| policy.compact_at),
         max_output_tokens: Some(options.base_config.max_output_tokens_per_request),
+        max_tool_calls_per_turn: Some(options.base_config.max_tool_calls_per_turn),
+        max_refused_calls_per_turn: Some(options.base_config.max_refused_calls_per_turn),
         tool_set: options.base_config.tool_set.report_name().to_string(),
         pricing: options.pricing.map(PricingRecord::from),
         unpriced_reason: options.unpriced_reason.clone(),

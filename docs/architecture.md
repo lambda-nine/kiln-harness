@@ -1789,6 +1789,11 @@ files, which could not compact, so `eval compare` notes any difference in
 it, off included. With it, each result line carries `compactions` (omitted
 when 0), and `report.md` adds a "Compactions (mean)" column; without it the
 report is unchanged.
+They also record `max_tool_calls_per_turn` and `max_refused_calls_per_turn`
+(the per-turn call cap and how many calls past it are refused, 0 included),
+absent in older files, where they are unknown, so `eval compare` notes a
+difference only when both reports recorded it; each run's journal records
+them too.
 The manifest and report always record `tool_set` (`base`, `coding_v1` or
 `coding_v2`);
 an older file reads as `base`, the only set it could have used, so `eval

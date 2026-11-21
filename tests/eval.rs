@@ -3281,6 +3281,8 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         clear_thinking: None,
         compact_at: None,
         max_output_tokens: None,
+        max_tool_calls_per_turn: None,
+        max_refused_calls_per_turn: None,
         tool_set: "base".to_string(),
         pricing: None,
         unpriced_reason: None,
@@ -4103,6 +4105,79 @@ fn effort_and_output_limit_reach_the_manifest_report_and_comparison() {
 }
 
 #[test]
+fn per_turn_call_limits_reach_the_manifest_report_and_comparison() {
+    let mut capped = manifest(&["a"], 1);
+    capped.max_tool_calls_per_turn = Some(8);
+    capped.max_refused_calls_per_turn = Some(0);
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let older = eval::report(&runs, &manifest(&["a"], 1));
+    let new = eval::report(&runs, &capped);
+    assert_eq!(
+        (new.max_tool_calls_per_turn, new.max_refused_calls_per_turn),
+        (Some(8), Some(0))
+    );
+
+    // 0 is a setting, not an absence: it is written.
+    let json = serde_json::to_value(&capped).expect("manifest JSON");
+    assert_eq!(
+        (
+            &json["max_tool_calls_per_turn"],
+            &json["max_refused_calls_per_turn"]
+        ),
+        (&json!(8), &json!(0))
+    );
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, capped);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+
+    // Files written before the fields existed have no keys and parse.
+    let unset = serde_json::to_value(&older).expect("report JSON");
+    for key in ["max_tool_calls_per_turn", "max_refused_calls_per_turn"] {
+        assert!(unset.get(key).is_none(), "{unset}");
+    }
+    let parsed: Report = serde_json::from_value(unset).expect("an older report parses");
+    assert_eq!(
+        (
+            parsed.max_tool_calls_per_turn,
+            parsed.max_refused_calls_per_turn
+        ),
+        (None, None)
+    );
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown
+            .contains("- Tool calls run per response: 8\n- Extra calls refused per response: 0\n"),
+        "{markdown}"
+    );
+    let markdown = eval::report_markdown(&older);
+    assert!(!markdown.contains("per response: "), "{markdown}");
+
+    let mut wider = new.clone();
+    wider.max_tool_calls_per_turn = Some(16);
+    wider.max_refused_calls_per_turn = Some(24);
+    let differing = eval::compare(&wider, &new);
+    assert!(
+        differing.contains(
+            "\n\nTool calls run per response differ (16 → 8); pass rates and tool calls are not \
+             directly comparable.\n\nExtra calls refused per response differ (24 → 0); pass \
+             rates and tool calls are not directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    // An older report recorded neither: unknown is not a difference.
+    for same in [
+        eval::compare(&new, &new),
+        eval::compare(&older, &new),
+        eval::compare(&new, &older),
+    ] {
+        assert!(!same.contains("per response differ"), "{same}");
+    }
+}
+
+#[test]
 fn clear_thinking_reaches_the_manifest_report_and_comparison() {
     let mut kept = manifest(&["a"], 1);
     kept.clear_thinking = Some("keep 2".to_string());
@@ -4215,6 +4290,17 @@ async fn runs_start_longest_session_timeout_first_and_report_in_task_order() {
     );
     assert_eq!(read_manifest(&out).effort, None);
     assert_eq!(read_manifest(&out).clear_thinking, None);
+    // And the per-turn call cap and refusal limit it ran with.
+    assert_eq!(
+        (
+            read_manifest(&out).max_tool_calls_per_turn,
+            read_manifest(&out).max_refused_calls_per_turn
+        ),
+        (
+            Some(config().max_tool_calls_per_turn),
+            Some(config().max_refused_calls_per_turn)
+        )
+    );
     let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
     let rows = markdown
         .lines()
