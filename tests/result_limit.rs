@@ -577,3 +577,164 @@ async fn a_cut_exec_result_is_journaled_and_replays_the_same() {
     assert_eq!(replay.provider().diverged_at(), None);
     assert_eq!(results(&replay.journal().records), original);
 }
+
+/// Run each of `turns` as one model response, then answer "done"; return
+/// each call's journaled result by call ID.
+async fn turn_results(
+    api: &FakeApi,
+    config: HarnessConfig,
+    turns: Vec<Vec<ToolCall>>,
+) -> BTreeMap<String, Value> {
+    let task = SessionTask::new(
+        default_system_prompt_for(&config.tool_limits, config.tool_set),
+        "Look at the workspace.",
+    );
+    let mut script: Vec<_> = turns.into_iter().map(ModelResponse::tool_use).collect();
+    script.push(ModelResponse::final_text("done"));
+    let mut harness = Harness::new(
+        api.clone(),
+        ScriptedProvider::new(script),
+        MemoryAudit::default(),
+        MemoryJournal::default(),
+        config,
+    );
+    harness
+        .run(&task, CancellationToken::new())
+        .await
+        .expect("the session completes");
+    results(&harness.journal().records)
+}
+
+/// A name of `len` characters, all `"` or `\` (each two bytes in JSON),
+/// spelling `index` in binary so every name is distinct. Neither is a
+/// control character, so the baseline manifest accepts it.
+fn escaping_name(index: usize, len: usize) -> String {
+    (0..len)
+        .map(|bit| {
+            if bit < usize::BITS as usize && (index >> bit) & 1 == 1 {
+                '\\'
+            } else {
+                '"'
+            }
+        })
+        .collect()
+}
+
+/// A workspace in which the model's first `exec` creates `names`, after
+/// the baseline, as a build or a hostile repository's script could.
+fn naming_api(names: Vec<String>) -> FakeApi {
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(Arc::new(
+        move |_: &[u8], files: &mut BTreeMap<String, Vec<u8>>| {
+            for name in &names {
+                files.insert(format!("/workspace/{name}"), b"x".to_vec());
+            }
+            ShAnswer::exit(0)
+        },
+    ));
+    api
+}
+
+fn make_then(calls: Vec<ToolCall>) -> Vec<Vec<ToolCall>> {
+    vec![
+        vec![call(
+            "make",
+            "exec",
+            json!({"argv": ["/bin/sh", "-s"], "stdin": "make files"}),
+        )],
+        calls,
+    ]
+}
+
+/// What `ls -1Ap` prints for the fake's workspace.
+fn fake_listing(api: &FakeApi) -> String {
+    let state = api.state();
+    let names: Vec<_> = state
+        .files
+        .keys()
+        .filter_map(|path| path.strip_prefix("/workspace/"))
+        .collect();
+    names.join("\n") + "\n"
+}
+
+/// A listing over the bound keeps the start of `ls` output that fits,
+/// marked truncated.
+fn assert_listing_cut(list: &Value, listing: &str, bound: usize) {
+    assert!(encoded(list) <= bound, "{}", encoded(list));
+    assert!(encoded(list) > bound - 16, "{}", encoded(list));
+    assert_eq!(list["ok"], true, "{list}");
+    assert_eq!(list["listing_truncated"], true);
+    let text = list["listing"].as_str().expect("listing");
+    assert!(text.len() > bound / 8, "{}", text.len());
+    assert!(listing.starts_with(text));
+}
+
+#[tokio::test]
+async fn a_list_dir_of_escaping_names_is_cut_to_fit_at_the_lowest_limit() {
+    // 80 names of 127 quotes and backslashes: about 10 KiB raw, so half the
+    // 16 KiB bound in raw bytes encodes to more than the whole bound.
+    let names = (0..80).map(|index| escaping_name(index, 127)).collect();
+    let api = naming_api(names);
+    let results = turn_results(
+        &api,
+        config(ToolSet::Base, MIN),
+        make_then(vec![
+            call("list", "list_dir", json!({"path": "."})),
+            call("diff", "workspace_diff", json!({})),
+        ]),
+    )
+    .await;
+    assert_eq!(results["make"]["ok"], true, "{}", results["make"]);
+    assert_listing_cut(&results["list"], &fake_listing(&api), MIN);
+    // workspace_diff on the same names is cut to fit too.
+    let diff = &results["diff"];
+    assert_eq!(
+        (&diff["ok"], &diff["truncated"]),
+        (&json!(true), &json!(true))
+    );
+}
+
+#[tokio::test]
+async fn a_list_dir_of_escaping_names_is_cut_to_fit_at_the_default() {
+    let bound = 128 << 10;
+    // Quotes and backslashes, which the baseline accepts: a listing over
+    // half the bound whose raw half encodes to about the whole bound. And
+    // control characters a sandbox program can create after the baseline
+    // (`ls` into a pipe prints them raw), six bytes each in JSON.
+    let quoted = (0..600).map(|index| escaping_name(index, 127)).collect();
+    let control = (0..300)
+        .map(|index| format!("{index:03}{}", "\u{1}".repeat(240)))
+        .collect();
+    for names in [quoted, control] {
+        let api = naming_api(names);
+        let results = turn_results(
+            &api,
+            config(ToolSet::CodingV2, bound),
+            make_then(vec![call("list", "list_dir", json!({"path": "."}))]),
+        )
+        .await;
+        assert_eq!(results["make"]["ok"], true, "{}", results["make"]);
+        assert_listing_cut(&results["list"], &fake_listing(&api), bound);
+    }
+}
+
+#[tokio::test]
+async fn a_list_dir_that_fits_is_as_it_was() {
+    // Escaping names that still fit, and plain names cut only by their half.
+    let escaping = (0..40).map(|index| escaping_name(index, 127)).collect();
+    let plain = (0..1000).map(|index| format!("{index:0>100}")).collect();
+    for names in [escaping, plain] {
+        let api = naming_api(names);
+        let results = turn_results(
+            &api,
+            config(ToolSet::Base, MIN),
+            make_then(vec![call("list", "list_dir", json!({"path": "."}))]),
+        )
+        .await;
+        let listing = fake_listing(&api);
+        let end = listing.len().min(MIN / 2);
+        let list = &results["list"];
+        assert_eq!(list["listing"], listing[..end], "{list}");
+        assert_eq!(list["listing_truncated"], listing.len() > end);
+    }
+}

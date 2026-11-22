@@ -74,7 +74,7 @@ through kilnd's Unix-socket API; the harness never invokes `kiln` or a host shel
 | `write_file` | base | Replaces a `/workspace` file with bounded UTF-8 text |
 | `edit_file` | coding | Replaces exact text in a `/workspace` file: one edit as `old_text` and `new_text`, or up to 32 as `edits`, each matching once or with `replace_all`, all applied or none |
 | `search` | coding | Finds lines containing a string, or an extended regex, in the files under a `/workspace` path, as `path:line:text` in path order |
-| `list_dir` | base | Lists entry names in a `/workspace` directory |
+| `list_dir` | base | Lists entry names in a `/workspace` directory; a listing over the result bound is cut to fit, marked truncated |
 | `workspace_diff` | base | Lists files added or removed since the session started; lists over the result bound are cut to fit, with their totals |
 
 `run` and `eval run` take `--tool-set coding` (the default) or

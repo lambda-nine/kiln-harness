@@ -1420,8 +1420,8 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             .await
         {
             Ok(execution) if execution.succeeded() => {
-                let listing =
-                    bounded_text(&execution.stdout.data, self.limits.max_result_bytes / 2);
+                let half = self.limits.max_result_bytes / 2;
+                let listing = bounded_text(&execution.stdout.data, half);
                 let mut run = ToolRun::from_execution(
                     &execution,
                     json!({
@@ -1432,6 +1432,7 @@ impl<A: SandboxApi> ToolSession<'_, A> {
                     true,
                 );
                 run.stdout.truncated |= listing.truncated;
+                fit_listing(&mut run, &execution, half, self.limits.max_result_bytes);
                 run
             }
             Ok(execution) => execution_error(&execution, "list_failed"),
@@ -2293,7 +2294,6 @@ fn fit_exec_output(
     text_limit: usize,
     max_result_bytes: usize,
 ) {
-    let encoded_size = |value: &Value| serde_json::to_vec(value).map_or(usize::MAX, |b| b.len());
     if encoded_size(&run.result) <= max_result_bytes {
         return;
     }
@@ -2334,6 +2334,44 @@ fn fit_exec_output(
             evidence.truncated = true;
         }
     }
+}
+
+/// Cut a `list_dir` listing, already at most `text_limit` raw bytes (half
+/// the bound), so the result fits `max_result_bytes` as JSON, as
+/// [`fit_exec_output`] cuts a stream: names heavy with quotes, backslashes
+/// or control bytes can encode to more than the whole bound, and the
+/// listing then keeps the start of its text that fits, marked truncated. A
+/// result that fits is left exactly as it was.
+fn fit_listing(
+    run: &mut ToolRun,
+    execution: &Execution,
+    text_limit: usize,
+    max_result_bytes: usize,
+) {
+    if encoded_size(&run.result) <= max_result_bytes {
+        return;
+    }
+    let Value::Object(result) = &mut run.result else {
+        return;
+    };
+    // The raw bytes the listing was decoded from.
+    let raw = &execution.stdout.data[..execution.stdout.data.len().min(text_limit)];
+    result.insert("listing".to_string(), Value::String(String::new()));
+    result.insert("listing_truncated".to_string(), Value::Bool(true));
+    // Everything else, with the listing as "" (two bytes, which the budget
+    // counts again).
+    let fixed = encoded_size(&Value::Object(result.clone()));
+    let budget = max_result_bytes.saturating_sub(fixed).saturating_add(2);
+    let end = coding::json_fitting_prefix(raw, budget);
+    let text = String::from_utf8_lossy(&raw[..end]).into_owned();
+    result.insert("listing".to_string(), Value::String(text));
+    run.stdout.truncated = true;
+}
+
+/// The bytes `value` encodes to as compact JSON, as [`ToolRun::bounded`]
+/// measures it.
+fn encoded_size(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 fn execution_error(execution: &Execution, kind: &str) -> ToolRun {

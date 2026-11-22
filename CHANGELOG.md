@@ -6,6 +6,12 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- A `list_dir` listing whose names escape past the tool result bound
+  (quotes, backslashes, control bytes a sandbox program wrote) is cut to
+  fit instead of being refused whole as `tool_result_too_large`, as `exec`
+  output and `workspace_diff` lists are: it keeps the start of its text
+  that fits, with `listing_truncated` set. A listing that fits is
+  unchanged.
 - `ignore-match` gains 4 hidden cases; results are not comparable with
   earlier runs. They test rules the spec states outright and none of its
   worked examples exercises: an anchored lone `/**` matches one segment, a segment of
