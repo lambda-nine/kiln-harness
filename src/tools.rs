@@ -2369,15 +2369,19 @@ fn fit_listing(
     // The raw bytes the listing was decoded from.
     let raw = &execution.stdout.data[..execution.stdout.data.len().min(text_limit)];
     result.insert("listing".to_string(), Value::String(String::new()));
-    result.insert("listing_truncated".to_string(), Value::Bool(true));
     // Everything else, with the listing as "" (two bytes, which the budget
-    // counts again).
+    // counts again) and its flag as it was, as `fit_exec_output` measures:
+    // a result over the bound is then always cut, and turning the flag
+    // true only shortens it.
     let fixed = encoded_size(&Value::Object(result.clone()));
     let budget = max_result_bytes.saturating_sub(fixed).saturating_add(2);
     let end = coding::json_fitting_prefix(raw, budget);
     let text = String::from_utf8_lossy(&raw[..end]).into_owned();
     result.insert("listing".to_string(), Value::String(text));
-    run.stdout.truncated = true;
+    if end < raw.len() {
+        result.insert("listing_truncated".to_string(), Value::Bool(true));
+        run.stdout.truncated = true;
+    }
 }
 
 /// The bytes `value` encodes to as compact JSON, as [`ToolRun::bounded`]

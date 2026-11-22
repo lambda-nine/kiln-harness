@@ -818,3 +818,70 @@ async fn a_whole_file_read_through_a_symlink_that_is_cut_says_so() {
         assert_eq!(read["truncated"], true, "{tool_set:?}");
     }
 }
+
+/// The `list_dir` result for a listing within half the bound, as it was
+/// before listings were cut to fit.
+fn whole_list_result(listing: &str) -> Value {
+    json!({"ok": true, "listing": listing, "listing_truncated": false})
+}
+
+/// Names whose `ls` listing is at most half `bound` raw bytes, so only the
+/// fit can cut it, and whose whole `list_dir` result encodes to exactly
+/// `target` bytes.
+fn names_encoding_to(bound: usize, target: usize) -> Vec<String> {
+    let listing_of = |names: &[String]| {
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        sorted.join("\n") + "\n"
+    };
+    let base: Vec<String> = (0..bound / 2 / 128 - 1)
+        .map(|index| escaping_name(index, 127))
+        .collect();
+    for quotes in 0..=250 {
+        let mut names = base.clone();
+        names.push(format!("z{}", "\"".repeat(quotes)));
+        let size = encoded(&whole_list_result(&listing_of(&names)));
+        let Some(plain) = target.checked_sub(size) else {
+            continue;
+        };
+        if listing_of(&names).len() + plain > bound / 2 || 1 + quotes + plain > 255 {
+            continue;
+        }
+        names.pop();
+        names.push(format!("z{}{}", "\"".repeat(quotes), "a".repeat(plain)));
+        let listing = listing_of(&names);
+        assert!(listing.len() <= bound / 2);
+        assert_eq!(encoded(&whole_list_result(&listing)), target);
+        return names;
+    }
+    panic!("no listing of {target} bytes for {bound}");
+}
+
+/// `list_dir` after the model's `exec` has created `names`.
+async fn listed(names: Vec<String>, bound: usize) -> (Value, String) {
+    let api = naming_api(names);
+    let results = turn_results(
+        &api,
+        config(ToolSet::Base, bound),
+        make_then(vec![call("list", "list_dir", json!({"path": "."}))]),
+    )
+    .await;
+    (results["list"].clone(), fake_listing(&api))
+}
+
+#[tokio::test]
+async fn a_list_dir_one_byte_over_the_limit_is_cut_and_says_so() {
+    // Whole, the result would be one byte over: its flag as `true` would
+    // fit, but the listing is cut by a character and marked.
+    for bound in [MIN, 128 << 10, MAX] {
+        let (list, listing) = listed(names_encoding_to(bound, bound + 1), bound).await;
+        assert!(encoded(&list) <= bound, "{bound}");
+        assert_eq!(list["ok"], true, "{bound}");
+        let text = list["listing"].as_str().expect("listing");
+        assert!(
+            text.len() < listing.len() && listing.starts_with(text),
+            "{bound}"
+        );
+        assert_eq!(list["listing_truncated"], true, "{bound}");
+    }
+}
