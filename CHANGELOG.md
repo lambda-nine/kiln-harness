@@ -6,6 +6,13 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- `ignore-match` gains 4 hidden cases; results are not comparable with
+  earlier runs. They test rules the spec states outright and none of its
+  worked examples exercises: an anchored lone `/**` matches one segment, a segment of
+  three stars is not `**`, a range whose start is above its end covers
+  nothing, and the error line names RULES exactly as given, backslash
+  included. Each comes with a `fail-*` overlay that is wrong in that way
+  only.
 - The `ignore-match` hard task's rules spec now says that a comment line is
   skipped even when it ends in a backslash. It used to say both that such a
   line is invalid and that a comment is skipped whatever it contains, and

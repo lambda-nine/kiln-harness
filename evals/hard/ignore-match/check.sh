@@ -208,4 +208,33 @@ if [ "$?" != 2 ] || [ -s "$C/out" ]; then
   echo "case $n"
   exit 1
 fi
+
+# A lone ** in an anchored rule matches one segment, like /*.
+printf '/**\n!a/\n' >"$C/rules"
+printf 'a/b\na/\nc\nd/e\n' >"$C/in"
+printf 'c\nd/e\n' >"$C/want"
+t
+
+# A segment of three stars is not exactly **: it stays in one segment.
+echo 'a/***/b' >"$C/rules"
+printf 'a/b\na/x/b\na/x/y/b\n' >"$C/in"
+printf 'a/x/b\n' >"$C/want"
+t
+
+# A range whose start is above its end covers nothing.
+printf 'x[z-a]y\n*.k\n' >"$C/rules"
+printf 'xay\nxzy\nxmy\nx-y\na.k\n' >"$C/in"
+printf 'a.k\n' >"$C/want"
+t
+
+# The error names RULES exactly as given, backslash included.
+n=$((n + 1))
+printf 'ok\n[x\n' >"$C/r\\t"
+printf 'a\n' >"$C/in"
+printf 'r\\t:2: bad pattern\n' >"$C/want"
+(cd "$C" && sh /workspace/ignored.sh 'r\t') <"$C/in" >"$C/out" 2>"$C/err"
+if [ "$?" != 3 ] || [ -s "$C/out" ] || ! cmp -s "$C/err" "$C/want"; then
+  echo "case $n"
+  exit 1
+fi
 rm -rf /workspace/.check
