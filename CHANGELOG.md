@@ -25,7 +25,8 @@ change the CLI or audit format.
 
 - Bring the README's introduction in step with the coding default: `run` and
   `eval run` give the model seven tools unless `--tool-set base` is passed,
-  not five. No behaviour changes.
+  not five; `demo` and the library's default keep the five base tools. No
+  behaviour changes.
 
 - `scripts/integration-vm.sh`'s clean-runs check skips kiln's
   `/var/lib/kiln/runs/.checkpoints`, which kiln creates on the first
