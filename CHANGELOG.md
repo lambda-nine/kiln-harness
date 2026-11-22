@@ -22,6 +22,16 @@ change the CLI or audit format.
   output and `workspace_diff` lists are: it keeps the start of its text
   that fits, with `listing_truncated` set. A listing that fits is
   unchanged.
+
+- Bring the README's introduction in step with the coding default: `run` and
+  `eval run` give the model seven tools unless `--tool-set base` is passed,
+  not five. No behaviour changes.
+
+- `scripts/integration-vm.sh`'s clean-runs check skips kiln's
+  `/var/lib/kiln/runs/.checkpoints`, which kiln creates on the first
+  checkpoint capture and never removes, so the check no longer fails on a VM
+  where anything has captured a checkpoint.
+
 - `ignore-match` gains 4 hidden cases; results are not comparable with
   earlier runs. They test rules the spec states outright and none of its
   worked examples exercises: an anchored lone `/**` matches one segment, a segment of

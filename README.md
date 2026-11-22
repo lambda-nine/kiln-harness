@@ -3,10 +3,10 @@
 A provider-neutral agent loop for running tool calls in
 [kiln](https://github.com/lambda-nine/kiln) sandboxes. It talks only to
 [kilnd](https://github.com/lambda-nine/kilnd)'s `kilnd.v1` gRPC API over a Unix
-socket: one no-network sandbox per session, five typed tools, multi-call model
-turns, hard budgets, a metadata-only audit log, a content-bearing session
-journal that replays deterministically, and verified sandbox deletion after
-every session.
+socket: one no-network sandbox per session, seven typed tools (five with
+`--tool-set base`), multi-call model turns, hard budgets, a metadata-only audit
+log, a content-bearing session journal that replays deterministically, and
+verified sandbox deletion after every session.
 
 **Status: experimental.** Besides a deterministic scripted provider, which
 needs no model account, API key or network access, it has two live
@@ -51,8 +51,10 @@ cargo run --locked -- demo --audit audit/demo.jsonl
 
 ## Overview
 
-The smallest useful provider-neutral agent loop over `kilnd.v1`. It creates one no-network sandbox per session, exposes five typed tools
-(`exec`, `read_file`, `write_file`, `list_dir`, and `workspace_diff`), runs
+The smallest useful provider-neutral agent loop over `kilnd.v1`. It creates one no-network sandbox per session, exposes typed tools
+(`exec`, `read_file`, `write_file`, `list_dir`, and `workspace_diff`, plus
+`edit_file`, `search` and line ranges in `read_file` in the default coding
+set; see [Tools](#tools)), runs
 model turns that may request several tool calls at once, applies hard
 step/call/per-turn/token/input/output/deadline budgets, writes a metadata-only
 append-only JSONL audit with host-generated call correlation IDs, records a
