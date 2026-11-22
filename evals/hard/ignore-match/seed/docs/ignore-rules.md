@@ -26,15 +26,16 @@ on its own, in these steps:
    any special meaning described below and is matched as itself. `\\` is a
    literal backslash, `\*` a literal `*`, `\ ` a literal space. `\/` counts
    as a plain `/` everywhere below. A backslash at the very end of the line
-   (after step 2) has nothing to escape, and the line is invalid.
+   (after step 2) has nothing to escape, and the line is invalid, unless
+   step 3 skips it as a comment.
 2. **Trailing spaces.** Spaces at the end of the line are removed, one by
    one, up to the first one that is escaped. So `a  ` becomes `a`, and
    `a\ ` and `a\  ` both become `a\ `, the name `a` followed by one space.
    Only spaces are removed this way; tabs are kept.
 3. **Blank lines and comments.** A line that is now empty is skipped. A
    line whose first character is an unescaped `#` is a comment and is
-   skipped, whatever else it contains. A line starting with `\#` is a pattern starting with a literal
-   `#`.
+   skipped, whatever else it contains, even a backslash at the very end.
+   A line starting with `\#` is a pattern starting with a literal `#`.
 4. **Negation.** If the first character is an unescaped `!`, the rule is a
    *negation* and the `!` is removed. A line starting with `\!` is a
    pattern starting with a literal `!`.
@@ -147,7 +148,8 @@ Errors, checked before any path is read or printed:
 - If RULES cannot be read, print nothing on standard output and exit with
   status 2.
 - If a line of RULES is invalid (an unterminated class, a backslash at the
-  end of the line, or nothing left of the pattern), print nothing on
-  standard output, print exactly one line `RULES:LINE: bad pattern` on
-  standard error, with RULES exactly as given on the command line and LINE
-  the number of the first invalid line, and exit with status 3.
+  end of a line that is not a comment, or nothing left of the pattern),
+  print nothing on standard output, print exactly one line
+  `RULES:LINE: bad pattern` on standard error, with RULES exactly as given
+  on the command line and LINE the number of the first invalid line, and
+  exit with status 3.

@@ -6,6 +6,13 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- The `ignore-match` hard task's rules spec now says that a comment line is
+  skipped even when it ends in a backslash. It used to say both that such a
+  line is invalid and that a comment is skipped whatever it contains, and
+  hidden check case 27 expected the second reading. Every recorded failure
+  of the task was that case. The check, its cases and the solution are
+  unchanged apart from the pinned hash of the seed docs. `ignore-match`
+  results from before this change are not comparable with later ones.
 - The tested kiln pin moves to `7b6a477`, which `scripts/integration-vm.sh`
   requires. That kiln refuses invalid create input before allocating
   anything; the harness's sandbox spec is within its limits. The minimum

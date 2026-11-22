@@ -5,7 +5,7 @@ rm -rf /workspace/.check && mkdir /workspace/.check || exit 2
 C=/workspace/.check
 [ -f ignored.sh ] || exit 1
 [ "$(find docs examples | sort | tr '\n' ' ')" = "docs docs/ignore-rules.md examples examples/paths examples/rules " ] || exit 1
-[ "$(for f in $(find docs examples -type f | sort); do sha256sum "$f" | cut -d ' ' -f 1; done | sha256sum | cut -d ' ' -f 1)" = "87ee7c193cc204f89e29b244776f2efac3aed164b1cf7401fec617ab0c9dab85" ] || exit 1
+[ "$(for f in $(find docs examples -type f | sort); do sha256sum "$f" | cut -d ' ' -f 1; done | sha256sum | cut -d ' ' -f 1)" = "9a3cc38ba3bdbdc3cc5b3f3abe94e040dc726a365c244653a3c47dd777f41af3" ] || exit 1
 n=0
 
 # t: run the program from $C on the rules file `rules` with $C/in on
