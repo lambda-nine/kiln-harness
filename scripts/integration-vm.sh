@@ -4,7 +4,7 @@ set -eu
 # The kiln pins in README.md's "Pinned control plane" section; keep both
 # equal to it. The installed kiln must be a clean build of TESTED_KILN.
 # MINIMUM_KILN, the first kiln with exec options, is documentation only.
-TESTED_KILN=00f4b008dbf20d8bab70da56f125fa2b0974505d
+TESTED_KILN=dbcbfd8c1a028f926e1bd4502b053596a0466d97
 MINIMUM_KILN=5cada841edd0bbe112550816fad221dfb1db6a47
 
 # The Linux ACL tests skip without these tools; this run must not. Install

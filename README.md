@@ -95,7 +95,7 @@ with the model's text as one argument or as stdin; see
 
 ## Pinned control plane
 
-- kiln, tested: `00f4b008dbf20d8bab70da56f125fa2b0974505d`. The integration
+- kiln, tested: `dbcbfd8c1a028f926e1bd4502b053596a0466d97`. The integration
   run requires exactly this kiln.
 - kiln, minimum: `5cada841edd0bbe112550816fad221dfb1db6a47`, the first kiln
   with exec options (capability bit `0x20`); without them kilnd lists neither

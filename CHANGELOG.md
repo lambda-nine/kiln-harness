@@ -101,11 +101,12 @@ change the CLI or audit format.
   of the task was that case. The check, its cases and the solution are
   unchanged apart from the pinned hash of the seed docs. `ignore-match`
   results from before this change are not comparable with later ones.
-- The tested kiln pin moves to `00f4b00`, which `scripts/integration-vm.sh`
+- The tested kiln pin moves to `dbcbfd8`, which `scripts/integration-vm.sh`
   requires. Since `7b6a477`, kiln refuses invalid create input before
-  allocating anything, and from `00f4b00` it also counts a run's writable
-  directories against its inode quota; the harness's sandbox spec is within
-  its limits. The minimum stays `5cada84`.
+  allocating anything, from `00f4b00` it also counts a run's writable
+  directories against its inode quota, and `dbcbfd8` hardens its create
+  and network cleanup paths; the harness's sandbox spec is within its
+  limits. The minimum stays `5cada84`.
 - `run` and `eval run` default to `--tool-set coding`: the model gets
   `edit_file`, `search` and line ranges in `read_file` unless
   `--tool-set base` is passed, which gives exactly the earlier default
