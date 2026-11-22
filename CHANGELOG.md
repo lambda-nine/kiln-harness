@@ -66,9 +66,10 @@ change the CLI or audit format.
   which the default system prompt states in KiB and the journal records.
   Lowering it lets a long session with many calls fit the journal's 64 MiB
   file cap. A whole-file `read_file` under a limit below its read size
-  returns the start that fits as JSON, marked truncated, where it would
-  have been refused as `tool_result_too_large`; at the default limits
-  nothing changes. `eval run` and `eval selftest` record the limit in
+  reads no more than fits and returns the start that fits as JSON,
+  marked truncated, where it would have been refused as
+  `tool_result_too_large`; a read at any limit whose content escapes past
+  it is cut too (see above). `eval run` and `eval selftest` record the limit in
   `manifest.json` and `report.json` as `max_result_bytes`, `report.md`
   lists it, and `eval compare` notes a difference only when both reports
   recorded it.
