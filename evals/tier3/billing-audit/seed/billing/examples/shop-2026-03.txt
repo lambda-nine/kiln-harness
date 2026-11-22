@@ -1,0 +1,15 @@
+invoice acme 2026-03-15 2026-04-15
+fee metered 5.00
+usage 100 at 0.10 10.00
+usage 50 at 0.08 4.00
+discount 10% -1.90
+total 17.10
+invoice birch 2026-03-03 2026-04-03
+fee bulk 20.00
+usage 1950 at 0.03 58.50
+credit 2026-03-01 -5.00
+total 73.50
+invoice cedar 2026-03-01 2026-04-01
+fee basic 12.00
+discount fixed -5.00
+total 7.00

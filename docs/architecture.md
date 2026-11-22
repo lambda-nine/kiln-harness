@@ -1494,7 +1494,11 @@ journal replays with every execution unary, and needs no `EXEC_STREAM`. A legacy
 replays with cwd `""` and env `[]`, so its tools behave as recorded, and
 expects kilnd's metadata to be empty too. `check_completed` holds the check's outcome, its execution ID and at
 most 4 KiB of each output stream, after the final `model_responded` and
-before `session_ended`.
+before `session_ended`, and, when the check ran, `stdout_complete`: whether
+the stdout it holds is every byte the check wrote (kilnd kept all of it, it
+is UTF-8 and it fit the 4 KiB). The field is left out when the check gave
+no output to judge, so an older journal, which never has it, reads and
+re-encodes to the same bytes and keeps its hashes.
 
 The journal and the audit share one opener. It refuses a path whose raw bytes
 are empty, end in `/`, or end in `.` or `..`, resolves the parent once to an
@@ -1818,6 +1822,28 @@ every run recorded them, `report.md` gives them on one line ("Tool calls by
 name: ...; failed N", or "unknown"), and `eval compare` shows each side's
 when both know them.
 `truncation_recoveries` is always written, and a line without it reads as 0.
+A graded check prints one line of case counts as its whole stdout (`cases N
+of N`, `cases P of N failed I,J,K` or `cases 0 of N failed all`; see
+`evals/README.md`). When the line parses and agrees with the exit code of a
+check that exited on its own (`passed`, or `failed` with an exit code and
+not by its timeout), and the record says its stdout is complete
+(`stdout_complete`), the result line carries it as `check_cases`, taken
+from the journal's `check_completed` record; never for `error`, a timeout
+or a verdict cancellation replaced, nor for stdout kilnd cut or whose length
+it did not know, nor from an older journal, which does not say. A task
+whose `task.json` gives `cases` scores only a line counting that many. A
+check reports at most 128 cases, which keeps `results.jsonl` and
+`report.json` within what `eval cost` and `eval compare` read at the most
+tasks and trials. Replay compares the check's verdict and exit status, not
+its case counts, so a `matched` replay does not show that a score
+reproduces: compare the two runs' `check_cases` for that. Each task in the report then has a
+`case_score` (runs with cases, cases passed and run, runs that failed each
+case, runs that failed all), `report.md` adds a "Cases" column and a "Failed
+cases" list, and `eval compare` adds the case score from base to new beside
+the pass rate. Without any, the report and comparison are unchanged, and a
+file without the fields reads as having none. The manifest and report also
+record `max_total_input_tokens`, each run's input token limit; an older file
+does not, so `eval compare` notes a difference only when both recorded it.
 With `--replay`, a completed run is replayed against a fresh sandbox right
 after it, on the same connection. The suite fails closed: a run or replay
 whose sandbox deletion was not confirmed (`cleanup_failed`, `Cleanup` or

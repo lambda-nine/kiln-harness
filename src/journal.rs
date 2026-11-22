@@ -138,6 +138,11 @@ pub enum JournalEvent {
         execution_id: Option<String>,
         stdout: String,
         stderr: String,
+        /// Whether `stdout` is the check's whole stdout (see
+        /// [`crate::tools::CheckRun::stdout_complete`]); missing when the
+        /// check gave no output to judge, and in older journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout_complete: Option<bool>,
     },
     SessionEnded {
         /// `cleanup_failed` whenever sandbox deletion could not be confirmed

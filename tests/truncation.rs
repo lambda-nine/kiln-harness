@@ -671,6 +671,7 @@ async fn a_discarded_turn_runs_no_tool_and_ends_no_session_successfully() {
         execution_id: None,
         stdout: String::new(),
         stderr: String::new(),
+        stdout_complete: None,
     });
     checked.push(ended_after(&checked, "failed", None, 1));
     assert_rejected_because(

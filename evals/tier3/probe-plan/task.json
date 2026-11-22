@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "probe-plan",
+  "description": "Choose a first probe that identifies an unknown device revision in as few probes as possible in the worst case.",
+  "check_timeout_secs": 180,
+  "cases": 24,
+  "session_timeout_secs": 1500,
+  "max_steps": 80,
+  "max_tool_calls": 160
+}

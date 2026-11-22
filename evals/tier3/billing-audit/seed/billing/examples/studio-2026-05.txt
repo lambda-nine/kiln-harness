@@ -1,0 +1,11 @@
+invoice ivy 2026-05-10 2026-06-10
+fee team 25.00
+usage 50 at 0.50 25.00
+usage 15 at 0.25 3.75
+discount fixed -10.00
+total 43.75
+invoice kite 2026-05-01 2026-06-01
+fee team 25.00
+discount 20% -5.00
+credit 2026-04-20 -20.00
+total 0.00

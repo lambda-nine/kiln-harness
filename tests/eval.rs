@@ -364,6 +364,207 @@ fn host_sh(script: &str) -> bool {
     child.wait().expect("wait").success()
 }
 
+/// What a script run as [`host_sh`] runs it printed, and how it exited.
+struct HostRun {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    /// It ran past its deadline, and its process group was killed.
+    timed_out: bool,
+}
+
+/// What of a [`host_sh_output`] run has finished so far.
+#[derive(Default)]
+struct Ends {
+    status: Option<std::process::ExitStatus>,
+    out: Option<std::io::Result<Vec<u8>>>,
+    err: Option<std::io::Result<Vec<u8>>>,
+    wrote: Option<std::io::Result<()>>,
+}
+impl Ends {
+    fn all(&self) -> bool {
+        self.status.is_some() && self.out.is_some() && self.err.is_some() && self.wrote.is_some()
+    }
+}
+
+/// [`host_sh`], keeping the script's stdout, stderr and exit code, and
+/// killing its whole process group if it hasn't exited and closed its
+/// output within `limit`. The script
+/// reaches `sh` through a pipe, as it does in a sandbox. It mustn't be a
+/// regular file: bash, before giving a forked child a new stdin, seeks the
+/// shared offset back to where that child's copy had read up to, and the
+/// parent then reads and runs part of the script again. A script that
+/// exits before `sh` has read all of it closes the pipe, and the writer's
+/// broken pipe is ignored.
+fn host_sh_output(script: &str, limit: Duration) -> HostRun {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut child = Command::new("/bin/sh")
+        .arg("-s")
+        .current_dir("/")
+        .process_group(0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn /bin/sh");
+    let written = {
+        let mut stdin = child.stdin.take().expect("stdin");
+        let script = script.as_bytes().to_vec();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Dropping stdin afterwards closes the pipe, so sh sees the end.
+            let _ = sender.send(std::io::Write::write_all(&mut stdin, &script));
+        });
+        receiver
+    };
+    let read = |mut stream: Box<dyn std::io::Read + Send>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = sender.send(stream.read_to_end(&mut bytes).map(|_| bytes));
+        });
+        receiver
+    };
+    let stdout = read(Box::new(child.stdout.take().expect("stdout")));
+    let stderr = read(Box::new(child.stderr.take().expect("stderr")));
+    // One deadline covers the shell's exit, the writer and both streams'
+    // ends: a script that exits but leaves something holding its output
+    // open has not finished. Past it, the group is killed, and the 10 s
+    // after that are only for what was killed to let go of the pipes.
+    let deadline = std::time::Instant::now() + limit;
+    let mut ends = Ends::default();
+    let poll = |child: &mut std::process::Child, ends: &mut Ends| {
+        if ends.status.is_none() {
+            ends.status = child.try_wait().expect("wait");
+        }
+        if ends.out.is_none() {
+            ends.out = stdout.try_recv().ok();
+        }
+        if ends.err.is_none() {
+            ends.err = stderr.try_recv().ok();
+        }
+        if ends.wrote.is_none() {
+            ends.wrote = written.try_recv().ok();
+        }
+    };
+    let mut timed_out = false;
+    loop {
+        poll(&mut child, &mut ends);
+        if ends.all() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if timed_out {
+        let group = rustix::process::Pid::from_child(&child);
+        // Already gone is fine; anything else leaves processes behind.
+        if let Err(error) =
+            rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+            && error != rustix::io::Errno::SRCH
+        {
+            panic!("kill the check's process group: {error}");
+        }
+        if ends.status.is_none() {
+            ends.status = Some(child.wait().expect("wait"));
+        }
+        // Something that left the group can hold the streams open still;
+        // the run has timed out either way.
+        let cleanup = std::time::Instant::now() + Duration::from_secs(10);
+        while !ends.all() && std::time::Instant::now() < cleanup {
+            std::thread::sleep(Duration::from_millis(20));
+            poll(&mut child, &mut ends);
+        }
+    }
+    // Only a script that stopped reading early may break the writer's pipe
+    // (or one killed at its deadline).
+    if let Some(Err(error)) = &ends.wrote
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("write the script: {error}")
+    }
+    let bytes = |slot: Option<std::io::Result<Vec<u8>>>| match slot {
+        Some(Ok(bytes)) => bytes,
+        Some(Err(error)) => panic!("read the script's output: {error}"),
+        None => Vec::new(),
+    };
+    let (stdout, stderr) = (bytes(ends.out), bytes(ends.err));
+    HostRun {
+        stdout: if timed_out {
+            String::from_utf8_lossy(&stdout).into_owned()
+        } else {
+            String::from_utf8(stdout).expect("UTF-8 stdout")
+        },
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code: ends.status.and_then(|status| status.code()),
+        timed_out,
+    }
+}
+
+#[test]
+fn a_host_script_may_exit_before_reading_all_of_itself() {
+    let script = format!("echo early\nexit 3\n{}", "# padding\n".repeat(10_000));
+    assert!(script.len() > 64 << 10);
+    let run = host_sh_output(&script, Duration::from_secs(30));
+    assert_eq!(
+        (run.stdout.as_str(), run.exit_code, run.timed_out),
+        ("early\n", Some(3), false)
+    );
+}
+
+#[test]
+fn a_host_script_that_forks_runs_each_of_its_lines_once() {
+    // Each child gets a new stdin, which on a seekable script makes bash
+    // read part of it again.
+    let script = "i=0\nwhile [ $i -lt 20 ]; do\n  (true) </dev/null &\n  i=$((i + 1))\ndone\nwait\necho once\n";
+    let run = host_sh_output(script, Duration::from_secs(30));
+    assert_eq!(
+        (
+            run.stdout.as_str(),
+            run.stderr.as_str(),
+            run.exit_code,
+            run.timed_out
+        ),
+        ("once\n", "", Some(0), false)
+    );
+}
+
+#[test]
+fn a_host_script_whose_helper_holds_its_output_past_the_deadline_times_out() {
+    // The shell prints a passing line and exits at once, but a helper it
+    // left behind holds stdout and stderr open for longer than the limit.
+    let script = "(sleep 5) &\necho 'cases 1 of 1'\nexit 0\n";
+    let started = std::time::Instant::now();
+    let run = host_sh_output(script, Duration::from_secs(1));
+    assert!(run.timed_out, "the open output kept it running");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_host_script_past_its_deadline_is_killed_with_its_children() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let marker = temp.path().join("survived");
+    let script = format!(
+        "(sleep 3; touch '{}') &\nsleep 30\n",
+        marker.to_str().expect("utf-8")
+    );
+    let started = std::time::Instant::now();
+    let run = host_sh_output(&script, Duration::from_secs(1));
+    assert!(run.timed_out);
+    assert_eq!(run.exit_code, None, "killed by a signal");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!marker.exists(), "a child outlived the deadline");
+}
+
 #[test]
 fn each_starter_check_fails_bare_and_passes_after_its_solution_on_the_host() {
     let mut tested = 0;
@@ -511,6 +712,244 @@ fn hard_task_overlays_fail_or_pass_as_named() {
         {
             assert!(passes >= 1, "{id}: no pass-* overlay");
         }
+    }
+}
+
+const TIER3_TASKS: [&str; 2] = ["billing-audit", "probe-plan"];
+
+/// The names in `dir`, sorted.
+fn sorted_names(dir: &Path) -> Vec<String> {
+    let mut names = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("utf-8")
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn tier3_fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/eval-tier3")
+}
+
+/// `tests/fixtures/eval-tier3/<id>/expected-lines.txt`: one line per run,
+/// `<name>\t<the check's exact stdout line>`, where the name is `bare` (the
+/// unmodified seed), `solution` or an overlay directory beside the file.
+fn tier3_expected_lines(id: &str) -> BTreeMap<String, String> {
+    let path = tier3_fixtures().join(id).join("expected-lines.txt");
+    let text = std::fs::read_to_string(&path).expect("read expected-lines.txt");
+    assert!(
+        text.ends_with('\n'),
+        "{id}: expected-lines.txt ends mid-line"
+    );
+    let mut lines = BTreeMap::new();
+    for line in text.lines() {
+        let (name, want) = line
+            .split_once('\t')
+            .unwrap_or_else(|| panic!("{id}: `{line}` has no tab"));
+        assert!(
+            lines.insert(name.to_owned(), want.to_owned()).is_none(),
+            "{id}: two lines for {name}"
+        );
+    }
+    lines
+}
+
+/// The exit code a tier-3 check must give for the run `name`: 0 for the
+/// solution and `pass-*` overlays, 1 for the bare seed and `fail-*` overlays.
+fn tier3_exit_code(name: &str) -> i32 {
+    match name {
+        "solution" => 0,
+        _ if name.starts_with("pass-") => 0,
+        _ => 1,
+    }
+}
+
+/// The tier-3 task `id`, as the loader gives it.
+fn tier3_task(id: &str) -> EvalTask {
+    load_tasks(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tier3"),
+        &[id.to_string()],
+        &eval::selftest_config(),
+    )
+    .expect("the tier-3 suite loads")
+    .remove(0)
+}
+
+/// Run `task`'s check and assert it finished, output closed included,
+/// within its task's check timeout, printed exactly `want` and one newline,
+/// nothing on stderr, and exited as the run `name` should.
+fn assert_tier3_check(task: &HostTask, id: &str, name: &str, want: &str) {
+    let limit = tier3_task(id).check.timeout;
+    let run = host_sh_output(&task.check, limit);
+    assert!(
+        !run.timed_out,
+        "{id}/{name}: the check timed out after {} s",
+        limit.as_secs()
+    );
+    assert_eq!(run.stdout, format!("{want}\n"), "{id}/{name}: check stdout");
+    assert_eq!(run.stderr, "", "{id}/{name}: check stderr");
+    assert_eq!(
+        run.exit_code,
+        Some(tier3_exit_code(name)),
+        "{id}/{name}: check exit code"
+    );
+}
+
+#[test]
+fn the_tier3_suite_holds_exactly_its_tasks_with_one_overlay_directory_each() {
+    assert_eq!(
+        sorted_names(&Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tier3")),
+        TIER3_TASKS
+    );
+    assert_eq!(
+        sorted_names(&tier3_fixtures()),
+        TIER3_TASKS,
+        "one overlay directory per tier-3 task"
+    );
+}
+
+#[test]
+fn the_tier3_suite_loads_with_its_limits() {
+    let tasks = load_tasks(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/tier3"),
+        &[],
+        &eval::selftest_config(),
+    )
+    .expect("the tier-3 suite loads");
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        TIER3_TASKS
+    );
+    // Each check runs every case, each promised 5 seconds and given 6 for
+    // its launch, and billing-audit's visible tests (15, given 16) too; its
+    // timeout leaves at least 30 seconds past all of that.
+    for (task, (check_secs, cases, visible_secs)) in tasks.iter().zip([(240, 32, 16), (180, 24, 0)])
+    {
+        let id = &task.id;
+        let script = String::from_utf8(task.check.script.clone()).expect("UTF-8");
+        assert!(script.starts_with("cd /workspace || exit 2\n"), "{id}");
+        assert_eq!(task.cases, Some(cases), "{id}");
+        assert!(
+            task.check.timeout >= Duration::from_secs(u64::from(cases) * 6 + visible_secs + 30),
+            "{id}"
+        );
+        assert_eq!(task.check.timeout, Duration::from_secs(check_secs), "{id}");
+        assert_eq!(
+            task.session_timeout,
+            Some(Duration::from_secs(1500)),
+            "{id}"
+        );
+        assert_eq!(task.max_steps, Some(80), "{id}");
+        assert_eq!(task.max_tool_calls, Some(160), "{id}");
+        assert_eq!(task.system, None, "{id}: no system.md");
+    }
+}
+
+/// Every line names the bare seed, the solution or an overlay beside it, and
+/// is a case line its run's exit code agrees with; all of a task's lines
+/// count the same cases, and the solution passes them all.
+#[test]
+fn tier3_expected_lines_are_case_lines_for_every_run() {
+    for id in TIER3_TASKS {
+        let lines = tier3_expected_lines(id);
+        let mut names = vec!["bare".to_owned(), "solution".to_owned()];
+        let (mut fails, mut passes) = (0, 0);
+        for entry in sorted_names(&tier3_fixtures().join(id)) {
+            if entry == "expected-lines.txt" {
+                continue;
+            }
+            assert!(
+                tier3_fixtures().join(id).join(&entry).is_dir(),
+                "{id}/{entry}: only overlay directories sit beside expected-lines.txt"
+            );
+            if entry.starts_with("fail-") {
+                fails += 1;
+            } else if entry.starts_with("pass-") {
+                passes += 1;
+            } else {
+                panic!("{id}/{entry}: an overlay is named fail-* or pass-*");
+            }
+            names.push(entry);
+        }
+        names.sort();
+        assert_eq!(
+            lines.keys().cloned().collect::<Vec<_>>(),
+            names,
+            "{id}: one line each for bare, solution and every overlay"
+        );
+        assert!(fails >= 4, "{id}: {fails} fail-* overlays, want at least 4");
+        assert!(passes >= 1, "{id}: no pass-* overlay");
+
+        let mut totals = Vec::new();
+        for (name, want) in &lines {
+            let exit_code = tier3_exit_code(name);
+            let cases = eval::parse_check_cases(want, Some(exit_code)).unwrap_or_else(|| {
+                panic!("{id}/{name}: `{want}` is not a case line for exit code {exit_code}")
+            });
+            totals.push(cases.total);
+        }
+        totals.sort_unstable();
+        totals.dedup();
+        assert_eq!(
+            totals,
+            [tier3_task(id).cases.expect("cases")],
+            "{id}: every line counts the task's cases"
+        );
+        let solution = eval::parse_check_cases(&lines["solution"], Some(0)).expect("parsed");
+        assert_eq!(solution.passed, solution.total, "{id}: the solution");
+    }
+}
+
+#[test]
+fn each_tier3_check_prints_its_line_bare_and_after_its_solution_on_the_host() {
+    for id in TIER3_TASKS {
+        let lines = tier3_expected_lines(id);
+        let task = host_task("evals/tier3", id);
+        assert_tier3_check(&task, id, "bare", &lines["bare"]);
+        assert!(host_sh(&task.solution), "{id}: the solution failed");
+        assert_tier3_check(&task, id, "solution", &lines["solution"]);
+    }
+}
+
+/// Each overlay under `tests/fixtures/eval-tier3/<id>/` is written over the
+/// task's seed, as for the hard suite, and the check must print the
+/// overlay's line from `expected-lines.txt` exactly: a `fail-*` overlay is a
+/// plausible wrong answer that fails the cases named there, a `pass-*`
+/// overlay a correct answer written differently from the solution.
+#[test]
+fn tier3_overlays_print_their_expected_lines() {
+    for id in TIER3_TASKS {
+        let lines = tier3_expected_lines(id);
+        let mut tested = 0;
+        for name in sorted_names(&tier3_fixtures().join(id)) {
+            if name == "expected-lines.txt" {
+                continue;
+            }
+            let overlay = tier3_fixtures().join(id).join(&name);
+            let task = host_task("evals/tier3", id);
+            for file in walk(&overlay) {
+                let relative = file.strip_prefix(&overlay).expect("under the overlay");
+                write(
+                    &task.workspace.join(relative),
+                    &std::fs::read(&file).expect("read"),
+                );
+            }
+            let want = lines
+                .get(&name)
+                .unwrap_or_else(|| panic!("{id}/{name}: no line in expected-lines.txt"));
+            assert_tier3_check(&task, id, &name, want);
+            tested += 1;
+        }
+        assert_eq!(tested, lines.len() - 2, "{id}: every overlay ran");
     }
 }
 
@@ -673,6 +1112,43 @@ fn each_loader_rule_refuses_its_task() {
     assert!(
         loader_error(&root.join("slow-override-case"), "slow-override")
             .contains("half the session timeout")
+    );
+
+    // Only an omitted key means no count; a present null is refused.
+    for (count, name) in [
+        (json!(0), "no-cases"),
+        (json!(129), "many-cases"),
+        (json!(null), "null-cases"),
+    ] {
+        let mut json = task_json(name);
+        json["cases"] = count.clone();
+        make_task(&root.join(format!("{name}-case")), name, &json, &[]);
+        assert!(
+            loader_error(&root.join(format!("{name}-case")), name)
+                .contains("cases must be 1 to 128"),
+            "{count}"
+        );
+    }
+    make_task(
+        &root.join("ungraded-case"),
+        "ungraded",
+        &task_json("ungraded"),
+        &[],
+    );
+    assert_eq!(
+        load_one(&root.join("ungraded-case"), "ungraded")
+            .expect("loads")
+            .cases,
+        None
+    );
+    let mut json = task_json("graded");
+    json["cases"] = json!(128);
+    make_task(&root.join("graded-case"), "graded", &json, &[]);
+    assert_eq!(
+        load_one(&root.join("graded-case"), "graded")
+            .expect("loads")
+            .cases,
+        Some(128)
     );
 
     let mut json = task_json("Bad_Id");
@@ -1136,6 +1612,7 @@ async fn the_check_runs_once_after_the_final_answer_and_final_check() {
         execution_id,
         stdout,
         stderr,
+        stdout_complete,
     } = &harness.journal().records[names.len() - 2].event
     else {
         panic!("check record");
@@ -1144,6 +1621,7 @@ async fn the_check_runs_once_after_the_final_answer_and_final_check() {
     assert!(execution_id.is_some());
     assert_eq!(stdout, "checked\n");
     assert_eq!(stderr, "");
+    assert_eq!(*stdout_complete, Some(true));
 
     let audit = &harness.audit().records;
     let final_check = audit
@@ -3247,6 +3725,7 @@ fn result(
             Some("failed") => Some(1),
             _ => None,
         },
+        check_cases: None,
         steps,
         tool_calls: steps.saturating_sub(1),
         input_tokens: tokens.0,
@@ -3277,6 +3756,7 @@ fn manifest(tasks: &[&str], trials: u32) -> Manifest {
         trials,
         concurrency: 1,
         max_run_secs: None,
+        max_total_input_tokens: None,
         effort: None,
         clear_thinking: None,
         compact_at: None,
@@ -3783,6 +4263,169 @@ async fn the_selftest_proves_a_task_and_catches_a_broken_one() {
             .iter()
             .any(|exec| exec.argv == strings(&["/bin/sh", "-s"])
                 && String::from_utf8_lossy(&exec.stdin).contains(SOLUTION_MARKER))
+    );
+}
+
+/// A fake `/bin/sh` for a self-test of a task made by [`make_task`] whose
+/// check prints a case line: the solution writes `out.txt`, and the check
+/// answers `solved` once it exists and `bare` before.
+fn case_line_handler(bare: ShAnswer, solved: ShAnswer) -> ShHandler {
+    Arc::new(
+        move |script: &[u8], files: &mut BTreeMap<String, Vec<u8>>| {
+            let script = String::from_utf8_lossy(script);
+            if script.contains(SOLUTION_MARKER) {
+                files.insert("/workspace/out.txt".to_string(), b"done\n".to_vec());
+                ShAnswer::exit(0)
+            } else if files.contains_key("/workspace/out.txt") {
+                solved.clone()
+            } else {
+                bare.clone()
+            }
+        },
+    )
+}
+
+/// [`selftest_one_with`] for a task that does not say how many cases its
+/// check runs.
+async fn selftest_one(handler: ShHandler) -> eval::SelftestSummary {
+    selftest_one_with(handler, None).await
+}
+
+/// Self-test one task made by [`make_task`], with `cases` in its
+/// `task.json` when given.
+async fn selftest_one_with(handler: ShHandler, cases: Option<u32>) -> eval::SelftestSummary {
+    let temp = common::private_tempdir().expect("tempdir");
+    let root = temp.path().join("tasks");
+    let mut json = task_json("graded");
+    if let Some(cases) = cases {
+        json["cases"] = json!(cases);
+    }
+    make_task(&root, "graded", &json, &[]);
+    let tasks = load_tasks(&root, &[], &eval::selftest_config()).expect("loads");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(handler);
+    eval::selftest(
+        &api,
+        &tasks,
+        &eval::selftest_config(),
+        &temp.path().join("out"),
+        &CancellationToken::new(),
+        &mut |_| {},
+    )
+    .await
+    .expect("runs")
+}
+
+#[tokio::test]
+async fn the_selftest_accepts_agreeing_case_lines() {
+    let summary = selftest_one(case_line_handler(
+        printing(1, "cases 1 of 3 failed 2,3\n"),
+        printing(0, "cases 3 of 3\n"),
+    ))
+    .await;
+    assert!(summary.ok(), "{summary:?}");
+}
+
+#[tokio::test]
+async fn the_selftest_refuses_case_lines_that_disagree() {
+    for (bare, solved, want) in [
+        // Exit 0 with failed cases is not a case line, so only the bare
+        // seed's check printed one.
+        (
+            printing(1, "cases 0 of 3 failed all\n"),
+            printing(0, "cases 2 of 3 failed 3\n"),
+            "only the bare seed check printed a case line",
+        ),
+        (
+            printing(1, "case 2\n"),
+            printing(0, "cases 3 of 3\n"),
+            "only the solution check printed a case line",
+        ),
+        (
+            printing(1, "cases 1 of 4 failed 2,3,4\n"),
+            printing(0, "cases 3 of 3\n"),
+            "the solution and bare seed checks report different case totals (3 and 4)",
+        ),
+    ] {
+        let summary = selftest_one(case_line_handler(bare, solved)).await;
+        assert!(!summary.ok());
+        assert_eq!(
+            summary.results[0].problem.as_deref(),
+            Some(want),
+            "{summary:?}"
+        );
+    }
+}
+
+/// A task that says how many cases its check runs must get a case line of
+/// that many from both runs; two malformed lines are not two absent ones.
+#[tokio::test]
+async fn the_selftest_holds_a_graded_task_to_its_case_count() {
+    for (bare, solved, want) in [
+        (
+            printing(1, "cases 0 of 1 failed all\r\n"),
+            printing(0, "cases 1 of 1\r\n"),
+            Some("the solution check printed no valid case line for its 1 cases"),
+        ),
+        (
+            printing(1, "cases 0 of 1 failed all\n"),
+            printing(0, "cases 1 of 1\r\n"),
+            Some("the solution check printed no valid case line for its 1 cases"),
+        ),
+        (
+            printing(1, "cases 0 of 1 failed all\r\n"),
+            printing(0, "cases 1 of 1\n"),
+            Some("the bare seed check printed no valid case line for its 1 cases"),
+        ),
+        (
+            printing(1, "cases 0 of 2 failed all\n"),
+            printing(0, "cases 2 of 2\n"),
+            Some("the solution check reported 2 cases, not 1"),
+        ),
+        (
+            printing(1, "cases 0 of 1 failed all\n"),
+            printing(0, "cases 1 of 1\n"),
+            None,
+        ),
+    ] {
+        let summary = selftest_one_with(case_line_handler(bare, solved), Some(1)).await;
+        assert_eq!(summary.results[0].problem.as_deref(), want, "{summary:?}");
+    }
+}
+
+/// A run of a task that says how many cases its check runs is scored only
+/// from a line counting that many.
+#[tokio::test]
+async fn a_graded_task_scores_only_its_own_case_count() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let root = temp.path().join("tasks");
+    let mut json = task_json("alpha");
+    json["cases"] = json!(3);
+    make_task(&root, "alpha", &json, &[]);
+    let tasks = load_tasks(&root, &[], &config()).expect("loads");
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(queued_handler(vec![
+        printing(1, "cases 2 of 3 failed 3\n"),
+        printing(1, "cases 2 of 4 failed 3,4\n"),
+    ]));
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &options(&out, 2, false),
+        || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite runs");
+    assert_eq!(
+        summary
+            .results
+            .iter()
+            .map(|result| result.check_cases.clone())
+            .collect::<Vec<_>>(),
+        [Some(cases(2, 3, Some(&[3]))), None]
     );
 }
 
@@ -5349,4 +5992,763 @@ async fn an_unconfirmed_replay_cleanup_stops_the_suite_with_its_error() {
         eval::read_report(&out).expect("report").stopped,
         summary.stopped
     );
+}
+
+// ---------------------------------------------------------------------------
+// Graded check cases
+
+fn cases(passed: u32, total: u32, failed: Option<&[u32]>) -> eval::CheckCases {
+    eval::CheckCases {
+        passed,
+        total,
+        failed: failed.map(<[u32]>::to_vec),
+    }
+}
+
+#[test]
+fn check_case_lines_parse_in_each_valid_form() {
+    for (stdout, exit_code, expected) in [
+        ("cases 99 of 99\n", 0, cases(99, 99, Some(&[]))),
+        ("cases 1 of 1", 0, cases(1, 1, Some(&[]))),
+        ("cases 128 of 128\n", 0, cases(128, 128, Some(&[]))),
+        (
+            "cases 97 of 99 failed 4,9\n",
+            1,
+            cases(97, 99, Some(&[4, 9])),
+        ),
+        ("cases 0 of 1 failed 1\n", 1, cases(0, 1, Some(&[1]))),
+        (
+            "cases 0 of 3 failed 1,2,3",
+            1,
+            cases(0, 3, Some(&[1, 2, 3])),
+        ),
+        (
+            "cases 127 of 128 failed 128\n",
+            1,
+            cases(127, 128, Some(&[128])),
+        ),
+        ("cases 0 of 99 failed all\n", 1, cases(0, 99, None)),
+        ("cases 0 of 1 failed all", 1, cases(0, 1, None)),
+    ] {
+        assert_eq!(
+            eval::parse_check_cases(stdout, Some(exit_code)),
+            Some(expected),
+            "{stdout:?}"
+        );
+    }
+}
+
+#[test]
+fn check_case_lines_outside_the_grammar_are_not_cases() {
+    for (stdout, exit_code) in [
+        // Leading zeros, in any number.
+        ("cases 05 of 05\n", Some(0)),
+        ("cases 3 of 05 failed 1,2\n", Some(1)),
+        ("cases 3 of 5 failed 01,2\n", Some(1)),
+        ("cases 00 of 5 failed all\n", Some(1)),
+        // Unsorted or repeated failures.
+        ("cases 3 of 5 failed 4,2\n", Some(1)),
+        ("cases 3 of 5 failed 2,2\n", Some(1)),
+        // The list's length is not N - P, or a case is out of range.
+        ("cases 3 of 5 failed 2\n", Some(1)),
+        ("cases 3 of 5 failed 1,2,3\n", Some(1)),
+        ("cases 3 of 5 failed 0,2\n", Some(1)),
+        ("cases 3 of 5 failed 2,6\n", Some(1)),
+        // P == N with a list, P > N, `all` with cases passed, a missing list.
+        ("cases 5 of 5 failed 1\n", Some(1)),
+        ("cases 5 of 5 failed all\n", Some(1)),
+        ("cases 6 of 5\n", Some(0)),
+        ("cases 2 of 5 failed all\n", Some(1)),
+        ("cases 3 of 5\n", Some(1)),
+        ("cases 3 of 5 failed \n", Some(1)),
+        ("cases 3 of 5 failed 2,,4\n", Some(1)),
+        ("cases 3 of 5 failed 2,4,\n", Some(1)),
+        ("cases 3 of 5 failed ALL\n", Some(1)),
+        // The exit code disagrees, or there is none.
+        ("cases 5 of 5\n", Some(1)),
+        ("cases 5 of 5\n", Some(2)),
+        ("cases 5 of 5\n", None),
+        ("cases 3 of 5 failed 2,4\n", Some(0)),
+        ("cases 3 of 5 failed 2,4\n", Some(2)),
+        ("cases 0 of 5 failed all\n", Some(0)),
+        ("cases 0 of 5 failed all\n", Some(2)),
+        // Extra lines, a second newline, CRLF, other text.
+        ("cases 5 of 5\n\n", Some(0)),
+        ("cases 5 of 5\r\n", Some(0)),
+        ("note\ncases 5 of 5\n", Some(0)),
+        ("cases 5 of 5\nnote\n", Some(0)),
+        ("case 3\n", Some(1)),
+        ("", Some(0)),
+        ("\n", Some(0)),
+        // Extra or missing spaces.
+        ("cases  5 of 5\n", Some(0)),
+        ("cases 5 of 5 \n", Some(0)),
+        (" cases 5 of 5\n", Some(0)),
+        ("cases 5 of  5\n", Some(0)),
+        ("cases 3 of 5 failed  2,4\n", Some(1)),
+        ("cases 3 of 5 failed 2, 4\n", Some(1)),
+        ("cases 3 of 5  failed 2,4\n", Some(1)),
+        ("cases 5of 5\n", Some(0)),
+        ("Cases 5 of 5\n", Some(0)),
+        // N out of range, signs and other digits.
+        ("cases 0 of 0\n", Some(0)),
+        ("cases 129 of 129\n", Some(0)),
+        ("cases 128 of 129 failed 129\n", Some(1)),
+        ("cases 999 of 999\n", Some(0)),
+        ("cases +5 of 5\n", Some(0)),
+        ("cases 5 of 5.0\n", Some(0)),
+        ("cases ５ of ５\n", Some(0)),
+    ] {
+        assert_eq!(
+            eval::parse_check_cases(stdout, exit_code),
+            None,
+            "{stdout:?} with {exit_code:?}"
+        );
+    }
+}
+
+/// A fake `/bin/sh` that gives the next queued answer each time.
+fn queued_handler(answers: Vec<ShAnswer>) -> ShHandler {
+    let answers = Arc::new(Mutex::new(std::collections::VecDeque::from(answers)));
+    Arc::new(move |_: &[u8], _: &mut BTreeMap<String, Vec<u8>>| {
+        answers
+            .lock()
+            .expect("answers")
+            .pop_front()
+            .expect("an answer for every check")
+    })
+}
+
+fn printing(code: i32, stdout: &str) -> ShAnswer {
+    ShAnswer {
+        stdout: stdout.as_bytes().to_vec(),
+        ..ShAnswer::exit(code)
+    }
+}
+
+#[tokio::test]
+async fn the_runner_records_the_cases_a_check_reports_and_reports_them() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let tasks = two_tasks(&temp.path().join("tasks"));
+    let tasks = vec![tasks[0].clone()];
+    let out = temp.path().join("out");
+    let api = FakeApi::default();
+    api.state().sh_handler = Some(queued_handler(vec![
+        printing(0, "cases 5 of 5\n"),
+        printing(1, "cases 3 of 5 failed 2,4\n"),
+        printing(1, "cases 0 of 5 failed all\n"),
+        // A check that does not report cases, and lines that disagree with
+        // their exit: no cases.
+        printing(1, "case 3\n"),
+        printing(0, "cases 3 of 5 failed 2,4\n"),
+        // A check cut off by its timeout never reports cases, whatever it
+        // printed first.
+        ShAnswer {
+            stdout: b"cases 5 of 5\n".to_vec(),
+            ..ShAnswer::state(ExecutionState::TimedOut)
+        },
+    ]));
+    let summary = eval::run_suite(
+        &api,
+        &tasks,
+        &options(&out, 6, false),
+        || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
+        &CancellationToken::new(),
+        &mut |_| Ok(()),
+    )
+    .await
+    .expect("the suite runs");
+    assert_eq!(summary.stopped, None);
+    let results = read_lines(&out.join("results.jsonl"));
+    assert_eq!(results, summary.results);
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (result.check.as_deref(), result.check_cases.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("passed"), Some(cases(5, 5, Some(&[])))),
+            (Some("failed"), Some(cases(3, 5, Some(&[2, 4])))),
+            (Some("failed"), Some(cases(0, 5, None))),
+            (Some("failed"), None),
+            (Some("passed"), None),
+            (Some("failed"), None),
+        ]
+    );
+    let text = std::fs::read_to_string(out.join("results.jsonl")).expect("results");
+    let lines = text.lines().collect::<Vec<_>>();
+    assert!(
+        lines[1].contains(r#""check_cases":{"passed":3,"total":5,"failed":[2,4]}"#),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains(r#""check_cases":{"passed":0,"total":5,"failed":null}"#),
+        "{}",
+        lines[2]
+    );
+    for line in &lines[3..] {
+        assert!(!line.contains("check_cases"), "{line}");
+    }
+
+    let score = summary.report.tasks[0].case_score.clone().expect("a score");
+    assert_eq!(
+        score,
+        eval::CaseScore {
+            runs: 3,
+            passed: 8,
+            total: 15,
+            failed_by_case: BTreeMap::from([(2, 1), (4, 1)]),
+            failed_all: 1,
+        }
+    );
+    assert_eq!(eval::read_report(&out).expect("report"), summary.report);
+    let markdown = std::fs::read_to_string(out.join("report.md")).expect("markdown");
+    assert!(
+        markdown.contains("| alpha | 6 | 2 | 33.3% | 8/15 (53.3%) | completed 6 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("\nFailed cases:\n\n- alpha: case 2 ×1, case 4 ×1; failed all ×1\n"),
+        "{markdown}"
+    );
+
+    // The input token limit every run had.
+    let limit = config().max_total_input_tokens;
+    assert_eq!(read_manifest(&out).max_total_input_tokens, Some(limit));
+    assert_eq!(summary.report.max_total_input_tokens, Some(limit));
+    assert!(
+        markdown.contains(&format!("\n- Input token limit per run: {limit} tokens\n")),
+        "{markdown}"
+    );
+}
+
+fn scored(mut run: RunResult, check_cases: eval::CheckCases) -> RunResult {
+    run.check_cases = Some(check_cases);
+    run
+}
+
+#[test]
+fn check_cases_round_trip_and_older_lines_still_parse() {
+    let run = scored(
+        result("a", 1, Some("failed"), 2, (10, 1)),
+        cases(97, 99, Some(&[4, 9])),
+    );
+    let json = serde_json::to_value(&run).expect("result JSON");
+    assert_eq!(
+        json["check_cases"],
+        json!({"passed": 97, "total": 99, "failed": [4, 9]})
+    );
+    let back: RunResult = serde_json::from_value(json.clone()).expect("round-trips");
+    assert_eq!(back, run);
+    let all = scored(run.clone(), cases(0, 99, None));
+    let back: RunResult =
+        serde_json::from_value(serde_json::to_value(&all).expect("JSON")).expect("round-trips");
+    assert_eq!(back, all);
+
+    // Without cases, and in lines written before the field existed: no key.
+    let plain = result("a", 1, Some("failed"), 2, (10, 1));
+    let json = serde_json::to_value(&plain).expect("result JSON");
+    assert!(json.get("check_cases").is_none(), "{json}");
+    let mut older = serde_json::to_value(&run).expect("result JSON");
+    older
+        .as_object_mut()
+        .expect("object")
+        .remove("check_cases")
+        .expect("check_cases");
+    let parsed: RunResult = serde_json::from_value(older).expect("an older line parses");
+    assert_eq!(parsed, plain);
+}
+
+/// Four tasks: three runs with cases and one without for `graded`, one run
+/// without for `plain`, a clean score for `clean`, and no runs for `idle`.
+fn mixed_runs() -> (Vec<RunResult>, Manifest) {
+    let runs = vec![
+        scored(
+            result("graded", 1, Some("failed"), 2, (10, 1)),
+            cases(97, 99, Some(&[4, 9])),
+        ),
+        scored(
+            result("graded", 2, Some("failed"), 2, (10, 1)),
+            cases(98, 99, Some(&[4])),
+        ),
+        scored(
+            result("graded", 3, Some("failed"), 2, (10, 1)),
+            cases(0, 99, None),
+        ),
+        // A run whose check gave no cases (an error, say) adds nothing.
+        result("graded", 4, Some("error"), 2, (10, 1)),
+        result("plain", 1, Some("passed"), 2, (10, 1)),
+        scored(
+            result("clean", 1, Some("passed"), 2, (10, 1)),
+            cases(3, 3, Some(&[])),
+        ),
+    ];
+    (runs, manifest(&["graded", "plain", "clean", "idle"], 4))
+}
+
+#[test]
+fn case_scores_reach_the_report_only_for_tasks_that_have_them() {
+    let (runs, listed) = mixed_runs();
+    let report = eval::report(&runs, &listed);
+    let graded = report.tasks[0].case_score.clone().expect("graded");
+    assert_eq!(
+        graded,
+        eval::CaseScore {
+            runs: 3,
+            passed: 195,
+            total: 297,
+            failed_by_case: BTreeMap::from([(4, 2), (9, 1)]),
+            failed_all: 1,
+        }
+    );
+    assert_eq!(report.tasks[1].case_score, None);
+    assert_eq!(
+        report.tasks[2]
+            .case_score
+            .as_ref()
+            .map(eval::CaseScore::rate),
+        Some(Some(1.0))
+    );
+    assert_eq!(report.tasks[3].case_score, None, "no runs");
+
+    let json = serde_json::to_value(&report).expect("report JSON");
+    assert_eq!(
+        json["tasks"][0]["case_score"],
+        json!({"runs": 3, "passed": 195, "total": 297,
+               "failed_by_case": {"4": 2, "9": 1}, "failed_all": 1})
+    );
+    assert!(json["tasks"][1].get("case_score").is_none(), "{json}");
+    assert!(
+        json["tasks"][2]["case_score"].get("failed_all").is_none(),
+        "{json}"
+    );
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, report);
+}
+
+#[test]
+fn report_md_shows_cases_only_when_a_task_has_them() {
+    let (runs, listed) = mixed_runs();
+    let report = eval::report(&runs, &listed);
+    let markdown = eval::report_markdown(&report);
+    assert!(
+        markdown.contains("| Task | Runs | Passed | Pass rate | Cases | Outcomes |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("|---|---:|---:|---:|---:|---|"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| graded | 4 | 0 | 0.0% | 195/297 (65.7%) | completed 4 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| plain | 1 | 1 | 100.0% | – | completed 1 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| clean | 1 | 1 | 100.0% | 3/3 (100.0%) |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| idle | 0 | 0 | n/a | – |  | n/a / n/a |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("| **Overall** | 6 | 2 | 66.7% (macro) | | | 2.0 |"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains(
+            "\nFailed cases:\n\n- graded: case 4 ×2, case 9 ×1; failed all ×1\n- clean: none\n\n\
+             Tool calls by name"
+        ),
+        "{markdown}"
+    );
+    // Every row has the same number of cells.
+    let widths = markdown
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .map(|line| line.matches('|').count())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(widths.len(), 1, "{markdown}");
+
+    // Without any case score the table and the text are as before.
+    let unscored = eval::report(&runs[3..5], &manifest(&["graded", "plain"], 1));
+    let markdown = eval::report_markdown(&unscored);
+    assert!(
+        markdown.contains("| Task | Runs | Passed | Pass rate | Outcomes |"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("|---|---:|---:|---:|---|"), "{markdown}");
+    assert!(
+        markdown.contains("| **Overall** | 2 | 1 | 50.0% (macro) | | 2.0 |"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("Failed cases"), "{markdown}");
+    assert!(!markdown.contains('–'), "{markdown}");
+}
+
+#[test]
+fn reports_without_case_scores_still_load() {
+    let runs = [scored(
+        result("a", 1, Some("failed"), 2, (10, 1)),
+        cases(1, 2, Some(&[2])),
+    )];
+    let mut file = serde_json::to_value(eval::report(&runs, &manifest(&["a"], 1))).expect("JSON");
+    file["tasks"][0]
+        .as_object_mut()
+        .expect("task")
+        .remove("case_score")
+        .expect("case_score");
+    let temp = common::private_tempdir().expect("tempdir");
+    write(
+        &temp.path().join("report.json"),
+        file.to_string().as_bytes(),
+    );
+    let parsed = eval::read_report(temp.path()).expect("an older report reads");
+    assert_eq!(parsed.tasks[0].case_score, None);
+    assert!(!eval::report_markdown(&parsed).contains("Cases"));
+}
+
+#[test]
+fn compare_shows_case_score_deltas_beside_the_pass_rate() {
+    let base = eval::report(
+        &[
+            scored(
+                result("graded", 1, Some("failed"), 2, (100, 10)),
+                cases(90, 100, Some(&(1..=10).collect::<Vec<_>>())),
+            ),
+            result("plain", 1, Some("passed"), 2, (100, 10)),
+            scored(
+                result("half", 1, Some("failed"), 2, (100, 10)),
+                cases(1, 2, Some(&[2])),
+            ),
+        ],
+        &manifest(&["graded", "plain", "half"], 1),
+    );
+    let new = eval::report(
+        &[
+            scored(
+                result("graded", 1, Some("failed"), 2, (100, 10)),
+                cases(99, 100, Some(&[7])),
+            ),
+            result("plain", 1, Some("passed"), 2, (100, 10)),
+            result("half", 1, Some("error"), 2, (100, 10)),
+        ],
+        &manifest(&["graded", "plain", "half"], 1),
+    );
+    let text = eval::compare(&base, &new);
+    assert!(
+        text.contains(
+            "| Task | Pass rate (base → new) | Δ | Cases (base → new) | Δ | Mean steps (base → \
+             new) |"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("|---|---|---:|---|---:|---|---:|---|---:|"),
+        "{text}"
+    );
+    assert!(
+        text.contains("| graded | 0.0% → 0.0% | +0.0 pp | 90.0% → 99.0% | +9.0 pp | 2.0 → 2.0 |"),
+        "{text}"
+    );
+    // A side without a score is unknown, not 0%.
+    assert!(
+        text.contains("| half | 0.0% → 0.0% | +0.0 pp | 50.0% → n/a | n/a | 2.0 → 2.0 |"),
+        "{text}"
+    );
+    assert!(
+        text.contains("| plain | 100.0% → 100.0% | +0.0 pp | n/a → n/a | n/a | 2.0 → 2.0 |"),
+        "{text}"
+    );
+
+    // Neither side scored: as before.
+    let plain = eval::report(
+        &[result("plain", 1, Some("passed"), 2, (100, 10))],
+        &manifest(&["plain"], 1),
+    );
+    let text = eval::compare(&plain, &plain);
+    assert!(
+        text.contains(
+            "| Task | Pass rate (base → new) | Δ | Mean steps (base → new) | Δ | Mean tokens \
+             (base → new) | Δ |\n|---|---|---:|---|---:|---|---:|\n| plain | 100.0% → 100.0% | \
+             +0.0 pp | 2.0 → 2.0 |"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Cases"), "{text}");
+}
+
+#[test]
+fn the_input_token_limit_reaches_the_manifest_report_and_comparison() {
+    let mut limited = manifest(&["a"], 1);
+    limited.max_total_input_tokens = Some(500_000);
+    let runs = [result("a", 1, Some("passed"), 2, (10, 1))];
+    let older = eval::report(&runs, &manifest(&["a"], 1));
+    let new = eval::report(&runs, &limited);
+    assert_eq!(
+        (older.max_total_input_tokens, new.max_total_input_tokens),
+        (None, Some(500_000))
+    );
+
+    let json = serde_json::to_value(&limited).expect("manifest JSON");
+    assert_eq!(json["max_total_input_tokens"], 500_000);
+    let back: Manifest = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, limited);
+    let json = serde_json::to_value(&new).expect("report JSON");
+    assert_eq!(json["max_total_input_tokens"], 500_000);
+    let back: Report = serde_json::from_value(json).expect("round-trips");
+    assert_eq!(back, new);
+
+    // Files written before the field existed: no key, and they still read.
+    let unset = serde_json::to_value(manifest(&["a"], 1)).expect("manifest JSON");
+    assert!(unset.get("max_total_input_tokens").is_none(), "{unset}");
+    let parsed: Manifest = serde_json::from_value(unset).expect("an older manifest parses");
+    assert_eq!(parsed.max_total_input_tokens, None);
+    let unset = serde_json::to_value(&older).expect("report JSON");
+    assert!(unset.get("max_total_input_tokens").is_none(), "{unset}");
+    let temp = common::private_tempdir().expect("tempdir");
+    write(
+        &temp.path().join("report.json"),
+        unset.to_string().as_bytes(),
+    );
+    assert_eq!(
+        eval::read_report(temp.path())
+            .expect("an older report reads")
+            .max_total_input_tokens,
+        None
+    );
+
+    let markdown = eval::report_markdown(&new);
+    assert!(
+        markdown.contains("- Runs at a time: 1\n- Input token limit per run: 500000 tokens\n"),
+        "{markdown}"
+    );
+    assert!(
+        !eval::report_markdown(&older).contains("Input token limit"),
+        "unknown says nothing"
+    );
+
+    let mut larger = new.clone();
+    larger.max_total_input_tokens = Some(2_000_000);
+    let differing = eval::compare(&larger, &new);
+    assert!(
+        differing.ends_with(
+            ").\n\nInput token limit per run differs (2000000 → 500000 tokens); pass rates, \
+             tokens and costs are not directly comparable.\n"
+        ),
+        "{differing}"
+    );
+    // An older report did not record it: unknown is not a difference.
+    for same in [
+        eval::compare(&new, &new),
+        eval::compare(&older, &new),
+        eval::compare(&new, &older),
+    ] {
+        assert!(!same.contains("Input token limit"), "{same}");
+    }
+}
+
+/// kilnd kept 13 of the stream's 19 bytes.
+fn cut_capture(output: &mut kiln_harness::api::CapturedOutput) {
+    output.observed_bytes = output.data.len() as u64 + 6;
+    output.truncated = true;
+}
+
+/// kilnd does not know how long the stream was.
+fn unknown_length_capture(output: &mut kiln_harness::api::CapturedOutput) {
+    output.total_bytes_known = false;
+}
+
+/// A case line counts only when the journal knows it is the check's whole
+/// stdout: kilnd kept every byte, it is UTF-8, and it fit the journal's
+/// 4 KiB.
+#[tokio::test]
+async fn the_runner_scores_only_stdout_known_to_be_complete() {
+    type Tamper = Option<fn(&mut kiln_harness::api::CapturedOutput)>;
+    // Name, check stdout, how kilnd's capture is changed, the journal's
+    // `stdout_complete`, and whether the run is scored.
+    type Capture = (&'static str, Vec<u8>, Tamper, Option<bool>, bool);
+    let line = b"cases 1 of 1\n".to_vec();
+    let mut long = line.clone();
+    long.extend(std::iter::repeat_n(b' ', 4 << 10));
+    let mut invalid = line.clone();
+    invalid.push(0xff);
+    let runs: [Capture; 5] = [
+        ("complete", line.clone(), None, Some(true), true),
+        ("cut", line.clone(), Some(cut_capture), Some(false), false),
+        (
+            "unknown length",
+            line,
+            Some(unknown_length_capture),
+            Some(false),
+            false,
+        ),
+        ("over 4 KiB", long, None, Some(false), false),
+        ("not UTF-8", invalid, None, Some(false), false),
+    ];
+    for (name, stdout, tamper, complete, scored) in runs {
+        let temp = common::private_tempdir().expect("tempdir");
+        let tasks = vec![two_tasks(&temp.path().join("tasks")).remove(0)];
+        let out = temp.path().join("out");
+        let api = FakeApi::default();
+        api.state().sh_handler = Some(fixed_handler(ShAnswer {
+            stdout,
+            ..ShAnswer::exit(0)
+        }));
+        if let Some(tamper) = tamper {
+            api.state().capture_tamper = Some(("/bin/sh", tamper));
+        }
+        let summary = eval::run_suite(
+            &api,
+            &tasks,
+            &options(&out, 1, false),
+            || Ok(ScriptedProvider::new([ModelResponse::final_text("done")])),
+            &CancellationToken::new(),
+            &mut |_| Ok(()),
+        )
+        .await
+        .expect("the suite runs");
+        assert_eq!(
+            summary.results[0].check.as_deref(),
+            Some("passed"),
+            "{name}"
+        );
+        assert_eq!(
+            summary.results[0].check_cases,
+            scored.then(|| cases(1, 1, Some(&[]))),
+            "{name}"
+        );
+        let journal = read_journal(&out.join("runs/alpha/1/journal.jsonl")).expect("journal");
+        let recorded = journal
+            .records
+            .iter()
+            .find_map(|record| match &record.event {
+                JournalEvent::CheckCompleted {
+                    stdout_complete, ..
+                } => Some(*stdout_complete),
+                _ => None,
+            })
+            .expect("a check record");
+        assert_eq!(recorded, complete, "{name}");
+    }
+}
+
+/// The longest a run's line in `results.jsonl` gets without its error
+/// message: every count at its widest, IDs and names at their longest, a
+/// cost, and a tool-call count for every tool name the sets offer.
+fn widest_result(task: &str, trial: u32) -> RunResult {
+    RunResult {
+        session_id: Some(format!("hs-{}", "f".repeat(61))),
+        outcome: "cleanup_failed".to_string(),
+        work_outcome: "create_failed".to_string(),
+        check_exit_code: Some(i32::MIN),
+        steps: u32::MAX,
+        tool_calls: u32::MAX,
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_read_tokens: Some(u64::MAX),
+        cache_write_tokens: Some(u64::MAX),
+        wall_ms: u64::MAX,
+        truncation_recoveries: u32::MAX,
+        cost_micro_usd: Some(u64::MAX),
+        long_prompt_requests: u32::MAX,
+        compactions: u32::MAX,
+        tool_calls_by_name: Some({
+            let registry = ToolRegistry::new(kiln_harness::tools::ToolLimits::default());
+            let mut names = registry
+                .definitions_of(kiln_harness::tools::ToolSet::CodingV2, true)
+                .iter()
+                .map(|tool| (tool.name.clone(), u32::MAX))
+                .collect::<BTreeMap<_, _>>();
+            names.insert("unknown".to_string(), u32::MAX);
+            names
+        }),
+        failed_tool_calls: Some(u32::MAX),
+        replay: Some(format!("diverged_turn:{}", u32::MAX)),
+        ..result(task, trial, Some("failed"), 1, (1, 1))
+    }
+}
+
+/// The widest case line: no case passed, each named.
+fn widest_cases() -> eval::CheckCases {
+    eval::CheckCases {
+        passed: 0,
+        total: eval::MAX_CHECK_CASES,
+        failed: Some((1..=eval::MAX_CHECK_CASES).collect()),
+    }
+}
+
+#[test]
+fn a_report_at_the_supported_maxima_reads_back() {
+    let temp = common::private_tempdir().expect("tempdir");
+    let ids = (0..eval::MAX_TASKS)
+        .map(|index| format!("{index:04}-{}", "t".repeat(59)))
+        .collect::<Vec<_>>();
+    let results = ids
+        .iter()
+        .map(|id| RunResult {
+            check_cases: Some(widest_cases()),
+            ..widest_result(id, 1)
+        })
+        .collect::<Vec<_>>();
+    let mut manifest = manifest(&[], eval::MAX_TRIALS);
+    manifest.tasks.clone_from(&ids);
+    let mut report = eval::report(&results, &manifest);
+    // Every trial failed every case: each count at its widest.
+    for task in &mut report.tasks {
+        let score = task.case_score.as_mut().expect("scored");
+        score.runs = eval::MAX_TRIALS;
+        score.total = eval::MAX_TRIALS * eval::MAX_CHECK_CASES;
+        for count in score.failed_by_case.values_mut() {
+            *count = eval::MAX_TRIALS;
+        }
+    }
+    // As `run_suite` writes it.
+    let mut bytes = serde_json::to_vec_pretty(&report).expect("encodes");
+    bytes.push(b'\n');
+    eprintln!("report.json at the maxima: {} bytes", bytes.len());
+    assert!(
+        bytes.len() <= eval::MAX_REPORT_BYTES,
+        "{} bytes",
+        bytes.len()
+    );
+    std::fs::write(temp.path().join("report.json"), &bytes).expect("write");
+    assert_eq!(eval::read_report(temp.path()).expect("reads"), report);
+}
+
+/// `eval cost` reads `results.jsonl` whole, up to [`eval::MAX_RESULTS_BYTES`]:
+/// room for every run of the largest suite at the most trials, each line
+/// with the widest case line and up to 2 KiB besides (an error message
+/// included). Writing that file would also need a journal per run, so this
+/// checks the widest line's length against the bound, and reads it back.
+#[test]
+fn results_at_the_supported_maxima_fit_what_eval_cost_reads() {
+    let widest = RunResult {
+        check_cases: Some(widest_cases()),
+        ..widest_result(&"t".repeat(64), eval::MAX_TRIALS)
+    };
+    let ordinary = serde_json::to_vec(&RunResult {
+        check_cases: None,
+        ..widest.clone()
+    })
+    .expect("encodes")
+    .len()
+        + 1;
+    let line = serde_json::to_vec(&widest).expect("encodes");
+    let cases = line.len() + 1 - ordinary;
+    eprintln!("widest line without an error: {ordinary} bytes, of it cases: {cases} more");
+    assert!(ordinary <= 1 << 10, "{ordinary} bytes");
+    let lines = eval::MAX_TASKS * eval::MAX_TRIALS as usize;
+    assert!(
+        lines * ((2 << 10) + cases) <= eval::MAX_RESULTS_BYTES,
+        "{} bytes",
+        lines * ((2 << 10) + cases)
+    );
+    let read: RunResult = serde_json::from_slice(&line).expect("reads back");
+    assert_eq!(read, widest);
 }

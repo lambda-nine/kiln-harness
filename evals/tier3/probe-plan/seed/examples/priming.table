@@ -1,0 +1,10 @@
+rev a m0
+rev b m0
+row a m0 arm 0 m1
+row a m0 read 0 m0
+row a m1 arm 0 m1
+row a m1 read 0 m1
+row b m0 arm 0 m1
+row b m0 read 0 m0
+row b m1 arm 0 m1
+row b m1 read 1 m1

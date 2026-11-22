@@ -572,6 +572,10 @@ pub struct CheckRun {
     pub execution_id: Option<String>,
     pub stdout: String,
     pub stderr: String,
+    /// Whether `stdout` is every byte the check wrote to stdout: kilnd kept
+    /// all of it, it is valid UTF-8, and it fit [`CHECK_OUTPUT_BYTES`].
+    /// `None` when the check gave no output to judge, as for an error.
+    pub stdout_complete: Option<bool>,
     pub stdout_evidence: OutputEvidence,
     pub stderr_evidence: OutputEvidence,
 }
@@ -2064,6 +2068,7 @@ impl CheckRun {
             execution_id: None,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_complete: None,
             stdout_evidence: unknown_evidence(),
             stderr_evidence: unknown_evidence(),
         }
@@ -2616,6 +2621,11 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             execution_id: Some(execution.id.clone()),
             stdout: check_output(&execution.stdout.data),
             stderr: check_output(&execution.stderr.data),
+            stdout_complete: Some(
+                complete(&execution.stdout)
+                    && execution.stdout.data.len() <= CHECK_OUTPUT_BYTES
+                    && std::str::from_utf8(&execution.stdout.data).is_ok(),
+            ),
             stdout_evidence: evidence(&execution.stdout),
             stderr_evidence: evidence(&execution.stderr),
         }

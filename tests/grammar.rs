@@ -1073,6 +1073,7 @@ fn check_completed(outcome: CheckOutcome) -> JournalEvent {
         execution_id: Some("ex-9".to_string()),
         stdout: String::new(),
         stderr: String::new(),
+        stdout_complete: None,
     }
 }
 
@@ -1175,6 +1176,7 @@ fn check_output_may_not_exceed_four_kib_of_utf8() {
             execution_id: Some("ex-9".to_string()),
             stdout,
             stderr,
+            stdout_complete: None,
         };
         events
     };

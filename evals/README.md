@@ -19,7 +19,7 @@ evals/tasks/<id>/
                  /workspace/<same relative path> before the session
 ```
 
-`task.json` takes exactly these fields:
+`task.json` takes exactly these fields, and an optional `cases`:
 
 ```json
 {
@@ -39,6 +39,11 @@ evals/tasks/<id>/
   works in the rest.
 - `session_timeout_secs`, `max_steps` and `max_tool_calls` are optional and
   override the command-line values for this task, within the usual ceilings.
+- `cases`, 1 to 128, is for a check that reports its cases (see
+  [Case counts](#case-counts)): how many it runs. A run is then scored only
+  from a case line counting that many, and `eval selftest` requires both of
+  its checks to print one. Leave it out for a check that doesn't; `null` is
+  refused, like any other value outside 1 to 128.
 
 The loader is strict. A task directory may hold only the entries above, and
 only regular files and directories (a symlink, FIFO, socket or device
@@ -48,6 +53,30 @@ rules as the file tools. Empty directories in `seed/` are not recreated.
 `check.sh` and `solution.sh` are 1 byte to 64 KiB of UTF-8, and no larger than
 the tools' stdin limit. Every task in the directory loads and validates before
 anything runs, even when `--task` picks a few, and every error names its task.
+
+### Case counts
+
+A check in any suite may also report how many of its hidden cases passed, by
+running every case and printing exactly one line as its whole stdout (one
+trailing newline allowed):
+
+- `cases N of N` and exit 0: every case passed;
+- `cases P of N failed I,J,K` and exit 1: P < N, followed by the N − P
+  failing case numbers, ascending, comma-separated, without spaces;
+- `cases 0 of N failed all` and exit 1: a precondition failed, such as a
+  protected file changed or the deliverable missing.
+
+Cases are numbered 1 to N, N is 1 to 128, and numbers have no leading zeros.
+The journal keeps at most 4 KiB of the check's stdout, so the line must fit
+in that. The pass or fail verdict still comes from the exit code alone. A
+line that does not follow this grammar, or disagrees with the exit code, is
+not a case count, and neither is the output of a check that timed out or
+gave no verdict, stdout that kilnd cut or whose length it did not know, nor
+a line from a journal written before the harness recorded whether stdout was
+complete; such a run simply has no `check_cases`. Replay compares the
+check's verdict and exit status, not its case counts, so to see whether a
+score reproduces, compare the two runs' `check_cases`. A check that prints
+anything else, such as the hard suite's `case 3`, works as before.
 
 ## Adding a task
 
@@ -59,7 +88,10 @@ anything runs, even when `--task` picks a few, and every error names its task.
    `/workspace` is the task's working tree; `/tmp` is writable scratch
    (`mktemp -d` works) that the check does not read.
    Redirect stdin from `/dev/null` when the check runs a script the agent
-   wrote, since the check itself arrives on stdin.
+   wrote, since the check itself arrives on stdin. Run that script in a
+   fresh directory holding only its inputs, and write each case's expected
+   output only after it has exited, outside that directory, so it cannot
+   read the answer.
 3. Make sure the bare seed fails the check and `solution.sh` makes it pass.
    Commands, `solution.sh` included, start in `/workspace`; say so in
    `prompt.md` when the task depends on it.
@@ -76,8 +108,11 @@ an in-process scripted model and no network provider (the solution is that
 model's `exec` call, so it is in the session's request history but is never
 sent to a model API): a bare one that answers at once, whose
 check must fail, and one that runs `solution.sh` through the `exec` tool
-(`/bin/sh -s` with the solution on stdin), whose check must pass. It prints
-`ok <id>` or `FAIL <id>: <reason>` for each task and exits non-zero if any
+(`/bin/sh -s` with the solution on stdin), whose check must pass. When
+either check prints a case count (see [Case counts](#case-counts)), both
+must, with the same number of cases, all passed for the solution and not
+all for the bare seed; for a task whose `task.json` gives `cases`, both
+must print one counting that many. It prints `ok <id>` or `FAIL <id>: <reason>` for each task and exits non-zero if any
 fails. `--task ID` (repeatable) picks tasks, and `--tasks DIR` another suite.
 Audits and journals go under `--out`, which must not exist.
 
@@ -160,11 +195,16 @@ long-prompt rate. `compactions` appears when the run compacted its history
 calls (`unknown` for a name the session did not offer) and
 `failed_tool_calls` counts the calls whose result was not ok; a line
 written before they existed has neither, and its counts are unknown, not
-zero.
+zero. `check_cases` appears when the check printed a case count (see
+[Case counts](#case-counts)): `{"passed": 97, "total": 99, "failed": [4, 9]}`,
+with `"failed": null` for `failed all`; it is missing for checks that don't
+report cases and in older files.
 
 At the end it writes `OUT/manifest.json` (harness version, label, provider
 kind and model, the base URL's host only, tasks, trials, runs at a time,
-the run cap when set, the effort sent and the thinking clearing (`off` or
+the run cap when set, the input token limit per run
+(`max_total_input_tokens`, from `--max-total-input-tokens`), the effort sent
+and the thinking clearing (`off` or
 `keep N`, Anthropic only), the compaction threshold `compact_at` when set,
 the output limit per
 response, the tool set (`tool_set`: `base`, `coding_v1` or `coding_v2`; an older
@@ -176,7 +216,14 @@ calls and wall time, mean tokens, mean cost, mean compactions (only with
 rate (the mean of the task pass rates), pass@1 with the number of trials, and
 totals and means, with the total cost and the cost per passed run. A line
 under the table gives the tool calls by name over every run and how many
-failed, or `unknown` when any run did not record them.
+failed, or `unknown` when any run did not record them. When any task's
+check reported case counts, each such task has a `case_score` in
+`report.json` (`runs` with cases, the cases `passed` and `total` summed over
+them, `failed_by_case` mapping each case number to the runs that failed it,
+and `failed_all`, the runs that failed all, when any), and `report.md` adds
+a "Cases" column (`195/297 (65.7%)`, or `–` for a task without cases) and a
+"Failed cases" list under the table, such as
+`- ignore-match: case 4 ×2, case 9 ×1`; otherwise the report is unchanged.
 
 ### Cost
 
@@ -240,10 +287,13 @@ prints Markdown: for every task in either report, sorted, the pass rate, mean
 steps and mean total tokens from base to new with their deltas, tasks present
 on one side only marked as such, and an overall line. When both reports are
 priced, it adds the total cost and the cost per passed run from base to new.
+When either report has case scores, it adds the case score from base to
+new and its delta in percentage points beside the pass rate, `n/a` for a
+side without one.
 It adds a note when
-the two reports ran at different concurrency, run caps, effort, thinking
-clearing or output limits per response, or were priced with different price
-tables; reports written before these were
+the two reports ran at different concurrency, run caps, input token limits,
+effort, thinking clearing or output limits per response, or were priced with
+different price tables; reports written before these were
 recorded carry none of them, and an unknown setting is not reported as a
 difference. It also notes a different compaction threshold, off included:
 off is recorded as absent, and older reports could not compact. It notes a
@@ -314,6 +364,56 @@ them on the host too. `tests/fixtures/eval-hard/<id>/` holds overlays for each
 task: `fail-*` directories are plausible wrong answers the check must refuse,
 and `pass-*` directories correct answers written differently from the
 reference solution, which it must accept.
+
+## The tier-3 suite
+
+`evals/tier3` is for telling configurations apart once the hard suite no
+longer does, when the configurations being compared pass nearly all of it.
+It is a two-task pilot and not yet calibrated: until runs show that it
+separates configurations, treat its pass rates and case scores as
+provisional. Both tasks use the default system prompt.
+
+- `billing-audit`: bring a small `sh` and `awk` billing tool into line with
+  its manual: two reported bugs that trace to a shared date helper, so a
+  fix where the symptom shows fails other cases, and six departures nobody
+  reported, without being told how many there are (32 cases).
+- `probe-plan`: given a table of how each probe reports and changes a
+  device's mode for every revision, find the adaptive probe plan that
+  identifies the revision in the fewest probes in the worst case, and print
+  that count and its ASCII-smallest first probe (24 cases).
+
+Each task gives a session 1500 seconds, 80 steps and 160 tool calls. Every
+check runs all its hidden cases, rather than stopping at the first failure,
+gives each its full 5 seconds (the prompt says so), and prints the one-line
+case count described in [Case counts](#case-counts), so the report gives
+each task a case score beside its pass rate. Its `task.json` gives the
+number of cases. Each run's watchdog allows 1 second beyond the promised 5
+for launch (and billing-audit's visible tests 16 seconds for their promised
+15), and the check timeout covers all of that with room to spare: 240
+seconds for `billing-audit` and 180 for `probe-plan`. A check the harness stops
+at its timeout prints no case line, and the run has no score.
+
+Run it with the settings used for any other comparison plus
+`--max-run-secs 1200 --max-total-input-tokens 4000000`:
+
+```sh
+cargo run --locked -- eval run --tasks evals/tier3 ... \
+  --max-run-secs 1200 --max-total-input-tokens 4000000 --out DIR
+```
+
+A stronger configuration tends to investigate longer on these tasks, and a
+run that ends on its deadline or input budget measures the limit rather
+than the configuration, so the limits are set well above what a run should
+need. Treat such a stop as a limit to raise and rerun, not as a result.
+Self-test the suite with `eval selftest --tasks evals/tier3`.
+
+As for the hard suite, the checks and solutions are POSIX `sh` and `awk`
+and the tests run them on the host. `tests/fixtures/eval-tier3/<id>/` holds
+the `fail-*` and `pass-*` overlays for each task and `expected-lines.txt`,
+which gives, for the bare seed (`bare`), the reference solution
+(`solution`) and each overlay, the exact line the check must print, as
+`<name>`, a tab, and the line. Each `fail-*` overlay is wrong in one way
+and must fail exactly the cases its line names.
 
 ## The coding suite
 

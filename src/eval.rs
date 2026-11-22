@@ -61,7 +61,7 @@ const MAX_TASK_JSON_BYTES: usize = 64 << 10;
 /// Most entries, files and directories together, under one task's `seed/`.
 const MAX_SEED_ENTRIES: usize = 1024;
 /// Most task directories one suite holds.
-const MAX_TASKS: usize = 1000;
+pub const MAX_TASKS: usize = 1000;
 
 #[derive(Debug, Error)]
 pub enum EvalError {
@@ -105,9 +105,27 @@ struct TaskSpec {
     /// For people; never model-visible.
     description: String,
     check_timeout_secs: u64,
+    /// How many cases a graded check runs, when it is one. Only an omitted
+    /// key means none; a present `null` is refused.
+    #[serde(default, deserialize_with = "case_count")]
+    cases: Option<u32>,
     session_timeout_secs: Option<u64>,
     max_steps: Option<u32>,
     max_tool_calls: Option<u32>,
+}
+
+/// `cases`, when the key is there (`default` makes an omitted one `None`):
+/// it must hold a count, so `null` is refused rather than taken as none.
+fn case_count<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<u32>::deserialize(deserializer)? {
+        Some(cases) => Ok(Some(cases)),
+        None => Err(serde::de::Error::custom(format!(
+            "cases must be 1 to {MAX_CHECK_CASES}"
+        ))),
+    }
 }
 
 /// One loaded and validated eval task.
@@ -126,6 +144,12 @@ pub struct EvalTask {
     pub session_timeout: Option<Duration>,
     pub max_steps: Option<u32>,
     pub max_tool_calls: Option<u32>,
+    /// `cases` in `task.json`: the number of cases its graded check runs
+    /// (see [`parse_check_cases`]). The self-test then requires both checks
+    /// to report exactly that many, and a run whose check reports another
+    /// number has no case score. `None` for a check that may or may not
+    /// report cases.
+    pub cases: Option<u32>,
 }
 
 impl EvalTask {
@@ -344,6 +368,12 @@ pub fn load_task(dir: &Path, name: &str, base: &HarnessConfig) -> Result<EvalTas
         )));
     }
     if spec
+        .cases
+        .is_some_and(|cases| !in_range(u64::from(cases), u64::from(MAX_CHECK_CASES)))
+    {
+        return Err(fail(format!("cases must be 1 to {MAX_CHECK_CASES}")));
+    }
+    if spec
         .session_timeout_secs
         .is_some_and(|secs| !in_range(secs, MAX_SESSION_TIMEOUT.as_secs()))
     {
@@ -388,6 +418,7 @@ pub fn load_task(dir: &Path, name: &str, base: &HarnessConfig) -> Result<EvalTas
         session_timeout: spec.session_timeout_secs.map(Duration::from_secs),
         max_steps: spec.max_steps,
         max_tool_calls: spec.max_tool_calls,
+        cases: spec.cases,
     };
     let config = task.config(base);
     if task.check.timeout.saturating_mul(2) > config.session_timeout {
@@ -491,6 +522,79 @@ fn read_seed(root: &Path, task: &str, max_file_bytes: usize) -> Result<Vec<SeedF
     Ok(files)
 }
 
+/// Most cases a graded check may report. It bounds the files that carry
+/// case scores: `results.jsonl` lists each run's failing cases, and
+/// `report.json` counts each task's failures per case, so at [`MAX_TASKS`]
+/// tasks and [`MAX_TRIALS`] trials both stay within what [`reprice`] and
+/// [`read_report`] read ([`MAX_RESULTS_BYTES`], [`MAX_REPORT_BYTES`]).
+pub const MAX_CHECK_CASES: u32 = 128;
+
+/// A graded check's case count, parsed from its one-line stdout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckCases {
+    pub passed: u32,
+    pub total: u32,
+    /// Failing case numbers ascending; `None` for `failed all`.
+    pub failed: Option<Vec<u32>>,
+}
+
+/// The case count a graded check printed as its whole stdout (one trailing
+/// newline allowed), checked against its exit code:
+///
+/// - `cases N of N`, exit 0: every case passed;
+/// - `cases P of N failed I,J,K`, exit 1: P < N, and the N − P failing case
+///   numbers, each 1 to N, strictly ascending, comma-separated;
+/// - `cases 0 of N failed all`, exit 1: a precondition failed.
+///
+/// Numbers are decimal without leading zeros, and N is 1 to
+/// [`MAX_CHECK_CASES`]. Anything else, or an exit code that disagrees, is
+/// `None`: the check did not report cases.
+#[must_use]
+pub fn parse_check_cases(stdout: &str, exit_code: Option<i32>) -> Option<CheckCases> {
+    let line = stdout.strip_suffix('\n').unwrap_or(stdout);
+    let (passed, rest) = line.strip_prefix("cases ")?.split_once(" of ")?;
+    let (total, failed) = match rest.split_once(" failed ") {
+        Some((total, failed)) => (total, Some(failed)),
+        None => (rest, None),
+    };
+    let (passed, total) = (case_number(passed)?, case_number(total)?);
+    if !(1..=MAX_CHECK_CASES).contains(&total) || passed > total {
+        return None;
+    }
+    let failed = match (failed, exit_code?) {
+        (None, 0) if passed == total => Some(Vec::new()),
+        (Some("all"), 1) if passed == 0 => None,
+        (Some(list), 1) if passed < total => {
+            let cases = list
+                .split(',')
+                .map(case_number)
+                .collect::<Option<Vec<_>>>()?;
+            let in_order = cases.windows(2).all(|pair| pair[0] < pair[1]);
+            let in_range = cases.iter().all(|case| (1..=total).contains(case));
+            let counted = u32::try_from(cases.len()).ok() == Some(total - passed);
+            if !(in_order && in_range && counted) {
+                return None;
+            }
+            Some(cases)
+        }
+        _ => return None,
+    };
+    Some(CheckCases {
+        passed,
+        total,
+        failed,
+    })
+}
+
+/// A case count or number: 1 to 3 decimal digits, no leading zero but `0`.
+fn case_number(text: &str) -> Option<u32> {
+    let digits = !text.is_empty() && text.len() <= 3 && text.bytes().all(|b| b.is_ascii_digit());
+    if !digits || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    text.parse().ok()
+}
+
 /// One run's line in `results.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResult {
@@ -505,6 +609,11 @@ pub struct RunResult {
     /// `passed`, `failed` or `error`; `None` when the check did not run.
     pub check: Option<String>,
     pub check_exit_code: Option<i32>,
+    /// The cases a graded check reported (see [`parse_check_cases`]), when
+    /// it ran to an ordinary exit; missing for checks that don't report
+    /// cases and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_cases: Option<CheckCases>,
     pub steps: u32,
     pub tool_calls: u32,
     /// All input tokens: uncached, cache reads and cache writes.
@@ -573,6 +682,11 @@ pub struct Manifest {
     /// `--max-run-secs`; missing when unset and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_secs: Option<u64>,
+    /// Input tokens per run, cached input included
+    /// (`--max-total-input-tokens`); missing in older files, where it is
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_input_tokens: Option<u64>,
     /// The reasoning effort sent (`--effort`); missing for providers
     /// without one and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -684,10 +798,65 @@ pub struct TaskReport {
     /// [`Report::compact_at`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions: Option<Stat>,
+    /// The graded check's cases over the runs that reported them; missing
+    /// when none did and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_score: Option<CaseScore>,
     pub replay_matched: u32,
     /// Diverged at a turn or at the check.
     pub replay_diverged: u32,
     pub replay_failed: u32,
+}
+
+/// One task's graded check cases, summed over its runs whose check reported
+/// them ([`RunResult::check_cases`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaseScore {
+    /// Runs whose check reported its cases.
+    pub runs: u32,
+    /// Cases passed, over those runs.
+    pub passed: u32,
+    /// Cases run, over those runs.
+    pub total: u32,
+    /// For each case number, how many of those runs failed it; a run that
+    /// failed all (a precondition) counts toward none.
+    pub failed_by_case: BTreeMap<u32, u32>,
+    /// Of those runs, the ones that failed all; missing when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed_all: u32,
+}
+
+impl CaseScore {
+    /// The cases passed over the cases run; `None` without cases.
+    #[must_use]
+    pub fn rate(&self) -> Option<f64> {
+        ratio(self.passed, self.total)
+    }
+
+    /// The score of `runs`, or `None` when none of them reported cases.
+    fn of(runs: &[&RunResult]) -> Option<Self> {
+        let mut score = Self {
+            runs: 0,
+            passed: 0,
+            total: 0,
+            failed_by_case: BTreeMap::new(),
+            failed_all: 0,
+        };
+        for cases in runs.iter().filter_map(|run| run.check_cases.as_ref()) {
+            score.runs += 1;
+            score.passed = score.passed.saturating_add(cases.passed);
+            score.total = score.total.saturating_add(cases.total);
+            match &cases.failed {
+                Some(failed) => {
+                    for case in failed {
+                        *score.failed_by_case.entry(*case).or_default() += 1;
+                    }
+                }
+                None => score.failed_all += 1,
+            }
+        }
+        (score.runs > 0).then_some(score)
+    }
 }
 
 /// Sums over every run.
@@ -767,6 +936,9 @@ pub struct Report {
     /// `--max-run-secs`; missing when unset and in older files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_secs: Option<u64>,
+    /// As in [`Manifest::max_total_input_tokens`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_input_tokens: Option<u64>,
     /// As in [`Manifest::effort`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -950,6 +1122,7 @@ fn task_report(id: &str, mine: &[&RunResult], totals: &mut Totals, compacting: b
             .map(|costs| Stat::of(&costs)),
         long_prompt_requests,
         compactions: compacting.then(|| column(|result| u64::from(result.compactions))),
+        case_score: CaseScore::of(mine),
         replay_matched: replay.0,
         replay_diverged: replay.1,
         replay_failed: replay.2,
@@ -1006,6 +1179,7 @@ pub fn report(results: &[RunResult], manifest: &Manifest) -> Report {
         trials: manifest.trials,
         concurrency: manifest.concurrency,
         max_run_secs: manifest.max_run_secs,
+        max_total_input_tokens: manifest.max_total_input_tokens,
         effort: manifest.effort.clone(),
         clear_thinking: manifest.clear_thinking.clone(),
         compact_at: manifest.compact_at,
@@ -1101,6 +1275,9 @@ fn write_report_header(text: &mut String, report: &Report) {
     if let Some(secs) = report.max_run_secs {
         let _ = writeln!(text, "- Longest run allowed: {secs} s");
     }
+    if let Some(tokens) = report.max_total_input_tokens {
+        let _ = writeln!(text, "- Input token limit per run: {tokens} tokens");
+    }
     if let Some(effort) = &report.effort {
         let _ = writeln!(text, "- Effort: {}", cell(effort));
     }
@@ -1147,7 +1324,8 @@ fn write_pricing_line(text: &mut String, report: &Report) {
 }
 
 /// `report.md`: a header naming the provider, model and label, then one
-/// table row per task and an overall row.
+/// table row per task and an overall row, the failed cases when a task has
+/// a case score, and the totals.
 #[must_use]
 pub fn report_markdown(report: &Report) -> String {
     let mut text = String::new();
@@ -1155,11 +1333,14 @@ pub fn report_markdown(report: &Report) -> String {
     // The compactions column only for a run that could compact, so other
     // reports are unchanged.
     let compacting = report.compact_at.is_some();
+    // The cases column likewise only when a task's check reported cases.
+    let scored = report.tasks.iter().any(|task| task.case_score.is_some());
     let _ = writeln!(
         text,
-        "\n| Task | Runs | Passed | Pass rate | Outcomes | Steps (mean / median) | Tool calls \
+        "\n| Task | Runs | Passed | Pass rate | {}Outcomes | Steps (mean / median) | Tool calls \
          (mean / median) | Input tokens (mean) | Output tokens (mean) | Cost (mean) | {}Wall ms \
          (mean / median) | Replay matched / diverged / failed |",
+        if scored { "Cases | " } else { "" },
         if compacting {
             "Compactions (mean) | "
         } else {
@@ -1168,9 +1349,17 @@ pub fn report_markdown(report: &Report) -> String {
     );
     let _ = writeln!(
         text,
-        "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|{}---:|---:|",
+        "|---|---:|---:|---:|{}---|---:|---:|---:|---:|---:|{}---:|---:|",
+        if scored { "---:|" } else { "" },
         if compacting { "---:|" } else { "" }
     );
+    let cases = |score: Option<&CaseScore>| {
+        if scored {
+            format!("{} | ", case_cell(score))
+        } else {
+            String::new()
+        }
+    };
     let compactions = |mean: Option<f64>| {
         if compacting {
             format!("{} | ", number(mean))
@@ -1187,11 +1376,12 @@ pub fn report_markdown(report: &Report) -> String {
             .join(", ");
         let _ = writeln!(
             text,
-            "| {} | {} | {} | {} | {} | {} / {} | {} / {} | {} | {} | {} | {}{} / {} | {} / {} / {} |",
+            "| {} | {} | {} | {} | {}{} | {} / {} | {} / {} | {} | {} | {} | {}{} / {} | {} / {} / {} |",
             cell(&task.task),
             task.runs,
             task.passed,
             percent(task.pass_rate),
+            cases(task.case_score.as_ref()),
             outcomes,
             number(task.steps.mean),
             number(task.steps.median),
@@ -1209,13 +1399,13 @@ pub fn report_markdown(report: &Report) -> String {
         );
     }
     let overall = &report.overall;
-    let tool_calls = tool_calls_sentence(overall);
     let _ = writeln!(
         text,
-        "| **Overall** | {} | {} | {} (macro) | | {} | {} | {} | {} | {} | {}{} | |",
+        "| **Overall** | {} | {} | {} (macro) | {}| {} | {} | {} | {} | {} | {}{} | |",
         overall.runs,
         overall.passed,
         percent(overall.macro_pass_rate),
+        if scored { "| " } else { "" },
         number(overall.means.steps),
         number(overall.means.tool_calls),
         number(overall.means.input_tokens),
@@ -1224,7 +1414,21 @@ pub fn report_markdown(report: &Report) -> String {
         compactions(overall.means.compactions),
         number(overall.means.wall_ms),
     );
-    let _ = writeln!(text, "\nTool calls by name: {tool_calls}.");
+    if scored {
+        write_failed_cases(&mut text, report);
+    }
+    write_report_summary(&mut text, overall);
+    text
+}
+
+/// The lines [`report_markdown`] ends with: the tool calls by name, then
+/// the macro pass rate, pass@1, the totals and, when priced, the cost.
+fn write_report_summary(text: &mut String, overall: &OverallReport) {
+    let _ = writeln!(
+        text,
+        "\nTool calls by name: {}.",
+        tool_calls_sentence(overall)
+    );
     let _ = write!(
         text,
         "\nMacro pass rate (mean of task pass rates): {}. pass@1 from {} trial(s) per task: {}. \
@@ -1250,7 +1454,49 @@ pub fn report_markdown(report: &Report) -> String {
         );
     }
     let _ = writeln!(text);
-    text
+}
+
+/// `97/99 (98.0%)`, or `–` for a task whose check reported no cases.
+fn case_cell(score: Option<&CaseScore>) -> String {
+    score.map_or_else(
+        || "–".to_string(),
+        |score| {
+            format!(
+                "{}/{} ({})",
+                score.passed,
+                score.total,
+                percent(score.rate())
+            )
+        },
+    )
+}
+
+/// The "Failed cases" list under [`report_markdown`]'s table: per task
+/// with a case score, how many runs failed each case, in case order, then
+/// how many failed all.
+fn write_failed_cases(text: &mut String, report: &Report) {
+    let _ = writeln!(text, "\nFailed cases:\n");
+    for task in &report.tasks {
+        let Some(score) = &task.case_score else {
+            continue;
+        };
+        let mut parts = score
+            .failed_by_case
+            .iter()
+            .map(|(case, runs)| format!("case {case} ×{runs}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if score.failed_all > 0 {
+            if !parts.is_empty() {
+                parts.push_str("; ");
+            }
+            let _ = write!(parts, "failed all ×{}", score.failed_all);
+        }
+        if parts.is_empty() {
+            parts.push_str("none");
+        }
+        let _ = writeln!(text, "- {}: {parts}", cell(&task.task));
+    }
 }
 
 fn delta(base: Option<f64>, new: Option<f64>, scale: f64, unit: &str) -> String {
@@ -1265,8 +1511,9 @@ fn mean_tokens(task: &TaskReport) -> Option<f64> {
 }
 
 /// Markdown comparing two reports, such as two models or a harness change:
-/// per task (the union, sorted by ID) the pass rate, mean steps and mean
-/// total tokens from `base` to `new` with deltas, tasks present on one side
+/// per task (the union, sorted by ID) the pass rate, the case score when
+/// either report has one, mean steps and mean total tokens from `base` to
+/// `new` with deltas, tasks present on one side
 /// only marked, then an overall line, the total cost when both reports have
 /// one, and a note for each run setting the two differ in.
 #[must_use]
@@ -1283,43 +1530,7 @@ pub fn compare(base: &Report, new: &Report) -> String {
     let _ = writeln!(text, "# Eval comparison\n");
     let _ = writeln!(text, "- Base: {}", side(base));
     let _ = writeln!(text, "- New: {}\n", side(new));
-    let _ = writeln!(
-        text,
-        "| Task | Pass rate (base → new) | Δ | Mean steps (base → new) | Δ | Mean tokens (base → \
-         new) | Δ |"
-    );
-    let _ = writeln!(text, "|---|---|---:|---|---:|---|---:|");
-    let ids = base
-        .tasks
-        .iter()
-        .chain(&new.tasks)
-        .map(|task| task.task.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    for id in ids {
-        let left = base.tasks.iter().find(|task| task.task == id);
-        let right = new.tasks.iter().find(|task| task.task == id);
-        let name = match (left, right) {
-            (Some(_), None) => format!("{} (only in base)", cell(id)),
-            (None, Some(_)) => format!("{} (only in new)", cell(id)),
-            _ => cell(id),
-        };
-        let rate = |task: Option<&TaskReport>| task.and_then(|task| task.pass_rate);
-        let steps = |task: Option<&TaskReport>| task.and_then(|task| task.steps.mean);
-        let tokens = |task: Option<&TaskReport>| task.and_then(mean_tokens);
-        let _ = writeln!(
-            text,
-            "| {name} | {} → {} | {} | {} → {} | {} | {} → {} | {} |",
-            percent(rate(left)),
-            percent(rate(right)),
-            delta(rate(left), rate(right), 100.0, " pp"),
-            number(steps(left)),
-            number(steps(right)),
-            delta(steps(left), steps(right), 1.0, ""),
-            number(tokens(left)),
-            number(tokens(right)),
-            delta(tokens(left), tokens(right), 1.0, ""),
-        );
-    }
+    write_task_deltas(&mut text, base, new);
     let total_tokens = |report: &Report| {
         Some(report.overall.means.input_tokens? + report.overall.means.output_tokens?)
     };
@@ -1368,6 +1579,78 @@ pub fn compare(base: &Report, new: &Report) -> String {
     text
 }
 
+/// [`compare`]'s table: per task, the union sorted by ID, the pass rate,
+/// the case score when either report has one, mean steps and mean tokens
+/// from `base` to `new` with deltas.
+fn write_task_deltas(text: &mut String, base: &Report, new: &Report) {
+    // The case score columns only when a report has a case score, so other
+    // comparisons are unchanged.
+    let scored = [base, new]
+        .iter()
+        .any(|report| report.tasks.iter().any(|task| task.case_score.is_some()));
+    let _ = writeln!(
+        text,
+        "| Task | Pass rate (base → new) | Δ | {}Mean steps (base → new) | Δ | Mean tokens (base → \
+         new) | Δ |",
+        if scored {
+            "Cases (base → new) | Δ | "
+        } else {
+            ""
+        }
+    );
+    let _ = writeln!(
+        text,
+        "|---|---|---:|{}---|---:|---|---:|",
+        if scored { "---|---:|" } else { "" }
+    );
+    let ids = base
+        .tasks
+        .iter()
+        .chain(&new.tasks)
+        .map(|task| task.task.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for id in ids {
+        let left = base.tasks.iter().find(|task| task.task == id);
+        let right = new.tasks.iter().find(|task| task.task == id);
+        let name = match (left, right) {
+            (Some(_), None) => format!("{} (only in base)", cell(id)),
+            (None, Some(_)) => format!("{} (only in new)", cell(id)),
+            _ => cell(id),
+        };
+        let rate = |task: Option<&TaskReport>| task.and_then(|task| task.pass_rate);
+        let steps = |task: Option<&TaskReport>| task.and_then(|task| task.steps.mean);
+        let tokens = |task: Option<&TaskReport>| task.and_then(mean_tokens);
+        // A side without a case score is unknown, never 0%.
+        let score = |task: Option<&TaskReport>| {
+            task.and_then(|task| task.case_score.as_ref())
+                .and_then(CaseScore::rate)
+        };
+        let cases = if scored {
+            format!(
+                "{} → {} | {} | ",
+                percent(score(left)),
+                percent(score(right)),
+                delta(score(left), score(right), 100.0, " pp")
+            )
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            text,
+            "| {name} | {} → {} | {} | {cases}{} → {} | {} | {} → {} | {} |",
+            percent(rate(left)),
+            percent(rate(right)),
+            delta(rate(left), rate(right), 100.0, " pp"),
+            number(steps(left)),
+            number(steps(right)),
+            delta(steps(left), steps(right), 1.0, ""),
+            number(tokens(left)),
+            number(tokens(right)),
+            delta(tokens(left), tokens(right), 1.0, ""),
+        );
+    }
+}
+
 /// Each side's tool calls by name, when both reports know them: unknown
 /// counts are not zero.
 fn write_tool_calls(text: &mut String, base: &Report, new: &Report) {
@@ -1410,6 +1693,18 @@ fn write_setting_notes(text: &mut String, base: &Report, new: &Report) {
              comparable.",
             secs(base.max_run_secs),
             secs(new.max_run_secs)
+        );
+    }
+    // Older reports did not record the input token limit: unknown is not a
+    // difference.
+    if let (Some(base_tokens), Some(new_tokens)) =
+        (base.max_total_input_tokens, new.max_total_input_tokens)
+        && base_tokens != new_tokens
+    {
+        let _ = writeln!(
+            text,
+            "\nInput token limit per run differs ({base_tokens} → {new_tokens} tokens); pass \
+             rates, tokens and costs are not directly comparable."
         );
     }
     // Reports written before these were recorded carry none of them, and an
@@ -1516,7 +1811,8 @@ fn write_call_limit_notes(text: &mut String, base: &Report, new: &Report) {
 /// Returns an error when the file cannot be read or is not a report.
 pub fn read_report(dir: &Path) -> Result<Report, EvalError> {
     let path = dir.join("report.json");
-    let bytes = read_regular_file(&path, 16 << 20).map_err(|error| output_error(&path, error))?;
+    let bytes =
+        read_regular_file(&path, MAX_REPORT_BYTES).map_err(|error| output_error(&path, error))?;
     let report: Report =
         serde_json::from_slice(&bytes).map_err(|error| output_error(&path, error))?;
     if report.schema != REPORT_SCHEMA {
@@ -1538,7 +1834,8 @@ pub fn read_report(dir: &Path) -> Result<Report, EvalError> {
 /// Returns an error when the file cannot be read or is not a manifest.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, EvalError> {
     let path = dir.join("manifest.json");
-    let bytes = read_regular_file(&path, 16 << 20).map_err(|error| output_error(&path, error))?;
+    let bytes =
+        read_regular_file(&path, MAX_REPORT_BYTES).map_err(|error| output_error(&path, error))?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|error| output_error(&path, error))?;
     if manifest.schema != REPORT_SCHEMA {
@@ -1554,8 +1851,12 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest, EvalError> {
 }
 
 /// Largest `results.jsonl` [`reprice`] reads: [`MAX_TASKS`] times
-/// [`MAX_TRIALS`] lines of about 2 KiB each, with room to spare.
-const MAX_RESULTS_BYTES: usize = 256 << 20;
+/// [`MAX_TRIALS`] lines of about 2 KiB each, plus the longest `check_cases`
+/// ([`MAX_CHECK_CASES`] failing case numbers), with room to spare.
+pub const MAX_RESULTS_BYTES: usize = 256 << 20;
+/// Largest `report.json` or `manifest.json` [`read_report`] and
+/// [`read_manifest`] read.
+pub const MAX_REPORT_BYTES: usize = 16 << 20;
 
 /// One task's line in a [`CostSummary`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1990,6 +2291,8 @@ struct Recorded {
     tool_calls: u32,
     usage: crate::provider::Usage,
     check: Option<CheckOutcome>,
+    /// The cases the check reported, from the same record as `check`.
+    check_cases: Option<CheckCases>,
     truncation_recoveries: u32,
     /// The responses' list-price cost, when priced.
     cost_picodollars: u128,
@@ -2017,6 +2320,26 @@ impl Recorded {
             }
         }
     }
+}
+
+/// The cases a check that ran to an ordinary exit (passed, or failed with an
+/// exit code and not by its timeout) reported in `stdout`, when `stdout` is
+/// known to be all it printed (`complete`); never for an error, such as
+/// cancellation or the session deadline, for output that was cut or whose
+/// length is unknown, or from an older journal, which does not say.
+fn check_cases(outcome: &CheckOutcome, stdout: &str, complete: Option<bool>) -> Option<CheckCases> {
+    if complete != Some(true) {
+        return None;
+    }
+    let exit_code = match outcome {
+        CheckOutcome::Passed => 0,
+        CheckOutcome::Failed {
+            exit_code: Some(code),
+            timed_out: false,
+        } => *code,
+        CheckOutcome::Failed { .. } | CheckOutcome::Error { .. } => return None,
+    };
+    parse_check_cases(stdout, Some(exit_code))
 }
 
 /// What `journal` says about its session, each model and compaction
@@ -2062,8 +2385,14 @@ fn recorded(journal: Option<&LoadedJournal>, pricing: Option<&ModelPricing>) -> 
                     .or_default() += 1;
                 recorded.failed_tool_calls += u32::from(!*ok);
             }
-            JournalEvent::CheckCompleted { outcome, .. } => {
+            JournalEvent::CheckCompleted {
+                outcome,
+                stdout,
+                stdout_complete,
+                ..
+            } => {
                 recorded.check = Some(outcome.clone());
+                recorded.check_cases = check_cases(outcome, stdout, *stdout_complete);
             }
             JournalEvent::SessionEnded {
                 outcome,
@@ -2277,6 +2606,7 @@ where
         trials: options.trials,
         concurrency: options.concurrency,
         max_run_secs: options.max_run_secs,
+        max_total_input_tokens: Some(options.base_config.max_total_input_tokens),
         effort: options.effort.clone(),
         clear_thinking: options.clear_thinking.clone(),
         compact_at: options
@@ -2476,6 +2806,12 @@ where
         work_outcome,
         check: check.as_ref().map(|check| check.label().to_string()),
         check_exit_code: check.as_ref().and_then(CheckOutcome::exit_code),
+        // The journal's check record is the verdict above whenever it was
+        // written; without one, there are no cases. A task that says how
+        // many cases its check runs scores only a line with that many.
+        check_cases: recorded
+            .check_cases
+            .filter(|cases| task.cases.is_none_or(|total| cases.total == total)),
         steps: recorded.steps,
         tool_calls: recorded.tool_calls,
         input_tokens: usage.total_input_tokens(),
@@ -2704,10 +3040,65 @@ pub fn solved_provider(solution: &str) -> ScriptedProvider {
     ])
 }
 
+/// Whether a task's two self-test checks agree on case counts: neither
+/// printed a case line (as for checks that don't report cases), or both did,
+/// counting the same cases, with the solution passing them all and the bare
+/// seed not. `solution` and `bare` are the cases each run's check reported,
+/// read as results read them. When the task says how many cases its check
+/// runs (`expected`), both must have printed a line counting that many.
+fn selftest_case_lines(
+    expected: Option<u32>,
+    solution: Option<&CheckCases>,
+    bare: Option<&CheckCases>,
+) -> Result<(), String> {
+    if let Some(expected) = expected {
+        for (name, cases) in [("solution", solution), ("bare seed", bare)] {
+            match cases {
+                None => {
+                    return Err(format!(
+                        "the {name} check printed no valid case line for its {expected} cases"
+                    ));
+                }
+                Some(cases) if cases.total != expected => {
+                    return Err(format!(
+                        "the {name} check reported {} cases, not {expected}",
+                        cases.total
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let (solution, bare) = match (solution, bare) {
+        (None, None) => return Ok(()),
+        (Some(_), None) => return Err("only the solution check printed a case line".to_string()),
+        (None, Some(_)) => return Err("only the bare seed check printed a case line".to_string()),
+        (Some(solution), Some(bare)) => (solution, bare),
+    };
+    if solution.total != bare.total {
+        return Err(format!(
+            "the solution and bare seed checks report different case totals ({} and {})",
+            solution.total, bare.total
+        ));
+    }
+    if solution.passed != solution.total {
+        return Err(format!(
+            "the solution passed {} of {} cases",
+            solution.passed, solution.total
+        ));
+    }
+    if bare.passed == bare.total {
+        return Err("the bare seed passed every case".to_string());
+    }
+    Ok(())
+}
+
 /// Prove each task's check through the real engine with a scripted model
 /// and no network provider: a bare
 /// session must fail its check, and a session that runs the reference
-/// solution must pass it. Audits and journals go under
+/// solution must pass it. When either check prints a case line (see
+/// [`parse_check_cases`]), both must, and they must agree as
+/// [`selftest_case_lines`] says. Audits and journals go under
 /// `OUT/<id>/bare/` and `OUT/<id>/solved/`. It fails closed like
 /// [`run_suite`].
 ///
@@ -2734,14 +3125,17 @@ pub async fn selftest<A: SandboxApi + Clone>(
         let config = task.config(base);
         let session = task.session(&config);
         let mut problem = None;
+        let (mut bare_cases, mut solved_cases) = (None, None);
         for (kind, provider, want_pass) in [
             ("bare", bare_provider(), false),
             ("solved", solved_provider(&task.solution), true),
         ] {
             let dir = out.join(&task.id).join(kind);
-            let (audit, journal, _) = open_outputs(&dir, "audit.jsonl", "journal.jsonl")?;
+            let (audit, journal, journal_path) =
+                open_outputs(&dir, "audit.jsonl", "journal.jsonl")?;
             let mut harness = Harness::new(api.clone(), provider, audit, journal, config.clone());
             let result = harness.run(&session, cancel.clone()).await;
+            drop(harness);
             let found = match result {
                 Err(error) if cleanup_unconfirmed(&error) => {
                     results.push(SelftestResult {
@@ -2767,9 +3161,30 @@ pub async fn selftest<A: SandboxApi + Clone>(
                     (None, _) => Err(format!("{kind}: the check did not run")),
                 },
             };
-            if let Err(found) = found {
-                problem.get_or_insert(found);
+            // The cases its check reported, read from the journal as
+            // results read them.
+            let loaded = found.and_then(|()| {
+                read_journal(&journal_path)
+                    .map_err(|error| format!("{kind}: the journal could not be read back: {error}"))
+            });
+            match loaded {
+                Ok(loaded) => {
+                    let cases = recorded(Some(&loaded), None).check_cases;
+                    if want_pass {
+                        solved_cases = cases;
+                    } else {
+                        bare_cases = cases;
+                    }
+                }
+                Err(found) => {
+                    problem.get_or_insert(found);
+                }
             }
+        }
+        if let Err(found) =
+            selftest_case_lines(task.cases, solved_cases.as_ref(), bare_cases.as_ref())
+        {
+            problem.get_or_insert(found);
         }
         let result = SelftestResult {
             task: task.id.clone(),
@@ -2788,12 +3203,126 @@ pub async fn selftest<A: SandboxApi + Clone>(
 mod tests {
     use super::*;
     use crate::audit::AuditError;
-    use crate::journal::JournalError;
+    use crate::journal::{JournalError, JournalRecord, sha256_hex};
 
     fn audit_failed() -> Result<(), HarnessError> {
         Err(HarnessError::Audit(AuditError::Io(std::io::Error::other(
             "disk gone",
         ))))
+    }
+
+    #[test]
+    fn only_a_check_that_exited_on_its_own_reports_cases() {
+        let all = "cases 3 of 3\n";
+        let some = "cases 2 of 3 failed 3\n";
+        assert_eq!(
+            check_cases(&CheckOutcome::Passed, all, Some(true)),
+            parse_check_cases(all, Some(0))
+        );
+        assert!(check_cases(&CheckOutcome::Passed, all, Some(true)).is_some());
+        let failed = |exit_code, timed_out| CheckOutcome::Failed {
+            exit_code,
+            timed_out,
+        };
+        assert!(check_cases(&failed(Some(1), false), some, Some(true)).is_some());
+        // The exit code still has to agree with the line.
+        assert_eq!(check_cases(&failed(Some(2), false), some, Some(true)), None);
+        assert_eq!(check_cases(&CheckOutcome::Passed, some, Some(true)), None);
+        // A timeout, or no verdict, never reports cases, whatever the
+        // check printed before it was stopped or replaced.
+        assert_eq!(check_cases(&failed(Some(1), true), some, Some(true)), None);
+        assert_eq!(check_cases(&failed(None, true), some, Some(true)), None);
+        assert_eq!(check_cases(&failed(None, false), some, Some(true)), None);
+        for reason in ["canceled", "deadline"] {
+            let error = CheckOutcome::Error {
+                reason: reason.to_string(),
+            };
+            assert_eq!(check_cases(&error, all, Some(true)), None, "{reason}");
+        }
+        // Output that was cut, or whose length is unknown, or a record from
+        // an older journal that does not say, never reports cases.
+        assert_eq!(check_cases(&CheckOutcome::Passed, all, Some(false)), None);
+        assert_eq!(check_cases(&CheckOutcome::Passed, all, None), None);
+    }
+
+    /// A check record from before `stdout_complete` existed decodes, encodes
+    /// back to the same bytes (so its hash, and the chain after it, hold),
+    /// and gives no score: it cannot say whether its stdout was complete.
+    #[test]
+    fn an_older_check_record_keeps_its_bytes_and_gives_no_score() {
+        let older = concat!(
+            r#"{"sequence":0,"unix_ms":1,"session_id":"hs-1","prev_sha256":"0","#,
+            r#""event":"check_completed","outcome":{"result":"passed"},"#,
+            r#""execution_id":"ex-1","stdout":"cases 1 of 1\n","stderr":""}"#
+        );
+        let record: JournalRecord = serde_json::from_str(older).expect("decodes");
+        assert!(matches!(
+            record.event,
+            JournalEvent::CheckCompleted {
+                stdout_complete: None,
+                ..
+            }
+        ));
+        let encoded = serde_json::to_string(&record).expect("encodes");
+        assert_eq!(encoded, older);
+        assert_eq!(sha256_hex(encoded.as_bytes()), sha256_hex(older.as_bytes()));
+        let journal = |record: JournalRecord| LoadedJournal {
+            records: vec![record],
+            complete: false,
+        };
+        let unscored = recorded(Some(&journal(record.clone())), None);
+        assert_eq!(unscored.check, Some(CheckOutcome::Passed));
+        assert_eq!(unscored.check_cases, None);
+
+        // The same record from a current journal, stdout known complete.
+        let current = older.replace(r#""stderr":""}"#, r#""stderr":"","stdout_complete":true}"#);
+        let record: JournalRecord = serde_json::from_str(&current).expect("decodes");
+        assert_eq!(serde_json::to_string(&record).expect("encodes"), current);
+        assert_eq!(
+            recorded(Some(&journal(record)), None).check_cases,
+            parse_check_cases("cases 1 of 1\n", Some(0))
+        );
+    }
+
+    #[test]
+    fn the_selftest_wants_both_case_lines_or_neither_and_agreeing_ones() {
+        let cases = |line: &str, exit_code| parse_check_cases(line, Some(exit_code)).expect(line);
+        let all = cases("cases 3 of 3", 0);
+        let some = cases("cases 1 of 3 failed 2,3", 1);
+        let none = cases("cases 0 of 3 failed all", 1);
+        // Checks that don't report cases, as in the starter and hard suites.
+        assert_eq!(selftest_case_lines(None, None, None), Ok(()));
+        assert_eq!(selftest_case_lines(None, Some(&all), Some(&some)), Ok(()));
+        assert_eq!(selftest_case_lines(None, Some(&all), Some(&none)), Ok(()));
+        assert_eq!(
+            selftest_case_lines(None, Some(&all), None),
+            Err("only the solution check printed a case line".to_string())
+        );
+        assert_eq!(
+            selftest_case_lines(None, None, Some(&some)),
+            Err("only the bare seed check printed a case line".to_string())
+        );
+        assert_eq!(
+            selftest_case_lines(None, Some(&cases("cases 4 of 4", 0)), Some(&some)),
+            Err(
+                "the solution and bare seed checks report different case totals (4 and 3)"
+                    .to_string()
+            )
+        );
+        // The parser gives a solution these only with a failing exit, which
+        // the self-test already refuses; the helper refuses them too.
+        assert_eq!(
+            selftest_case_lines(None, Some(&cases("cases 2 of 3 failed 3", 1)), Some(&some)),
+            Err("the solution passed 2 of 3 cases".to_string())
+        );
+        assert_eq!(
+            selftest_case_lines(None, Some(&none), Some(&some)),
+            Err("the solution passed 0 of 3 cases".to_string())
+        );
+        assert_eq!(
+            selftest_case_lines(None, Some(&all), Some(&all)),
+            Err("the bare seed passed every case".to_string())
+        );
     }
 
     #[test]

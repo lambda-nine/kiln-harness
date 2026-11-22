@@ -33,6 +33,46 @@ change the CLI or audit format.
   checkpoint capture and never removes, so the check no longer fails on a VM
   where anything has captured a checkpoint.
 
+- A tier-3 eval suite, `evals/tier3`, for telling configurations apart once
+  the hard suite no longer does. It is a two-task pilot, not yet
+  calibrated: `billing-audit` (bring a billing tool into line with its
+  manual, two reported bugs and six unreported departures) and `probe-plan`
+  (the worst-case shortest adaptive probe plan that identifies a device
+  revision). Each check runs every hidden case, each within 5 seconds
+  (its watchdog allows 1 second more for launch), and prints a case count;
+  each `task.json` gives the count (`cases`) and a check timeout with room
+  past all its runs (240 seconds for `billing-audit`, 180 for
+  `probe-plan`). Run it with
+  `--max-run-secs 1200 --max-total-input-tokens 4000000` so a long run
+  isn't ended by its limits. The tests run every check on the
+  host and assert the exact line it prints for the bare seed, the
+  reference solution and each overlay in `tests/fixtures/eval-tier3/`.
+- Eval results record graded check case scores. A check may print one line
+  as its whole stdout, `cases N of N` (exit 0), `cases P of N failed I,J,K`
+  or `cases 0 of N failed all` (exit 1), for at most 128 cases, and a run
+  whose check exited on its own with a line that agrees with its exit code
+  gets `check_cases` in `results.jsonl`. Only stdout known to be complete
+  counts: the journal's `check_completed` record gains an optional
+  `stdout_complete`, and stdout that kilnd cut or whose length it did not
+  know, or a record from an older journal, gives no score. Older journals
+  read and verify as before. A task may give `cases` in its `task.json`;
+  then only a line counting that many scores. Each task with such runs gets a `case_score` in
+  `report.json` (runs, cases passed and run, runs that failed each case and
+  that failed all), `report.md` gains a "Cases" column and a "Failed cases"
+  list, and `eval compare` shows the case score from base to new beside the
+  pass rate. The fields are optional: reports and comparisons without case
+  scores are unchanged, the report schema stays 1, and older files still
+  load. The pass or fail verdict is still the exit code, and replay still
+  compares only the verdict and exit status, not case counts. `eval
+  selftest` also requires that when either of a task's checks prints a case
+  count, both do, with the same total, every case passed by the solution
+  and not every case by the bare seed, and, for a task that gives `cases`,
+  that both print one counting that many.
+- The eval manifest and report record each run's input token limit,
+  `max_total_input_tokens` (`--max-total-input-tokens`), and `report.md`
+  gives it as "Input token limit per run". `eval compare` notes a
+  difference when both reports recorded it; older files, without it, still
+  load.
 - The `ignore-match` and `patch-apply` hard checks now run the solution in a
   fresh directory holding only its inputs. Each case's expected output and
   expected tree, `patch-apply`'s seeded tree, and the copies of the

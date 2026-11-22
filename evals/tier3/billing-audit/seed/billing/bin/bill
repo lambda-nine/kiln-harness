@@ -1,0 +1,47 @@
+#!/bin/sh
+# bill DATADIR PERIOD: print the invoices of month PERIOD for the
+# accounts in DATADIR. docs/MANUAL.md is the specification.
+
+LC_ALL=C
+export LC_ALL
+
+usage() {
+  echo 'usage: bill DATADIR YYYY-MM' >&2
+  exit 2
+}
+
+[ $# -eq 2 ] || usage
+case $2 in
+  [0-9][0-9][0-9][0-9]-0[1-9] | [0-9][0-9][0-9][0-9]-1[0-2]) ;;
+  *) usage ;;
+esac
+[ "${2%%-*}" != 0000 ] || usage
+
+dir=$1
+period=$2
+lib=$(cd "$(dirname "$0")/../lib" && pwd) || exit 2
+
+for f in plans accounts; do
+  if [ ! -f "$dir/$f" ] || [ ! -r "$dir/$f" ]; then
+    echo "bill: cannot read $dir/$f" >&2
+    exit 1
+  fi
+done
+
+# The data files that exist, in the order the manual checks them.
+set --
+for f in plans tiers accounts usage discounts credits; do
+  if [ -f "$dir/$f" ]; then
+    set -- "$@" "$dir/$f"
+  fi
+done
+
+exec awk -v period="$period" \
+  -f "$lib/dates.awk" \
+  -f "$lib/money.awk" \
+  -f "$lib/prorate.awk" \
+  -f "$lib/tiers.awk" \
+  -f "$lib/discounts.awk" \
+  -f "$lib/credits.awk" \
+  -f "$lib/main.awk" \
+  "$@"

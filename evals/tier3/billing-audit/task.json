@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "billing-audit",
+  "description": "Audit a small awk billing tool against its manual: fix two reported bugs that trace to shared date helpers, and find the departures nobody reported.",
+  "check_timeout_secs": 240,
+  "cases": 32,
+  "session_timeout_secs": 1500,
+  "max_steps": 80,
+  "max_tool_calls": 160
+}

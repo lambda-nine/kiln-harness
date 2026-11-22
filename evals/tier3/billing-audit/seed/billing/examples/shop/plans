@@ -1,0 +1,4 @@
+# NAME    FEE    MODEL      TRIAL
+basic     12.00  flat       0
+metered   5.00   graduated  0
+bulk      20.00  volume     1

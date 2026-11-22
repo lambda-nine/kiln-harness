@@ -1124,6 +1124,7 @@ where
                         execution_id: run.execution_id.clone(),
                         stdout: run.stdout,
                         stderr: run.stderr,
+                        stdout_complete: run.stdout_complete,
                     },
                 )?;
                 self.audit.append(
