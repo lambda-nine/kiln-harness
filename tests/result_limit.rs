@@ -789,33 +789,37 @@ async fn a_whole_file_read_that_escapes_past_the_limit_is_cut_to_fit() {
 #[tokio::test]
 async fn a_whole_file_read_through_a_symlink_that_is_cut_says_so() {
     // `stat` sizes the link itself (5 bytes of link text) and `head`
-    // reads its 64 KiB target, which escapes past the default bound.
-    let bound = 128 << 10;
+    // reads its 64 KiB target, which escapes past the default bound: that
+    // cut says truncated. Under a limit below the read size (16 KiB), the
+    // read is bounded and cut as it always was, and keeps the flag it
+    // always had, measured against the link's size, so recorded journals
+    // replay.
     for tool_set in [ToolSet::Base, ToolSet::CodingV2] {
-        let api = FakeApi::default();
-        {
-            let mut state = api.state();
-            state
-                .files
-                .insert("/workspace/a.out".to_string(), vec![0_u8; 64 << 10]);
-            state
-                .symlinks
-                .insert("/workspace/liba.so".to_string(), "a.out".to_string());
+        for (bound, truncated) in [(128 << 10, true), (MIN, false)] {
+            let api = FakeApi::default();
+            {
+                let mut state = api.state();
+                state
+                    .files
+                    .insert("/workspace/a.out".to_string(), vec![0_u8; 64 << 10]);
+                state
+                    .symlinks
+                    .insert("/workspace/liba.so".to_string(), "a.out".to_string());
+            }
+            let results = turn_results(
+                &api,
+                config(tool_set, bound),
+                vec![vec![call("read", "read_file", json!({"path": "liba.so"}))]],
+            )
+            .await;
+            let read = &results["read"];
+            let case = format!("{tool_set:?} {bound}");
+            assert!(encoded(read) <= bound, "{case}");
+            assert_eq!(read["ok"], true, "{case}");
+            assert_eq!(read["file_bytes"], 5, "{case}");
+            assert!(read["returned_bytes"].as_u64() < Some(64 << 10), "{case}");
+            assert_eq!(read["truncated"], truncated, "{case}");
         }
-        let results = turn_results(
-            &api,
-            config(tool_set, bound),
-            vec![vec![call("read", "read_file", json!({"path": "liba.so"}))]],
-        )
-        .await;
-        let read = &results["read"];
-        assert!(encoded(read) <= bound, "{tool_set:?}");
-        assert_eq!(read["ok"], true, "{tool_set:?}");
-        assert!(
-            read["returned_bytes"].as_u64() < Some(64 << 10),
-            "{tool_set:?}"
-        );
-        assert_eq!(read["truncated"], true, "{tool_set:?}");
     }
 }
 

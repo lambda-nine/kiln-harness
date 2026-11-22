@@ -13,7 +13,9 @@ change the CLI or audit format.
   it, so at the default 128 KiB such a read was refused whole as
   `tool_result_too_large` while a lower limit returned its start. Such a
   read is marked truncated even through a symlink, whose `file_bytes`
-  is still the link's own size. A read that fits is unchanged.
+  is still the link's own size; a read through a symlink cut under a
+  limit below the read size (64 KiB or less) still says
+  `truncated: false`, as before. A read that fits is unchanged.
 - A `list_dir` listing whose names escape past the tool result bound
   (quotes, backslashes, control bytes a sandbox program wrote) is cut to
   fit instead of being refused whole as `tool_result_too_large`, as `exec`
