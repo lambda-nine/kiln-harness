@@ -885,3 +885,68 @@ async fn a_list_dir_one_byte_over_the_limit_is_cut_and_says_so() {
         assert_eq!(list["listing_truncated"], true, "{bound}");
     }
 }
+
+#[tokio::test]
+async fn a_list_dir_exactly_at_the_limit_is_as_it_was() {
+    for bound in [MIN, 128 << 10, MAX] {
+        let (list, listing) = listed(names_encoding_to(bound, bound), bound).await;
+        assert_eq!(list, whole_list_result(&listing), "{bound}");
+        assert_eq!(encoded(&list), bound);
+    }
+}
+
+/// A 64 KiB file, the read size, whose whole-file `read_file` result
+/// encodes to exactly `target` bytes: `a`s, with leading NULs (five bytes
+/// more each) and then quotes (one more each).
+fn file_encoding_to(target: usize) -> Vec<u8> {
+    let size = 64 << 10;
+    let whole = |file: &[u8]| {
+        json!({
+            "ok": true,
+            "content": String::from_utf8_lossy(file),
+            "utf8": true,
+            "file_bytes": size,
+            "returned_bytes": size,
+            "truncated": false
+        })
+    };
+    let mut file = vec![b'a'; size];
+    let extra = target - encoded(&whole(&file));
+    let (nuls, quotes) = (extra / 5, extra % 5);
+    file[..nuls].fill(0);
+    file[nuls..nuls + quotes].fill(b'"');
+    assert_eq!(encoded(&whole(&file)), target);
+    file
+}
+
+#[tokio::test]
+async fn a_whole_file_read_at_or_just_under_the_limit_is_as_it_was() {
+    // At the bound, and within its 1 KiB reserve: whole, as it always was.
+    for tool_set in [ToolSet::Base, ToolSet::CodingV2] {
+        for bound in [128 << 10, 256 << 10] {
+            for target in [bound, bound - 500] {
+                let file = file_encoding_to(target);
+                let api = FakeApi::default();
+                api.state()
+                    .files
+                    .insert("/workspace/near.bin".to_string(), file.clone());
+                let results = turn_results(
+                    &api,
+                    config(tool_set, bound),
+                    vec![vec![call("read", "read_file", json!({"path": "near.bin"}))]],
+                )
+                .await;
+                let read = &results["read"];
+                let case = format!("{tool_set:?} {bound} {target}");
+                assert_eq!(encoded(read), target, "{case}");
+                assert_eq!(read["returned_bytes"], file.len(), "{case}");
+                assert_eq!(read["truncated"], false, "{case}");
+                assert_eq!(
+                    read["content"].as_str().map(str::as_bytes),
+                    Some(file.as_slice()),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
