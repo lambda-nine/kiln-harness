@@ -1328,8 +1328,9 @@ impl<A: SandboxApi> ToolSession<'_, A> {
             return execution_error(&stat, "invalid_stat_output");
         };
         // A result limit below the read size bounds the read: no more than
-        // fits is read, and the content is cut to fit as JSON, as a line
-        // range is. At the default limits it never is.
+        // fits is read. The content is cut to fit as JSON, as a line range
+        // is, when the limit bounded the read or when it escapes past the
+        // bound (control bytes, invalid UTF-8) at any read size.
         let fit = self
             .limits
             .max_result_bytes
@@ -1356,22 +1357,25 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         if !read.succeeded() {
             return combine_execution_error(&stat, &read, "read_failed");
         }
-        let mut returned = read.stdout.data.as_slice();
-        if read_bytes < max_bytes {
-            returned = &returned[..coding::json_fitting_prefix(returned, fit)];
-        }
-        let utf8 = std::str::from_utf8(returned).is_ok();
-        let content = String::from_utf8_lossy(returned);
-        let mut run = ToolRun {
-            ok: true,
-            result: json!({
+        let result = |returned: &[u8]| {
+            json!({
                 "ok": true,
-                "content": content,
-                "utf8": utf8,
+                "content": String::from_utf8_lossy(returned),
+                "utf8": std::str::from_utf8(returned).is_ok(),
                 "file_bytes": size,
                 "returned_bytes": returned.len(),
                 "truncated": size > returned.len() as u64
-            }),
+            })
+        };
+        let mut returned = read.stdout.data.as_slice();
+        // A whole read that fits is returned exactly as it always was.
+        if read_bytes < max_bytes || encoded_size(&result(returned)) > self.limits.max_result_bytes
+        {
+            returned = &returned[..coding::json_fitting_prefix(returned, fit)];
+        }
+        let mut run = ToolRun {
+            ok: true,
+            result: result(returned),
             execution_ids: vec![stat.id.clone(), read.id.clone()],
             stdout: merge_evidence(evidence(&stat.stdout), evidence(&read.stdout)),
             stderr: merge_evidence(evidence(&stat.stderr), evidence(&read.stderr)),

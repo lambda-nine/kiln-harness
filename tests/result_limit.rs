@@ -738,3 +738,50 @@ async fn a_list_dir_that_fits_is_as_it_was() {
         assert_eq!(list["listing_truncated"], listing.len() > end);
     }
 }
+
+#[tokio::test]
+async fn a_whole_file_read_that_escapes_past_the_limit_is_cut_to_fit() {
+    // 64 KiB, the read size, of bytes that escape to six (NUL, control) or
+    // decode to a three-byte U+FFFD each (invalid UTF-8): over the default
+    // bound, which the read size alone never reaches.
+    for tool_set in [ToolSet::Base, ToolSet::CodingV2] {
+        for byte in [0x00_u8, 0x01, 0xff] {
+            let file = vec![byte; 64 << 10];
+            for bound in [64 << 10, 128 << 10, MAX] {
+                let api = FakeApi::default();
+                api.state()
+                    .files
+                    .insert("/workspace/a.out".to_string(), file.clone());
+                let results = turn_results(
+                    &api,
+                    config(tool_set, bound),
+                    vec![vec![call("read", "read_file", json!({"path": "a.out"}))]],
+                )
+                .await;
+                let read = &results["read"];
+                let case = format!("{tool_set:?} {byte:#04x} {bound}: {read}");
+                assert!(encoded(read) <= bound, "{case}");
+                assert_eq!(read["ok"], true, "{case}");
+                assert_eq!(read["utf8"], byte != 0xff, "{case}");
+                let returned = read["returned_bytes"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .expect("returned");
+                assert_eq!(
+                    read["content"].as_str(),
+                    Some(String::from_utf8_lossy(&file[..returned]).as_ref()),
+                    "{case}"
+                );
+                if bound == MAX {
+                    // It fits whole, as it always did.
+                    assert_eq!(returned, file.len(), "{case}");
+                    assert_eq!(read["truncated"], false, "{case}");
+                } else {
+                    // The start that fits the bound less its 1 KiB reserve.
+                    assert!(encoded(read) > bound - 1024, "{case}");
+                    assert_eq!(read["truncated"], true, "{case}");
+                }
+            }
+        }
+    }
+}

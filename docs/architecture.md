@@ -1067,7 +1067,7 @@ of headroom. Without the flag, requests are byte for byte as before.
 | Tool | kilnd executions | Validation |
 |---|---:|---|
 | `exec` | 1 (streamed) | 1–128 literal UTF-8 argv entries, no NUL, 32 KiB argv, 64 KiB stdin, at most 5 s; stopped past 8 MiB of either output; each stream shows at most a third of the result bound, and output that escapes past the bound keeps, cut between characters, the start of each stream that fits, half the room each and the other's unused share, marked model-truncated |
-| `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned, and under a result limit below that the start that fits it as JSON |
+| `read_file` | 2 | `/workspace` file path; fixed `stat` then bounded `head`; at most 64 KiB returned; under a result limit below that, or when the content escapes past the limit as JSON (control bytes, invalid UTF-8), the start that fits it less 1 KiB, cut between characters and marked truncated |
 | `write_file` | 1 | `/workspace` file path; fixed `dd` argv and bounded stdin; at most 64 KiB |
 | `list_dir` | 1 | `/workspace` directory, `.` or `/workspace` for the root; fixed `ls -1Ap` argv, names only; the listing shows at most half the result bound, and a listing whose names escape past the bound (quotes, backslashes, control bytes) keeps, cut between characters, the start that fits, marked `listing_truncated` |
 | `workspace_diff` | 1 | fixed NUL-delimited `find`; compares at most 512 paths / 64 KiB with baseline; lists that would not fit the result bound keep, in path order, what fits in it less 1 KiB, each list half and the other's unused share, marked `truncated` with `added_total` and `removed_total` |

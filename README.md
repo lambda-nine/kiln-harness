@@ -258,7 +258,8 @@ as the model sees it and the journal records it, and the default system
 prompt states it in KiB. Each result counts toward the journal's 64 MiB
 file cap, so a long run with many calls fits by lowering it (see "Journal
 size" in `docs/architecture.md`); a whole-file `read_file` then returns the
-start that fits, marked truncated. Lower `--max-output-tokens` only for models that do not think. `--temperature`
+start that fits, marked truncated, as it does at any limit for content
+that escapes past it, such as a binary. Lower `--max-output-tokens` only for models that do not think. `--temperature`
 (default 0) and `--seed` are forwarded. Output matches `demo`. The audit
 defaults to `audit/run.jsonl` and the journal to
 `journal/run-<unix_ms>.jsonl`, which `replay` reruns without the model

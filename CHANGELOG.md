@@ -6,6 +6,13 @@ change the CLI or audit format.
 
 ## Unreleased
 
+- A whole-file `read_file` whose content escapes past the tool result
+  bound as JSON (control bytes, NULs and invalid UTF-8, as in most
+  binaries over about 50 KiB) returns the start that fits, marked
+  truncated, at every limit. Before, only a limit below the read size cut
+  it, so at the default 128 KiB such a read was refused whole as
+  `tool_result_too_large` while a lower limit returned its start. A read
+  that fits is unchanged.
 - A `list_dir` listing whose names escape past the tool result bound
   (quotes, backslashes, control bytes a sandbox program wrote) is cut to
   fit instead of being refused whole as `tool_result_too_large`, as `exec`
