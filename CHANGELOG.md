@@ -33,6 +33,20 @@ change the CLI or audit format.
   checkpoint capture and never removes, so the check no longer fails on a VM
   where anything has captured a checkpoint.
 
+- The `ignore-match` and `patch-apply` hard checks now run the solution in a
+  fresh directory holding only its inputs. Each case's expected output and
+  expected tree, `patch-apply`'s seeded tree, and the copies of the
+  solution's output and tree that are compared are kept in a directory
+  outside the workspace, the expected ones made only after the solution has
+  exited. The check removes that directory on every exit the shell can
+  catch, even one during setup or after a solution has left part of its
+  tree read-only; sandbox teardown covers the rest. That includes a TERM
+  that lands before `mktemp` has returned the directory's name, which can
+  leave it behind, empty. Results are unchanged. The
+  expected output is no longer in the workspace while the solution runs,
+  which keeps an honest solution from coming across it; the check runs as
+  the same user as the solution, so it does not stop one that goes looking
+  for it.
 - `ignore-match` gains 4 hidden cases; results are not comparable with
   earlier runs. They test rules the spec states outright and none of its
   worked examples exercises: an anchored lone `/**` matches one segment, a segment of
