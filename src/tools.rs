@@ -1369,13 +1369,21 @@ impl<A: SandboxApi> ToolSession<'_, A> {
         };
         let mut returned = read.stdout.data.as_slice();
         // A whole read that fits is returned exactly as it always was.
-        if read_bytes < max_bytes || encoded_size(&result(returned)) > self.limits.max_result_bytes
-        {
+        let escapes = read_bytes >= max_bytes
+            && encoded_size(&result(returned)) > self.limits.max_result_bytes;
+        if read_bytes < max_bytes || escapes {
             returned = &returned[..coding::json_fitting_prefix(returned, fit)];
+        }
+        let mut value = result(returned);
+        // A read that escapes past the bound was cut here, so it is truncated
+        // whatever `stat` measured (a symlink's own size, for one). A read
+        // the lowered limit bounded keeps its recorded flag.
+        if escapes {
+            value["truncated"] = Value::Bool(true);
         }
         let mut run = ToolRun {
             ok: true,
-            result: result(returned),
+            result: value,
             execution_ids: vec![stat.id.clone(), read.id.clone()],
             stdout: merge_evidence(evidence(&stat.stdout), evidence(&read.stdout)),
             stderr: merge_evidence(evidence(&stat.stderr), evidence(&read.stderr)),

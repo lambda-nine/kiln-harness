@@ -785,3 +785,36 @@ async fn a_whole_file_read_that_escapes_past_the_limit_is_cut_to_fit() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_whole_file_read_through_a_symlink_that_is_cut_says_so() {
+    // `stat` sizes the link itself (5 bytes of link text) and `head`
+    // reads its 64 KiB target, which escapes past the default bound.
+    let bound = 128 << 10;
+    for tool_set in [ToolSet::Base, ToolSet::CodingV2] {
+        let api = FakeApi::default();
+        {
+            let mut state = api.state();
+            state
+                .files
+                .insert("/workspace/a.out".to_string(), vec![0_u8; 64 << 10]);
+            state
+                .symlinks
+                .insert("/workspace/liba.so".to_string(), "a.out".to_string());
+        }
+        let results = turn_results(
+            &api,
+            config(tool_set, bound),
+            vec![vec![call("read", "read_file", json!({"path": "liba.so"}))]],
+        )
+        .await;
+        let read = &results["read"];
+        assert!(encoded(read) <= bound, "{tool_set:?}");
+        assert_eq!(read["ok"], true, "{tool_set:?}");
+        assert!(
+            read["returned_bytes"].as_u64() < Some(64 << 10),
+            "{tool_set:?}"
+        );
+        assert_eq!(read["truncated"], true, "{tool_set:?}");
+    }
+}
