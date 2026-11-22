@@ -1873,3 +1873,46 @@ fn an_unbounded_drain_never_panics() {
     assert!(harness.drain_live_output(Duration::MAX));
     assert!(begun.elapsed() < Duration::from_secs(1));
 }
+
+#[tokio::test]
+async fn unary_exec_output_that_escapes_past_the_bound_is_cut_as_streamed() {
+    // Output that escapes past the default result bound, quotes and tabs on
+    // one stream and control bytes on the other, is cut to fit on the
+    // streamed path a live session takes. The same session replayed as
+    // recorded unary (`workspace_v1`) takes the unary path and must cut it
+    // to the same result.
+    let api = FakeApi::with_expiry();
+    api.state().sh_handler = Some(Arc::new(
+        |_: &[u8], _: &mut std::collections::BTreeMap<String, Vec<u8>>| ShAnswer {
+            stdout: "\"\t".repeat(100_000).into_bytes(),
+            stderr: vec![1_u8; 60_000],
+            ..ShAnswer::exit(0)
+        },
+    ));
+    let provider = ScriptedProvider::new([
+        ModelResponse::tool_use([ToolCall::new(
+            "c1",
+            "exec",
+            json!({"argv": ["/bin/sh", "-s"], "stdin": "print"}),
+        )]),
+        ModelResponse::final_text("done"),
+    ]);
+    let (records, _, hashes) = recorded_with_hashes(&api, provider).await;
+    assert_eq!(api.state().streams.len(), 1);
+    let results = tool_results_of(&records);
+    let bound = short_lifecycle_config().tool_limits.max_result_bytes;
+    let encoded = serde_json::to_vec(&results[0]).expect("encode").len();
+    assert!(encoded <= bound && encoded > bound - 16, "{encoded}");
+    assert_eq!(results[0]["ok"], true, "{}", results[0]);
+    assert_eq!(results[0]["stdout_model_truncated"], true);
+    assert_eq!(results[0]["stderr_model_truncated"], true);
+
+    let unary = api.clone();
+    unary.state().streams.clear();
+    let earlier = recorded_in(&records, Some("workspace_v1"), &hashes);
+    let replayed = replay_in(&earlier, &unary).await;
+    assert_eq!(replayed.provider().diverged_at(), None);
+    assert!(replayed.provider().exhausted());
+    assert!(unary.state().streams.is_empty(), "replayed unary");
+    assert_eq!(tool_results_of(&replayed.journal().records), results);
+}
